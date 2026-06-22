@@ -1,0 +1,21 @@
+[workspace]
+members = ["bin/*", "crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+# reth, pinned to the tag the local checkout tracks (~/Projects/arkiv/reth).
+# Docker builds the workspace in isolation, so reth must be a git dependency.
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+
+# Common
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+tracing = "0.1"

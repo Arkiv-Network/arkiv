@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# devnet runtime artifacts
+/data
+**/datadir
+jwt.hex
+.env
+
+.DS_Store
