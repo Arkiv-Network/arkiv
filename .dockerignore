@@ -1,0 +1,7 @@
+target
+.git
+data
+**/datadir
+jwt.hex
+*.md
+.DS_Store
