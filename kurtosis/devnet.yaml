@@ -1,0 +1,25 @@
+# Args for ethpandaops/ethereum-package.
+# A single arkiv-node (vanilla reth) EL + lighthouse CL devnet for the harness.
+# Kurtosis generates genesis, JWT, validator keys and wiring for us.
+#
+#   docker build -t arkiv-node:dev -f docker/arkiv-node.Dockerfile .
+#   kurtosis run --enclave arkiv-harness \
+#     github.com/ethpandaops/ethereum-package \
+#     --args-file kurtosis/devnet.yaml
+#
+# Schema: https://github.com/ethpandaops/ethereum-package#configuration
+
+participants:
+  # EL is our custom arkiv-node image, driven as a standard reth client.
+  - el_type: reth
+    el_image: arkiv-node:dev
+    cl_type: lighthouse
+  # To test watcher keep-up, add a second follower participant here, e.g.:
+  # - el_type: reth
+  #   el_image: arkiv-node:dev
+  #   cl_type: lighthouse
+  #   validator_count: 0
+
+network_params:
+  preset: minimal
+  seconds_per_slot: 4
