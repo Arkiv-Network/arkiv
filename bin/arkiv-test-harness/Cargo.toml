@@ -1,0 +1,13 @@
+[package]
+name = "arkiv-test-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arkiv-test-harness"
+path = "src/main.rs"
+
+[dependencies]
+arkiv-harness.workspace = true
