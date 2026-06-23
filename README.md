@@ -9,9 +9,12 @@ The EL is a dummy `arkiv-node` (vanilla reth for now), standing in for the real 
 ```
 bin/arkiv-node/          dummy EL — vanilla reth wrapper
 bin/arkiv-test-harness/  black-box driver (skeleton)
+bin/arkiv-committer/     committer entrypoint (DA stub — owner Piotr)
 crates/arkiv-harness/    shared config types
-docker/                  arkiv-node Dockerfile (debian-slim)
-kurtosis/                arkiv-chain.yaml (ethereum-package args) + base-chain/ package
+crates/arkiv-da/         frozen DA format — zstd-compressed RLP block (contract C2)
+crates/arkiv-committer/  committer config + run loop (stub)
+docker/                  arkiv-node + arkiv-committer Dockerfiles (debian-slim)
+kurtosis/                arkiv-chain.yaml (ethereum-package args) + base-chain/ + committer/ packages
 scripts/kurtosis/        up / down helpers
 ```
 
@@ -25,7 +28,9 @@ scripts/kurtosis/up.py         # build arkiv-node image, run devnet
 scripts/kurtosis/down.py       # tear down
 ```
 
-`up.py` brings up two chains in one enclave via two kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later). Two runs because kurtosis can't import a remote package from a local one.
+`up.py` brings up the stack in one enclave via additive kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL), a plain-reth **base chain** below it (DA / settlement substrate), and the **committer** wired to both. Separate runs because kurtosis can't import a remote package from a local one.
+
+The committer (`arkiv-committer`) is **leg-work, not the committer itself** (owner Piotr): it links the frozen DA format (`arkiv-da` — `DA_VERSION || zstd(rlp(block))`), self-checks the round-trip, and heartbeats. The real poll-block → encode → post-to-inbox loop drops into the same slot; it waits on the inbox contract (Contracts) and the functional-MVP go-ahead.
 
 Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
 
