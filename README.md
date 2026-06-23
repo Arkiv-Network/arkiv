@@ -21,10 +21,10 @@ Needs Rust, Docker, and the [kurtosis](https://docs.kurtosis.com/install) CLI.
 
 ```sh
 cargo build --workspace        # build
-scripts/kurtosis/up.sh         # build arkiv-node image, run devnet
-scripts/kurtosis/down.sh       # tear down
+scripts/kurtosis/up.py         # build arkiv-node image, run devnet
+scripts/kurtosis/down.py       # tear down
 ```
 
-`up.sh` brings up two chains in one enclave via two kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later). Two runs because kurtosis can't import a remote package from a local one.
+`up.py` brings up two chains in one enclave via two kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later). Two runs because kurtosis can't import a remote package from a local one.
 
 Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
