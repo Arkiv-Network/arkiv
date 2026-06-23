@@ -1320,6 +1320,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-committer-bin"
+version = "0.1.0"
+dependencies = [
+ "arkiv-committer",
+ "clap",
+ "eyre",
+]
+
+[[package]]
 name = "arkiv-da"
 version = "0.1.0"
 dependencies = [

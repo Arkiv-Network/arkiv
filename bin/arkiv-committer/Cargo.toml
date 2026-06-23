@@ -1,0 +1,15 @@
+[package]
+name = "arkiv-committer-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arkiv-committer"
+path = "src/main.rs"
+
+[dependencies]
+arkiv-committer.workspace = true
+clap.workspace = true
+eyre.workspace = true
