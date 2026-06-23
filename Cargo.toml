@@ -19,3 +19,6 @@ reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 tracing = "0.1"
+
+# Internal
+arkiv-harness = { path = "crates/arkiv-harness" }
