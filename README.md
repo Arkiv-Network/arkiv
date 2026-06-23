@@ -1,53 +1,30 @@
 # arkiv-harness
 
-Black-box test harness for the Arkiv database-chain. It stands up an execution client + consensus client devnet and drives it from the outside — no in-process node, only the public RPC / Engine / beacon surfaces a real deployment exposes.
+Black-box test harness for the Arkiv database-chain. Stands up a devnet with kurtosis and drives it from the outside.
 
-For now the EL is a **dummy `arkiv-node`**: a vanilla reth node standing in for the real arkiv-op-reth execution client, so the harness has something to drive while the precompile/entity semantics land elsewhere.
+The EL is a dummy `arkiv-node` (vanilla reth for now), standing in for the real arkiv-op-reth execution client.
 
 ## Layout
 
 ```
-bin/arkiv-node/          dummy EL — vanilla reth wrapper (the custom EL image)
+bin/arkiv-node/          dummy EL — vanilla reth wrapper
 bin/arkiv-test-harness/  black-box driver (skeleton)
-crates/arkiv-harness/    shared config / topology types
-docker/                  arkiv-node Dockerfile (musl builder -> alpine runtime)
-kurtosis/                kurtosis package — Arkiv chain + base chain in one enclave
-scripts/kurtosis/        devnet up / down helpers
+crates/arkiv-harness/    shared config types
+docker/                  arkiv-node Dockerfile (alpine)
+kurtosis/                devnet package — Arkiv chain + base chain
+scripts/kurtosis/        up / down helpers
 ```
 
-The Cargo workspace pins all crates to shared `[workspace.package]` metadata and borrows dependencies from the root `Cargo.toml`. reth is a git dependency pinned to tag `v2.2.0`.
+## Usage
 
-## Prerequisites
-
-- Rust (toolchain pinned in `rust-toolchain.toml`)
-- Docker
-- [kurtosis](https://docs.kurtosis.com/install) CLI
-
-## Build & test
+Needs Rust, Docker, and the [kurtosis](https://docs.kurtosis.com/install) CLI.
 
 ```sh
-cargo build --workspace
-cargo test --workspace
-cargo run -p arkiv-test-harness     # prints the planned topology
-./target/debug/arkiv-node --version
+cargo build --workspace        # build
+scripts/kurtosis/up.sh         # build arkiv-node image, run devnet
+scripts/kurtosis/down.sh       # tear down
 ```
 
-## Devnet
+The devnet (`kurtosis/devnet.yaml`) runs two chains in one enclave: the **Arkiv chain** (arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later).
 
-Everything runs through one kurtosis package (`kurtosis/main.star`) in a single enclave, so there's one tool and one teardown. The package composes on [ethpandaops/ethereum-package](https://github.com/ethpandaops/ethereum-package) — which generates genesis, the JWT secret, validator keys and all wiring — and adds the base chain as one more service.
-
-```sh
-scripts/kurtosis/up.sh      # build arkiv-node:dev, then kurtosis run ./kurtosis
-scripts/kurtosis/down.sh    # tear the enclave down (both chains)
-```
-
-`kurtosis/devnet.yaml` defines two chains:
-
-- **Arkiv chain** — one `reth` EL (our `arkiv-node:dev` image) paired with a `lighthouse` CL. Add a second participant to exercise follower / watcher keep-up.
-- **Base chain** — a bespoke plain-`reth --dev` node that sits below the Arkiv chain as the DA / settlement substrate. The committer posts here later; deliberately plain reth, with no Arkiv semantics and no CL.
-
-Endpoints are assigned dynamically by kurtosis — discover them with `kurtosis enclave inspect arkiv-harness` or `kurtosis port print`. The defaults in `HarnessConfig` are placeholders until the harness reads them from the enclave.
-
-## Status
-
-Scaffold only: the workspace builds, the EL image is defined, and the devnet is wired. Real CL→EL block production assertions and enclave-driven harness logic are the next step.
+Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
