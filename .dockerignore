@@ -1,5 +1,6 @@
 target
 .git
+.docker
 data
 **/datadir
 jwt.hex

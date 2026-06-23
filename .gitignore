@@ -8,4 +8,8 @@
 jwt.hex
 .env
 
+# docker build cache (kept on disk under the repo, not committed)
+/.docker/caches/*
+!/.docker/caches/.gitkeep
+
 .DS_Store
