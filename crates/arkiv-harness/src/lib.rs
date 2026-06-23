@@ -23,6 +23,10 @@ pub struct HarnessConfig {
     /// Bespoke base-chain JSON-RPC endpoint — the DA / settlement substrate
     /// below the Arkiv chain (plain reth, no Arkiv semantics).
     pub base_chain_rpc_url: String,
+    /// Inbox contract the committer posts DA to, on the base chain (contract C2).
+    /// Zero until Contracts deploys it; T4 decodes its `BlockPosted` logs with
+    /// `arkiv_da::decode_block`.
+    pub inbox_address: String,
 }
 
 impl Default for HarnessConfig {
@@ -40,6 +44,7 @@ impl Default for HarnessConfig {
             cl_beacon_url: "http://127.0.0.1:33001".to_string(),
             jwt_path: PathBuf::from("jwt.hex"),
             base_chain_rpc_url: "http://127.0.0.1:18545".to_string(),
+            inbox_address: "0x0000000000000000000000000000000000000000".to_string(),
         }
     }
 }
