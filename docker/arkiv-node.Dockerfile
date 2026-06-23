@@ -1,14 +1,19 @@
 # syntax=docker/dockerfile:1.7
 #
-# Builds the dummy arkiv-node (vanilla reth) as a static musl binary on an
-# alpine builder, then ships it on a bare alpine runtime.
+# Builds the dummy arkiv-node (vanilla reth) on a glibc builder and ships it on
+# debian-slim. Alpine/musl was attempted first but reth-tasks does not compile
+# against musl's sched_param (extra sched_ss_* fields); glibc is reth's
+# supported platform, so we use it.
 
-# ---- builder: native musl on alpine ----
-FROM rust:1.94-alpine AS builder
+# ---- builder ----
+FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /build
 
-# C toolchain + headers reth's native deps (libmdbx, etc.) need under musl.
-RUN apk add --no-cache build-base clang lld cmake linux-headers git pkgconfig
+# reth native deps: libclang for bindgen (reth-mdbx-sys), plus clang/cmake/git.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        pkg-config libclang-dev clang cmake git build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
@@ -20,10 +25,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin arkiv-node \
     && cp target/release/arkiv-node /build/arkiv-node
 
-# ---- runtime: bare alpine ----
-FROM alpine:3.20 AS runtime
-RUN apk add --no-cache ca-certificates \
-    && adduser -D -u 714 arkiv \
+# ---- runtime ----
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 714 -m -s /usr/sbin/nologin arkiv \
     && mkdir -p /data && chown arkiv:arkiv /data
 
 COPY --from=builder /build/arkiv-node /usr/local/bin/arkiv-node

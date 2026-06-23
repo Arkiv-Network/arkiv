@@ -10,7 +10,7 @@ The EL is a dummy `arkiv-node` (vanilla reth for now), standing in for the real 
 bin/arkiv-node/          dummy EL — vanilla reth wrapper
 bin/arkiv-test-harness/  black-box driver (skeleton)
 crates/arkiv-harness/    shared config types
-docker/                  arkiv-node Dockerfile (alpine)
+docker/                  arkiv-node Dockerfile (debian-slim)
 kurtosis/                devnet package — Arkiv chain + base chain
 scripts/kurtosis/        up / down helpers
 ```
