@@ -20,6 +20,9 @@ pub struct HarnessConfig {
     pub cl_beacon_url: String,
     /// Shared JWT secret used to authenticate the Engine API.
     pub jwt_path: PathBuf,
+    /// Bespoke base-chain JSON-RPC endpoint — the DA / settlement substrate
+    /// below the Arkiv chain (plain reth, no Arkiv semantics).
+    pub base_chain_rpc_url: String,
 }
 
 impl Default for HarnessConfig {
@@ -31,6 +34,7 @@ impl Default for HarnessConfig {
             el_engine_url: "http://127.0.0.1:8551".to_string(),
             cl_beacon_url: "http://127.0.0.1:5052".to_string(),
             jwt_path: PathBuf::from("jwt.hex"),
+            base_chain_rpc_url: "http://127.0.0.1:18545".to_string(),
         }
     }
 }
