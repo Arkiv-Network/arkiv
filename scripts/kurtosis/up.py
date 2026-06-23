@@ -7,7 +7,11 @@ lighthouse CL), then the base chain (local package = plain reth --dev).
 
 Usage: scripts/kurtosis/up.py [enclave]
 """
-import shutil, subprocess, sys, tempfile
+
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +25,9 @@ def run(*cmd):
 
 
 CACHE.mkdir(parents=True, exist_ok=True)
-if subprocess.run(["docker", "buildx", "inspect", BUILDER], capture_output=True).returncode:
+if subprocess.run(
+    ["docker", "buildx", "inspect", BUILDER], capture_output=True
+).returncode:
     run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
 
 print("==> build arkiv-node:dev image")
