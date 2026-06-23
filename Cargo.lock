@@ -1311,6 +1311,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-da"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "zstd",
+]
+
+[[package]]
 name = "arkiv-harness"
 version = "0.1.0"
 

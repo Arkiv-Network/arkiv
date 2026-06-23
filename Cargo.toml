@@ -20,5 +20,13 @@ clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 tracing = "0.1"
 
+# alloy + compression for the DA format (versions match what reth v2.2.0 already
+# pins in Cargo.lock — adding them as direct deps resolves to the locked stack).
+alloy-rlp = "0.3"
+alloy-primitives = "1.6"
+alloy-consensus = "2.0"
+zstd = "0.13"
+
 # Internal
 arkiv-harness = { path = "crates/arkiv-harness" }
+arkiv-da = { path = "crates/arkiv-da" }
