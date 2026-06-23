@@ -31,6 +31,8 @@ Scaffold only — the workspace builds and the devnet is wired; real harness log
 
 ## Development
 
-The Python helper scripts are formatted with [black](https://black.readthedocs.io); config lives in `pyproject.toml` and CI checks it (`.github/workflows/lint.yml`).
+CI runs two workflows: `rust.yml` (`cargo fmt --check` + `cargo build --workspace`, with cargo caching) and `lint.yml` (black over the Python scripts).
+
+The Python helper scripts are formatted with [black](https://black.readthedocs.io); config lives in `pyproject.toml`.
 
 Enable the local pre-commit hook with `pip install pre-commit && pre-commit install` — black then runs on staged Python before each commit.
