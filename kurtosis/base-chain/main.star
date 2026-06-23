@@ -18,6 +18,13 @@ def run(plan, args):
                     application_protocol = "http",
                 ),
             },
+            # Pin the host port so the harness can hardcode the endpoint (no discovery).
+            public_ports = {
+                "rpc": PortSpec(
+                    number = 18545,
+                    transport_protocol = "TCP",
+                ),
+            },
             cmd = [
                 "node",
                 "--dev",

@@ -26,13 +26,18 @@ pub struct HarnessConfig {
 }
 
 impl Default for HarnessConfig {
-    /// Defaults match the `docker-compose.yml` service topology, reached from
-    /// the host via published ports.
+    /// Defaults match the deterministic host ports kurtosis publishes for our
+    /// enclave: the Arkiv chain via ethereum-package `port_publisher`
+    /// (EL block base 32000, CL base 33000) and the base chain via the
+    /// `public_ports` pin in `kurtosis/base-chain/main.star`. No discovery —
+    /// these are fixed by config, not allocated at random.
     fn default() -> Self {
         Self {
-            el_rpc_url: "http://127.0.0.1:8545".to_string(),
-            el_engine_url: "http://127.0.0.1:8551".to_string(),
-            cl_beacon_url: "http://127.0.0.1:5052".to_string(),
+            // EL block (base 32000): rpc=+3, engine-rpc=+1.
+            el_rpc_url: "http://127.0.0.1:32003".to_string(),
+            el_engine_url: "http://127.0.0.1:32001".to_string(),
+            // CL block (base 33000): beacon http=+1.
+            cl_beacon_url: "http://127.0.0.1:33001".to_string(),
             jwt_path: PathBuf::from("jwt.hex"),
             base_chain_rpc_url: "http://127.0.0.1:18545".to_string(),
         }

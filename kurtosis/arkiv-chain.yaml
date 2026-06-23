@@ -17,3 +17,13 @@ participants:
 network_params:
   preset: minimal
   seconds_per_slot: 4
+
+# Publish EL/CL host ports at deterministic numbers so the harness can hardcode
+# endpoints instead of discovering kurtosis' random allocations.
+port_publisher:
+  el:
+    enabled: true
+    public_port_start: 32000
+  cl:
+    enabled: true
+    public_port_start: 33000
