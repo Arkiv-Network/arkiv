@@ -2,14 +2,15 @@
 # substrate the committer posts to later. Plain reth, no Arkiv semantics, no CL
 # (--dev auto-mines). Run into the same enclave as the Arkiv chain.
 #
-# No remote imports here on purpose: kurtosis can't import a remote package from
-# a local one, so this stays self-contained and the Arkiv chain runs separately.
+# Self-contained (no imports): kurtosis can't import a remote package from a
+# local one, and up.sh runs this from a neutral temp dir because kurtosis roots
+# a local package's archive at the enclosing git repo root.
 
 def run(plan, args):
     plan.add_service(
         name = "base-chain",
         config = ServiceConfig(
-            image = args.get("image", "ghcr.io/paradigmxyz/reth:v2.2.0"),
+            image = "ghcr.io/paradigmxyz/reth:v2.2.0",
             ports = {
                 "rpc": PortSpec(
                     number = 8545,
@@ -20,7 +21,7 @@ def run(plan, args):
             cmd = [
                 "node",
                 "--dev",
-                "--dev.block-time", args.get("block_time", "2s"),
+                "--dev.block-time", "2s",
                 "--http",
                 "--http.addr", "0.0.0.0",
                 "--http.api", "eth,net,web3,txpool",

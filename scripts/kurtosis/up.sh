@@ -36,4 +36,11 @@ kurtosis run --enclave "$ENCLAVE" \
   --args-file ./kurtosis/arkiv-chain.yaml
 
 echo "==> base chain -> enclave $ENCLAVE"
-kurtosis run --enclave "$ENCLAVE" ./kurtosis/base-chain
+# kurtosis roots a local package's archive at the enclosing git repo root, which
+# breaks a package living in a repo subdir (its kurtosis.yml ends up below the
+# archive root). Run the self-contained base-chain package from a neutral temp
+# dir to avoid that.
+BC_TMP="$(mktemp -d)"
+cp kurtosis/base-chain/kurtosis.yml kurtosis/base-chain/main.star "$BC_TMP/"
+kurtosis run --enclave "$ENCLAVE" "$BC_TMP"
+rm -rf "$BC_TMP"
