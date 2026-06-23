@@ -11,7 +11,7 @@ bin/arkiv-node/          dummy EL — vanilla reth wrapper
 bin/arkiv-test-harness/  black-box driver (skeleton)
 crates/arkiv-harness/    shared config types
 docker/                  arkiv-node Dockerfile (debian-slim)
-kurtosis/                devnet package — Arkiv chain + base chain
+kurtosis/                arkiv-chain.yaml (ethereum-package args) + base-chain/ package
 scripts/kurtosis/        up / down helpers
 ```
 
@@ -25,6 +25,6 @@ scripts/kurtosis/up.sh         # build arkiv-node image, run devnet
 scripts/kurtosis/down.sh       # tear down
 ```
 
-The devnet (`kurtosis/devnet.yaml`) runs two chains in one enclave: the **Arkiv chain** (arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later).
+`up.sh` brings up two chains in one enclave via two kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later). Two runs because kurtosis can't import a remote package from a local one.
 
 Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.

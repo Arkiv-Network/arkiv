@@ -1,0 +1,19 @@
+# Args for ethpandaops/ethereum-package — the Arkiv chain.
+# arkiv-node EL + lighthouse CL; genesis / JWT / validators generated for us.
+#
+# Run directly (the local wrapper approach fails: kurtosis can't import a remote
+# package from a local one, so we run ethereum-package remotely and add the base
+# chain as a second run into the same enclave — see scripts/kurtosis/up.sh).
+#
+# Schema: https://github.com/ethpandaops/ethereum-package#configuration
+
+participants:
+  # EL is our custom arkiv-node image, driven as a standard reth client.
+  - el_type: reth
+    el_image: arkiv-node:dev
+    cl_type: lighthouse
+  # To test watcher keep-up, add a second follower participant here.
+
+network_params:
+  preset: minimal
+  seconds_per_slot: 4
