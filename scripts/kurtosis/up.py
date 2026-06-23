@@ -24,15 +24,18 @@ CACHE.mkdir(parents=True, exist_ok=True)
 if subprocess.run(["docker", "buildx", "inspect", BUILDER], capture_output=True).returncode:
     run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
 
+print("==> build arkiv-node:dev image")
 run("docker", "buildx", "build", "--builder", BUILDER, "-t", "arkiv-node:dev",
     "-f", "docker/arkiv-node.Dockerfile", "--cache-from", f"type=local,src={CACHE}",
     "--cache-to", f"type=local,dest={CACHE},mode=max", "--load", ".")
 
+print(f"==> Arkiv chain (ethereum-package) -> enclave {enclave}")
 run("kurtosis", "run", "--enclave", enclave, "github.com/ethpandaops/ethereum-package",
     "--args-file", "./kurtosis/arkiv-chain.yaml")
 
 # kurtosis roots a local package's archive at the git repo root, which breaks a
 # package in a subdir; run the self-contained base-chain from a neutral temp dir.
+print(f"==> base chain (reth --dev) -> enclave {enclave}")
 with tempfile.TemporaryDirectory() as tmp:
     for f in ("kurtosis.yml", "main.star"):
         shutil.copy(ROOT / "kurtosis/base-chain" / f, Path(tmp) / f)
