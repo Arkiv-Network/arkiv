@@ -32,7 +32,7 @@ docker buildx build \
   --load \
   .
 
-echo "==> kurtosis run --enclave $ENCLAVE"
+echo "==> kurtosis run --enclave $ENCLAVE ./kurtosis"
 kurtosis run --enclave "$ENCLAVE" \
-  github.com/ethpandaops/ethereum-package \
-  --args-file kurtosis/devnet.yaml
+  ./kurtosis \
+  --args-file ./kurtosis/devnet.yaml

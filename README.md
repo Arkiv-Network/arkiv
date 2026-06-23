@@ -11,8 +11,8 @@ bin/arkiv-node/          dummy EL — vanilla reth wrapper (the custom EL image)
 bin/arkiv-test-harness/  black-box driver (skeleton)
 crates/arkiv-harness/    shared config / topology types
 docker/                  arkiv-node Dockerfile (musl builder -> alpine runtime)
-kurtosis/                ethereum-package devnet args
-scripts/kurtosis/        up / down helpers
+kurtosis/                kurtosis package — Arkiv chain + base chain in one enclave
+scripts/kurtosis/        devnet up / down helpers
 ```
 
 The Cargo workspace pins all crates to shared `[workspace.package]` metadata and borrows dependencies from the root `Cargo.toml`. reth is a git dependency pinned to tag `v2.2.0`.
@@ -34,14 +34,17 @@ cargo run -p arkiv-test-harness     # prints the planned topology
 
 ## Devnet
 
-Orchestration is delegated to [ethpandaops/ethereum-package](https://github.com/ethpandaops/ethereum-package), which generates genesis, the JWT secret, validator keys and all wiring.
+Everything runs through one kurtosis package (`kurtosis/main.star`) in a single enclave, so there's one tool and one teardown. The package composes on [ethpandaops/ethereum-package](https://github.com/ethpandaops/ethereum-package) — which generates genesis, the JWT secret, validator keys and all wiring — and adds the base chain as one more service.
 
 ```sh
-scripts/kurtosis/up.sh      # build arkiv-node:dev, then kurtosis run
-scripts/kurtosis/down.sh    # tear the enclave down
+scripts/kurtosis/up.sh      # build arkiv-node:dev, then kurtosis run ./kurtosis
+scripts/kurtosis/down.sh    # tear the enclave down (both chains)
 ```
 
-`kurtosis/devnet.yaml` runs one `reth` EL (our `arkiv-node:dev` image) paired with a `lighthouse` CL. Add a second participant there to exercise follower / watcher keep-up.
+`kurtosis/devnet.yaml` defines two chains:
+
+- **Arkiv chain** — one `reth` EL (our `arkiv-node:dev` image) paired with a `lighthouse` CL. Add a second participant to exercise follower / watcher keep-up.
+- **Base chain** — a bespoke plain-`reth --dev` node that sits below the Arkiv chain as the DA / settlement substrate. The committer posts here later; deliberately plain reth, with no Arkiv semantics and no CL.
 
 Endpoints are assigned dynamically by kurtosis — discover them with `kurtosis enclave inspect arkiv-harness` or `kurtosis port print`. The defaults in `HarnessConfig` are placeholders until the harness reads them from the enclave.
 

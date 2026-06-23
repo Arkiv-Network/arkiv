@@ -1,25 +1,25 @@
-# Args for ethpandaops/ethereum-package.
-# A single arkiv-node (vanilla reth) EL + lighthouse CL devnet for the harness.
-# Kurtosis generates genesis, JWT, validator keys and wiring for us.
+# Args for the arkiv-harness kurtosis package (kurtosis/main.star).
+# One enclave, two chains:
+#   1. Arkiv chain — arkiv-node EL + lighthouse CL (via ethereum-package)
+#   2. base chain  — a bespoke plain-reth --dev node (DA / settlement substrate)
 #
 #   docker build -t arkiv-node:dev -f docker/arkiv-node.Dockerfile .
-#   kurtosis run --enclave arkiv-harness \
-#     github.com/ethpandaops/ethereum-package \
-#     --args-file kurtosis/devnet.yaml
+#   kurtosis run --enclave arkiv-harness ./kurtosis --args-file ./kurtosis/devnet.yaml
 #
-# Schema: https://github.com/ethpandaops/ethereum-package#configuration
+# ethereum-package schema:
+# https://github.com/ethpandaops/ethereum-package#configuration
 
-participants:
-  # EL is our custom arkiv-node image, driven as a standard reth client.
-  - el_type: reth
-    el_image: arkiv-node:dev
-    cl_type: lighthouse
-  # To test watcher keep-up, add a second follower participant here, e.g.:
-  # - el_type: reth
-  #   el_image: arkiv-node:dev
-  #   cl_type: lighthouse
-  #   validator_count: 0
+ethereum_package:
+  participants:
+    # EL is our custom arkiv-node image, driven as a standard reth client.
+    - el_type: reth
+      el_image: arkiv-node:dev
+      cl_type: lighthouse
+    # To test watcher keep-up, add a second follower participant here.
+  network_params:
+    preset: minimal
+    seconds_per_slot: 4
 
-network_params:
-  preset: minimal
-  seconds_per_slot: 4
+base_chain:
+  image: ghcr.io/paradigmxyz/reth:v2.2.0   # plain reth; override to taste
+  block_time: "2s"
