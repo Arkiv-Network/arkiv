@@ -1,0 +1,4 @@
+# Python tooling config (the kurtosis helper scripts). The Rust workspace is
+# configured separately in Cargo.toml.
+[tool.black]
+line-length = 100

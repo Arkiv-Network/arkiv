@@ -1,0 +1,7 @@
+# Install once with: pip install pre-commit && pre-commit install
+# Then black runs automatically on staged Python files before each commit.
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black

@@ -28,3 +28,9 @@ scripts/kurtosis/down.py       # tear down
 `up.py` brings up two chains in one enclave via two kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL) and a plain-reth **base chain** below it (DA / settlement substrate for the committer, built later). Two runs because kurtosis can't import a remote package from a local one.
 
 Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
+
+## Development
+
+The Python helper scripts are formatted with [black](https://black.readthedocs.io); config lives in `pyproject.toml` and CI checks it (`.github/workflows/lint.yml`).
+
+Enable the local pre-commit hook with `pip install pre-commit && pre-commit install` — black then runs on staged Python before each commit.

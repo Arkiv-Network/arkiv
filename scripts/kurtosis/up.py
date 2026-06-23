@@ -25,13 +25,34 @@ if subprocess.run(["docker", "buildx", "inspect", BUILDER], capture_output=True)
     run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
 
 print("==> build arkiv-node:dev image")
-run("docker", "buildx", "build", "--builder", BUILDER, "-t", "arkiv-node:dev",
-    "-f", "docker/arkiv-node.Dockerfile", "--cache-from", f"type=local,src={CACHE}",
-    "--cache-to", f"type=local,dest={CACHE},mode=max", "--load", ".")
+run(
+    "docker",
+    "buildx",
+    "build",
+    "--builder",
+    BUILDER,
+    "-t",
+    "arkiv-node:dev",
+    "-f",
+    "docker/arkiv-node.Dockerfile",
+    "--cache-from",
+    f"type=local,src={CACHE}",
+    "--cache-to",
+    f"type=local,dest={CACHE},mode=max",
+    "--load",
+    ".",
+)
 
 print(f"==> Arkiv chain (ethereum-package) -> enclave {enclave}")
-run("kurtosis", "run", "--enclave", enclave, "github.com/ethpandaops/ethereum-package",
-    "--args-file", "./kurtosis/arkiv-chain.yaml")
+run(
+    "kurtosis",
+    "run",
+    "--enclave",
+    enclave,
+    "github.com/ethpandaops/ethereum-package",
+    "--args-file",
+    "./kurtosis/arkiv-chain.yaml",
+)
 
 # kurtosis roots a local package's archive at the git repo root, which breaks a
 # package in a subdir; run the self-contained base-chain from a neutral temp dir.
