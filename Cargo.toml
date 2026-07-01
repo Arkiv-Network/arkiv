@@ -32,14 +32,17 @@ alloy-evm = "0.34"
 zstd = "0.13"
 
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
-# arkiv-genesis (mnemonic-derived dev signers). Versions match arkiv-op-reth.
-alloy-genesis = "2.0.5"
+# arkiv-genesis (mnemonic-derived dev signers). Pinned to =2.0.4: alloy-rpc-types
+# 2.0.5+ requires alloy-rpc-types-engine ^2.0.5, whose only match is 2.1.0 — and
+# 2.1.0 adds EthPayloadAttributes::target_gas_limit, a field reth v2.2.0 doesn't
+# set, breaking the workspace build. 2.0.4 keeps the engine crate at 2.0.4.
+alloy-genesis = "=2.0.4"
 alloy-sol-types = "1.6.0"
-alloy-provider = "2.0.5"
-alloy-signer-local = { version = "2.0.5", features = ["mnemonic"] }
-alloy-network = "2.0.5"
-alloy-contract = "2.0.5"
-alloy-rpc-types = "2.0.5"
+alloy-provider = "=2.0.4"
+alloy-signer-local = { version = "=2.0.4", features = ["mnemonic"] }
+alloy-network = "=2.0.4"
+alloy-contract = "=2.0.4"
+alloy-rpc-types = "=2.0.4"
 
 # Solidity bindings for the Arkiv EntityRegistry ABI (external, Arkiv-specific).
 arkiv-bindings = { git = "https://github.com/Arkiv-Network/arkiv-contracts.git", rev = "d6ebe18" }
