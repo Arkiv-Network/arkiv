@@ -13,6 +13,11 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    # reth binaries are large; linking them with debug info OOMs the runner's
+    # linker (ld bus error). This job only checks the workspace compiles, so
+    # drop debug info to keep peak linker memory under the ~7 GB limit.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
