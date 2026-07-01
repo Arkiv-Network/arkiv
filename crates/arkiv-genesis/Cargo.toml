@@ -1,0 +1,17 @@
+[package]
+name = "arkiv-genesis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Genesis primitives for the Arkiv chain: the precompile address and the
+# mnemonic-derived dev-funding alloc. Ported from arkiv-op-reth; the sole
+# dependency on arkiv-entitydb (the ARKIV_ADDRESS constant) is inlined here.
+
+[dependencies]
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-signer-local.workspace = true
+
+eyre.workspace = true
