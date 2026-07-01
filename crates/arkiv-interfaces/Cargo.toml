@@ -1,0 +1,17 @@
+[package]
+name = "arkiv-interfaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Generic, dependency-free trait surface for an Arkiv-compatible state model.
+# Any host — today a custom reth build, later possibly something else —
+# implements these traits to gain Arkiv execution, state and query semantics.
+#
+# Deliberately `#![no_std]` + `alloc` and with ZERO external crates: primitives
+# are fixed-width byte arrays, errors are associated types. This keeps the
+# interface portable into deterministic / fault-proof / zkVM contexts and free
+# of any host's type stack. See the crate-level docs in `src/lib.rs`.
+
+[dependencies]

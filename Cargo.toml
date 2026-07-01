@@ -28,6 +28,7 @@ alloy-consensus = "2.0"
 zstd = "0.13"
 
 # Internal
+arkiv-interfaces = { path = "crates/arkiv-interfaces" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-da = { path = "crates/arkiv-da" }
 arkiv-committer = { path = "crates/arkiv-committer" }
