@@ -1343,6 +1343,10 @@ name = "arkiv-harness"
 version = "0.1.0"
 
 [[package]]
+name = "arkiv-interfaces"
+version = "0.1.0"
+
+[[package]]
 name = "arkiv-node"
 version = "0.1.0"
 dependencies = [
