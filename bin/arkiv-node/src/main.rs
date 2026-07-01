@@ -1,14 +1,20 @@
-//! Dummy `arkiv-node`: a vanilla reth Ethereum node.
+//! `arkiv-node`: a reth Ethereum node with the Arkiv executor wired in.
 //!
-//! This stands in for the real arkiv-op-reth execution client so the harness has
-//! an EL to drive. Arkiv precompile / entity semantics are intentionally absent —
-//! this is just `EthereumNode` behind the standard reth CLI. It speaks the same
-//! Engine API a Lighthouse CL expects, which is all the harness needs for now.
+//! This is the assembly point. We keep reth as the host (networking, txpool,
+//! JSON-RPC, MDBX, engine/Engine API, sync) and override exactly one component:
+//! the **executor**, replaced by [`arkiv_executor::ArkivExecutorBuilder`]. The
+//! node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
+//!
+//! Today the Arkiv executor is the stock Ethereum executor with an Arkiv
+//! precompile registered at `ARKIV_ADDRESS` — it proves the injection wiring end
+//! to end. The neutered-EVM policy and the entity engine land behind that same
+//! seam without touching this file (see experiments/post-evm-execution-report.md).
 
+use arkiv_executor::ArkivExecutorBuilder;
 use clap::Parser;
 use reth::cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_ethereum::EthereumNode;
+use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
 use tracing::info;
 
 fn main() {
@@ -18,9 +24,14 @@ fn main() {
     }
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
-        info!(target: "arkiv-node", "Launching dummy arkiv-node (vanilla reth)");
+        info!(target: "arkiv-node", "Launching arkiv-node (reth host + Arkiv executor)");
         let handle = builder
-            .node(EthereumNode::default())
+            // Standard Ethereum node types (primitives, chainspec, payload, storage).
+            .with_types::<EthereumNode>()
+            // Default Ethereum components, but our executor replaces the EVM one.
+            .with_components(EthereumNode::components().executor(ArkivExecutorBuilder::default()))
+            // Standard Ethereum add-ons (RPC, engine API, validator).
+            .with_add_ons(EthereumAddOns::default())
             .launch_with_debug_capabilities()
             .await?;
         handle.wait_for_node_exit().await

@@ -13,5 +13,6 @@ path = "src/main.rs"
 reth.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-ethereum.workspace = true
+arkiv-executor.workspace = true
 clap.workspace = true
 tracing.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "arkiv-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Arkiv execution seam: a custom reth executor that replaces the stock EVM
+# config. For now it is the stock Ethereum executor with an Arkiv-branded
+# precompile registered at ARKIV_ADDRESS — i.e. it proves the *injection
+# mechanism* end to end (the executor component the node assembles is ours).
+# The fixed-function entity engine and the neutered-EVM policy land on top of
+# this seam in later steps (see experiments/post-evm-execution-report.md §3).
+
+[dependencies]
+reth-ethereum = { workspace = true, features = ["evm", "node"] }
+alloy-evm.workspace = true
+alloy-primitives.workspace = true
+eyre.workspace = true
+tracing.workspace = true
