@@ -16,5 +16,6 @@ license.workspace = true
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
 alloy-evm.workspace = true
 alloy-primitives.workspace = true
+arkiv-db-engine.workspace = true
 eyre.workspace = true
 tracing.workspace = true

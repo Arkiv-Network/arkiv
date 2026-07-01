@@ -1,0 +1,21 @@
+[package]
+name = "arkiv-db-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-sol-types.workspace = true
+roaring.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+test-utils = []
+
+[dev-dependencies]
+arkiv-db-engine = { path = ".", features = ["test-utils"] }
