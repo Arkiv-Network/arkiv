@@ -14,7 +14,7 @@ use arkiv_executor::ArkivExecutorBuilder;
 use clap::Parser;
 use reth::cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
+use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
 use tracing::info;
 
 fn main() {
@@ -29,9 +29,7 @@ fn main() {
             // Standard Ethereum node types (primitives, chainspec, payload, storage).
             .with_types::<EthereumNode>()
             // Default Ethereum components, but our executor replaces the EVM one.
-            .with_components(
-                EthereumNode::components().executor(ArkivExecutorBuilder::default()),
-            )
+            .with_components(EthereumNode::components().executor(ArkivExecutorBuilder::default()))
             // Standard Ethereum add-ons (RPC, engine API, validator).
             .with_add_ons(EthereumAddOns::default())
             .launch_with_debug_capabilities()

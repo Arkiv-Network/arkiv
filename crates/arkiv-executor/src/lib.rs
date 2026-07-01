@@ -33,13 +33,16 @@
 //! by the keccak-MPT (see the report, §3 and Appendix A): any execution *logic*,
 //! not any state engine.
 
-use alloy_evm::{eth::EthEvmContext, precompiles::PrecompilesMap, Evm, EvmFactory};
-use alloy_primitives::{address, Address, Bytes, TxKind, U256};
+use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
+use alloy_primitives::{Address, Bytes, TxKind, U256, address};
 use reth_ethereum::{
+    EthPrimitives,
     chainspec::ChainSpec,
     evm::{
+        EthEvm, EthEvmConfig,
         primitives::{Database, EvmEnv},
         revm::{
+            MainBuilder, MainContext,
             context::{BlockEnv, CfgEnv, Context, TxEnv},
             context_interface::result::{
                 EVMError, ExecutionResult, HaltReason, Output, ResultAndState, ResultGas,
@@ -50,15 +53,12 @@ use reth_ethereum::{
             precompile::Precompiles,
             primitives::hardfork::SpecId,
             state::{Account, EvmState},
-            MainBuilder, MainContext,
         },
-        EthEvm, EthEvmConfig,
     },
     node::{
         api::{FullNodeTypes, NodeTypes},
-        builder::{components::ExecutorBuilder, BuilderContext},
+        builder::{BuilderContext, components::ExecutorBuilder},
     },
-    EthPrimitives,
 };
 
 /// The Arkiv address — `0x4400…0044`.
@@ -164,7 +164,7 @@ fn arkiv_transact<DB: Database>(
         TxKind::Create => {
             return Err(EVMError::Custom(
                 "contract creation is disabled (no-EVM Arkiv executor)".to_string(),
-            ))
+            ));
         }
     };
 
@@ -174,11 +174,21 @@ fn arkiv_transact<DB: Database>(
     }
 
     let gas_cost = U256::from(ARKIV_TX_GAS).saturating_mul(U256::from(tx.gas_price));
-    let value_out = if to == tx.caller { U256::ZERO } else { tx.value };
+    let value_out = if to == tx.caller {
+        U256::ZERO
+    } else {
+        tx.value
+    };
 
     // Sender: debit value + gas, bump nonce, mark touched.
-    let mut sender = db.basic(tx.caller).map_err(EVMError::Database)?.unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(value_out).saturating_sub(gas_cost);
+    let mut sender = db
+        .basic(tx.caller)
+        .map_err(EVMError::Database)?
+        .unwrap_or_default();
+    sender.balance = sender
+        .balance
+        .saturating_sub(value_out)
+        .saturating_sub(gas_cost);
     sender.nonce = sender.nonce.saturating_add(1);
     let mut sender_acc = Account::from(sender);
     sender_acc.mark_touch();
@@ -188,7 +198,10 @@ fn arkiv_transact<DB: Database>(
 
     // Recipient: credit value.
     if to != tx.caller {
-        let mut recipient = db.basic(to).map_err(EVMError::Database)?.unwrap_or_default();
+        let mut recipient = db
+            .basic(to)
+            .map_err(EVMError::Database)?
+            .unwrap_or_default();
         recipient.balance = recipient.balance.saturating_add(tx.value);
         let mut recipient_acc = Account::from(recipient);
         recipient_acc.mark_touch();
@@ -234,7 +247,9 @@ impl EvmFactory for ArkivEvmFactory {
             .build_mainnet_with_inspector(NoOpInspector {})
             .with_precompiles(PrecompilesMap::from_static(Precompiles::prague()));
 
-        ArkivEvm { inner: EthEvm::new(inner, false) }
+        ArkivEvm {
+            inner: EthEvm::new(inner, false),
+        }
     }
 
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>, EthInterpreter>>(
@@ -243,8 +258,14 @@ impl EvmFactory for ArkivEvmFactory {
         input: EvmEnv,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        let inner = self.create_evm(db, input).inner.into_inner().with_inspector(inspector);
-        ArkivEvm { inner: EthEvm::new(inner, true) }
+        let inner = self
+            .create_evm(db, input)
+            .inner
+            .into_inner()
+            .with_inspector(inspector);
+        ArkivEvm {
+            inner: EthEvm::new(inner, true),
+        }
     }
 }
 
@@ -267,6 +288,9 @@ where
             arkiv_address = %ARKIV_ADDRESS,
             "Assembling Arkiv no-EVM executor over reth host (interpreter bypassed)",
         );
-        Ok(EthEvmConfig::new_with_evm_factory(ctx.chain_spec(), ArkivEvmFactory::default()))
+        Ok(EthEvmConfig::new_with_evm_factory(
+            ctx.chain_spec(),
+            ArkivEvmFactory::default(),
+        ))
     }
 }
