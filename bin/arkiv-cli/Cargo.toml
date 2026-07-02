@@ -1,0 +1,33 @@
+[package]
+name = "arkiv-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arkiv-cli"
+path = "src/main.rs"
+
+[dependencies]
+arkiv-bindings.workspace = true
+arkiv-genesis.workspace = true
+
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+alloy-provider.workspace = true
+alloy-signer-local.workspace = true
+alloy-network.workspace = true
+alloy-contract.workspace = true
+alloy-rpc-types.workspace = true
+
+clap.workspace = true
+eyre.workspace = true
+tokio.workspace = true
+rand = "0.9"
+rand_chacha = "0.9"
+tracing.workspace = true
+hex.workspace = true
+humantime = "2"
+serde.workspace = true
+serde_json.workspace = true

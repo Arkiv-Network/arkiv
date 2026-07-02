@@ -26,13 +26,36 @@ tracing = "0.1"
 # alloy + compression for the DA format (versions match what reth v2.2.0 already
 # pins in Cargo.lock — adding them as direct deps resolves to the locked stack).
 alloy-rlp = "0.3"
-alloy-primitives = "1.6"
+alloy-primitives = { version = "1.6", features = ["rlp"] }
 alloy-consensus = "2.0"
 alloy-evm = "0.34"
 zstd = "0.13"
 
+# alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
+# arkiv-genesis (mnemonic-derived dev signers). Pinned to =2.0.4: alloy-rpc-types
+# 2.0.5+ requires alloy-rpc-types-engine ^2.0.5, whose only match is 2.1.0 — and
+# 2.1.0 adds EthPayloadAttributes::target_gas_limit, a field reth v2.2.0 doesn't
+# set, breaking the workspace build. 2.0.4 keeps the engine crate at 2.0.4.
+alloy-genesis = "=2.0.4"
+alloy-sol-types = "1.6.0"
+alloy-provider = "=2.0.4"
+alloy-signer-local = { version = "=2.0.4", features = ["mnemonic"] }
+alloy-network = "=2.0.4"
+alloy-contract = "=2.0.4"
+alloy-rpc-types = "=2.0.4"
+
+# Solidity bindings for the Arkiv EntityRegistry ABI (external, Arkiv-specific).
+arkiv-bindings = { git = "https://github.com/Arkiv-Network/arkiv-contracts.git", rev = "d6ebe18" }
+
+# CLI extras
+tokio = { version = "1", features = ["full"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
+arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-da = { path = "crates/arkiv-da" }
 arkiv-committer = { path = "crates/arkiv-committer" }
