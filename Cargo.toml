@@ -59,4 +59,4 @@ arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-da = { path = "crates/arkiv-da" }
 arkiv-committer = { path = "crates/arkiv-committer" }
-arkiv-executor = { path = "crates/arkiv-executor" }
+arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }

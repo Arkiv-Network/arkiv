@@ -2,20 +2,20 @@
 
 use alloc::vec::Vec;
 
+use crate::entity::Entity;
 use crate::primitives::{BlockNumber, EntityKey, Hash};
 use crate::query::{PageParams, Query, QueryMatches};
 
 /// Holds the **entities** — the state that is Arkiv's reason to exist.
 ///
-/// It is just a map from [`EntityKey`] to bytes, plus a
+/// It is a map from [`EntityKey`] to [`Entity`], plus a
 /// [`commitment`](EntityStore::commitment) over the whole map. You read one entity
 /// with [`get`](EntityStore::get); you apply a whole block's changes at once with
-/// [`apply_delta`](EntityStore::apply_delta). The bytes are opaque to the store —
-/// encoding an [`Entity`](crate::entity::Entity) to and from them follows the
-/// version-tagged [`EntityCodec`](crate::codec::EntityCodec) contract, shared by
-/// everyone who reads or writes entity bytes.
+/// [`apply_delta`](EntityStore::apply_delta). The store deals in whole
+/// [`Entity`] values — **how** it serializes them for storage (its codec,
+/// compression, layout) is entirely its own concern, hidden behind this trait.
 ///
-/// The host decides where the bytes actually live and handles any low-level
+/// The host decides where the entities actually live and handles any low-level
 /// bookkeeping underneath (persistence markers, tombstones).
 ///
 /// Every method takes `&mut self`, reads included: a host's read path may need to
@@ -24,8 +24,8 @@ pub trait EntityStore {
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// This entity's bytes, or `None` if there is no such entity.
-    fn get(&mut self, entity: EntityKey) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// This entity, or `None` if there is no such entity.
+    fn get(&mut self, entity: EntityKey) -> Result<Option<Entity>, Self::Error>;
 
     /// Apply one block's entity changes: the writes and removals in `delta`.
     fn apply_delta(&mut self, delta: &BlockEntityStoreDelta) -> Result<(), Self::Error>;
@@ -38,18 +38,15 @@ pub trait EntityStore {
 /// Optional: read entities as of a **past block**, for a host that keeps — or can
 /// reconstruct — history. Extends [`EntityStore`] (whose reads are at the tip).
 pub trait HistoricalEntityStore: EntityStore {
-    /// This entity's bytes as of block `at`, or `None` if it didn't exist then.
-    fn get_at(
-        &mut self,
-        entity: EntityKey,
-        at: BlockNumber,
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// This entity as of block `at`, or `None` if it didn't exist then.
+    fn get_at(&mut self, entity: EntityKey, at: BlockNumber)
+    -> Result<Option<Entity>, Self::Error>;
 }
 
 /// Holds the **query index** over the entities.
 ///
-/// Where the [`EntityStore`] is a dumb byte map, this store understands the query
-/// language: give it a [`Query`] and it returns the keys of the entities that
+/// Where the [`EntityStore`] is a plain key→entity map, this store understands the
+/// query language: give it a [`Query`] and it returns the keys of the entities that
 /// match. It is part of consensus too, kept up to date as blocks apply, and
 /// commits to its own contents separately from the entities.
 pub trait AuxiliaryStore {
@@ -84,8 +81,9 @@ pub trait HistoricalAuxiliaryStore: AuxiliaryStore {
 /// One block's changes to the [`EntityStore`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockEntityStoreDelta {
-    /// Entities written this block (key → new bytes).
-    pub puts: Vec<(EntityKey, Vec<u8>)>,
+    /// Entities written this block. Each carries its own [`EntityKey`]; the store
+    /// serializes them however it likes.
+    pub puts: Vec<Entity>,
     /// Entities removed this block.
     pub deletes: Vec<EntityKey>,
 }

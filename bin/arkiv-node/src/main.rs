@@ -2,7 +2,7 @@
 //!
 //! This is the assembly point. We keep reth as the host (networking, txpool,
 //! JSON-RPC, MDBX, engine/Engine API, sync) and override exactly one component:
-//! the **executor**, replaced by [`arkiv_executor::ArkivExecutorBuilder`]. The
+//! the **executor**, replaced by [`arkiv_reth_executor::ArkivExecutorBuilder`]. The
 //! node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 //!
 //! Today the Arkiv executor is the stock Ethereum executor with an Arkiv
@@ -10,7 +10,7 @@
 //! to end. The neutered-EVM policy and the entity engine land behind that same
 //! seam without touching this file (see experiments/post-evm-execution-report.md).
 
-use arkiv_executor::ArkivExecutorBuilder;
+use arkiv_reth_executor::ArkivExecutorBuilder;
 use clap::Parser;
 use reth::cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;

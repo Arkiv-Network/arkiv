@@ -1,5 +1,5 @@
 [package]
-name = "arkiv-executor"
+name = "arkiv-reth-executor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,9 @@ license.workspace = true
 # this seam in later steps (see experiments/post-evm-execution-report.md §3).
 
 [dependencies]
+# The host-agnostic executor interface this crate implements (see arkiv.rs).
+arkiv-interfaces.workspace = true
+
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
 alloy-evm.workspace = true
 alloy-primitives.workspace = true
