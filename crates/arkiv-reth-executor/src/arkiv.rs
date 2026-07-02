@@ -233,7 +233,12 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     }
 
     /// Shared read-modify-write for [`Op::Update`] / [`Op::ExtendExpiry`] /
-    /// [`Op::Transfer`]: load the entity, check ownership, mutate, re-stage.
+    /// [`Op::Transfer`]: load the entity, check ownership and liveness, mutate,
+    /// re-stage.
+    ///
+    /// An expired entity (current block at or past its `expires_at`) is not
+    /// mutable — including by [`Op::ExtendExpiry`]: lifetime must be renewed
+    /// *before* expiry, not resurrected after it.
     fn mutate(
         &self,
         env: &ExecEnv,
@@ -248,6 +253,9 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         };
         if entity.owner != env.caller {
             return Ok(Err(format!("caller does not own entity {}", hex(&key))));
+        }
+        if entity.expires_at <= env.block_number {
+            return Ok(Err(format!("entity {} has expired", hex(&key))));
         }
         edit(&mut entity);
         entity.last_modified_at_block = env.block_number;
@@ -600,6 +608,137 @@ mod tests {
             .unwrap();
         assert_eq!(out.status, ExecStatus::Ok);
         assert_eq!(draft.entities.deletes, vec![[7u8; 32]]);
+    }
+
+    /// `Update` (owner, live entity) replaces `content_type` / `payload` /
+    /// `attributes` and stamps `last_modified_at_block`, while identity and
+    /// lifecycle fields (creator, owner, created_at_block, expires_at) are left
+    /// exactly as they were.
+    #[test]
+    fn update_replaces_content_and_stamps_modified() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()], // owner [2; 20], expires_at 100
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let mut draft = BlockDraft::default();
+
+        let out = exec
+            .apply(
+                &env([2u8; 20], 20),
+                &mut store,
+                &mut draft,
+                &[Op::Update {
+                    key: [7u8; 32],
+                    content_type: b"application/json".to_vec(),
+                    payload: b"world".to_vec(),
+                    attributes: Vec::new(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(out.status, ExecStatus::Ok);
+        let e = &draft.entities.puts[0];
+        assert_eq!(e.content_type, b"application/json");
+        assert_eq!(e.payload, b"world");
+        assert!(e.attributes.is_empty());
+        assert_eq!(e.last_modified_at_block, 20);
+        // Identity and lifecycle untouched.
+        assert_eq!(e.creator, [1u8; 20]);
+        assert_eq!(e.owner, [2u8; 20]);
+        assert_eq!(e.created_at_block, 3);
+        assert_eq!(e.expires_at, 100);
+    }
+
+    /// `ExtendExpiry` (owner, live entity) moves `expires_at` forward and stamps
+    /// `last_modified_at_block`; the content is left untouched.
+    #[test]
+    fn extend_expiry_moves_expiry_and_stamps_modified() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()], // expires_at 100
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let mut draft = BlockDraft::default();
+
+        let out = exec
+            .apply(
+                &env([2u8; 20], 20),
+                &mut store,
+                &mut draft,
+                &[Op::ExtendExpiry {
+                    key: [7u8; 32],
+                    new_expires_at: 500,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(out.status, ExecStatus::Ok);
+        let e = &draft.entities.puts[0];
+        assert_eq!(e.expires_at, 500);
+        assert_eq!(e.last_modified_at_block, 20);
+        assert_eq!(e.payload, b"hello"); // content untouched
+    }
+
+    /// Expiry is final: once the current block reaches `expires_at`, the owner can
+    /// no longer mutate the entity — `Update`, `ExtendExpiry`, and `Transfer` all
+    /// revert and stage nothing. In particular you cannot resurrect a dead entity
+    /// by extending it; renewal must happen before expiry.
+    #[test]
+    fn cannot_mutate_after_expiry() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()], // expires_at 100
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let owner = [2u8; 20];
+
+        let expired_ops = [
+            Op::Update {
+                key: [7u8; 32],
+                content_type: Vec::new(),
+                payload: b"x".to_vec(),
+                attributes: Vec::new(),
+            },
+            Op::ExtendExpiry {
+                key: [7u8; 32],
+                new_expires_at: 999,
+            },
+            Op::Transfer {
+                key: [7u8; 32],
+                new_owner: [9u8; 20],
+            },
+        ];
+
+        // Block 100 == expires_at, so the entity is expired.
+        for op in expired_ops {
+            let mut draft = BlockDraft::default();
+            let out = exec
+                .apply(
+                    &env(owner, 100),
+                    &mut store,
+                    &mut draft,
+                    std::slice::from_ref(&op),
+                )
+                .unwrap();
+            assert_eq!(
+                out.status,
+                ExecStatus::Reverted,
+                "{:?} should revert post-expiry",
+                op.kind()
+            );
+            assert!(draft.entities.puts.is_empty());
+            assert!(draft.entities.deletes.is_empty());
+        }
     }
 
     /// The `decode_ops` seam is not wired yet: non-empty calldata is a hard
