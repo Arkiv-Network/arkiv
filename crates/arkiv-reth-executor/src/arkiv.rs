@@ -124,7 +124,17 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         let mut gas_used = 0u64;
 
         for op in ops {
+            // Charge for the op up front. If the batch's cost outruns the gas the
+            // caller supplied, it's out of gas: consume everything provided, stage
+            // nothing (the overlay is dropped on this early return).
             gas_used = gas_used.saturating_add(self.cost.op_cost(op));
+            if gas_used > env.gas_supplied {
+                return Ok(ExecOutput {
+                    status: ExecStatus::Reverted,
+                    gas_used: env.gas_supplied,
+                    revert: Some("out of gas".into()),
+                });
+            }
             if let Err(reason) = self.stage_op(env, entities, draft, &mut tx_state_overlay, op)? {
                 // Business-rule revert: discard the overlay, leave `draft` as it was.
                 return Ok(ExecOutput {
@@ -374,13 +384,22 @@ mod tests {
         }
     }
 
-    /// A minimal [`ExecEnv`] for a given caller and block; gas/chain are fixed
-    /// since the tests exercise state logic, not metering.
+    /// Comfortably more gas than any op in these tests costs, so the state-logic
+    /// tests never trip the (now non-zero) [`PlaceholderCost`] out-of-gas path.
+    const AMPLE_GAS: u64 = 100_000_000;
+
+    /// A minimal [`ExecEnv`] for a given caller and block, with ample gas so the
+    /// tests that exercise state logic aren't metered out.
     fn env(caller: [u8; 20], block: u64) -> ExecEnv {
+        env_gas(caller, block, AMPLE_GAS)
+    }
+
+    /// [`env`] with an explicit gas budget, for the metering tests.
+    fn env_gas(caller: [u8; 20], block: u64, gas_supplied: u64) -> ExecEnv {
         ExecEnv {
             caller,
             block_number: block,
-            gas_supplied: 0,
+            gas_supplied,
             chain_id: 1,
         }
     }
@@ -739,6 +758,69 @@ mod tests {
             assert!(draft.entities.puts.is_empty());
             assert!(draft.entities.deletes.is_empty());
         }
+    }
+
+    /// When a batch's cost exceeds the gas supplied, execution reverts out of gas:
+    /// all supplied gas is consumed and nothing is staged. The op's real cost is
+    /// taken from [`PlaceholderCost`] so the test tracks the schedule.
+    #[test]
+    fn reverts_out_of_gas_when_cost_exceeds_supplied() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        let mut draft = BlockDraft::default();
+        let create = Op::Create {
+            key: [1u8; 32],
+            expires_at: 50,
+            content_type: Vec::new(),
+            payload: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let cost = PlaceholderCost.op_cost(&create);
+        assert!(cost > 0, "placeholder must charge for a create");
+
+        let out = exec
+            .apply(
+                &env_gas([0xAA; 20], 10, cost - 1), // one gas short
+                &mut store,
+                &mut draft,
+                core::slice::from_ref(&create),
+            )
+            .unwrap();
+
+        assert_eq!(out.status, ExecStatus::Reverted);
+        assert_eq!(out.gas_used, cost - 1); // all supplied gas is consumed
+        assert_eq!(out.revert.as_deref(), Some("out of gas"));
+        assert!(draft.entities.puts.is_empty());
+    }
+
+    /// Gas exactly equal to the batch's cost is enough — it succeeds and reports
+    /// that cost.
+    #[test]
+    fn succeeds_when_gas_exactly_covers_cost() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        let mut draft = BlockDraft::default();
+        let create = Op::Create {
+            key: [1u8; 32],
+            expires_at: 50,
+            content_type: Vec::new(),
+            payload: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let cost = PlaceholderCost.op_cost(&create);
+
+        let out = exec
+            .apply(
+                &env_gas([0xAA; 20], 10, cost), // exactly enough
+                &mut store,
+                &mut draft,
+                core::slice::from_ref(&create),
+            )
+            .unwrap();
+
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas_used, cost);
+        assert_eq!(draft.entities.puts.len(), 1);
     }
 
     /// The `decode_ops` seam is not wired yet: non-empty calldata is a hard
