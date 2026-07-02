@@ -120,12 +120,12 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         // Per-transaction overlay: Some(entity) = staged write, None = staged
         // delete. Reads consult it before the draft and the store, so operations
         // in this transaction see each other's effects.
-        let mut overlay: BTreeMap<EntityKey, Option<Entity>> = BTreeMap::new();
+        let mut tx_state_overlay = BTreeMap::<EntityKey, Option<Entity>>::new();
         let mut gas_used = 0u64;
 
         for op in ops {
             gas_used = gas_used.saturating_add(self.cost.op_cost(op));
-            if let Err(reason) = self.stage_op(env, entities, draft, &mut overlay, op)? {
+            if let Err(reason) = self.stage_op(env, entities, draft, &mut tx_state_overlay, op)? {
                 // Business-rule revert: discard the overlay, leave `draft` as it was.
                 return Ok(ExecOutput {
                     status: ExecStatus::Reverted,
@@ -137,7 +137,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
 
         // Every op succeeded — merge the overlay into the caller's draft,
         // last-writer-wins per key.
-        for (key, staged) in overlay {
+        for (key, staged) in tx_state_overlay {
             draft.entities.puts.retain(|e| e.key != key);
             draft.entities.deletes.retain(|k| *k != key);
             match staged {
@@ -198,7 +198,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 e.payload = payload.clone();
                 e.attributes = attributes.clone();
             }),
-            Op::Extend {
+            Op::ExtendExpiry {
                 key,
                 new_expires_at,
             } => self.mutate(env, entities, draft, overlay, *key, |e| {
@@ -232,7 +232,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         }
     }
 
-    /// Shared read-modify-write for [`Op::Update`] / [`Op::Extend`] /
+    /// Shared read-modify-write for [`Op::Update`] / [`Op::ExtendExpiry`] /
     /// [`Op::Transfer`]: load the entity, check ownership, mutate, re-stage.
     fn mutate(
         &self,
