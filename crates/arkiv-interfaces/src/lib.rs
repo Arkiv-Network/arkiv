@@ -28,6 +28,10 @@
 //! - [`EntityStore`] — the entities, stored as bytes.
 //! - [`AuxiliaryStore`] — the query index over them.
 //!
+//! [`EntityCodec`] is the version-tagged contract for turning an entity into those
+//! stored bytes and back — a consensus format, so it lives here even though its
+//! implementation (RLP, …) does not.
+//!
 //! A host that serves history also implements the optional
 //! [`HistoricalEntityStore`] and [`HistoricalAuxiliaryStore`], which add
 //! past-block reads.
@@ -53,6 +57,7 @@
 
 extern crate alloc;
 
+pub mod codec;
 pub mod collections;
 pub mod entity;
 pub mod execution;
@@ -62,6 +67,7 @@ pub mod query;
 pub mod rpc;
 pub mod state;
 
+pub use codec::*;
 pub use collections::*;
 pub use entity::*;
 pub use execution::*;

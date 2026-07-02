@@ -10,9 +10,10 @@ use crate::query::{PageParams, Query, QueryMatches};
 /// It is just a map from [`EntityKey`] to bytes, plus a
 /// [`commitment`](EntityStore::commitment) over the whole map. You read one entity
 /// with [`get`](EntityStore::get); you apply a whole block's changes at once with
-/// [`apply_delta`](EntityStore::apply_delta). The bytes are opaque — encoding an
-/// [`Entity`](crate::entity::Entity) to and from them is the executor's and query
-/// layer's job, not this store's.
+/// [`apply_delta`](EntityStore::apply_delta). The bytes are opaque to the store —
+/// encoding an [`Entity`](crate::entity::Entity) to and from them follows the
+/// version-tagged [`EntityCodec`](crate::codec::EntityCodec) contract, shared by
+/// everyone who reads or writes entity bytes.
 ///
 /// The host decides where the bytes actually live and handles any low-level
 /// bookkeeping underneath (persistence markers, tombstones).
