@@ -60,3 +60,4 @@ arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-da = { path = "crates/arkiv-da" }
 arkiv-committer = { path = "crates/arkiv-committer" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
+arkiv-reth-entitystore = { path = "crates/arkiv-reth-entitystore" }

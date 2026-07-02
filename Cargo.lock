@@ -1433,6 +1433,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-reth-entitystore"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "arkiv-interfaces",
+]
+
+[[package]]
 name = "arkiv-reth-executor"
 version = "0.1.0"
 dependencies = [
