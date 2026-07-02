@@ -32,6 +32,21 @@
 //! `Database` and write a `BundleState` in Ethereum's account model, committed
 //! by the keccak-MPT (see the report, §3 and Appendix A): any execution *logic*,
 //! not any state engine.
+//!
+//! ## Where the business logic lives
+//!
+//! This file is the **exact executor** — the reth-specific wiring (the [`Evm`],
+//! [`EvmFactory`] and [`ExecutorBuilder`] reth injects). The **entity business
+//! logic** is not here: it lives in [`arkiv`], written against the host-agnostic
+//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. When the entity
+//! engine replaces the transfer stub, [`arkiv_transact`] drives
+//! [`arkiv::ArkivExecutor`] over an [`arkiv_interfaces::state::EntityStore`] view
+//! of reth's database.
+
+/// Entity business logic, implementing the `arkiv-interfaces` executor interface.
+pub mod arkiv;
+
+pub use arkiv::ArkivExecutor;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, Bytes, TxKind, U256, address};
