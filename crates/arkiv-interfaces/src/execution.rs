@@ -63,7 +63,7 @@ pub enum Op {
         payload: Vec<u8>,
         attributes: Vec<Attribute>,
     },
-    Extend {
+    ExtendExpiry {
         key: EntityKey,
         new_expires_at: BlockNumber,
     },
@@ -85,7 +85,7 @@ impl Op {
         match self {
             Op::Create { key, .. }
             | Op::Update { key, .. }
-            | Op::Extend { key, .. }
+            | Op::ExtendExpiry { key, .. }
             | Op::Transfer { key, .. }
             | Op::Delete { key }
             | Op::Expire { key } => key,
@@ -97,7 +97,7 @@ impl Op {
         match self {
             Op::Create { .. } => OpKind::Create,
             Op::Update { .. } => OpKind::Update,
-            Op::Extend { .. } => OpKind::Extend,
+            Op::ExtendExpiry { .. } => OpKind::ExtendExpiry,
             Op::Transfer { .. } => OpKind::Transfer,
             Op::Delete { .. } => OpKind::Delete,
             Op::Expire { .. } => OpKind::Expire,
@@ -110,7 +110,7 @@ impl Op {
 pub enum OpKind {
     Create,
     Update,
-    Extend,
+    ExtendExpiry,
     Transfer,
     Delete,
     Expire,

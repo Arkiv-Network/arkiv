@@ -1403,17 +1403,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arkiv-executor"
-version = "0.1.0"
-dependencies = [
- "alloy-evm",
- "alloy-primitives",
- "eyre",
- "reth-ethereum",
- "tracing",
-]
-
-[[package]]
 name = "arkiv-genesis"
 version = "0.1.0"
 dependencies = [
@@ -1435,11 +1424,23 @@ version = "0.1.0"
 name = "arkiv-node"
 version = "0.1.0"
 dependencies = [
- "arkiv-executor",
+ "arkiv-reth-executor",
  "clap",
  "reth",
  "reth-ethereum-cli",
  "reth-node-ethereum",
+ "tracing",
+]
+
+[[package]]
+name = "arkiv-reth-executor"
+version = "0.1.0"
+dependencies = [
+ "alloy-evm",
+ "alloy-primitives",
+ "arkiv-interfaces",
+ "eyre",
+ "reth-ethereum",
  "tracing",
 ]
 
