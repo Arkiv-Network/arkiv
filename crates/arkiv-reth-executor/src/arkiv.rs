@@ -366,6 +366,8 @@ mod tests {
         }
     }
 
+    /// A minimal [`ExecEnv`] for a given caller and block; gas/chain are fixed
+    /// since the tests exercise state logic, not metering.
     fn env(caller: [u8; 20], block: u64) -> ExecEnv {
         ExecEnv {
             caller,
@@ -375,6 +377,8 @@ mod tests {
         }
     }
 
+    /// A fully-populated entity (owner `[2; 20]`, `expires_at` 100, two attributes)
+    /// used to seed the store in tests that read an existing entity.
     fn sample_entity() -> Entity {
         Entity {
             key: [7u8; 32],
@@ -408,6 +412,9 @@ mod tests {
         }
     }
 
+    /// A `Create` stages one put whose lifecycle fields come from the environment:
+    /// the caller is both `creator` and `owner`, and `created_at_block` is the
+    /// block being executed — none of it is taken from the op itself.
     #[test]
     fn create_stages_a_put() {
         let exec = ArkivExecutor::<MemStore>::new();
@@ -438,6 +445,9 @@ mod tests {
         assert_eq!(e.created_at_block, 10);
     }
 
+    /// `Create` on a key that already exists in the store is a revert, not an
+    /// error — and a revert must leave the caller's `draft` exactly as it was
+    /// (all-or-nothing: no partial staging leaks out).
     #[test]
     fn create_on_existing_reverts_and_leaves_draft_untouched() {
         let exec = ArkivExecutor::<MemStore>::new();
@@ -470,6 +480,9 @@ mod tests {
         assert!(draft.entities.puts.is_empty());
     }
 
+    /// `Transfer` is owner-gated: a caller who is not the current owner reverts
+    /// (and stages nothing), while the real owner succeeds — moving `owner` to the
+    /// new address and stamping `last_modified_at_block` with the current block.
     #[test]
     fn transfer_requires_ownership_then_moves_owner() {
         let exec = ArkivExecutor::<MemStore>::new();
@@ -516,6 +529,10 @@ mod tests {
         assert_eq!(e.last_modified_at_block, 20);
     }
 
+    /// Operations within one transaction see each other through the overlay: a
+    /// `Delete` following a `Create` of the same key (never committed to the store)
+    /// resolves against the just-staged entity, and the net result collapses to a
+    /// single staged delete with no put.
     #[test]
     fn create_then_delete_in_one_tx_sees_overlay() {
         let exec = ArkivExecutor::<MemStore>::new();
@@ -547,6 +564,9 @@ mod tests {
         assert_eq!(draft.entities.deletes, vec![[3u8; 32]]);
     }
 
+    /// `Expire` is gated on the clock, not on ownership: it reverts while the
+    /// entity is still live (current block before `expires_at`) and succeeds once
+    /// the block has reached `expires_at`, staging a delete.
     #[test]
     fn expire_only_after_expiry_block() {
         let exec = ArkivExecutor::<MemStore>::new();
@@ -582,6 +602,9 @@ mod tests {
         assert_eq!(draft.entities.deletes, vec![[7u8; 32]]);
     }
 
+    /// The `decode_ops` seam is not wired yet: non-empty calldata is a hard
+    /// [`ExecError::Decode`] (a host fault), not a silent success or a revert — so
+    /// the gap is explicit until the ABI decoder lands.
     #[test]
     fn execute_rejects_undecodable_calldata() {
         let exec = ArkivExecutor::<MemStore>::new();
