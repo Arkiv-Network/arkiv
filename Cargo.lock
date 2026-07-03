@@ -1339,11 +1339,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-db-engine"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-sol-types",
+ "arkiv-db-engine",
+ "eyre",
+ "roaring",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "arkiv-executor"
 version = "0.1.0"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
+ "arkiv-db-engine",
  "eyre",
  "reth-ethereum",
  "tracing",
@@ -1357,11 +1372,24 @@ version = "0.1.0"
 name = "arkiv-node"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.4",
+ "alloy-primitives",
+ "arkiv-db-engine",
  "arkiv-executor",
+ "async-trait",
  "clap",
+ "eyre",
+ "jsonrpsee",
  "reth",
+ "reth-db-api",
+ "reth-ethereum",
  "reth-ethereum-cli",
  "reth-node-ethereum",
+ "reth-storage-api",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

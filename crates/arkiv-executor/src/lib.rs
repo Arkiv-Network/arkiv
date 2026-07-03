@@ -1,55 +1,40 @@
-//! Arkiv execution seam for reth — **no-EVM** executor.
+//! `arkiv-executor`: reth executor seam — no-EVM, entity-engine backed.
 //!
-//! This crate owns the one component arkiv-node overrides on top of reth's host:
-//! the **executor** (`evm_config`). reth injects it via
-//! `EthereumNode::components().executor(ArkivExecutorBuilder)` — no fork of reth.
+//! Overrides reth's executor component via
+//! `EthereumNode::components().executor(ArkivExecutorBuilder)`. All
+//! user transactions are handled by [`arkiv_transact`]:
 //!
-//! ## What this is
+//! - **Plain transfer** — sender debit + nonce bump, recipient credit.
+//! - **Call to [`ARKIV_ADDRESS`]** — raw calldata forwarded to
+//!   [`arkiv_db_engine::dispatch`]; the executor never touches ABI types.
+//! - **Contract creation** — rejected (neutered).
 //!
-//! The transaction interpreter is **bypassed**. We keep reth's stock
-//! [`EthEvmConfig`] / `EthBlockExecutor` for block assembly, receipts, gas
-//! accounting and state-root, but we plug in a custom [`ArkivEvm`] whose
-//! [`transact_raw`](alloy_evm::Evm::transact_raw) applies a fixed-function state
-//! transition **directly** — it never builds or runs the revm bytecode
-//! interpreter. So for user/entity transactions, `revm`'s EVM is not invoked.
-//!
-//! - **Plain transfer** — debit sender (value + flat 21k gas), bump nonce,
-//!   credit recipient. Computed in Rust, committed as a `BundleState`.
-//! - **Call to [`ARKIV_ADDRESS`]** — the entity-engine routing point. Today a
-//!   stub (same value/gas accounting, no entity logic yet); the
-//!   `arkiv-entitydb` `StateAdapter` STF lands here next.
-//! - **Contract creation** — rejected (neutered): user programs never execute.
-//!
-//! ## Honest scope
-//!
-//! Two things still touch revm and are intentionally out of scope for this step:
-//! the precompile set is the stock one (unused, since the interpreter never
-//! runs), and **system-contract calls** (EIP-4788 beacon root / EIP-2935 block
-//! hashes) in pre-execution still delegate to revm — they are protocol
-//! housekeeping, not user execution. Both can be neutered later.
-//!
-//! The state boundary is fixed by reth regardless: we read through revm's
-//! `Database` and write a `BundleState` in Ethereum's account model, committed
-//! by the keccak-MPT (see the report, §3 and Appendix A): any execution *logic*,
-//! not any state engine.
+//! System-contract calls (EIP-4788 / EIP-2935) are delegated to revm.
+
+mod state_adapter;
 
 use alloy_evm::{eth::EthEvmContext, precompiles::PrecompilesMap, Evm, EvmFactory};
-use alloy_primitives::{address, Address, Bytes, TxKind, U256};
+use alloy_primitives::{Address, Bytes, Log, TxKind, U256};
+use arkiv_db_engine::{ARKIV_ADDRESS, CallResult};
 use reth_ethereum::{
     chainspec::ChainSpec,
     evm::{
         primitives::{Database, EvmEnv},
         revm::{
-            context::{BlockEnv, CfgEnv, Context, TxEnv},
-            context_interface::result::{
-                EVMError, ExecutionResult, HaltReason, Output, ResultAndState, ResultGas,
-                SuccessReason,
+            context::{BlockEnv, CfgEnv, Context, Journal, TxEnv},
+            context_interface::{
+                JournalTr,
+                journaled_state::account::JournaledAccountTr,
+                result::{
+                    EVMError, ExecutionResult, HaltReason, OutOfGasError, Output, ResultAndState,
+                    ResultGas, SuccessReason,
+                },
             },
             inspector::{Inspector, NoOpInspector},
             interpreter::interpreter::EthInterpreter,
             precompile::Precompiles,
             primitives::hardfork::SpecId,
-            state::{Account, EvmState},
+            state::EvmState,
             MainBuilder, MainContext,
         },
         EthEvm, EthEvmConfig,
@@ -61,26 +46,34 @@ use reth_ethereum::{
     EthPrimitives,
 };
 
-/// The Arkiv address — `0x4400…0044`.
-///
-/// Matches the SDK's `ARKIV_ADDRESS`: EOAs `CALL` here with entity
-/// `execute(Operation[])` calldata. There is no precompile object and no
-/// bytecode — calls to this address are routed directly in [`arkiv_transact`].
-pub const ARKIV_ADDRESS: Address = address!("0x4400000000000000000000000000000000000044");
+use state_adapter::JournalStateAdapter;
 
-/// Flat gas charged per transaction by the fixed-function executor.
-const ARKIV_TX_GAS: u64 = 21_000;
+/// Computes the minimum gas that passes reth's tx-pool IntrinsicGasTooLow check.
+///
+/// The pool enforces two conditions (validate/eth.rs):
+///   gas_limit >= initial_total_gas  (21_000 + 4*zero + 16*nonzero)
+///   gas_limit >= floor_gas          (EIP-7623 Prague: 10 * (zero + 4*nonzero))
+/// We return max(initial, floor) so eth_estimateGas always satisfies both.
+fn intrinsic_gas(data: &Bytes) -> u64 {
+    let zero: u64 = data.iter().filter(|b| **b == 0).count() as u64;
+    let nonzero: u64 = data.len() as u64 - zero;
+    let tokens = zero + 4 * nonzero;
+
+    // GasParams::initial_tx_gas in revm-context-interface-17.0.1:
+    //   initial = tokens * 4 (tx_token_cost) + 21000 (tx_base_stipend)
+    //   floor   = tokens * 10 (TOTAL_COST_FLOOR_PER_TOKEN) + 21000 (tx_floor_cost_base_gas)
+    // floor > initial whenever tokens > 0, so floor is almost always the binding limit.
+    let initial = 21_000 + 4 * tokens;
+    let floor = 21_000 + 10 * tokens;
+
+    initial.max(floor)
+}
 
 // ---------------------------------------------------------------------------
 // The no-EVM execution engine
 // ---------------------------------------------------------------------------
 
 /// Arkiv's EVM replacement.
-///
-/// Wraps reth's stock [`EthEvm`] purely to reuse its database/environment
-/// plumbing (block env, cfg, the `State` cache, system-call path). User
-/// transactions are executed by [`arkiv_transact`] — the bytecode interpreter is
-/// never invoked.
 pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     inner: EthEvm<DB, I, PrecompilesMap>,
 }
@@ -111,17 +104,16 @@ where
         self.inner.chain_id()
     }
 
-    /// The interception point. Applies the state transition directly — **no
-    /// interpreter, no `revm` execution of the transaction.**
     fn transact_raw(
         &mut self,
         tx: TxEnv,
     ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-        arkiv_transact(self.inner.db_mut(), tx)
+        let block_number: u64 = self.inner.block().number.saturating_to();
+        let chain_id = self.inner.chain_id();
+        let journal = &mut self.inner.ctx_mut().journaled_state;
+        arkiv_transact(journal, tx, block_number, chain_id)
     }
 
-    /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
-    /// user execution; we delegate them to revm so block validity is preserved.
     fn transact_system_call(
         &mut self,
         caller: Address,
@@ -148,15 +140,15 @@ where
     }
 }
 
-/// The fixed-function state-transition function — Rust, no EVM.
-///
-/// Reads accounts through the `Database`, applies the transfer / entity-call
-/// accounting, and returns a `ResultAndState` (execution result + the account
-/// diff). The caller (`EthBlockExecutor::commit_transaction`) commits the diff
-/// into the `State`, producing the `BundleState` reth hashes into the state root.
+// ---------------------------------------------------------------------------
+// Fixed-function state-transition function
+// ---------------------------------------------------------------------------
+
 fn arkiv_transact<DB: Database>(
-    db: &mut DB,
+    journal: &mut Journal<DB>,
     tx: TxEnv,
+    block_number: u64,
+    chain_id: u64,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     // Neuter: user programs never execute.
     let to = match tx.kind {
@@ -168,49 +160,127 @@ fn arkiv_transact<DB: Database>(
         }
     };
 
-    // A call to ARKIV_ADDRESS is the entity-engine routing point (stub today).
-    if to == ARKIV_ADDRESS {
-        tracing::debug!(target: "arkiv::executor", caller = %tx.caller, "entity call routed (no EVM)");
+    // Sender accounting: debit value + intrinsic gas, bump nonce.
+    let gas_used = intrinsic_gas(&tx.data);
+
+    tracing::debug!(
+        target: "arkiv::executor",
+        tx_gas_limit = tx.gas_limit,
+        intrinsic = gas_used,
+        data_len = tx.data.len(),
+        "arkiv_transact"
+    );
+
+    // During eth_estimateGas the binary search probes gas limits below intrinsic.
+    // Return Halt so the search raises its lower bound; otherwise it converges to
+    // a value < intrinsic_gas and the tx-pool rejects with IntrinsicGasTooLow.
+    // Nothing is written to the journal, so it stays clean for the next probe.
+    if tx.gas_limit < gas_used {
+        return Ok(ResultAndState::new(
+            ExecutionResult::Halt {
+                reason: HaltReason::OutOfGas(OutOfGasError::Basic),
+                gas: ResultGas::default(),
+                logs: Vec::<Log>::new(),
+            },
+            EvmState::default(),
+        ));
     }
 
-    let gas_cost = U256::from(ARKIV_TX_GAS).saturating_mul(U256::from(tx.gas_price));
+    // `finalize` resets the journal (including spec) after every tx, so set the
+    // spec each call to get correct EIP-161 empty-account pruning. This executor
+    // is Prague-only (see `create_evm`'s `Precompiles::prague`).
+    journal.set_spec_id(SpecId::PRAGUE);
+
+    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
     let value_out = if to == tx.caller { U256::ZERO } else { tx.value };
 
-    // Sender: debit value + gas, bump nonce, mark touched.
-    let mut sender = db.basic(tx.caller).map_err(EVMError::Database)?.unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(value_out).saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-
-    let mut state = EvmState::default();
-    state.insert(tx.caller, sender_acc);
-
-    // Recipient: credit value.
-    if to != tx.caller {
-        let mut recipient = db.basic(to).map_err(EVMError::Database)?.unwrap_or_default();
-        recipient.balance = recipient.balance.saturating_add(tx.value);
-        let mut recipient_acc = Account::from(recipient);
-        recipient_acc.mark_touch();
-        state.insert(to, recipient_acc);
+    // Sender accounting through the journal, applied *before* the checkpoint so
+    // it survives an entity-engine revert (gas is burned even on revert).
+    {
+        let mut sender = journal.load_account_mut(tx.caller).map_err(EVMError::Database)?.data;
+        let new_balance = sender.balance().saturating_sub(value_out).saturating_sub(gas_cost);
+        sender.set_balance(new_balance);
+        sender.bump_nonce();
+        sender.touch();
     }
 
-    let result = ExecutionResult::Success {
-        reason: SuccessReason::Stop,
-        gas: ResultGas::default().with_total_gas_spent(ARKIV_TX_GAS),
-        logs: Vec::new(),
-        output: Output::Call(Bytes::new()),
-    };
+    // Route calls to ARKIV_ADDRESS through the entity-engine dispatcher.
+    if to == ARKIV_ADDRESS {
+        let ctx = arkiv_db_engine::CallContext {
+            caller: tx.caller,
+            chain_id,
+            block_number,
+        };
 
-    Ok(ResultAndState::new(result, state))
+        // Checkpoint after sender accounting: on revert we roll back the entity
+        // writes but keep the burned gas / bumped nonce.
+        let checkpoint = journal.checkpoint();
+        let dispatch_result = {
+            let mut adapter = JournalStateAdapter::new(&mut *journal);
+            arkiv_db_engine::dispatch(&mut adapter, &ctx, &tx.data)
+        };
+
+        let call_result = match dispatch_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Roll back and finalize so the journal is clean for the next tx.
+                journal.checkpoint_revert(checkpoint);
+                let _ = journal.finalize();
+                return Err(EVMError::Custom(e.to_string()));
+            }
+        };
+
+        return match call_result {
+            CallResult::Success { output, logs } => {
+                journal.checkpoint_commit();
+                let state = journal.finalize();
+                Ok(ResultAndState::new(
+                    ExecutionResult::Success {
+                        reason: SuccessReason::Return,
+                        gas: ResultGas::default().with_total_gas_spent(gas_used),
+                        logs,
+                        output: Output::Call(output),
+                    },
+                    state,
+                ))
+            }
+            CallResult::Revert { data } => {
+                // Discard entity writes; sender accounting (pre-checkpoint) stays.
+                journal.checkpoint_revert(checkpoint);
+                let state = journal.finalize();
+                Ok(ResultAndState::new(
+                    ExecutionResult::Revert {
+                        gas: ResultGas::default().with_total_gas_spent(gas_used),
+                        logs: Vec::new(),
+                        output: data,
+                    },
+                    state,
+                ))
+            }
+        };
+    }
+
+    // Plain transfer: credit recipient (sender already debited above).
+    if to != tx.caller {
+        journal.balance_incr(to, tx.value).map_err(EVMError::Database)?;
+    }
+
+    let state = journal.finalize();
+    Ok(ResultAndState::new(
+        ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas: ResultGas::default().with_total_gas_spent(gas_used),
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        },
+        state,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Factory + executor builder (the reth injection points)
 // ---------------------------------------------------------------------------
 
-/// Custom EVM factory for Arkiv: builds [`ArkivEvm`] (the no-EVM engine) on top
-/// of reth's stock EVM context.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ArkivEvmFactory;
@@ -226,7 +296,6 @@ impl EvmFactory for ArkivEvmFactory {
     type Precompiles = PrecompilesMap;
 
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
-        // Stock precompiles, carried but unused — the interpreter never runs.
         let inner = Context::mainnet()
             .with_db(db)
             .with_cfg(input.cfg_env)
@@ -248,9 +317,6 @@ impl EvmFactory for ArkivEvmFactory {
     }
 }
 
-/// Builds the Arkiv block executor: reth's stock Ethereum block executor driven
-/// by [`ArkivEvmFactory`]. This is the type arkiv-node hands to
-/// `EthereumNode::components().executor(..)`.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct ArkivExecutorBuilder;

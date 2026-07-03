@@ -13,3 +13,4 @@ jwt.hex
 !/.docker/caches/.gitkeep
 
 .DS_Store
+.vscode
