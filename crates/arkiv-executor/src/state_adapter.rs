@@ -1,115 +1,48 @@
-//! [`ExecutorStateAdapter`] — bridges reth's [`Database`] trait to
+//! [`JournalStateAdapter`] — bridges reth/revm's [`Journal`] to
 //! [`arkiv_db_engine::StateAdapter`].
 //!
-//! Unlike the revm-backed `ReadWriteStateAdapter` in `arkiv-op-reth`
-//! (which writes through revm's live journal), here we have no journal:
-//! `arkiv_transact` receives a `&mut DB` (read-only trie) and returns an
-//! `EvmState` diff. `ExecutorStateAdapter` lazily loads accounts from
-//! `DB` and accumulates all entity-engine writes in an in-memory cache.
-//! Call [`ExecutorStateAdapter::into_evm_state`] after dispatch to
-//! harvest the diff for merging into the returned [`ResultAndState`].
+//! Earlier this crate hand-rolled a per-transaction write cache
+//! (`CachedAccount`) over reth's read-only [`Database`], then harvested a
+//! diff via `into_evm_state`. That duplicated machinery revm already
+//! ships: [`Journal`] is a transaction-scoped write buffer with
+//! read-your-own-writes, checkpoint/revert, and `finalize()` to produce
+//! the [`EvmState`] diff.
+//!
+//! `JournalStateAdapter` therefore forwards every entity-engine state
+//! operation straight to the live journal. `arkiv_transact` takes a
+//! checkpoint before dispatch and calls `journal.finalize()` afterwards to
+//! obtain the diff for the returned `ResultAndState` — no manual caching,
+//! no `original_info` diff-engine workaround.
 
-use std::collections::HashMap;
-
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use arkiv_db_engine::StateAdapter;
 use eyre::Result;
 use reth_ethereum::evm::{
     primitives::Database,
     revm::{
         bytecode::JumpTable,
+        context::Journal,
+        context_interface::{JournalTr, journaled_state::account::JournaledAccountTr},
         primitives::KECCAK_EMPTY,
-        state::{Account, AccountInfo, EvmState, EvmStorageSlot, Bytecode},
+        state::Bytecode,
     },
 };
 
-// ─── Cache entry ─────────────────────────────────────────────────────
+// ─── JournalStateAdapter ──────────────────────────────────────────────
 
-struct CachedAccount {
-    info: AccountInfo,
-    /// slot → (original_value_from_db, current_value)
-    storage: HashMap<B256, (B256, B256)>,
-    code_dirty: bool,
-    storage_dirty: bool,
+pub struct JournalStateAdapter<'a, DB: Database> {
+    journal: &'a mut Journal<DB>,
 }
 
-impl CachedAccount {
-    fn mark_code_dirty(&mut self) {
-        self.code_dirty = true;
-    }
-    fn mark_storage_dirty(&mut self) {
-        self.storage_dirty = true;
-    }
-    fn is_dirty(&self) -> bool {
-        self.code_dirty || self.storage_dirty
-    }
-}
-
-// ─── ExecutorStateAdapter ─────────────────────────────────────────────
-
-pub struct ExecutorStateAdapter<'a, DB: Database> {
-    db: &'a mut DB,
-    cache: HashMap<Address, CachedAccount>,
-}
-
-impl<'a, DB: Database> ExecutorStateAdapter<'a, DB> {
-    pub fn new(db: &'a mut DB) -> Self {
-        Self { db, cache: HashMap::new() }
-    }
-
-    /// Load account info from DB into cache (if not already cached).
-    fn load_account(&mut self, addr: Address) -> Result<()> {
-        if self.cache.contains_key(&addr) {
-            return Ok(());
-        }
-        let info = self
-            .db
-            .basic(addr)
-            .map_err(|e| eyre::eyre!("db.basic({addr}): {e:?}"))?
-            .unwrap_or_default();
-        self.cache.insert(addr, CachedAccount {
-            info,
-            storage: HashMap::new(),
-            code_dirty: false,
-            storage_dirty: false,
-        });
-        Ok(())
-    }
-
-    /// Consume the adapter and produce an `EvmState` from all dirty cache
-    /// entries. This diff is merged with the sender/recipient accounting
-    /// in `arkiv_transact` before being returned.
-    pub fn into_evm_state(self) -> EvmState {
-        let mut state = EvmState::default();
-        for (addr, cached) in self.cache {
-            if !cached.is_dirty() {
-                continue;
-            }
-            let account = Account::from(cached.info)
-                .with_storage(
-                    cached.storage.into_iter().filter(|(_, (orig, cur))| orig != cur).map(
-                        |(slot, (orig, cur))| {
-                            (
-                                U256::from_be_bytes(slot.0),
-                                EvmStorageSlot::new_changed(
-                                    U256::from_be_bytes(orig.0),
-                                    U256::from_be_bytes(cur.0),
-                                    0,
-                                ),
-                            )
-                        },
-                    ),
-                )
-                .with_touched_mark();
-            state.insert(addr, account);
-        }
-        state
+impl<'a, DB: Database> JournalStateAdapter<'a, DB> {
+    pub fn new(journal: &'a mut Journal<DB>) -> Self {
+        Self { journal }
     }
 
     /// Build a `Bytecode` from raw bytes without running the EVM analyzer
     /// (same bypass as `ReadWriteStateAdapter` in op-reth: avoids
     /// O(N) `analyze_legacy` for bitmap/entity data that is never executed).
-    fn make_bytecode(bytes: alloy_primitives::Bytes) -> Bytecode {
+    fn make_bytecode(bytes: Bytes) -> Bytecode {
         if bytes.is_empty() {
             return Bytecode::new();
         }
@@ -121,111 +54,85 @@ impl<'a, DB: Database> ExecutorStateAdapter<'a, DB> {
 
 // ─── StateAdapter implementation ─────────────────────────────────────
 
-impl<DB: Database> StateAdapter for ExecutorStateAdapter<'_, DB> {
+impl<DB: Database> StateAdapter for JournalStateAdapter<'_, DB> {
     fn code(&mut self, addr: &Address) -> Result<Vec<u8>> {
-        self.load_account(*addr)?;
-        let cached = self.cache.get_mut(addr).unwrap();
-
-        // If we already set code in this tx, return it directly.
-        if cached.code_dirty {
-            return Ok(cached.info.code.as_ref().map(|c: &Bytecode| c.original_bytes().to_vec()).unwrap_or_default());
-        }
-
-        // Otherwise fetch from DB via code_hash.
-        let hash = cached.info.code_hash;
-        if hash == KECCAK_EMPTY || hash == B256::ZERO {
-            return Ok(vec![]);
-        }
-        // AccountInfo may already carry the code inline.
-        if let Some(code) = cached.info.code.as_ref() {
-            return Ok((code as &Bytecode).original_bytes().to_vec());
-        }
-        let bytecode = self
-            .db
-            .code_by_hash(hash)
-            .map_err(|e| eyre::eyre!("db.code_by_hash({hash}): {e:?}"))?;
-        let bytes = bytecode.original_bytes().to_vec();
-        // Cache inline for subsequent reads.
-        self.cache.get_mut(addr).unwrap().info.code = Some(bytecode);
-        Ok(bytes)
+        // `Journal::code` loads (and warms) the account, inserting empty
+        // code if absent, so the returned bytes are always valid.
+        let code = self
+            .journal
+            .code(*addr)
+            .map_err(|e| eyre::eyre!("journal.code({addr}): {e:?}"))?;
+        Ok(code.data.to_vec())
     }
 
     fn set_code(&mut self, addr: &Address, code: Vec<u8>) -> Result<()> {
-        self.load_account(*addr)?;
-        let cached = self.cache.get_mut(addr).unwrap();
-        let bytes: alloy_primitives::Bytes = code.into();
+        let bytes: Bytes = code.into();
         let hash = if bytes.is_empty() { KECCAK_EMPTY } else { keccak256(&bytes) };
-        cached.info.code_hash = hash;
-        cached.info.code = Some(Self::make_bytecode(bytes));
-        // Ensure nonce ≥ 1 (EIP-161: account must not be empty-coded + nonce=0).
-        if cached.info.nonce == 0 {
-            cached.info.nonce = 1;
+        let bytecode = Self::make_bytecode(bytes);
+        let mut acc = self
+            .journal
+            .load_account_mut(*addr)
+            .map_err(|e| eyre::eyre!("journal.load_account_mut({addr}): {e:?}"))?
+            .data;
+        acc.set_code(hash, bytecode);
+        // EIP-161: an account with code must not be empty (nonce 0 + no
+        // balance), or `finalize` prunes it. Keep it alive.
+        if acc.nonce() == 0 {
+            acc.set_nonce(1);
         }
-        cached.mark_code_dirty();
+        acc.touch();
         Ok(())
     }
 
     fn tombstone_code(&mut self, addr: &Address) -> Result<()> {
-        self.load_account(*addr)?;
-        let cached = self.cache.get_mut(addr).unwrap();
-        cached.info.code_hash = KECCAK_EMPTY;
-        cached.info.code = Some(Bytecode::new());
-        if cached.info.nonce == 0 {
-            cached.info.nonce = 1;
+        let mut acc = self
+            .journal
+            .load_account_mut(*addr)
+            .map_err(|e| eyre::eyre!("journal.load_account_mut({addr}): {e:?}"))?
+            .data;
+        acc.set_code(KECCAK_EMPTY, Bytecode::new());
+        if acc.nonce() == 0 {
+            acc.set_nonce(1);
         }
-        cached.mark_code_dirty();
+        acc.touch();
         Ok(())
     }
 
     fn storage(&mut self, addr: &Address, slot: B256) -> Result<B256> {
-        self.load_account(*addr)?;
-        let cached = self.cache.get_mut(addr).unwrap();
-
-        // Return pending write if present.
-        if let Some((_, cur)) = cached.storage.get(&slot) {
-            return Ok(*cur);
-        }
-
-        // Load from DB.
-        let slot_u256 = U256::from_be_bytes(slot.0);
-        let val_u256 = self
-            .db
-            .storage(*addr, slot_u256)
-            .map_err(|e| eyre::eyre!("db.storage({addr}, {slot}): {e:?}"))?;
-        let val = B256::from(val_u256.to_be_bytes::<32>());
-        // Cache as (original, current) with same value — no write yet.
-        cached.storage.insert(slot, (val, val));
-        Ok(val)
+        // `sload` assumes the account is already present in the journal.
+        self.journal
+            .load_account(*addr)
+            .map_err(|e| eyre::eyre!("journal.load_account({addr}): {e:?}"))?;
+        let key = U256::from_be_bytes(slot.0);
+        let val = self
+            .journal
+            .sload(*addr, key)
+            .map_err(|e| eyre::eyre!("journal.sload({addr}, {slot}): {e:?}"))?;
+        Ok(B256::from(val.data.to_be_bytes::<32>()))
     }
 
     fn set_storage(&mut self, addr: &Address, slot: B256, value: B256) -> Result<()> {
-        self.load_account(*addr)?;
-        let cached = self.cache.get_mut(addr).unwrap();
-
-        // Preserve original if we haven't loaded this slot yet.
-        let original = if let Some((orig, _)) = cached.storage.get(&slot) {
-            *orig
-        } else {
-            let slot_u256 = U256::from_be_bytes(slot.0);
-            let orig_u256 = self
-                .db
-                .storage(*addr, slot_u256)
-                .map_err(|e| eyre::eyre!("db.storage({addr}, {slot}): {e:?}"))?;
-            B256::from(orig_u256.to_be_bytes::<32>())
-        };
-
-        cached.storage.insert(slot, (original, value));
-        cached.mark_storage_dirty();
+        self.journal
+            .load_account(*addr)
+            .map_err(|e| eyre::eyre!("journal.load_account({addr}): {e:?}"))?;
+        let key = U256::from_be_bytes(slot.0);
+        let val = U256::from_be_bytes(value.0);
+        self.journal
+            .sstore(*addr, key, val)
+            .map_err(|e| eyre::eyre!("journal.sstore({addr}, {slot}): {e:?}"))?;
         Ok(())
     }
 
     fn ensure_account_persists(&mut self, addr: &Address) -> Result<()> {
-        self.load_account(*addr)?;
-        let cached = self.cache.get_mut(addr).unwrap();
-        if cached.info.nonce == 0 {
-            cached.info.nonce = 1;
-            cached.mark_code_dirty();
+        let mut acc = self
+            .journal
+            .load_account_mut(*addr)
+            .map_err(|e| eyre::eyre!("journal.load_account_mut({addr}): {e:?}"))?
+            .data;
+        if acc.nonce() == 0 {
+            acc.set_nonce(1);
         }
+        acc.touch();
         Ok(())
     }
 

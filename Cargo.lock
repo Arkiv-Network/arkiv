@@ -1348,6 +1348,7 @@ dependencies = [
  "arkiv-db-engine",
  "eyre",
  "roaring",
+ "serde",
  "tracing",
 ]
 
@@ -1371,11 +1372,24 @@ version = "0.1.0"
 name = "arkiv-node"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.4",
+ "alloy-primitives",
+ "arkiv-db-engine",
  "arkiv-executor",
+ "async-trait",
  "clap",
+ "eyre",
+ "jsonrpsee",
  "reth",
+ "reth-db-api",
+ "reth-ethereum",
  "reth-ethereum-cli",
  "reth-node-ethereum",
+ "reth-storage-api",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

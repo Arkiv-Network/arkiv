@@ -1,14 +1,19 @@
-//! `arkiv-node`: a reth Ethereum node with the Arkiv executor wired in.
+//! `arkiv-node`: a reth Ethereum node with the Arkiv executor and `arkiv_*`
+//! RPC namespace wired in.
 //!
-//! This is the assembly point. We keep reth as the host (networking, txpool,
-//! JSON-RPC, MDBX, engine/Engine API, sync) and override exactly one component:
-//! the **executor**, replaced by [`arkiv_executor::ArkivExecutorBuilder`]. The
-//! node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
+//! Assembly point: reth hosts networking, txpool, engine/Engine API, MDBX,
+//! and the standard Ethereum RPC. We override two things:
 //!
-//! Today the Arkiv executor is the stock Ethereum executor with an Arkiv
-//! precompile registered at `ARKIV_ADDRESS` — it proves the injection wiring end
-//! to end. The neutered-EVM policy and the entity engine land behind that same
-//! seam without touching this file (see experiments/post-evm-execution-report.md).
+//! 1. **Executor** — replaced by [`arkiv_executor::ArkivExecutorBuilder`].
+//!    All transactions are handled by a fixed-function state machine; the
+//!    EVM is never entered.
+//!
+//! 2. **RPC** — the `arkiv_*` namespace is injected via `.extend_rpc_modules`,
+//!    giving SDK clients access to `arkiv_query`, `arkiv_getEntityCount`, and
+//!    `arkiv_getBlockTiming`.
+
+mod rpc;
+mod state_adapter;
 
 use arkiv_executor::ArkivExecutorBuilder;
 use clap::Parser;
@@ -17,23 +22,28 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use tracing::info;
 
+use rpc::{ArkivApiServer, ArkivRpc};
+
 fn main() {
-    // Enable backtraces unless the caller already set a preference.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
-        info!(target: "arkiv-node", "Launching arkiv-node (reth host + Arkiv executor)");
+        info!(target: "arkiv-node", "Launching arkiv-node (reth host + Arkiv executor + arkiv_* RPC)");
         let handle = builder
-            // Standard Ethereum node types (primitives, chainspec, payload, storage).
             .with_types::<EthereumNode>()
-            // Default Ethereum components, but our executor replaces the EVM one.
             .with_components(
                 EthereumNode::components().executor(ArkivExecutorBuilder::default()),
             )
-            // Standard Ethereum add-ons (RPC, engine API, validator).
             .with_add_ons(EthereumAddOns::default())
+            .extend_rpc_modules(|ctx| {
+                let provider = ctx.provider().clone();
+                let ext = ArkivRpc::new(provider);
+                ctx.modules.merge_configured(ext.into_rpc())?;
+                info!(target: "arkiv-node", "arkiv_* RPC namespace registered");
+                Ok(())
+            })
             .launch_with_debug_capabilities()
             .await?;
         handle.wait_for_node_exit().await

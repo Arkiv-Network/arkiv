@@ -13,6 +13,19 @@ path = "src/main.rs"
 reth.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-ethereum.workspace = true
+reth-ethereum = { workspace = true, features = ["node"] }
+reth-storage-api.workspace = true
+reth-db-api.workspace = true
 arkiv-executor.workspace = true
+arkiv-db-engine = { workspace = true, features = ["view"] }
 clap.workspace = true
 tracing.workspace = true
+jsonrpsee.workspace = true
+async-trait.workspace = true
+alloy-eips.workspace = true
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+eyre.workspace = true

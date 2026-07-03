@@ -42,6 +42,8 @@ use roaring::RoaringTreemap;
 
 pub mod call;
 pub mod query;
+#[cfg(feature = "view")]
+pub mod view;
 
 pub use call::{CallContext, CallResult, dispatch};
 

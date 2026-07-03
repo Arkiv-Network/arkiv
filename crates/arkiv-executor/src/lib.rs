@@ -21,16 +21,20 @@ use reth_ethereum::{
     evm::{
         primitives::{Database, EvmEnv},
         revm::{
-            context::{BlockEnv, CfgEnv, Context, TxEnv},
-            context_interface::result::{
-                EVMError, ExecutionResult, HaltReason, OutOfGasError, Output, ResultAndState,
-                ResultGas, SuccessReason,
+            context::{BlockEnv, CfgEnv, Context, Journal, TxEnv},
+            context_interface::{
+                JournalTr,
+                journaled_state::account::JournaledAccountTr,
+                result::{
+                    EVMError, ExecutionResult, HaltReason, OutOfGasError, Output, ResultAndState,
+                    ResultGas, SuccessReason,
+                },
             },
             inspector::{Inspector, NoOpInspector},
             interpreter::interpreter::EthInterpreter,
             precompile::Precompiles,
             primitives::hardfork::SpecId,
-            state::{Account, EvmState},
+            state::EvmState,
             MainBuilder, MainContext,
         },
         EthEvm, EthEvmConfig,
@@ -42,7 +46,7 @@ use reth_ethereum::{
     EthPrimitives,
 };
 
-use state_adapter::ExecutorStateAdapter;
+use state_adapter::JournalStateAdapter;
 
 /// Computes the minimum gas that passes reth's tx-pool IntrinsicGasTooLow check.
 ///
@@ -106,7 +110,8 @@ where
     ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
         let block_number: u64 = self.inner.block().number.saturating_to();
         let chain_id = self.inner.chain_id();
-        arkiv_transact(self.inner.db_mut(), tx, block_number, chain_id)
+        let journal = &mut self.inner.ctx_mut().journaled_state;
+        arkiv_transact(journal, tx, block_number, chain_id)
     }
 
     fn transact_system_call(
@@ -140,7 +145,7 @@ where
 // ---------------------------------------------------------------------------
 
 fn arkiv_transact<DB: Database>(
-    db: &mut DB,
+    journal: &mut Journal<DB>,
     tx: TxEnv,
     block_number: u64,
     chain_id: u64,
@@ -169,6 +174,7 @@ fn arkiv_transact<DB: Database>(
     // During eth_estimateGas the binary search probes gas limits below intrinsic.
     // Return Halt so the search raises its lower bound; otherwise it converges to
     // a value < intrinsic_gas and the tx-pool rejects with IntrinsicGasTooLow.
+    // Nothing is written to the journal, so it stays clean for the next probe.
     if tx.gas_limit < gas_used {
         return Ok(ResultAndState::new(
             ExecutionResult::Halt {
@@ -180,13 +186,23 @@ fn arkiv_transact<DB: Database>(
         ));
     }
 
+    // `finalize` resets the journal (including spec) after every tx, so set the
+    // spec each call to get correct EIP-161 empty-account pruning. This executor
+    // is Prague-only (see `create_evm`'s `Precompiles::prague`).
+    journal.set_spec_id(SpecId::PRAGUE);
+
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
     let value_out = if to == tx.caller { U256::ZERO } else { tx.value };
-    let mut sender = db.basic(tx.caller).map_err(EVMError::Database)?.unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(value_out).saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
+
+    // Sender accounting through the journal, applied *before* the checkpoint so
+    // it survives an entity-engine revert (gas is burned even on revert).
+    {
+        let mut sender = journal.load_account_mut(tx.caller).map_err(EVMError::Database)?.data;
+        let new_balance = sender.balance().saturating_sub(value_out).saturating_sub(gas_cost);
+        sender.set_balance(new_balance);
+        sender.bump_nonce();
+        sender.touch();
+    }
 
     // Route calls to ARKIV_ADDRESS through the entity-engine dispatcher.
     if to == ARKIV_ADDRESS {
@@ -195,52 +211,61 @@ fn arkiv_transact<DB: Database>(
             chain_id,
             block_number,
         };
-        let mut adapter = ExecutorStateAdapter::new(db);
-        let call_result = arkiv_db_engine::dispatch(&mut adapter, &ctx, &tx.data)
-            .map_err(|e| EVMError::Custom(e.to_string()))?;
-        let mut entity_state = adapter.into_evm_state();
 
-        // Sender accounting always applies (gas burned even on revert).
-        entity_state.insert(tx.caller, sender_acc);
+        // Checkpoint after sender accounting: on revert we roll back the entity
+        // writes but keep the burned gas / bumped nonce.
+        let checkpoint = journal.checkpoint();
+        let dispatch_result = {
+            let mut adapter = JournalStateAdapter::new(&mut *journal);
+            arkiv_db_engine::dispatch(&mut adapter, &ctx, &tx.data)
+        };
+
+        let call_result = match dispatch_result {
+            Ok(r) => r,
+            Err(e) => {
+                // Roll back and finalize so the journal is clean for the next tx.
+                journal.checkpoint_revert(checkpoint);
+                let _ = journal.finalize();
+                return Err(EVMError::Custom(e.to_string()));
+            }
+        };
 
         return match call_result {
-            CallResult::Success { output, logs } => Ok(ResultAndState::new(
-                ExecutionResult::Success {
-                    reason: SuccessReason::Return,
-                    gas: ResultGas::default().with_total_gas_spent(gas_used),
-                    logs,
-                    output: Output::Call(output),
-                },
-                entity_state,
-            )),
-            CallResult::Revert { data } => Ok(ResultAndState::new(
-                ExecutionResult::Revert {
-                    gas: ResultGas::default().with_total_gas_spent(gas_used),
-                    logs: Vec::new(),
-                    output: data,
-                },
-                // Only sender accounting on revert; entity state discarded.
-                {
-                    let mut s = EvmState::default();
-                    s.insert(tx.caller, entity_state.remove(&tx.caller).unwrap());
-                    s
-                },
-            )),
+            CallResult::Success { output, logs } => {
+                journal.checkpoint_commit();
+                let state = journal.finalize();
+                Ok(ResultAndState::new(
+                    ExecutionResult::Success {
+                        reason: SuccessReason::Return,
+                        gas: ResultGas::default().with_total_gas_spent(gas_used),
+                        logs,
+                        output: Output::Call(output),
+                    },
+                    state,
+                ))
+            }
+            CallResult::Revert { data } => {
+                // Discard entity writes; sender accounting (pre-checkpoint) stays.
+                journal.checkpoint_revert(checkpoint);
+                let state = journal.finalize();
+                Ok(ResultAndState::new(
+                    ExecutionResult::Revert {
+                        gas: ResultGas::default().with_total_gas_spent(gas_used),
+                        logs: Vec::new(),
+                        output: data,
+                    },
+                    state,
+                ))
+            }
         };
     }
 
-    // Plain transfer.
-    let mut state = EvmState::default();
-    state.insert(tx.caller, sender_acc);
-
+    // Plain transfer: credit recipient (sender already debited above).
     if to != tx.caller {
-        let mut recipient = db.basic(to).map_err(EVMError::Database)?.unwrap_or_default();
-        recipient.balance = recipient.balance.saturating_add(tx.value);
-        let mut recipient_acc = Account::from(recipient);
-        recipient_acc.mark_touch();
-        state.insert(to, recipient_acc);
+        journal.balance_incr(to, tx.value).map_err(EVMError::Database)?;
     }
 
+    let state = journal.finalize();
     Ok(ResultAndState::new(
         ExecutionResult::Success {
             reason: SuccessReason::Stop,
