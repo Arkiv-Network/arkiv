@@ -1,43 +1,33 @@
-//! [`ReadOnlyStateAdapter`] — bridges reth's [`StateProvider`] + a DB
-//! cursor provider to [`arkiv_db_engine::StateAdapter`] for query execution.
+//! [`ReadOnlyStateAdapter`] — bridges reth's [`StateProvider`] to
+//! [`arkiv_db_engine::StateAdapter`] for query execution.
 //!
-//! Single-key reads (code, storage) go through `StateProviderBox`.
-//! [`StateAdapter::iter_storage_asc`] opens a duplicate-sort cursor on the
-//! `PlainStorageState` MDBX table for efficient range iteration.
+//! All reads — single-key (`code`, `storage`) and range (`iter_storage_asc`)
+//! — go through a single `StateProviderBox` snapshot, so they observe a
+//! consistent view (including reth's in-memory canonical state for `latest`).
 //!
-//! **Limitation**: `iter_storage_asc` reads from the *current* plain-state
-//! table regardless of the snapshot requested by the caller. Range queries
-//! against historical blocks may therefore return stale index data. Point
-//! reads (code, storage) ARE historical via the `StateProviderBox`.
+//! Range iteration cannot use an MDBX cursor: the entity engine addresses
+//! its Tier-2 index nodes by `keccak`-derived account addresses, so index
+//! entries are scattered across the keyspace rather than laid out in
+//! sorted-slot order under one account. `iter_storage_asc` therefore
+//! delegates to [`arkiv_db_engine::iter_storage_asc_impl`], which walks the
+//! B+tree / list structure with point `storage` reads against the snapshot.
 
 use alloy_primitives::{Address, B256};
-use arkiv_db_engine::StateAdapter;
+use arkiv_db_engine::{StateAdapter, iter_storage_asc_impl};
 use eyre::Result;
-use reth_db_api::{
-    cursor::DbDupCursorRO,
-    tables,
-    transaction::DbTx,
-};
-use reth_storage_api::{DBProvider, StateProviderBox};
+use reth_storage_api::StateProviderBox;
 
-pub struct ReadOnlyStateAdapter<DP> {
+pub struct ReadOnlyStateAdapter {
     state: StateProviderBox,
-    db_provider: DP,
 }
 
-impl<DP: DBProvider> ReadOnlyStateAdapter<DP>
-where
-    DP::Tx: DbTx,
-{
-    pub fn new(state: StateProviderBox, db_provider: DP) -> Self {
-        Self { state, db_provider }
+impl ReadOnlyStateAdapter {
+    pub fn new(state: StateProviderBox) -> Self {
+        Self { state }
     }
 }
 
-impl<DP: DBProvider> StateAdapter for ReadOnlyStateAdapter<DP>
-where
-    DP::Tx: DbTx,
-{
+impl StateAdapter for ReadOnlyStateAdapter {
     fn code(&mut self, addr: &Address) -> Result<Vec<u8>> {
         let maybe = self
             .state
@@ -72,21 +62,7 @@ where
     }
 
     fn iter_storage_asc(&mut self, addr: &Address, from: B256) -> Result<Vec<(B256, B256)>> {
-        let mut cursor = self
-            .db_provider
-            .tx_ref()
-            .cursor_dup_read::<tables::PlainStorageState>()
-            .map_err(|e| eyre::eyre!("cursor_dup_read: {e:?}"))?;
-
-        let walker = cursor
-            .walk_dup(Some(*addr), Some(from))
-            .map_err(|e| eyre::eyre!("walk_dup: {e:?}"))?;
-
-        walker
-            .map(|r| {
-                let (_, entry) = r.map_err(|e| eyre::eyre!("cursor iter: {e:?}"))?;
-                Ok((entry.key, B256::from(entry.value.to_be_bytes::<32>())))
-            })
-            .collect()
+        // Structural walk over point reads against the snapshot — see module docs.
+        iter_storage_asc_impl(self, addr, from)
     }
 }

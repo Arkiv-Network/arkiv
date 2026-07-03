@@ -17,9 +17,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     types::error::{ErrorObject, ErrorObjectOwned, INTERNAL_ERROR_CODE},
 };
-use reth_storage_api::{
-    BlockNumReader, DatabaseProviderFactory, DBProvider, HeaderProvider, StateProviderFactory,
-};
+use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
 use serde::{Deserialize, Serialize};
 
 use crate::state_adapter::ReadOnlyStateAdapter;
@@ -98,15 +96,12 @@ impl<P> ArkivRpc<P> {
 impl<P> ArkivApiServer for ArkivRpc<P>
 where
     P: StateProviderFactory
-        + DatabaseProviderFactory
         + HeaderProvider
         + BlockNumReader
         + Clone
         + Send
         + Sync
         + 'static,
-    P::Provider: DBProvider,
-    <P::Provider as DBProvider>::Tx: reth_db_api::transaction::DbTx,
 {
     async fn query(&self, q: String, options: Option<QueryOptions>) -> RpcResult<QueryResponse> {
         let provider = self.provider.clone();
@@ -119,11 +114,8 @@ where
     async fn get_entity_count(&self) -> RpcResult<u64> {
         let provider = self.provider.clone();
         tokio::task::spawn_blocking(move || -> Result<u64> {
-            let db_provider = provider
-                .database_provider_ro()
-                .map_err(|e| eyre::eyre!("{e:?}"))?;
             let state = provider.latest().map_err(|e| eyre::eyre!("{e:?}"))?;
-            let mut adapter = ReadOnlyStateAdapter::new(state, db_provider);
+            let mut adapter = ReadOnlyStateAdapter::new(state);
             Ok(all_entities(&mut adapter)?.len())
         })
         .await
@@ -166,13 +158,10 @@ where
 
 fn run_query<P>(provider: &P, q: &str, options: &QueryOptions) -> Result<QueryResponse>
 where
-    P: StateProviderFactory + DatabaseProviderFactory + HeaderProvider,
-    P::Provider: DBProvider,
-    <P::Provider as DBProvider>::Tx: reth_db_api::transaction::DbTx,
+    P: StateProviderFactory + HeaderProvider,
 {
     let (state, block_number) = snapshot_for(provider, options.at_block)?;
-    let db_provider = provider.database_provider_ro().map_err(|e| eyre::eyre!("{e:?}"))?;
-    let mut adapter = ReadOnlyStateAdapter::new(state, db_provider);
+    let mut adapter = ReadOnlyStateAdapter::new(state);
 
     let params = PageParams {
         page_size: options
