@@ -1444,6 +1444,7 @@ name = "arkiv-reth-entitystore"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "arkiv-interfaces",
 ]
 

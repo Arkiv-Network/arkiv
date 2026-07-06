@@ -16,12 +16,15 @@
 //! is one concrete answer to that on reth.
 //!
 //! It is being ported, module by module, from the proven `arkiv-db-engine`
-//! reference. Here so far: [`layout`] — the entity address anchor — and
-//! [`store`] — the [`EntityStore`](arkiv_interfaces::state::EntityStore) impl over
-//! an [`EntityBackend`](store::EntityBackend) seam (the reth persistence lands
-//! behind that seam next).
+//! reference. Here so far: [`layout`] — the entity address anchor; [`record`] —
+//! the `Entity` ⇄ account-code byte codec (`0xFE || RLP`); and [`store`] — the
+//! [`EntityStore`](arkiv_interfaces::state::EntityStore) impl over an
+//! [`EntityBackend`](store::EntityBackend) seam (the reth persistence, which will
+//! use [`record`], lands behind that seam next).
 
 pub mod layout;
+pub mod record;
 pub mod store;
 
+pub use record::{RecordError, decode, encode};
 pub use store::{EntityBackend, RethEntityStore};
