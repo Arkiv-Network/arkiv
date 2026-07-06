@@ -1433,6 +1433,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-query"
+version = "0.1.0"
+dependencies = [
+ "arkiv-interfaces",
+]
+
+[[package]]
 name = "arkiv-reth-entitystore"
 version = "0.1.0"
 dependencies = [
