@@ -1,0 +1,15 @@
+[package]
+name = "arkiv-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Arkiv query language: parse a query string into the `arkiv-interfaces`
+# `Query` AST. A hand-rolled lexer + recursive-descent parser, kept `no_std` and
+# zero-external-dep (only the AST from arkiv-interfaces) so it stays deterministic
+# and portable — the query grammar is part of the Arkiv spec, but a parser is
+# logic, so it lives here rather than bloating the pure-traits interfaces crate.
+
+[dependencies]
+arkiv-interfaces.workspace = true

@@ -55,6 +55,7 @@ serde_json = "1"
 
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
+arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-da = { path = "crates/arkiv-da" }
