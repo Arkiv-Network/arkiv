@@ -1,0 +1,18 @@
+[package]
+name = "arkiv-reth-entitystore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The reth-host implementation of the Arkiv entity store. Sibling to
+# arkiv-reth-executor: where the executor implements the executor traits, this
+# crate implements arkiv-interfaces' `EntityStore`/`AuxiliaryStore` against reth's
+# account/slot state model. Ported, module by module, from the proven db-engine.
+#
+# This is host-specific by nature: the physical layout (which address/slot an
+# entity or index entry lives at) is reth's business, not the Arkiv spec's.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+alloy-primitives.workspace = true
