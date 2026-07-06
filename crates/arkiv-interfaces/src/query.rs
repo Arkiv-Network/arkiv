@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use crate::collections::NonEmptyVec;
 use crate::entity::Entity;
-use crate::primitives::{BlockNumber, EntityKey, Gas};
+use crate::primitives::{Address, BlockNumber, EntityKey, Gas};
 use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, HistoricalEntityStore};
 
 /// A query — a tree of predicates over an entity's attributes.
@@ -85,6 +85,8 @@ pub enum AnnotVal {
     Str(Vec<u8>),
     /// An entity key.
     Key(EntityKey),
+    /// A 20-byte address (e.g. an `$owner` / `$creator` value).
+    Addr(Address),
 }
 
 /// Where to start and how many to return.
