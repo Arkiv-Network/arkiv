@@ -3,9 +3,10 @@
 //! Tokens:
 //! - operators: `(`, `)`, `&&`, `||`, `=`, `!=`, `>`, `>=`, `<`, `<=`, `~`, `!~`, `*`
 //! - keywords (case-insensitive): `AND`, `OR`, `NOT`, `IN`
-//! - built-in idents: `$all`, `$owner`, `$creator`, `$key`, `$expiration`,
-//!   `$contentType`, `$createdAtBlock`
-//! - literals: `0x` + 64 hex (entity key), `0x` + 40 hex (address), `"…"`
+//! - `$term` — any `$`-prefixed identifier (e.g. `$owner`, `$expiration`). The
+//!   lexer captures the name only; which names are valid built-ins is resolved by
+//!   the parser, so adding a built-in never touches the grammar.
+//! - literals: `0x` + hex (an address or an entity key, by length), `"…"`
 //!   (string with `\\ \" \n \t \r` escapes), decimal number, and a
 //!   Unicode-letter-led identifier.
 //!
@@ -15,7 +16,17 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use arkiv_interfaces::primitives::{Address, EntityKey};
+
 use crate::parse::ParseError;
+
+/// Byte length of an address and of an entity key, taken from the spec primitives
+/// so the hex-literal lengths below aren't magic numbers.
+pub(crate) const ADDRESS_LEN: usize = core::mem::size_of::<Address>();
+pub(crate) const KEY_LEN: usize = core::mem::size_of::<EntityKey>();
+/// Hex-character length of each — two hex chars per byte.
+pub(crate) const ADDRESS_HEX_LEN: usize = ADDRESS_LEN * 2;
+pub(crate) const KEY_HEX_LEN: usize = KEY_LEN * 2;
 
 /// One lexed token. Identifiers and literals carry their decoded value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,30 +49,27 @@ pub(crate) enum Token {
     /// `!~` — negated prefix/glob match operator.
     NotTilde,
 
-    DollarAll,
-    DollarOwner,
-    DollarCreator,
-    DollarKey,
-    DollarExpiration,
-    DollarContentType,
-    DollarCreatedAtBlock,
+    /// A `$`-prefixed term, carrying the name after the `$` (e.g. `owner`). The
+    /// parser decides which names are valid built-ins.
+    DollarTerm(String),
 
-    /// `0x` + 64 hex chars, decoded to 32 bytes.
-    EntityKey([u8; 32]),
-    /// `0x` + 40 hex chars, decoded to 20 bytes.
-    Address([u8; 20]),
+    /// `0x` + [`KEY_HEX_LEN`] hex chars, decoded to an entity key.
+    EntityKey(EntityKey),
+    /// `0x` + [`ADDRESS_HEX_LEN`] hex chars, decoded to an address.
+    Address(Address),
     /// `"…"` literal contents, escapes resolved.
     StringLit(String),
     /// Decimal `[0-9]+`, `<= u64::MAX`.
     Number(u64),
-    /// User identifier (reserved words and `$`-idents get their own variants).
+    /// User identifier (reserved words and `$`-terms get their own variants).
     Ident(String),
 }
 
 /// Tokenize an input string into the full token list.
 pub(crate) fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
     let mut lex = Lexer::new(src);
-    let mut out = Vec::new();
+    // Most queries are small; a modest reservation avoids a couple of regrowths.
+    let mut out = Vec::with_capacity(16);
     while let Some(tok) = lex.next_token()? {
         out.push(tok);
     }
@@ -78,30 +86,35 @@ impl<'a> Lexer<'a> {
         Self { src, pos: 0 }
     }
 
+    /// The not-yet-consumed input.
     fn rest(&self) -> &'a str {
         &self.src[self.pos..]
     }
 
+    /// The next character without consuming it.
     fn peek_char(&self) -> Option<char> {
         self.rest().chars().next()
     }
 
-    fn bump_char(&mut self) -> Option<char> {
+    /// Consume and return the next character.
+    fn read_char(&mut self) -> Option<char> {
         let c = self.peek_char()?;
         self.pos += c.len_utf8();
         Some(c)
     }
 
+    /// Skip any run of whitespace.
     fn skip_whitespace(&mut self) {
         while let Some(c) = self.peek_char() {
             if c.is_whitespace() {
-                self.bump_char();
+                self.read_char();
             } else {
                 break;
             }
         }
     }
 
+    /// Lex the next token, or `None` at end of input.
     fn next_token(&mut self) -> Result<Option<Token>, ParseError> {
         self.skip_whitespace();
         let Some(c) = self.peek_char() else {
@@ -110,19 +123,19 @@ impl<'a> Lexer<'a> {
 
         match c {
             '(' => {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::LParen));
             }
             ')' => {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::RParen));
             }
             '*' => {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::Star));
             }
             '=' => {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::Eq));
             }
             _ => {}
@@ -135,36 +148,36 @@ impl<'a> Lexer<'a> {
             return self.expect_pair('|', '|').map(|()| Some(Token::Or));
         }
         if c == '!' {
-            self.bump_char();
+            self.read_char();
             if self.peek_char() == Some('=') {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::Neq));
             }
             if self.peek_char() == Some('~') {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::NotTilde));
             }
             // Bare `!` is the NOT keyword (`!(a = b)`).
             return Ok(Some(Token::Not));
         }
         if c == '>' {
-            self.bump_char();
+            self.read_char();
             if self.peek_char() == Some('=') {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::Gte));
             }
             return Ok(Some(Token::Gt));
         }
         if c == '<' {
-            self.bump_char();
+            self.read_char();
             if self.peek_char() == Some('=') {
-                self.bump_char();
+                self.read_char();
                 return Ok(Some(Token::Lte));
             }
             return Ok(Some(Token::Lt));
         }
         if c == '~' {
-            self.bump_char();
+            self.read_char();
             return Ok(Some(Token::Tilde));
         }
         if c == '"' {
@@ -174,7 +187,7 @@ impl<'a> Lexer<'a> {
             return self.lex_number_or_hex().map(Some);
         }
         if c == '$' {
-            return self.lex_dollar_ident().map(Some);
+            return Ok(Some(self.lex_dollar_term()));
         }
         if is_ident_start(c) {
             return self.lex_ident_or_keyword().map(Some);
@@ -183,26 +196,28 @@ impl<'a> Lexer<'a> {
         Err(ParseError::at(self.pos, "unexpected character"))
     }
 
+    /// Consume a two-character operator, erroring if the pair doesn't match.
     fn expect_pair(&mut self, first: char, second: char) -> Result<(), ParseError> {
         let start = self.pos;
-        let a = self.bump_char();
+        let a = self.read_char();
         let b = self.peek_char();
         if a != Some(first) || b != Some(second) {
             return Err(ParseError::at(start, "expected a two-character operator"));
         }
-        self.bump_char();
+        self.read_char();
         Ok(())
     }
 
+    /// Lex a `"…"` string literal, resolving escapes.
     fn lex_string(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
-        self.bump_char(); // opening "
+        self.read_char(); // opening "
         let mut out = String::new();
         loop {
-            match self.bump_char() {
+            match self.read_char() {
                 None => return Err(ParseError::at(start, "unterminated string literal")),
                 Some('"') => return Ok(Token::StringLit(out)),
-                Some('\\') => match self.bump_char() {
+                Some('\\') => match self.read_char() {
                     Some('"') => out.push('"'),
                     Some('\\') => out.push('\\'),
                     Some('n') => out.push('\n'),
@@ -216,6 +231,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Lex a decimal number, or a `0x`-prefixed hex address / entity-key literal.
     fn lex_number_or_hex(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
         if self.rest().starts_with("0x") || self.rest().starts_with("0X") {
@@ -223,34 +239,34 @@ impl<'a> Lexer<'a> {
             let hex_start = self.pos;
             while let Some(c) = self.peek_char() {
                 if c.is_ascii_hexdigit() {
-                    self.bump_char();
+                    self.read_char();
                 } else {
                     break;
                 }
             }
             let hex = &self.src[hex_start..self.pos];
             match hex.len() {
-                40 => {
-                    let mut a = [0u8; 20];
+                ADDRESS_HEX_LEN => {
+                    let mut a: Address = [0u8; ADDRESS_LEN];
                     hex_to_bytes(hex, &mut a)
                         .map_err(|()| ParseError::at(start, "invalid address hex"))?;
                     Ok(Token::Address(a))
                 }
-                64 => {
-                    let mut b = [0u8; 32];
+                KEY_HEX_LEN => {
+                    let mut b: EntityKey = [0u8; KEY_LEN];
                     hex_to_bytes(hex, &mut b)
                         .map_err(|()| ParseError::at(start, "invalid entity-key hex"))?;
                     Ok(Token::EntityKey(b))
                 }
                 _ => Err(ParseError::at(
                     start,
-                    "hex literal must be 40 (address) or 64 (entity key) chars",
+                    "hex literal must be an address or an entity key",
                 )),
             }
         } else {
             while let Some(c) = self.peek_char() {
                 if c.is_ascii_digit() {
-                    self.bump_char();
+                    self.read_char();
                 } else {
                     break;
                 }
@@ -263,34 +279,27 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_dollar_ident(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos;
-        self.bump_char(); // consume '$'
+    /// Lex a `$`-prefixed term, returning the name after the `$`. Validity of the
+    /// name is the parser's concern.
+    fn lex_dollar_term(&mut self) -> Token {
+        self.read_char(); // consume '$'
         let name_start = self.pos;
         while let Some(c) = self.peek_char() {
             if is_ident_continue(c) {
-                self.bump_char();
+                self.read_char();
             } else {
                 break;
             }
         }
-        match &self.src[name_start..self.pos] {
-            "all" => Ok(Token::DollarAll),
-            "owner" => Ok(Token::DollarOwner),
-            "creator" => Ok(Token::DollarCreator),
-            "key" => Ok(Token::DollarKey),
-            "expiration" => Ok(Token::DollarExpiration),
-            "contentType" => Ok(Token::DollarContentType),
-            "createdAtBlock" => Ok(Token::DollarCreatedAtBlock),
-            _ => Err(ParseError::at(start, "unknown built-in annotation")),
-        }
+        Token::DollarTerm(self.src[name_start..self.pos].to_string())
     }
 
+    /// Lex a bare identifier, or a (case-insensitive) reserved keyword.
     fn lex_ident_or_keyword(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
         while let Some(c) = self.peek_char() {
             if is_ident_continue(c) {
-                self.bump_char();
+                self.read_char();
             } else {
                 break;
             }
@@ -311,10 +320,12 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Whether `c` may start an identifier.
 fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// Whether `c` may continue an identifier.
 fn is_ident_continue(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -334,6 +345,7 @@ pub(crate) fn hex_to_bytes(hex: &str, out: &mut [u8]) -> Result<(), ()> {
     Ok(())
 }
 
+/// A single hex character to its 0–15 value.
 fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),

@@ -34,10 +34,11 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use arkiv_interfaces::collections::NonEmptyVec;
-use arkiv_interfaces::primitives::EntityKey;
+use arkiv_interfaces::entity::annotations;
+use arkiv_interfaces::primitives::{Address, EntityKey};
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query};
 
-use crate::lexer::{Token, hex_to_bytes, tokenize};
+use crate::lexer::{KEY_HEX_LEN, KEY_LEN, Token, hex_to_bytes, tokenize};
 
 /// Why a query string failed to parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,8 +87,8 @@ pub fn parse(input: &str) -> Result<Query, ParseError> {
 enum Literal {
     Number(u64),
     String(String),
-    Address([u8; 20]),
-    EntityKey([u8; 32]),
+    Address(Address),
+    EntityKey(EntityKey),
 }
 
 struct Parser {
@@ -119,7 +120,9 @@ impl Parser {
 
     fn parse_top_level(&mut self) -> Result<Query, ParseError> {
         // Standalone `*` / `$all` only at top level.
-        if matches!(self.peek(), Some(Token::Star | Token::DollarAll)) {
+        let is_all = matches!(self.peek(), Some(Token::Star))
+            || matches!(self.peek(), Some(Token::DollarTerm(n)) if n.as_bytes() == &annotations::ALL[1..]);
+        if is_all {
             self.advance();
             if self.peek().is_some() {
                 return Err(ParseError::msg("expected end of input after '*' / '$all'"));
@@ -241,12 +244,9 @@ impl Parser {
 
     fn parse_annot_key(&mut self) -> Result<AnnotKey, ParseError> {
         match self.advance() {
-            Some(Token::DollarOwner) => Ok(AnnotKey::BuiltIn(BuiltIn::Owner)),
-            Some(Token::DollarCreator) => Ok(AnnotKey::BuiltIn(BuiltIn::Creator)),
-            Some(Token::DollarKey) => Ok(AnnotKey::BuiltIn(BuiltIn::Key)),
-            Some(Token::DollarExpiration) => Ok(AnnotKey::BuiltIn(BuiltIn::Expiration)),
-            Some(Token::DollarContentType) => Ok(AnnotKey::BuiltIn(BuiltIn::ContentType)),
-            Some(Token::DollarCreatedAtBlock) => Ok(AnnotKey::BuiltIn(BuiltIn::CreatedAtBlock)),
+            Some(Token::DollarTerm(name)) => builtin_from_dollar(&name)
+                .map(AnnotKey::BuiltIn)
+                .ok_or_else(|| ParseError::msg("unknown or non-queryable built-in field")),
             Some(Token::Ident(s)) => Ok(AnnotKey::User(s)),
             _ => Err(ParseError::msg("expected an annotation key")),
         }
@@ -351,6 +351,29 @@ fn value_for_key(key: &AnnotKey, lit: Literal) -> Result<AnnotVal, ParseError> {
     })
 }
 
+/// Resolve a `$term` name (the text after the `$`) to a built-in field, if it is
+/// one. Names come from the spec's [`annotations`] constants (minus the `$`), so
+/// the parser and the store agree on the vocabulary. `$all` is deliberately not a
+/// field — it is the all-selector, handled at the top level.
+fn builtin_from_dollar(name: &str) -> Option<BuiltIn> {
+    let n = name.as_bytes();
+    if n == &annotations::OWNER[1..] {
+        Some(BuiltIn::Owner)
+    } else if n == &annotations::CREATOR[1..] {
+        Some(BuiltIn::Creator)
+    } else if n == &annotations::KEY[1..] {
+        Some(BuiltIn::Key)
+    } else if n == &annotations::EXPIRATION[1..] {
+        Some(BuiltIn::Expiration)
+    } else if n == &annotations::CONTENT_TYPE[1..] {
+        Some(BuiltIn::ContentType)
+    } else if n == &annotations::CREATED_AT_BLOCK[1..] {
+        Some(BuiltIn::CreatedAtBlock)
+    } else {
+        None
+    }
+}
+
 /// Decode a `0x…64hex` string into a 32-byte entity key (the JS SDK sends `$key`
 /// values quoted).
 fn decode_key_string(s: &str) -> Result<EntityKey, ParseError> {
@@ -358,10 +381,10 @@ fn decode_key_string(s: &str) -> Result<EntityKey, ParseError> {
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .ok_or_else(|| ParseError::msg("$key string must be 0x-prefixed"))?;
-    if stripped.len() != 64 {
-        return Err(ParseError::msg("$key string must be 64 hex chars"));
+    if stripped.len() != KEY_HEX_LEN {
+        return Err(ParseError::msg("$key string must be a 32-byte hex key"));
     }
-    let mut out = [0u8; 32];
+    let mut out = [0u8; KEY_LEN];
     hex_to_bytes(stripped, &mut out).map_err(|()| ParseError::msg("invalid hex in $key string"))?;
     Ok(out)
 }
@@ -751,5 +774,26 @@ mod tests {
         assert!(parse("(a = 1").is_err()); // unbalanced paren
         assert!(parse("a = = 1").is_err()); // double operator
         assert!(parse("a = 1 b = 2").is_err()); // missing connective
+    }
+
+    #[test]
+    fn any_dollar_term_lexes_parser_resolves_builtins() {
+        // Every `$term` lexes; only the parser rejects unknown / non-field ones,
+        // so adding a future built-in (e.g. `$recipient`) never touches the lexer.
+        let e = parse("$recipient = 5").unwrap_err();
+        assert!(
+            e.position.is_none(),
+            "unknown built-in is a parse error, not a lex error"
+        );
+        // `$all` is the all-selector, not a queryable field.
+        assert!(parse("$all = 1").is_err());
+        // The known built-ins still resolve.
+        assert!(matches!(
+            parse("$owner = 0x1111111111111111111111111111111111111111").unwrap(),
+            Query::Eq {
+                key: AnnotKey::BuiltIn(BuiltIn::Owner),
+                ..
+            }
+        ));
     }
 }

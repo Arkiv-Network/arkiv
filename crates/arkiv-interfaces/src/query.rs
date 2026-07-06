@@ -86,6 +86,10 @@ pub enum AnnotVal {
     /// An entity key.
     Key(EntityKey),
     /// A 20-byte address (e.g. an `$owner` / `$creator` value).
+    ///
+    /// The 20-byte width is an **Ethereum-host convention**, not intrinsic to
+    /// Arkiv. It's enshrined here only so address-valued annotations are
+    /// representable in the AST — treat it as loosely coupled to the host.
     Addr(Address),
 }
 
