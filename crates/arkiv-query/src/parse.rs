@@ -514,4 +514,242 @@ mod tests {
         let e = parse("a = @").unwrap_err();
         assert!(e.position.is_some());
     }
+
+    #[test]
+    fn neq_and_every_range_op() {
+        assert!(matches!(parse("a != 1").unwrap(), Query::Neq { .. }));
+        assert!(matches!(parse("a > 1").unwrap(), Query::Gt { .. }));
+        assert!(matches!(parse("a >= 1").unwrap(), Query::Gte { .. }));
+        assert!(matches!(parse("a < 1").unwrap(), Query::Lt { .. }));
+        assert!(matches!(parse("a <= 1").unwrap(), Query::Lte { .. }));
+    }
+
+    #[test]
+    fn boolean_associativity_and_grouping() {
+        // AND tighter than OR, both left-associative.
+        assert!(matches!(
+            parse("a=1 && b=2 || c=3").unwrap(),
+            Query::Or(l, _) if matches!(*l, Query::And(_, _))
+        ));
+        assert!(matches!(
+            parse("a=1 || b=2 || c=3").unwrap(),
+            Query::Or(l, _) if matches!(*l, Query::Or(_, _))
+        ));
+        assert!(matches!(
+            parse("a=1 && b=2 && c=3").unwrap(),
+            Query::And(l, _) if matches!(*l, Query::And(_, _))
+        ));
+        // Parens override precedence.
+        assert!(matches!(
+            parse("(a=1 || b=2) && c=3").unwrap(),
+            Query::And(l, _) if matches!(*l, Query::Or(_, _))
+        ));
+        // Redundant nesting collapses.
+        assert!(matches!(parse("((a = 1))").unwrap(), Query::Eq { .. }));
+        assert!(matches!(
+            parse("NOT (a=1 && b=2)").unwrap(),
+            Query::Not(inner) if matches!(*inner, Query::And(_, _))
+        ));
+    }
+
+    #[test]
+    fn keyword_case_and_operator_aliases() {
+        // `&&`==AND, `||`==OR, `!`==NOT, case-insensitive keywords.
+        assert_eq!(parse("a=1 && b=2").unwrap(), parse("a=1 AND b=2").unwrap());
+        assert_eq!(parse("a=1 && b=2").unwrap(), parse("a=1 and b=2").unwrap());
+        assert_eq!(parse("a=1 || b=2").unwrap(), parse("a=1 Or b=2").unwrap());
+        assert_eq!(parse("!(a=1)").unwrap(), parse("not (a=1)").unwrap());
+        assert_eq!(parse("a in (1)").unwrap(), parse("a IN (1)").unwrap());
+        assert_eq!(
+            parse("a NOT IN (1)").unwrap(),
+            parse("a not in (1)").unwrap()
+        );
+    }
+
+    #[test]
+    fn whitespace_is_insignificant() {
+        assert_eq!(parse("   a   =   1   ").unwrap(), parse("a=1").unwrap());
+        assert_eq!(parse("a=1\t&&\nb=2").unwrap(), parse("a=1 && b=2").unwrap());
+    }
+
+    #[test]
+    fn string_escapes_and_empty() {
+        assert_eq!(
+            parse("x = \"a\\nb\\t\\\"\\\\\"").unwrap(),
+            Query::Eq {
+                key: AnnotKey::User("x".to_string()),
+                value: AnnotVal::Str(b"a\nb\t\"\\".to_vec()),
+            }
+        );
+        assert_eq!(
+            parse("x = \"\"").unwrap(),
+            Query::Eq {
+                key: AnnotKey::User("x".to_string()),
+                value: AnnotVal::Str(Vec::new()),
+            }
+        );
+        assert!(parse("x = \"bad\\q\"").is_err()); // unknown escape
+        assert!(parse("x = \"trailing\\").is_err()); // trailing backslash
+    }
+
+    #[test]
+    fn number_bounds() {
+        assert_eq!(
+            parse("a = 0").unwrap(),
+            Query::Eq {
+                key: AnnotKey::User("a".to_string()),
+                value: AnnotVal::Uint([0u8; 32]),
+            }
+        );
+        // u64::MAX parses; one past it is a lex error.
+        assert!(parse(&alloc::format!("a = {}", u64::MAX)).is_ok());
+        assert!(parse("a = 18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn uint_layout_is_big_endian() {
+        let Query::Eq {
+            value: AnnotVal::Uint(bytes),
+            ..
+        } = parse("a = 258").unwrap()
+        else {
+            panic!("expected uint");
+        };
+        let mut want = [0u8; 32];
+        want[30] = 0x01; // 258 = 0x0102
+        want[31] = 0x02;
+        assert_eq!(bytes, want);
+    }
+
+    #[test]
+    fn every_builtin_type_check() {
+        let addr = alloc::format!("0x{}", "cd".repeat(20));
+        let key = alloc::format!("0x{}", "ab".repeat(32));
+        assert!(matches!(
+            parse(&alloc::format!("$creator = {addr}")).unwrap(),
+            Query::Eq {
+                key: AnnotKey::BuiltIn(BuiltIn::Creator),
+                value: AnnotVal::Addr(_)
+            }
+        ));
+        assert!(matches!(
+            parse("$createdAtBlock = 7").unwrap(),
+            Query::Eq {
+                key: AnnotKey::BuiltIn(BuiltIn::CreatedAtBlock),
+                value: AnnotVal::Uint(_)
+            }
+        ));
+        assert!(matches!(
+            parse("$contentType = \"text/plain\"").unwrap(),
+            Query::Eq {
+                key: AnnotKey::BuiltIn(BuiltIn::ContentType),
+                value: AnnotVal::Str(_)
+            }
+        ));
+        assert!(matches!(
+            parse(&alloc::format!("$key = {key}")).unwrap(),
+            Query::Eq {
+                key: AnnotKey::BuiltIn(BuiltIn::Key),
+                value: AnnotVal::Key(_)
+            }
+        ));
+        // Each built-in rejects the wrong literal type.
+        assert!(parse("$creator = 5").is_err());
+        assert!(parse("$createdAtBlock = \"x\"").is_err());
+        assert!(parse("$contentType = 5").is_err());
+        assert!(parse("$key = 5").is_err());
+        assert!(parse("$key = \"0xdead\"").is_err()); // short key string
+    }
+
+    #[test]
+    fn user_key_accepts_any_literal() {
+        let addr = alloc::format!("0x{}", "cd".repeat(20));
+        let key = alloc::format!("0x{}", "ab".repeat(32));
+        assert!(matches!(
+            parse(&alloc::format!("who = {addr}")).unwrap(),
+            Query::Eq {
+                value: AnnotVal::Addr(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&alloc::format!("ref = {key}")).unwrap(),
+            Query::Eq {
+                value: AnnotVal::Key(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn in_list_variants() {
+        // Three values, then a single value.
+        assert!(matches!(
+            parse("c IN (1 2 3)").unwrap(),
+            Query::In { values, .. } if values.len() == 3
+        ));
+        assert!(matches!(parse("c IN (1)").unwrap(), Query::In { .. }));
+        // User key accepts a mixed-type list.
+        let addr = alloc::format!("0x{}", "cd".repeat(20));
+        assert_eq!(
+            parse(&alloc::format!("m IN (1 \"two\" {addr})")).unwrap(),
+            Query::In {
+                key: AnnotKey::User("m".to_string()),
+                values: nev(vec![
+                    AnnotVal::Uint(u64_to_be32(1)),
+                    AnnotVal::Str(b"two".to_vec()),
+                    AnnotVal::Addr([0xcd; 20]),
+                ]),
+            }
+        );
+        // A built-in still type-checks each element.
+        assert!(parse("$expiration IN (1 \"two\")").is_err());
+    }
+
+    #[test]
+    fn glob_edges() {
+        // Bare `*` → empty prefix (matches any value of that attribute).
+        assert_eq!(
+            parse("n ~ \"*\"").unwrap(),
+            Query::Glob {
+                key: AnnotKey::User("n".to_string()),
+                value: AnnotVal::Str(Vec::new()),
+            }
+        );
+        // Only a single trailing star.
+        assert!(parse("n ~ \"a*b*\"").is_err());
+        // $contentType (a built-in string) supports glob.
+        assert!(matches!(
+            parse("$contentType ~ \"text/*\"").unwrap(),
+            Query::Glob {
+                key: AnnotKey::BuiltIn(BuiltIn::ContentType),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn range_on_strings_ok_but_keys_rejected() {
+        assert!(matches!(
+            parse("name >= \"abc\"").unwrap(),
+            Query::Gte {
+                value: AnnotVal::Str(_),
+                ..
+            }
+        ));
+        let key = alloc::format!("0x{}", "ab".repeat(32));
+        assert!(parse(&alloc::format!("ref < {key}")).is_err());
+    }
+
+    #[test]
+    fn malformed_and_incomplete_inputs() {
+        assert!(parse("").is_err()); // empty
+        assert!(parse("a =").is_err()); // missing value
+        assert!(parse("= 1").is_err()); // missing key
+        assert!(parse("a").is_err()); // no operator
+        assert!(parse("a = 1 &&").is_err()); // dangling connective
+        assert!(parse("(a = 1").is_err()); // unbalanced paren
+        assert!(parse("a = = 1").is_err()); // double operator
+        assert!(parse("a = 1 b = 2").is_err()); // missing connective
+    }
 }
