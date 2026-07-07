@@ -45,10 +45,13 @@
 
 /// Entity business logic, implementing the `arkiv-interfaces` executor interface.
 pub mod arkiv;
+/// ABI op decoding: `execute(Operation[])` calldata → the spec's `Op`s.
+pub mod decode;
 /// The reth write-path bridge: `AccountCode` over the `Database` + `EvmState` diff.
 pub mod state;
 
 pub use arkiv::ArkivExecutor;
+pub use decode::{DecodeError, decode_ops, derive_entity_key};
 pub use state::ExecutorState;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
