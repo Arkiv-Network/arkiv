@@ -19,14 +19,23 @@
 //! reference. Here so far: [`layout`] — the entity address anchor; [`record`] —
 //! the versioned `Entity` ⇄ account-code byte codec (`0xFE00 || RLP`), which
 //! implements the spec's [`EntityCodec`](arkiv_interfaces::codec::EntityCodec) via
-//! [`RecordCodec`](record::RecordCodec); and [`store`] — the
+//! [`RecordCodec`](record::RecordCodec); [`store`] — the
 //! [`EntityStore`](arkiv_interfaces::state::EntityStore) impl over an
-//! [`EntityBackend`](store::EntityBackend) seam (the reth persistence, which will
-//! use [`record`], lands behind that seam next).
+//! [`EntityBackend`](store::EntityBackend) seam; [`account`] — the [`AccountCode`]
+//! reth code seam; and [`backend`] — [`CodeBackend`], the `EntityBackend` that
+//! keeps each entity in its account's code. The reth [`AccountCode`] bridges (over
+//! a revm `Journal` and a `StateProvider` snapshot) land next.
+//!
+//! [`AccountCode`]: account::AccountCode
+//! [`CodeBackend`]: backend::CodeBackend
 
+pub mod account;
+pub mod backend;
 pub mod layout;
 pub mod record;
 pub mod store;
 
+pub use account::AccountCode;
+pub use backend::{CodeBackend, CodeBackendError};
 pub use record::{RecordCodec, RecordError, decode, encode};
 pub use store::{EntityBackend, RethEntityStore};
