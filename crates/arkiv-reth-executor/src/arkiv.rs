@@ -100,7 +100,11 @@ impl<E: EntityStore, C: CostModel> TransactionExecutor for ArkivExecutor<E, C> {
         draft: &mut BlockDraft,
         op_bytes: &[u8],
     ) -> Result<ExecOutput, Self::Error> {
-        let ops = decode_ops(op_bytes)?;
+        // `start_nonce` is 0 here: threading the caller's persistent nonce from the
+        // system account is the wiring step's job (this trait path isn't the live
+        // reth executor yet). Decode failures are host faults surfaced as errors.
+        let ops = crate::decode::decode_ops(env, op_bytes, 0)
+            .map_err(|e| ExecError::Decode(e.to_string()))?;
         self.apply(env, entities, draft, &ops)
     }
 }
@@ -321,22 +325,6 @@ impl fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
-
-/// Decode raw transaction calldata into operations.
-///
-/// **Placeholder.** The real decoder is the host's ABI step (the `Operation[]`
-/// layout from the Arkiv contracts); it lands with the reth bridge. Until then
-/// empty calldata is an empty batch and anything else is rejected, so the seam is
-/// explicit rather than silently wrong.
-fn decode_ops(op_bytes: &[u8]) -> Result<Vec<Op>, ExecError> {
-    if op_bytes.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Err(ExecError::Decode(
-            "op-batch ABI decoding is not wired yet".to_string(),
-        ))
-    }
-}
 
 /// Lower-hex of a key, for revert messages.
 fn hex(key: &EntityKey) -> String {
@@ -823,9 +811,9 @@ mod tests {
         assert_eq!(draft.entities.puts.len(), 1);
     }
 
-    /// The `decode_ops` seam is not wired yet: non-empty calldata is a hard
-    /// [`ExecError::Decode`] (a host fault), not a silent success or a revert — so
-    /// the gap is explicit until the ABI decoder lands.
+    /// Undecodable calldata (here, too short for a selector) surfaces as an
+    /// [`ExecError::Decode`] host fault rather than a silent success. The decoder's
+    /// own cases are covered in `decode::tests`.
     #[test]
     fn execute_rejects_undecodable_calldata() {
         let exec = ArkivExecutor::<MemStore>::new();

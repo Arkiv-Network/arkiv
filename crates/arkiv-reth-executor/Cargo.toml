@@ -16,18 +16,23 @@ license.workspace = true
 # The host-agnostic executor interface this crate implements (see arkiv.rs).
 arkiv-interfaces.workspace = true
 # The entity store's `AccountCode` seam, which the reth write-path bridge
-# (journal.rs) implements over a revm `Journal`.
+# (state.rs) implements over the Database + EvmState diff.
 arkiv-reth-entitystore.workspace = true
+# The Solidity ABI (Operation[] calldata) the op decoder (decode.rs) parses.
+arkiv-bindings.workspace = true
 
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
 alloy-evm.workspace = true
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 eyre.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# The integration test wires apply → RethEntityStore → CodeBackend → ExecutorState
-# → EvmState across all four crates, over a revm EmptyDB.
+# Integration tests wire calldata → decode_ops → apply → RethEntityStore →
+# CodeBackend → ExecutorState → EvmState, and build calldata via the SDK bindings.
 arkiv-interfaces.workspace = true
 arkiv-reth-entitystore.workspace = true
+arkiv-bindings.workspace = true
+alloy-sol-types.workspace = true
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
