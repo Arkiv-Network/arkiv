@@ -33,6 +33,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
+use arkiv_constants::WORD_LEN;
 use arkiv_interfaces::collections::NonEmptyVec;
 use arkiv_interfaces::entity::annotations;
 use arkiv_interfaces::primitives::{Address, EntityKey};
@@ -389,10 +390,17 @@ fn decode_key_string(s: &str) -> Result<EntityKey, ParseError> {
     Ok(out)
 }
 
-/// A `u64` as a 32-byte big-endian [`AnnotVal::Uint`] payload.
-fn u64_to_be32(n: u64) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    buf[24..].copy_from_slice(&n.to_be_bytes());
+/// A `u64` as a 32-byte big-endian [`AnnotVal::Uint`] payload — **right**-aligned
+/// (its low 8 bytes), so it compares equal to a uint annotation carrying the same
+/// number:
+///
+/// ```text
+///   byte:  0 .............. 24 ............ 32
+///          | 0 (padding)      | n (u64 be)   |
+/// ```
+fn u64_to_be32(n: u64) -> [u8; WORD_LEN] {
+    let mut buf = [0u8; WORD_LEN];
+    buf[WORD_LEN - size_of::<u64>()..].copy_from_slice(&n.to_be_bytes());
     buf
 }
 

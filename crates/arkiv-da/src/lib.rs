@@ -49,9 +49,16 @@ pub fn decode_block<B: alloy_rlp::Decodable>(payload: &[u8]) -> Result<B, DaErro
     B::decode(&mut rlp.as_slice()).map_err(DaError::Rlp)
 }
 
-/// 4-byte selector for the inbox call `postBlock(bytes)` (contract C2).
-pub fn post_block_selector() -> [u8; 4] {
-    keccak256("postBlock(bytes)")[..4].try_into().unwrap()
+/// Length of an Ethereum ABI function selector, in bytes: the leading 4 bytes of
+/// `keccak256(signature)`.
+const SELECTOR_LEN: usize = 4;
+
+/// Selector for the inbox call `postBlock(bytes)` (contract C2) — the first
+/// [`SELECTOR_LEN`] bytes of the signature hash.
+pub fn post_block_selector() -> [u8; SELECTOR_LEN] {
+    keccak256("postBlock(bytes)")[..SELECTOR_LEN]
+        .try_into()
+        .unwrap()
 }
 
 /// topic0 of the inbox event `BlockPosted(uint256,bytes32,bytes)` (contract C2).
