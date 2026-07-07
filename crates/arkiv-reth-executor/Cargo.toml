@@ -24,3 +24,10 @@ alloy-evm.workspace = true
 alloy-primitives.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The integration test wires apply → RethEntityStore → CodeBackend → ExecutorState
+# → EvmState across all four crates, over a revm EmptyDB.
+arkiv-interfaces.workspace = true
+arkiv-reth-entitystore.workspace = true
+reth-ethereum = { workspace = true, features = ["evm", "node"] }
