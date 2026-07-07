@@ -14,7 +14,7 @@
 //! reth-specific: mapping Arkiv onto accounts/slots is the host's job, not the
 //! Arkiv specification's.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, keccak256};
 use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::primitives::EntityKey;
 
@@ -38,6 +38,16 @@ pub const SYSTEM_ACCOUNT_ADDRESS: Address = Address::new([
 #[inline]
 pub fn entity_address(key: EntityKey) -> Address {
     Address::from_slice(&key[..ADDRESS_LEN])
+}
+
+/// Storage slot on [`SYSTEM_ACCOUNT_ADDRESS`] holding `caller`'s entity-key minting
+/// nonce: `keccak256("nonces" || caller)`. The nonce feeds `Create` key derivation
+/// (and the SDK's `nonces(address)` view), and is advanced once per created entity.
+pub fn nonce_slot(caller: Address) -> B256 {
+    let mut buf = [0u8; 6 + ADDRESS_LEN];
+    buf[..6].copy_from_slice(b"nonces");
+    buf[6..].copy_from_slice(caller.as_slice());
+    keccak256(buf)
 }
 
 #[cfg(test)]
