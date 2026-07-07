@@ -45,8 +45,11 @@
 
 /// Entity business logic, implementing the `arkiv-interfaces` executor interface.
 pub mod arkiv;
+/// The reth write-path bridge: `AccountCode` over the `Database` + `EvmState` diff.
+pub mod state;
 
 pub use arkiv::ArkivExecutor;
+pub use state::ExecutorState;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, Bytes, TxKind, U256, address};
