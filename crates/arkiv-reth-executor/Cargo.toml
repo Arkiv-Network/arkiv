@@ -15,6 +15,9 @@ license.workspace = true
 [dependencies]
 # The host-agnostic executor interface this crate implements (see arkiv.rs).
 arkiv-interfaces.workspace = true
+# The entity store's `AccountCode` seam, which the reth write-path bridge
+# (journal.rs) implements over a revm `Journal`.
+arkiv-reth-entitystore.workspace = true
 
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
 alloy-evm.workspace = true
