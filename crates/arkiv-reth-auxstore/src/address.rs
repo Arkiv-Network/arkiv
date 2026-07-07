@@ -17,6 +17,21 @@ use alloy_primitives::{Address, keccak256};
 /// Domain tag for a tier-1 equality (pair) bucket.
 const PAIR_DOMAIN: &[u8] = b"arkiv.pair";
 
+/// Domain tag for a tier-2 int-mode B+ tree header account.
+const BTREE_HEADER_DOMAIN: &[u8] = b"arkiv.ibth";
+
+/// Domain tag for a tier-2 int-mode B+ tree node account.
+const BTREE_NODE_DOMAIN: &[u8] = b"arkiv.ibtn";
+
+/// Magic byte stored at offset 16 of a B+ tree header slot (slot 0 of
+/// [`btree_header_address`]). Distinguishes a header from a string-index list
+/// account, whose slot 0 is a plain u64 count (byte 16 always zero).
+pub const BTREE_MAGIC: u8 = 0x42;
+
+/// Maximum number of keys per B+ tree node (leaf or internal). A node splits when
+/// an insert would take it past this.
+pub const BTREE_ORDER: usize = 32;
+
 /// Address of the *pair account* for the `(attr, value)` equality bucket.
 ///
 /// `pair_address = keccak256("arkiv.pair" || attr || 0x00 || value)[:20]`. The
@@ -39,6 +54,31 @@ pub fn pair_address(attr: &[u8], value: &[u8]) -> Address {
 /// …) are evaluated as "everything in `$all`, minus the matching bitmap".
 pub fn all_entities_bucket() -> Address {
     pair_address(arkiv_interfaces::entity::annotations::ALL, b"")
+}
+
+/// Address of the **header account** for `attr`'s tier-2 int-mode B+ tree.
+///
+/// `btree_header_address = keccak256("arkiv.ibth" || attr)[:20]`. Slot 0 holds the
+/// tree's header: `[0..8]` = root node id, `[8..16]` = next node id to allocate,
+/// `[16]` = [`BTREE_MAGIC`] — all big-endian.
+pub fn btree_header_address(attr: &[u8]) -> Address {
+    let mut buf = Vec::with_capacity(BTREE_HEADER_DOMAIN.len() + attr.len());
+    buf.extend_from_slice(BTREE_HEADER_DOMAIN);
+    buf.extend_from_slice(attr);
+    Address::from_slice(&keccak256(buf).0[..20])
+}
+
+/// Address of the **node account** with id `node_id` under `header_addr`.
+///
+/// `btree_node_address = keccak256("arkiv.ibtn" || header_addr || node_id_be)[:20]`,
+/// where `header_addr` is the 20 header bytes and `node_id` is 8 big-endian bytes.
+/// A node's keys and values live in this account's storage slots.
+pub fn btree_node_address(header_addr: Address, node_id: u64) -> Address {
+    let mut buf = [0u8; 38];
+    buf[..10].copy_from_slice(BTREE_NODE_DOMAIN);
+    buf[10..30].copy_from_slice(header_addr.as_slice());
+    buf[30..].copy_from_slice(&node_id.to_be_bytes());
+    Address::from_slice(&keccak256(buf).0[..20])
 }
 
 #[cfg(test)]
@@ -88,5 +128,30 @@ mod tests {
     #[test]
     fn distinct_values_get_distinct_buckets() {
         assert_ne!(pair_address(b"$owner", b"a"), pair_address(b"$owner", b"b"));
+    }
+
+    #[test]
+    fn btree_header_golden() {
+        assert_eq!(
+            btree_header_address(b"$expiration"),
+            address!("c1833f2adcf10d317185c779bdbc9a787323e104"),
+        );
+    }
+
+    #[test]
+    fn btree_node_golden() {
+        let header = btree_header_address(b"$expiration");
+        assert_eq!(
+            btree_node_address(header, 1),
+            address!("ac874fabef0c4042e0af2486f95e1e08b8502ed4"),
+        );
+    }
+
+    #[test]
+    fn btree_nodes_are_distinct_per_id_and_tree() {
+        let a = btree_header_address(b"attrA");
+        let b = btree_header_address(b"attrB");
+        assert_ne!(btree_node_address(a, 1), btree_node_address(a, 2));
+        assert_ne!(btree_node_address(a, 1), btree_node_address(b, 1));
     }
 }
