@@ -17,6 +17,12 @@ reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.
 # Umbrella crate used by the executor seam (matches the custom-evm example's deps).
 # Keep default features (std); the executor crate adds "evm" + "node".
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+# Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+
+# JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
+# reth v2.2.0 uses so the RpcModule we register merges into reth's rpc modules.
+jsonrpsee = { version = "0.26", features = ["server"] }
 
 # Common
 clap = { version = "4", features = ["derive", "env"] }

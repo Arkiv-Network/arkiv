@@ -13,6 +13,15 @@ path = "src/main.rs"
 reth.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-ethereum.workspace = true
+reth-storage-api.workspace = true
 arkiv-reth-executor.workspace = true
+# The entity store + spec types the arkiv_getEntity read path reads through.
+arkiv-reth-entitystore.workspace = true
+arkiv-interfaces.workspace = true
+jsonrpsee.workspace = true
+alloy-primitives.workspace = true
+serde.workspace = true
+tokio.workspace = true
+eyre.workspace = true
 clap.workspace = true
 tracing.workspace = true
