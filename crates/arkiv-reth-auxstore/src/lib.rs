@@ -27,7 +27,8 @@
 //! - **Tier 2 — range.** For range-queried keys (`$expiration`, `$createdAtBlock`,
 //!   uint/string attributes) an ordered structure over the *values* lets `Gt`/`Lt`
 //!   scans enumerate the matching values, each of which resolves back to its tier-1
-//!   bitmap. (Lands in a later module.)
+//!   bitmap. The int-mode half — values ≤ 32 bytes, backed by a storage-slot
+//!   [`btree`] — is [`range`]; the string cascade for longer values lands next.
 //!
 //! ## Consensus
 //!
@@ -36,15 +37,24 @@
 //! are therefore **consensus-critical**: a change to either changes the state root,
 //! so they are locked with golden test vectors and must never drift silently.
 //!
-//! Here so far: [`bitmap`] — the roaring64 entity-id set, and [`address`] — the
-//! keccak-derived index bucket addresses. The write path (`apply_delta`) and read
-//! path (`evaluate`) that use them land behind these primitives next.
+//! Here so far: [`bitmap`] — the roaring64 entity-id set; [`address`] — the
+//! keccak-derived index bucket addresses; [`storage`] — the [`IndexStorage`] seam
+//! the tier-2 index writes through; [`btree`] — the int-mode B+ tree over that
+//! seam; and [`range`] — the caller-facing int range index (encode a value, scan a
+//! bound). The write path (`apply_delta`) and read path (`evaluate`) that combine
+//! these land next.
 //!
 //! [`Bitmap`]: bitmap::Bitmap
 //! [`pair_address`]: address::pair_address
+//! [`IndexStorage`]: storage::IndexStorage
 
 pub mod address;
 pub mod bitmap;
+pub mod btree;
+pub mod range;
+pub mod storage;
 
 pub use address::{all_entities_bucket, pair_address};
 pub use bitmap::{Bitmap, BitmapError};
+pub use range::Bound;
+pub use storage::IndexStorage;
