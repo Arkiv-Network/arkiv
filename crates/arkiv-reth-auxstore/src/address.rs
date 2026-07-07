@@ -13,6 +13,11 @@
 //! adjust them to "clean up" the encoding.
 
 use alloy_primitives::{Address, keccak256};
+use arkiv_constants::ADDRESS_LEN;
+
+/// Every domain tag is this many bytes (`b"arkiv.pair"`, `b"arkiv.ibth"`, …), so
+/// the fixed-size node buffer below can be sized from it.
+const DOMAIN_TAG_LEN: usize = 10;
 
 /// Domain tag for a tier-1 equality (pair) bucket.
 const PAIR_DOMAIN: &[u8] = b"arkiv.pair";
@@ -22,6 +27,13 @@ const BTREE_HEADER_DOMAIN: &[u8] = b"arkiv.ibth";
 
 /// Domain tag for a tier-2 int-mode B+ tree node account.
 const BTREE_NODE_DOMAIN: &[u8] = b"arkiv.ibtn";
+
+const _: () = assert!(
+    PAIR_DOMAIN.len() == DOMAIN_TAG_LEN
+        && BTREE_HEADER_DOMAIN.len() == DOMAIN_TAG_LEN
+        && BTREE_NODE_DOMAIN.len() == DOMAIN_TAG_LEN,
+    "every domain tag must be DOMAIN_TAG_LEN bytes",
+);
 
 /// Magic byte stored at offset 16 of a B+ tree header slot (slot 0 of
 /// [`btree_header_address`]). Distinguishes a header from a string-index list
@@ -45,7 +57,7 @@ pub fn pair_address(attr: &[u8], value: &[u8]) -> Address {
     buf.extend_from_slice(attr);
     buf.push(0x00);
     buf.extend_from_slice(value);
-    Address::from_slice(&keccak256(buf).0[..20])
+    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
 
 /// Address of the bucket every live entity belongs to: the `($all, "")` pair.
@@ -65,20 +77,31 @@ pub fn btree_header_address(attr: &[u8]) -> Address {
     let mut buf = Vec::with_capacity(BTREE_HEADER_DOMAIN.len() + attr.len());
     buf.extend_from_slice(BTREE_HEADER_DOMAIN);
     buf.extend_from_slice(attr);
-    Address::from_slice(&keccak256(buf).0[..20])
+    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
 
 /// Address of the **node account** with id `node_id` under `header_addr`.
 ///
-/// `btree_node_address = keccak256("arkiv.ibtn" || header_addr || node_id_be)[:20]`,
-/// where `header_addr` is the 20 header bytes and `node_id` is 8 big-endian bytes.
-/// A node's keys and values live in this account's storage slots.
+/// A B+ tree's nodes each get their own account; this maps `(tree, node id)` to
+/// that account's address. The hash preimage is a fixed 38 bytes:
+///
+/// ```text
+///   byte:  0 ................ 10 ...................... 30 ......... 38
+///          | "arkiv.ibtn" (10) | header_addr (ADDRESS_LEN) | node_id (u64) |
+/// ```
+///
+/// i.e. `keccak256("arkiv.ibtn" || header_addr || node_id_be)[..ADDRESS_LEN]`.
+/// Folding `header_addr` into the preimage **namespaces the node ids to their own
+/// tree**, so node 1 of one attribute's index and node 1 of another's never land
+/// at the same account. `node_id` is big-endian; id 0 is never allocated (it is the
+/// header's "no root / no node" sentinel), so no node account collides with the
+/// header account.
 pub fn btree_node_address(header_addr: Address, node_id: u64) -> Address {
-    let mut buf = [0u8; 38];
-    buf[..10].copy_from_slice(BTREE_NODE_DOMAIN);
-    buf[10..30].copy_from_slice(header_addr.as_slice());
-    buf[30..].copy_from_slice(&node_id.to_be_bytes());
-    Address::from_slice(&keccak256(buf).0[..20])
+    let mut buf = [0u8; DOMAIN_TAG_LEN + ADDRESS_LEN + size_of::<u64>()];
+    buf[..DOMAIN_TAG_LEN].copy_from_slice(BTREE_NODE_DOMAIN);
+    buf[DOMAIN_TAG_LEN..DOMAIN_TAG_LEN + ADDRESS_LEN].copy_from_slice(header_addr.as_slice());
+    buf[DOMAIN_TAG_LEN + ADDRESS_LEN..].copy_from_slice(&node_id.to_be_bytes());
+    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
 
 #[cfg(test)]

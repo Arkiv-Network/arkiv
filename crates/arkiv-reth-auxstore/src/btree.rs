@@ -26,28 +26,62 @@
 
 use alloy_primitives::{Address, B256};
 
+use arkiv_constants::WORD_LEN;
+
 use crate::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
 use crate::storage::IndexStorage;
 
 // ── Slot numbering within a node account ──────────────────────────────
 
+/// Slot 0 of a node holds its meta word; the `i`-th key lives at
+/// `KEYS_BASE_SLOT + i`, and the `i`-th value/child at `VALUES_BASE_SLOT + i`
+/// (values follow all `BTREE_ORDER` key slots).
+const KEYS_BASE_SLOT: u64 = 1;
+const VALUES_BASE_SLOT: u64 = KEYS_BASE_SLOT + BTREE_ORDER as u64;
+
+// Layout invariants, checked at compile time so a stray edit to the node order or a
+// field type can't silently corrupt the on-chain encoding:
+const _: () = assert!(size_of::<B256>() == WORD_LEN, "a storage word is a B256");
+const _: () = assert!(
+    size_of::<u64>() + size_of::<u16>() + size_of::<u8>() <= WORD_LEN,
+    "the node meta word (u64 sibling id + u16 key count + u8 leaf flag) must fit one word",
+);
+const _: () = assert!(
+    2 * size_of::<u64>() < WORD_LEN,
+    "the header word (root id + next id + a magic byte) must fit one word",
+);
+const _: () = assert!(
+    BTREE_ORDER < u16::MAX as usize,
+    "a splitting node holds up to BTREE_ORDER + 1 keys, and the count is a u16",
+);
+
+/// Encode a `u64` right-aligned in a storage word: the low `size_of::<u64>()` bytes
+/// hold the value big-endian, the rest is zero. Node ids and child pointers are
+/// stored this way.
 #[inline]
 fn u64_to_storage(n: u64) -> B256 {
-    let mut buf = [0u8; 32];
-    buf[24..].copy_from_slice(&n.to_be_bytes());
+    let mut buf = [0u8; WORD_LEN];
+    buf[WORD_LEN - size_of::<u64>()..].copy_from_slice(&n.to_be_bytes());
     B256::from(buf)
 }
 
-/// Slot holding the `i`-th key. Slot 0 is the meta word, so keys start at 1.
+/// Read a `u64` back from the low bytes of a right-aligned storage word — the exact
+/// inverse of [`u64_to_storage`]. Decodes child node ids from value words.
 #[inline]
-fn key_slot(i: usize) -> B256 {
-    u64_to_storage(1 + i as u64)
+fn storage_to_u64(word: B256) -> u64 {
+    u64::from_be_bytes(word.0[WORD_LEN - size_of::<u64>()..].try_into().unwrap())
 }
 
-/// Slot holding the `i`-th value/child. Values follow all `BTREE_ORDER` key slots.
+/// Slot holding the `i`-th key.
+#[inline]
+fn key_slot(i: usize) -> B256 {
+    u64_to_storage(KEYS_BASE_SLOT + i as u64)
+}
+
+/// Slot holding the `i`-th value/child.
 #[inline]
 fn value_slot(i: usize) -> B256 {
-    u64_to_storage(1 + BTREE_ORDER as u64 + i as u64)
+    u64_to_storage(VALUES_BASE_SLOT + i as u64)
 }
 
 /// A decoded B+ tree node. Leaves store presence markers in `values`; internal
@@ -60,8 +94,18 @@ struct Node {
 }
 
 // ── Header ────────────────────────────────────────────────────────────
+//
+// Header word — slot 0 of the header account. `M` = BTREE_MAGIC:
+//
+//   byte:  0 ............. 8 ............. 16   17 ......... 32
+//          | root_id (u64) | next_id (u64) | M | 0 (unused)   |
+//
+// `root_id` is the current root node id (0 ⇒ empty tree); `next_id` is the next
+// node id to hand out; `M` tags this account as a B+ tree header (a string-index
+// list account instead holds a plain u64 count here, so its byte 16 is 0).
 
-/// Read `(root_id, next_id)` from the header. Both are 0 on a fresh tree.
+/// Read `(root_id, next_id)` from the header word (see the section comment). Both
+/// are 0 on a fresh tree.
 fn read_header<S: IndexStorage>(
     storage: &mut S,
     header_addr: Address,
@@ -72,13 +116,14 @@ fn read_header<S: IndexStorage>(
     Ok((root_id, next_id))
 }
 
+/// Write the header word (see the section comment), stamping [`BTREE_MAGIC`].
 fn write_header<S: IndexStorage>(
     storage: &mut S,
     header_addr: Address,
     root_id: u64,
     next_id: u64,
 ) -> Result<(), S::Error> {
-    let mut buf = [0u8; 32];
+    let mut buf = [0u8; WORD_LEN];
     buf[0..8].copy_from_slice(&root_id.to_be_bytes());
     buf[8..16].copy_from_slice(&next_id.to_be_bytes());
     buf[16] = BTREE_MAGIC;
@@ -96,7 +141,23 @@ fn alloc_node<S: IndexStorage>(storage: &mut S, header_addr: Address) -> Result<
 }
 
 // ── Node read / write ─────────────────────────────────────────────────
+//
+// Each node lives in its own account (at `btree_node_address`). Its slot 0 is a
+// meta word; keys and values follow in later slots:
+//
+//   meta word:  0 ................ 8 .......... 10   11 ....... 32
+//               | right_sibling id | key_count | leaf | 0 ...    |
+//               |      (u64)       |   (u16)   | (u8) |          |
+//
+//   slot KEYS_BASE_SLOT + i     → the i-th key
+//   slot VALUES_BASE_SLOT + i   → the i-th value (leaf: presence marker;
+//                                 internal: child node id, u64-encoded)
+//
+// `right_sibling` chains leaves left-to-right for range scans (0 = last leaf).
+// A leaf stores `key_count` values; an internal node stores `key_count + 1`.
 
+/// Read the node with id `node_id`: decode its meta word, then its keys and values
+/// from the following slots (see the section comment for the layout).
 fn read_node<S: IndexStorage>(
     storage: &mut S,
     header_addr: Address,
@@ -126,6 +187,8 @@ fn read_node<S: IndexStorage>(
     })
 }
 
+/// Write `node` to id `node_id`: encode the meta word, then the keys and values
+/// into the following slots (see the section comment for the layout).
 fn write_node<S: IndexStorage>(
     storage: &mut S,
     header_addr: Address,
@@ -134,7 +197,7 @@ fn write_node<S: IndexStorage>(
 ) -> Result<(), S::Error> {
     let node_addr = btree_node_address(header_addr, node_id);
     storage.ensure_account_persists(node_addr)?;
-    let mut meta = [0u8; 32];
+    let mut meta = [0u8; WORD_LEN];
     meta[0..8].copy_from_slice(&node.right_sibling.to_be_bytes());
     meta[8..10].copy_from_slice(&(node.keys.len() as u16).to_be_bytes());
     meta[10] = if node.is_leaf { 1 } else { 0 };
@@ -162,7 +225,7 @@ fn descend_to_leaf<S: IndexStorage>(
         // Among children, `k <= key` counts how many keys precede the target
         // child; that count is the correct child index.
         let pos = node.keys.partition_point(|k| *k <= key);
-        node_id = u64::from_be_bytes(node.values[pos].0[24..32].try_into().unwrap());
+        node_id = storage_to_u64(node.values[pos]);
     }
 }
 
@@ -216,7 +279,7 @@ fn insert_recursive<S: IndexStorage>(
 
     // Internal node.
     let pos = node.keys.partition_point(|k| *k <= key);
-    let child_id = u64::from_be_bytes(node.values[pos].0[24..32].try_into().unwrap());
+    let child_id = storage_to_u64(node.values[pos]);
     match insert_recursive(storage, header_addr, child_id, key, value)? {
         InsertResult::Done => Ok(InsertResult::Done),
         InsertResult::Split {
@@ -224,9 +287,8 @@ fn insert_recursive<S: IndexStorage>(
             new_sibling_id,
         } => {
             node.keys.insert(pos, push_up);
-            let mut rhs_buf = [0u8; 32];
-            rhs_buf[24..32].copy_from_slice(&new_sibling_id.to_be_bytes());
-            node.values.insert(pos + 1, B256::from(rhs_buf));
+            // A child pointer is the child's node id, encoded like any u64 value.
+            node.values.insert(pos + 1, u64_to_storage(new_sibling_id));
             if node.keys.len() <= BTREE_ORDER {
                 write_node(storage, header_addr, node_id, &node)?;
                 return Ok(InsertResult::Done);
@@ -280,15 +342,12 @@ pub fn insert<S: IndexStorage>(
             new_sibling_id,
         } => {
             let new_root_id = alloc_node(storage, header_addr)?;
-            let mut lhs_buf = [0u8; 32];
-            lhs_buf[24..32].copy_from_slice(&root_id.to_be_bytes());
-            let mut rhs_buf = [0u8; 32];
-            rhs_buf[24..32].copy_from_slice(&new_sibling_id.to_be_bytes());
+            // Two child pointers: the old root (now the left child) and its new sibling.
             let new_root = Node {
                 is_leaf: false,
                 right_sibling: 0,
                 keys: vec![push_up],
-                values: vec![B256::from(lhs_buf), B256::from(rhs_buf)],
+                values: vec![u64_to_storage(root_id), u64_to_storage(new_sibling_id)],
             };
             write_node(storage, header_addr, new_root_id, &new_root)?;
             let (_, next) = read_header(storage, header_addr)?;
@@ -376,8 +435,21 @@ mod tests {
         iter_from(storage, hdr, B256::ZERO)
             .unwrap()
             .into_iter()
-            .map(|(k, _)| u64::from_be_bytes(k.0[24..32].try_into().unwrap()))
+            .map(|(k, _)| storage_to_u64(k))
             .collect()
+    }
+
+    #[test]
+    fn u64_storage_roundtrips_and_is_right_aligned() {
+        let w = u64_to_storage(0x0102);
+        assert_eq!(storage_to_u64(w), 0x0102);
+        // High bytes zero; the value sits big-endian in the low size_of::<u64>() bytes.
+        assert_eq!(
+            &w.0[..WORD_LEN - size_of::<u64>()],
+            &[0u8; WORD_LEN - size_of::<u64>()]
+        );
+        assert_eq!(w.0[WORD_LEN - 2], 0x01);
+        assert_eq!(w.0[WORD_LEN - 1], 0x02);
     }
 
     #[test]
@@ -432,7 +504,7 @@ mod tests {
         let got: Vec<u64> = iter_from(&mut s, hdr, slot(40))
             .unwrap()
             .into_iter()
-            .map(|(k, _)| u64::from_be_bytes(k.0[24..32].try_into().unwrap()))
+            .map(|(k, _)| storage_to_u64(k))
             .collect();
         assert_eq!(got, (40..=50).collect::<Vec<_>>());
     }

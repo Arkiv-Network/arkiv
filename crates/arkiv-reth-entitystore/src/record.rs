@@ -30,10 +30,22 @@ pub const ENTITY_CODE_MARKER: u8 = 0xFE;
 /// on-code layout changes; [`decode`] keeps reading older versions.
 pub const RECORD_VERSION: u8 = 0x00;
 
-/// Encode an entity to its stored-code bytes: `0xFE || RECORD_VERSION || RLP`.
+/// Length of the framing prefix: the marker byte followed by the version byte. The
+/// RLP body starts after it.
+const PREFIX_LEN: usize = 2;
+
+/// Encode an entity to its stored account-code bytes:
+///
+/// ```text
+///   byte:  0      1                2 ..
+///          | 0xFE | RECORD_VERSION | RLP(entity fields) |
+/// ```
+///
+/// `0xFE` is the EVM `INVALID` opcode (a stray `CALL` to an entity account halts);
+/// the version byte lets [`decode`] dispatch. Field order is [`EntityRlp`]'s.
 pub fn encode(entity: &Entity) -> Vec<u8> {
     let rlp = EntityRlp::from_entity(entity);
-    let mut out = Vec::with_capacity(2 + rlp.length());
+    let mut out = Vec::with_capacity(PREFIX_LEN + rlp.length());
     out.push(ENTITY_CODE_MARKER);
     out.push(RECORD_VERSION);
     rlp.encode(&mut out);
@@ -50,7 +62,7 @@ pub fn decode(code: &[u8]) -> Result<Entity, RecordError> {
         return Err(RecordError::MissingPrefix);
     };
     match version {
-        RECORD_VERSION => decode_v0(&code[2..]),
+        RECORD_VERSION => decode_v0(&code[PREFIX_LEN..]),
         v => Err(RecordError::UnsupportedVersion(v)),
     }
 }
@@ -232,7 +244,7 @@ mod tests {
     fn roundtrips_full_entity() {
         let e = sample();
         let bytes = encode(&e);
-        assert_eq!(&bytes[..2], &[ENTITY_CODE_MARKER, RECORD_VERSION]); // 0xFE00
+        assert_eq!(&bytes[..PREFIX_LEN], &[ENTITY_CODE_MARKER, RECORD_VERSION]); // 0xFE00
         assert_eq!(decode(&bytes).unwrap(), e);
     }
 

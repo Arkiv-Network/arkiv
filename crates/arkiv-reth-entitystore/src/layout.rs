@@ -15,7 +15,13 @@
 //! Arkiv specification's.
 
 use alloy_primitives::Address;
+use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::primitives::EntityKey;
+
+// The named widths must match the types this module bridges: an entity key is a
+// spec word, and its prefix is an alloy address. Enforced at compile time.
+const _: () = assert!(size_of::<EntityKey>() == WORD_LEN);
+const _: () = assert!(size_of::<Address>() == ADDRESS_LEN);
 
 /// The storage-host account for entity-store bookkeeping — the global entity
 /// counter, the per-caller nonce map, and the id ↔ address maps live here as
@@ -25,13 +31,13 @@ pub const SYSTEM_ACCOUNT_ADDRESS: Address = Address::new([
     0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x46,
 ]);
 
-/// Entity-account address: the first 20 bytes of the entity key.
+/// Entity-account address: the first [`ADDRESS_LEN`] bytes of the entity key.
 ///
 /// The address is a pure identity anchor; the entity's content is committed via
 /// the account's `codeHash`, not its address.
 #[inline]
 pub fn entity_address(key: EntityKey) -> Address {
-    Address::from_slice(&key[..20])
+    Address::from_slice(&key[..ADDRESS_LEN])
 }
 
 #[cfg(test)]
@@ -42,6 +48,17 @@ mod tests {
     fn entity_address_is_the_key_prefix() {
         let key: EntityKey = [0xAB; 32];
         assert_eq!(entity_address(key), Address::from([0xAB; 20]));
+    }
+
+    #[test]
+    fn address_is_exactly_the_key_prefix() {
+        // Two keys that agree on the first ADDRESS_LEN bytes but differ afterwards
+        // must map to the same account — the address is the prefix, nothing more.
+        let mut a: EntityKey = [9u8; 32];
+        let mut b: EntityKey = [9u8; 32];
+        a[ADDRESS_LEN] = 1;
+        b[ADDRESS_LEN] = 2;
+        assert_eq!(entity_address(a), entity_address(b));
     }
 
     #[test]

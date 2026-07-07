@@ -19,34 +19,54 @@
 //! later module).
 
 use alloy_primitives::B256;
+use arkiv_constants::WORD_LEN;
 
 use crate::address::btree_header_address;
 use crate::btree;
 use crate::storage::IndexStorage;
 
-/// Encode a value (≤ 32 bytes) as its B+ tree key by right-padding with zeros.
+/// Encode a value (≤ [`WORD_LEN`] bytes) as its B+ tree **key** by **left**-aligning
+/// it and zero-padding the tail:
+///
+/// ```text
+///   byte:  0 ....... value.len() ....... WORD_LEN
+///          | value             | 0 (padding)     |
+/// ```
+///
+/// Left alignment makes byte order match value order, so a fixed-width big-endian
+/// value (a block number, a uint) sorts numerically in the tree. Values carry no
+/// null bytes (the precompile enforces it), so the padding is unambiguous.
 pub fn annot_val_to_slot(value: &[u8]) -> B256 {
     debug_assert!(
-        value.len() <= 32,
+        value.len() <= WORD_LEN,
         "annot_val_to_slot: value too long ({} bytes)",
         value.len()
     );
-    let mut buf = [0u8; 32];
+    let mut buf = [0u8; WORD_LEN];
     buf[..value.len()].copy_from_slice(value);
     B256::from(buf)
 }
 
-/// Encode "a value of length `len` is present" as a B+ tree value word.
-/// `slot_presence(0)` = `1` (present, empty value); `0` is reserved for absent.
+/// Encode "a value of length `len` is present" as a B+ tree **value** word — the
+/// length `+ 1` as a **right**-aligned u32 (its low 4 bytes, for a 32-byte word):
+///
+/// ```text
+///   byte:  0 .............. 28 .............. 32
+///          | 0 (padding)      | len + 1 (u32 be) |
+/// ```
+///
+/// The `+ 1` is what lets `0` mean "absent" (a never-written or lazy-deleted slot)
+/// while still recording a genuinely empty value: `slot_presence(0)` = `1`.
 pub fn slot_presence(len: usize) -> B256 {
-    let mut buf = [0u8; 32];
-    buf[28..].copy_from_slice(&(len as u32 + 1).to_be_bytes());
+    let mut buf = [0u8; WORD_LEN];
+    buf[WORD_LEN - size_of::<u32>()..].copy_from_slice(&(len as u32 + 1).to_be_bytes());
     B256::from(buf)
 }
 
-/// Decode a value's original length from a presence word, or `None` if absent.
+/// Decode a value's original length from a presence word, or `None` if absent —
+/// the exact inverse of [`slot_presence`].
 pub fn slot_to_val_len(word: B256) -> Option<usize> {
-    let n = u32::from_be_bytes(word.0[28..].try_into().unwrap());
+    let n = u32::from_be_bytes(word.0[WORD_LEN - size_of::<u32>()..].try_into().unwrap());
     if n == 0 { None } else { Some((n - 1) as usize) }
 }
 
@@ -142,6 +162,27 @@ mod tests {
         assert_eq!(slot_to_val_len(slot_presence(0)), Some(0));
         assert_eq!(slot_to_val_len(slot_presence(11)), Some(11));
         assert_eq!(slot_to_val_len(B256::ZERO), None);
+    }
+
+    #[test]
+    fn presence_word_is_right_aligned_len_plus_one() {
+        let w = slot_presence(5);
+        // High bytes zero; `len + 1` sits big-endian in the low size_of::<u32>() bytes.
+        assert_eq!(
+            &w.0[..WORD_LEN - size_of::<u32>()],
+            &[0u8; WORD_LEN - size_of::<u32>()]
+        );
+        assert_eq!(
+            u32::from_be_bytes(w.0[WORD_LEN - size_of::<u32>()..].try_into().unwrap()),
+            6,
+        );
+    }
+
+    #[test]
+    fn slot_key_is_left_aligned_and_zero_padded() {
+        let k = annot_val_to_slot(b"hi");
+        assert_eq!(&k.0[..2], b"hi");
+        assert_eq!(&k.0[2..], &[0u8; WORD_LEN - 2]);
     }
 
     #[test]

@@ -16,6 +16,7 @@ license.workspace = true
 # the Arkiv spec's — the spec only says "there is a committed query index".
 
 [dependencies]
+arkiv-constants.workspace = true
 arkiv-interfaces.workspace = true
 alloy-primitives.workspace = true
 roaring.workspace = true
