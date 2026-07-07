@@ -15,9 +15,10 @@
 //!
 //! - **Plain transfer** — debit sender (value + flat 21k gas), bump nonce,
 //!   credit recipient. Computed in Rust, committed as a `BundleState`.
-//! - **Call to [`ARKIV_ADDRESS`]** — the entity-engine routing point. Today a
-//!   stub (same value/gas accounting, no entity logic yet); the
-//!   `arkiv-entitydb` `StateAdapter` STF lands here next.
+//! - **Call to [`ARKIV_ADDRESS`]** — the entity engine. The `execute(Operation[])`
+//!   calldata is decoded to entity [`Op`]s and applied by [`ArkivExecutor`] over a
+//!   reth-backed entity store, returning the account diff reth commits (plus the
+//!   sender's gas charge) — see [`arkiv_transact`].
 //! - **Contract creation** — rejected (neutered): user programs never execute.
 //!
 //! ## Honest scope
@@ -38,10 +39,10 @@
 //! This file is the **exact executor** — the reth-specific wiring (the [`Evm`],
 //! [`EvmFactory`] and [`ExecutorBuilder`] reth injects). The **entity business
 //! logic** is not here: it lives in [`arkiv`], written against the host-agnostic
-//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. When the entity
-//! engine replaces the transfer stub, [`arkiv_transact`] drives
-//! [`arkiv::ArkivExecutor`] over an [`arkiv_interfaces::state::EntityStore`] view
-//! of reth's database.
+//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. [`arkiv_transact`]
+//! drives [`arkiv::ArkivExecutor`] over a reth-backed
+//! [`arkiv_interfaces::state::EntityStore`] (`RethEntityStore` → `CodeBackend` →
+//! [`ExecutorState`]) and returns the diff for reth to commit.
 
 /// Entity business logic, implementing the `arkiv-interfaces` executor interface.
 pub mod arkiv;
@@ -81,6 +82,10 @@ use reth_ethereum::{
         builder::{BuilderContext, components::ExecutorBuilder},
     },
 };
+
+use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op};
+use arkiv_interfaces::state::EntityStore;
+use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
 
 /// The Arkiv address — `0x4400…0044`.
 ///
@@ -138,7 +143,8 @@ where
         &mut self,
         tx: TxEnv,
     ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-        arkiv_transact(self.inner.db_mut(), tx)
+        let block_number = self.inner.block().number.saturating_to::<u64>();
+        arkiv_transact(self.inner.db_mut(), block_number, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -177,6 +183,7 @@ where
 /// into the `State`, producing the `BundleState` reth hashes into the state root.
 fn arkiv_transact<DB: Database>(
     db: &mut DB,
+    block_number: u64,
     tx: TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     // Neuter: user programs never execute.
@@ -189,11 +196,12 @@ fn arkiv_transact<DB: Database>(
         }
     };
 
-    // A call to ARKIV_ADDRESS is the entity-engine routing point (stub today).
+    // A call to ARKIV_ADDRESS runs the entity state transition.
     if to == ARKIV_ADDRESS {
-        tracing::debug!(target: "arkiv::executor", caller = %tx.caller, "entity call routed (no EVM)");
+        return arkiv_entity_transact(db, block_number, &tx);
     }
 
+    // Otherwise it's a plain value transfer.
     let gas_cost = U256::from(ARKIV_TX_GAS).saturating_mul(U256::from(tx.gas_price));
     let value_out = if to == tx.caller {
         U256::ZERO
@@ -237,6 +245,119 @@ fn arkiv_transact<DB: Database>(
     };
 
     Ok(ResultAndState::new(result, state))
+}
+
+/// The entity state transition for a call to [`ARKIV_ADDRESS`].
+///
+/// Reads the caller's minting nonce, decodes the `Operation[]` calldata, runs the
+/// batch over a diff-backed store, and returns the `EvmState` reth commits — plus
+/// the sender's gas charge and nonce bump. A business-rule revert charges gas but
+/// stages no entity changes; a decode fault reverts likewise.
+fn arkiv_entity_transact<DB: Database>(
+    db: &mut DB,
+    block_number: u64,
+    tx: &TxEnv,
+) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+    let caller = tx.caller;
+    let env = ExecEnv {
+        caller: caller.into_array(),
+        block_number,
+        gas_supplied: tx.gas_limit,
+        chain_id: tx.chain_id.unwrap_or(1),
+    };
+
+    // Entity phase — borrows `db` until `into_state` releases it.
+    let mut state = ExecutorState::new(db);
+    let start_nonce = state
+        .read_nonce(caller)
+        .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
+    let outcome = match decode_ops(&env, &tx.data, start_nonce) {
+        Ok(ops) => run_ops(state, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
+        Err(e) => Outcome {
+            gas_used: 0,
+            revert: Some(e.to_string()),
+            entity_state: state.into_state(),
+        },
+    };
+
+    // Sender phase — `db` is free again: charge gas, bump the EOA nonce.
+    let gas_cost = U256::from(outcome.gas_used).saturating_mul(U256::from(tx.gas_price));
+    let mut sender = db
+        .basic(caller)
+        .map_err(EVMError::Database)?
+        .unwrap_or_default();
+    sender.balance = sender.balance.saturating_sub(gas_cost);
+    sender.nonce = sender.nonce.saturating_add(1);
+    let mut sender_acc = Account::from(sender);
+    sender_acc.mark_touch();
+
+    let mut evm_state = outcome.entity_state;
+    evm_state.insert(caller, sender_acc);
+
+    let gas = ResultGas::default().with_total_gas_spent(outcome.gas_used);
+    let result = match outcome.revert {
+        None => ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas,
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        },
+        Some(reason) => ExecutionResult::Revert {
+            gas,
+            logs: Vec::new(),
+            output: Bytes::from(reason.into_bytes()),
+        },
+    };
+    Ok(ResultAndState::new(result, evm_state))
+}
+
+/// What running an op batch produced: the gas metered, a revert reason if the batch
+/// failed a business rule, and the entity `EvmState` diff (empty on revert).
+struct Outcome {
+    gas_used: u64,
+    revert: Option<String>,
+    entity_state: EvmState,
+}
+
+/// Run a decoded batch over the reth-backed stores. On success it commits the draft
+/// and advances the minting nonce by the number of entities created; on a revert it
+/// stages nothing.
+fn run_ops<DB: Database>(
+    state: ExecutorState<'_, DB>,
+    env: &ExecEnv,
+    ops: Vec<Op>,
+) -> Result<Outcome, eyre::Report> {
+    let create_count = ops
+        .iter()
+        .filter(|o| matches!(o, Op::Create { .. }))
+        .count() as u32;
+    let caller = Address::from(env.caller);
+
+    let mut store = RethEntityStore::new(CodeBackend::new(state));
+    let mut draft = BlockDraft::default();
+    let out = ArkivExecutor::new()
+        .apply(env, &mut store, &mut draft, &ops)
+        .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
+
+    match out.status {
+        ExecStatus::Ok => {
+            store
+                .apply_delta(&draft.entities)
+                .map_err(|e| eyre::eyre!("apply_delta: {e:?}"))?;
+            let mut state = store.into_backend().into_inner();
+            state.bump_nonce(caller, create_count)?;
+            Ok(Outcome {
+                gas_used: out.gas_used,
+                revert: None,
+                entity_state: state.into_state(),
+            })
+        }
+        ExecStatus::Reverted => Ok(Outcome {
+            gas_used: out.gas_used,
+            revert: out.revert,
+            entity_state: store.into_backend().into_inner().into_state(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,5 +434,99 @@ where
             ctx.chain_spec(),
             ArkivEvmFactory::default(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Bytes;
+    use alloy_sol_types::SolCall;
+    use arkiv_bindings::{IEntityRegistry, Mime128, Operation};
+    use arkiv_reth_entitystore::decode;
+    use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot};
+    use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+    fn create_calldata(btl: u32, payload: &'static [u8]) -> Bytes {
+        let mime = Mime128 {
+            data: [alloy_primitives::FixedBytes::ZERO; 4],
+        };
+        IEntityRegistry::executeCall {
+            ops: vec![Operation::create(
+                btl,
+                Bytes::from_static(payload),
+                mime,
+                vec![],
+            )],
+        }
+        .abi_encode()
+        .into()
+    }
+
+    fn arkiv_tx(caller: Address, data: Bytes) -> TxEnv {
+        TxEnv {
+            caller,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            kind: TxKind::Call(ARKIV_ADDRESS),
+            data,
+            chain_id: Some(1),
+            ..Default::default()
+        }
+    }
+
+    /// A create call through `arkiv_transact`: the entity is committed at its minted
+    /// key, the sender is charged/bumped, and the minting nonce advances — all in the
+    /// returned `EvmState`.
+    #[test]
+    fn entity_create_call_commits_the_entity() {
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let rs =
+            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+
+        assert!(rs.result.is_success());
+
+        // The entity landed at the derived key, decodable, with env-resolved fields.
+        let key = derive_entity_key(1, &[0xAA; 20], 0);
+        let acc = rs
+            .state
+            .get(&entity_address(key))
+            .expect("entity account in the diff");
+        let entity = decode(&acc.info.code.as_ref().unwrap().original_bytes()).unwrap();
+        assert_eq!(entity.owner, [0xAA; 20]);
+        assert_eq!(entity.expires_at, 60); // block 10 + btl 50
+        assert_eq!(entity.payload, b"hello");
+
+        // The minting nonce advanced to 1 in the system account.
+        let sys = rs
+            .state
+            .get(&SYSTEM_ACCOUNT_ADDRESS)
+            .expect("system account");
+        let slot = U256::from_be_bytes(nonce_slot(alice).0);
+        assert_eq!(sys.storage.get(&slot).unwrap().present_value, U256::from(1));
+
+        // The sender is touched with its EOA nonce bumped.
+        let sender = rs.state.get(&alice).expect("sender account");
+        assert_eq!(sender.info.nonce, 1);
+    }
+
+    /// Undecodable calldata reverts, but the sender is still charged/bumped and no
+    /// entity is staged.
+    #[test]
+    fn undecodable_call_reverts_but_charges_sender() {
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            arkiv_tx(alice, Bytes::from_static(&[0xDE, 0xAD])),
+        )
+        .unwrap();
+
+        assert!(!rs.result.is_success());
+        assert_eq!(rs.state.get(&alice).expect("sender").info.nonce, 1);
+        // Nothing else was staged (only the sender).
+        assert_eq!(rs.state.len(), 1);
     }
 }
