@@ -1,0 +1,21 @@
+[package]
+name = "arkiv-reth-auxstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The reth-host implementation of the Arkiv auxiliary (query index) store.
+# Sibling to arkiv-reth-entitystore: where that crate implements
+# arkiv-interfaces' `EntityStore` (the entities), this crate implements
+# `AuxiliaryStore` (the index over them). Ported, module by module, from the
+# proven db-engine.
+#
+# Host-specific by nature: how the index is physically laid out (bitmap buckets
+# at derived account addresses, storage-slot B+ trees) is reth's business, not
+# the Arkiv spec's — the spec only says "there is a committed query index".
+
+[dependencies]
+arkiv-interfaces.workspace = true
+alloy-primitives.workspace = true
+roaring.workspace = true

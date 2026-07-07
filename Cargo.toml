@@ -31,6 +31,13 @@ alloy-consensus = "2.0"
 alloy-evm = "0.34"
 zstd = "0.13"
 
+# Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
+# pair account's bitmap bytes are consensus state (its codeHash =
+# keccak256(bitmap_bytes)), so the portable serialization must stay byte-for-byte
+# stable across nodes — even a patch bump could shift it. =0.11.4 is what v1
+# (arkiv-db-engine) used.
+roaring = "=0.11.4"
+
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
 # arkiv-genesis (mnemonic-derived dev signers). Pinned to =2.0.4: alloy-rpc-types
 # 2.0.5+ requires alloy-rpc-types-engine ^2.0.5, whose only match is 2.1.0 — and
@@ -62,3 +69,4 @@ arkiv-da = { path = "crates/arkiv-da" }
 arkiv-committer = { path = "crates/arkiv-committer" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-entitystore = { path = "crates/arkiv-reth-entitystore" }
+arkiv-reth-auxstore = { path = "crates/arkiv-reth-auxstore" }
