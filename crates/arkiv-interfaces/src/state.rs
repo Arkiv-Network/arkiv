@@ -98,14 +98,14 @@ pub struct BlockAuxiliaryStoreDelta {
 
 /// One entity's index changes: attribute values to add and to remove. A transfer,
 /// for example, removes the old `$owner` value and adds the new one.
+///
+/// The entity is named only by its [`EntityKey`]. The index's own compact `u64`
+/// id — what its bitmaps are keyed on — is the store's concern: it maps key → id
+/// itself (allocating on the key's first appearance), so a producer of deltas never
+/// deals in ids.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuxiliaryEntityDelta {
-    /// The entity, by its index id — the compact `u64` the index's bitmaps are
-    /// keyed on. The host assigns it (densely, from a counter) when the entity is
-    /// created.
-    pub entity_id: u64,
-    /// The entity's full key. Carried so the index can maintain an `id → key` map
-    /// and answer queries with keys directly, without reading the entity store.
+    /// The entity whose index entries are changing.
     pub entity_key: EntityKey,
     /// Values to add to the index.
     pub inserts: Vec<AttrEntry>,

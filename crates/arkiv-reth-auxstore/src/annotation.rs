@@ -19,9 +19,11 @@
 //! in lockstep, so the port unifies on 32.) Fixed-width big-endian still sorts
 //! numerically, so range order is unchanged.
 
-use arkiv_interfaces::entity::annotations;
-use arkiv_interfaces::entity::{ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT};
+use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::entity::{ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT, Entity, annotations};
+use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn};
+use arkiv_interfaces::state::AttrEntry;
 
 /// Which physical index an attribute's values live in, beyond the tier-1 equality
 /// bitmap every indexed value has.
@@ -105,6 +107,51 @@ pub fn value_type(value: &AnnotVal) -> u8 {
     }
 }
 
+/// A block number as a 32-byte big-endian word — the canonical uint index encoding
+/// (see the module docs). Right-aligned so it sorts numerically.
+fn block_number_bytes(block: BlockNumber) -> Vec<u8> {
+    let mut buf = [0u8; WORD_LEN];
+    buf[WORD_LEN - size_of::<BlockNumber>()..].copy_from_slice(&block.to_be_bytes());
+    buf.to_vec()
+}
+
+/// Every indexable `(attr, value)` pair for an entity: the seven built-ins plus its
+/// user attributes. This is the write-side counterpart to the query-side
+/// [`attr_bytes`]/[`value_bytes`] — the executor diffs an entity's annotations
+/// before and after an op to build a [delta](AttrEntry), so both sides must produce
+/// identical bytes, and both live here.
+///
+/// The built-ins, in order: `$all` (empty value), `$creator`, `$owner`, `$key`,
+/// `$createdAtBlock`, `$expiration`, `$contentType`. Addresses are 20 raw bytes, the
+/// key 32, block numbers 32-byte big-endian, the content type its raw bytes.
+pub fn entity_annotations(entity: &Entity) -> Vec<AttrEntry> {
+    use annotations::{ALL, CONTENT_TYPE, CREATED_AT_BLOCK, CREATOR, EXPIRATION, KEY, OWNER};
+    let entry = |attr: &[u8], value_type: u8, value: Vec<u8>| AttrEntry {
+        attr: attr.to_vec(),
+        value_type,
+        value,
+    };
+    let mut out = vec![
+        entry(ALL, ATTR_STRING, Vec::new()),
+        entry(CREATOR, ATTR_ENTITY_KEY, entity.creator.to_vec()),
+        entry(OWNER, ATTR_ENTITY_KEY, entity.owner.to_vec()),
+        entry(KEY, ATTR_ENTITY_KEY, entity.key.to_vec()),
+        entry(
+            CREATED_AT_BLOCK,
+            ATTR_UINT,
+            block_number_bytes(entity.created_at_block),
+        ),
+        entry(EXPIRATION, ATTR_UINT, block_number_bytes(entity.expires_at)),
+        entry(CONTENT_TYPE, ATTR_STRING, entity.content_type.clone()),
+    ];
+    out.extend(entity.attributes.iter().map(|attribute| AttrEntry {
+        attr: attribute.key.clone(),
+        value_type: attribute.value_type,
+        value: attribute.value.clone(),
+    }));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +191,47 @@ mod tests {
         assert_eq!(mode_for(b"rank", value_type(&v)), Mode::Int);
         let v = AnnotVal::Str(b"x".to_vec());
         assert_eq!(mode_for(b"name", value_type(&v)), Mode::Str);
+    }
+
+    #[test]
+    fn entity_annotations_covers_builtins_plus_user_attrs() {
+        use arkiv_interfaces::entity::Attribute;
+        let entity = Entity {
+            key: [7u8; 32],
+            creator: [1u8; 20],
+            owner: [2u8; 20],
+            created_at_block: 3,
+            last_modified_at_block: 4,
+            expires_at: 60,
+            content_type: b"text/plain".to_vec(),
+            payload: b"ignored".to_vec(),
+            attributes: vec![Attribute {
+                key: b"rank".to_vec(),
+                value_type: ATTR_UINT,
+                value: vec![0u8; 32],
+            }],
+        };
+        let annotations = entity_annotations(&entity);
+        // Seven built-ins + one user attribute.
+        assert_eq!(annotations.len(), 8);
+
+        // A query against $owner must hit the same (attr, value) bytes the entity's
+        // annotation produced — the write/read agreement this module guarantees.
+        let owner_query = value_bytes(&AnnotVal::Addr(entity.owner));
+        assert!(annotations.iter().any(|a| a.attr == annotations::OWNER
+            && a.value == owner_query
+            && a.value.len() == 20));
+
+        // $expiration is a 32-byte big-endian uint, matching a Uint query value.
+        let exp = annotations
+            .iter()
+            .find(|a| a.attr == annotations::EXPIRATION)
+            .unwrap();
+        assert_eq!(exp.value.len(), 32);
+        assert_eq!(exp.value[31], 60);
+        assert_eq!(exp.value_type, ATTR_UINT);
+
+        // The payload is not indexed.
+        assert!(!annotations.iter().any(|a| a.value == b"ignored"));
     }
 }

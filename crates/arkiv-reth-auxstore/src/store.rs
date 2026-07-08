@@ -8,21 +8,29 @@
 //!
 //! Its three jobs:
 //! - [`apply_delta`](RethAuxStore::apply_delta) folds a block's per-entity changes
-//!   into the index (via [`index`](crate::index)) and records each entity's id→key.
+//!   into the index (via [`index`](crate::index)), resolving each entity's key to
+//!   its id first.
 //! - [`evaluate`](RethAuxStore::evaluate) runs a query (via
 //!   [`interpret`](crate::interpret)) to a set of ids, pages them newest-first, and
 //!   maps the page back to entity keys.
 //! - [`commitment`](RethAuxStore::commitment) — see the note on the method.
 //!
-//! ## The id→key map
+//! ## Entity ids: allocation and the two maps
 //!
-//! Bitmaps are keyed on a compact `u64` entity id, but a query answers in
-//! [`EntityKey`]s, so the store keeps an `id → key` map at
-//! [`SYSTEM_ACCOUNT_ADDRESS`]. The host assigns ids and passes both id and key in
-//! the [delta](AuxiliaryEntityDelta), so the map is written straight from there — no
-//! need to read the entity store. A deleted entity is removed from every bitmap
-//! (including `$all`), so evaluation never surfaces its id; its stale map entry is
-//! therefore harmless and left in place.
+//! Bitmaps are keyed on a compact, dense `u64` entity id, but a delta names an
+//! entity by its [`EntityKey`] and a query answers in keys — so the store owns the
+//! whole id bookkeeping, all at [`SYSTEM_ACCOUNT_ADDRESS`]:
+//! - a **counter** (next id to hand out),
+//! - **key → id**, so a later op on an existing entity reuses its id, and
+//! - **id → key**, so a query result's ids become keys.
+//!
+//! [`id_for_key`](RethAuxStore::id_for_key) allocates on a key's first appearance
+//! (bumping the counter, writing both maps) and looks up on every appearance after —
+//! ids are therefore dense and monotonic in creation order, deterministic across
+//! nodes given the same block. A deleted entity leaves every bitmap (including
+//! `$all`), so evaluation never surfaces its id; its `id → key` entry is harmless and
+//! left in place. Both maps store `id + 1`, so an unwritten slot (`0`) reads as
+//! "absent" without colliding with the genuine id `0`.
 
 use alloy_primitives::{B256, keccak256};
 use arkiv_interfaces::primitives::{EntityKey, Hash};
@@ -33,20 +41,34 @@ use arkiv_reth_entitystore::layout::SYSTEM_ACCOUNT_ADDRESS;
 
 use crate::annotation::mode_for;
 use crate::error::AuxError;
+use crate::slot::{storage_to_u64, u64_to_storage};
 use crate::storage::IndexStorage;
 use crate::{index, interpret};
 
-/// Domain tag for the id→key map slots on [`SYSTEM_ACCOUNT_ADDRESS`]. Keeps them
-/// clear of the entity store's own bookkeeping (`nonces`, `entity_count`, …) on the
-/// shared account.
-const ID_TO_KEY_DOMAIN: &[u8] = b"arkiv.id2key";
+/// [`SYSTEM_ACCOUNT_ADDRESS`] slot holding the next entity id to allocate:
+/// `keccak256("arkiv.entity_count")`. Domain-tagged to stay clear of the entity
+/// store's own bookkeeping (`nonces`, …) on the shared account.
+fn entity_count_slot() -> B256 {
+    keccak256(b"arkiv.entity_count")
+}
 
-/// The [`SYSTEM_ACCOUNT_ADDRESS`] storage slot mapping `entity_id` to its
-/// [`EntityKey`]: `keccak256("arkiv.id2key" || entity_id_be)`.
+/// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `key` to its entity id (stored as
+/// `id + 1`): `keccak256("arkiv.key2id" || key)`.
+fn key_to_id_slot(key: EntityKey) -> B256 {
+    const DOMAIN: &[u8] = b"arkiv.key2id";
+    let mut buf = [0u8; DOMAIN.len() + size_of::<EntityKey>()];
+    buf[..DOMAIN.len()].copy_from_slice(DOMAIN);
+    buf[DOMAIN.len()..].copy_from_slice(&key);
+    keccak256(buf)
+}
+
+/// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `entity_id` to its [`EntityKey`]:
+/// `keccak256("arkiv.id2key" || entity_id_be)`.
 fn id_to_key_slot(entity_id: u64) -> B256 {
-    let mut buf = [0u8; ID_TO_KEY_DOMAIN.len() + size_of::<u64>()];
-    buf[..ID_TO_KEY_DOMAIN.len()].copy_from_slice(ID_TO_KEY_DOMAIN);
-    buf[ID_TO_KEY_DOMAIN.len()..].copy_from_slice(&entity_id.to_be_bytes());
+    const DOMAIN: &[u8] = b"arkiv.id2key";
+    let mut buf = [0u8; DOMAIN.len() + size_of::<u64>()];
+    buf[..DOMAIN.len()].copy_from_slice(DOMAIN);
+    buf[DOMAIN.len()..].copy_from_slice(&entity_id.to_be_bytes());
     keccak256(buf)
 }
 
@@ -77,21 +99,35 @@ impl<B, E> RethAuxStore<B>
 where
     B: IndexStorage<Error = E>,
 {
-    /// Record `entity_id → key` (idempotent).
-    fn set_id_key(&mut self, entity_id: u64, key: EntityKey) -> Result<(), AuxError<E>> {
+    /// The entity id for `key`: its existing id, or a freshly allocated one if this
+    /// is the key's first appearance (bumping the counter and writing both maps).
+    fn id_for_key(&mut self, key: EntityKey) -> Result<u64, AuxError<E>> {
+        let key_slot = key_to_id_slot(key);
+        let existing = self
+            .backend
+            .storage(SYSTEM_ACCOUNT_ADDRESS, key_slot)
+            .map_err(AuxError::Backend)?;
+        if existing != B256::ZERO {
+            return Ok(storage_to_u64(existing) - 1); // stored as id + 1
+        }
+
+        // First sight of this key: allocate the next id and record both maps.
         self.backend
             .ensure_account_persists(SYSTEM_ACCOUNT_ADDRESS)
             .map_err(AuxError::Backend)?;
-        self.backend
-            .set_storage(
-                SYSTEM_ACCOUNT_ADDRESS,
-                id_to_key_slot(entity_id),
-                B256::from(key),
-            )
-            .map_err(AuxError::Backend)
+        let count_slot = entity_count_slot();
+        let new_id = storage_to_u64(
+            self.backend
+                .storage(SYSTEM_ACCOUNT_ADDRESS, count_slot)
+                .map_err(AuxError::Backend)?,
+        );
+        self.write_slot(count_slot, u64_to_storage(new_id + 1))?;
+        self.write_slot(key_slot, u64_to_storage(new_id + 1))?;
+        self.write_slot(id_to_key_slot(new_id), B256::from(key))?;
+        Ok(new_id)
     }
 
-    /// The key for `entity_id`, or `None` if the id was never recorded.
+    /// The key for `entity_id`, or `None` if the id was never allocated.
     fn id_key(&mut self, entity_id: u64) -> Result<Option<EntityKey>, AuxError<E>> {
         let word = self
             .backend
@@ -102,6 +138,13 @@ where
         } else {
             Ok(Some(word.0))
         }
+    }
+
+    /// Write a bookkeeping slot on the system account.
+    fn write_slot(&mut self, slot: B256, value: B256) -> Result<(), AuxError<E>> {
+        self.backend
+            .set_storage(SYSTEM_ACCOUNT_ADDRESS, slot, value)
+            .map_err(AuxError::Backend)
     }
 }
 
@@ -150,14 +193,14 @@ where
 
     fn apply_delta(&mut self, delta: &BlockAuxiliaryStoreDelta) -> Result<(), Self::Error> {
         for entity in &delta.entities {
-            self.set_id_key(entity.entity_id, entity.entity_key)?;
+            let entity_id = self.id_for_key(entity.entity_key)?;
             for entry in &entity.inserts {
                 let mode = mode_for(&entry.attr, entry.value_type);
                 index::insert(
                     &mut self.backend,
                     &entry.attr,
                     &entry.value,
-                    entity.entity_id,
+                    entity_id,
                     mode,
                 )?;
             }
@@ -167,7 +210,7 @@ where
                     &mut self.backend,
                     &entry.attr,
                     &entry.value,
-                    entity.entity_id,
+                    entity_id,
                     mode,
                 )?;
             }
@@ -267,7 +310,6 @@ mod tests {
     }
 
     struct NewEntity {
-        id: u64,
         key: EntityKey,
         owner: [u8; 20],
         expires: u64,
@@ -276,7 +318,8 @@ mod tests {
     }
 
     /// The full insert set for a created entity: the built-ins plus its user
-    /// attributes — mirroring `arkiv-db-engine`'s `built_in_annotations`.
+    /// attributes — mirroring `arkiv-db-engine`'s `built_in_annotations`. The store
+    /// allocates the entity id itself on first sight of the key.
     fn create(entity: &NewEntity) -> AuxiliaryEntityDelta {
         let mut inserts = vec![
             entry(ALL, ATTR_STRING, Vec::new()),
@@ -289,7 +332,6 @@ mod tests {
         ];
         inserts.extend(entity.attributes.iter().cloned());
         AuxiliaryEntityDelta {
-            entity_id: entity.id,
             entity_key: entity.key,
             inserts,
             removes: Vec::new(),
@@ -332,9 +374,8 @@ mod tests {
         )]
     }
 
-    fn sample(id: u64, key: u8, owner: u8, expires: u64, attributes: Vec<AttrEntry>) -> NewEntity {
+    fn sample(key: u8, owner: u8, expires: u64, attributes: Vec<AttrEntry>) -> NewEntity {
         NewEntity {
-            id,
             key: key_of(key),
             owner: addr_of(owner),
             expires,
@@ -349,9 +390,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 100, vec![])),
-                create(&sample(1, 0xB0, 2, 100, vec![])),
-                create(&sample(2, 0xC0, 1, 100, vec![])),
+                create(&sample(0xA0, 1, 100, vec![])),
+                create(&sample(0xB0, 2, 100, vec![])),
+                create(&sample(0xC0, 1, 100, vec![])),
             ],
         );
 
@@ -376,8 +417,8 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 100, vec![])),
-                create(&sample(1, 0xB0, 2, 100, vec![])),
+                create(&sample(0xA0, 1, 100, vec![])),
+                create(&sample(0xB0, 2, 100, vec![])),
             ],
         );
         assert_eq!(
@@ -392,9 +433,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 100, vec![])),
-                create(&sample(1, 0xB0, 2, 100, vec![])),
-                create(&sample(2, 0xC0, 1, 100, vec![])),
+                create(&sample(0xA0, 1, 100, vec![])),
+                create(&sample(0xB0, 2, 100, vec![])),
+                create(&sample(0xC0, 1, 100, vec![])),
             ],
         );
         let q = Query::Neq {
@@ -410,9 +451,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 100, vec![])),
-                create(&sample(1, 0xB0, 2, 100, vec![])),
-                create(&sample(2, 0xC0, 3, 100, vec![])),
+                create(&sample(0xA0, 1, 100, vec![])),
+                create(&sample(0xB0, 2, 100, vec![])),
+                create(&sample(0xC0, 3, 100, vec![])),
             ],
         );
         let q = Query::In {
@@ -431,9 +472,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 10, vec![])),
-                create(&sample(1, 0xB0, 1, 20, vec![])),
-                create(&sample(2, 0xC0, 1, 30, vec![])),
+                create(&sample(0xA0, 1, 10, vec![])),
+                create(&sample(0xB0, 1, 20, vec![])),
+                create(&sample(0xC0, 1, 30, vec![])),
             ],
         );
         let gt = |n: u64| Query::Gt {
@@ -454,9 +495,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 100, user_uint("rank", 5))),
-                create(&sample(1, 0xB0, 1, 100, user_uint("rank", 15))),
-                create(&sample(2, 0xC0, 1, 100, user_uint("rank", 25))),
+                create(&sample(0xA0, 1, 100, user_uint("rank", 5))),
+                create(&sample(0xB0, 1, 100, user_uint("rank", 15))),
+                create(&sample(0xC0, 1, 100, user_uint("rank", 25))),
             ],
         );
         let q = Query::Gte {
@@ -472,9 +513,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 100, user_str("name", "apple"))),
-                create(&sample(1, 0xB0, 1, 100, user_str("name", "banana"))),
-                create(&sample(2, 0xC0, 1, 100, user_str("name", "blueberry"))),
+                create(&sample(0xA0, 1, 100, user_str("name", "apple"))),
+                create(&sample(0xB0, 1, 100, user_str("name", "banana"))),
+                create(&sample(0xC0, 1, 100, user_str("name", "blueberry"))),
             ],
         );
         let gt = Query::Gt {
@@ -498,9 +539,9 @@ mod tests {
         apply(
             &mut store,
             vec![
-                create(&sample(0, 0xA0, 1, 10, vec![])),
-                create(&sample(1, 0xB0, 1, 30, vec![])),
-                create(&sample(2, 0xC0, 2, 30, vec![])),
+                create(&sample(0xA0, 1, 10, vec![])),
+                create(&sample(0xB0, 1, 30, vec![])),
+                create(&sample(0xC0, 2, 30, vec![])),
             ],
         );
         // owner==1 AND expiration>20  → only B0
@@ -531,14 +572,13 @@ mod tests {
     #[test]
     fn delete_drops_an_entity_from_every_query() {
         let mut store = RethAuxStore::new(MemBackend::default());
-        let a = sample(0, 0xA0, 1, 100, user_uint("rank", 5));
-        let b = sample(1, 0xB0, 1, 100, user_uint("rank", 5));
+        let a = sample(0xA0, 1, 100, user_uint("rank", 5));
+        let b = sample(0xB0, 1, 100, user_uint("rank", 5));
         apply(&mut store, vec![create(&a), create(&b)]);
 
         // A delete removes every annotation the create inserted.
         let created = create(&a);
         let delete = AuxiliaryEntityDelta {
-            entity_id: a.id,
             entity_key: a.key,
             inserts: Vec::new(),
             removes: created.inserts,
@@ -562,7 +602,7 @@ mod tests {
     fn paging_returns_newest_first_and_a_resumable_cursor() {
         let mut store = RethAuxStore::new(MemBackend::default());
         let deltas: Vec<_> = (0..5)
-            .map(|i| create(&sample(i, 0xA0 + i as u8, 1, 100, vec![])))
+            .map(|i| create(&sample(0xA0 + i as u8, 1, 100, vec![])))
             .collect();
         apply(&mut store, deltas);
 
@@ -607,11 +647,10 @@ mod tests {
     #[test]
     fn transfer_moves_an_entity_between_owner_buckets() {
         let mut store = RethAuxStore::new(MemBackend::default());
-        apply(&mut store, vec![create(&sample(0, 0xA0, 1, 100, vec![]))]);
+        apply(&mut store, vec![create(&sample(0xA0, 1, 100, vec![]))]);
 
         // A transfer removes the old $owner value and inserts the new one.
         let transfer = AuxiliaryEntityDelta {
-            entity_id: 0,
             entity_key: key_of(0xA0),
             inserts: vec![entry(OWNER, ATTR_ENTITY_KEY, addr_of(2).to_vec())],
             removes: vec![entry(OWNER, ATTR_ENTITY_KEY, addr_of(1).to_vec())],
@@ -632,6 +671,22 @@ mod tests {
     fn id_to_key_slot_is_deterministic_and_distinct() {
         assert_eq!(id_to_key_slot(7), id_to_key_slot(7));
         assert_ne!(id_to_key_slot(7), id_to_key_slot(8));
+    }
+
+    #[test]
+    fn id_for_key_allocates_densely_then_reuses() {
+        let mut store = RethAuxStore::new(MemBackend::default());
+        // Fresh keys get dense, monotonic ids.
+        assert_eq!(store.id_for_key(key_of(0xA0)).unwrap(), 0);
+        assert_eq!(store.id_for_key(key_of(0xB0)).unwrap(), 1);
+        assert_eq!(store.id_for_key(key_of(0xC0)).unwrap(), 2);
+        // A seen key resolves back to its existing id (including id 0).
+        assert_eq!(store.id_for_key(key_of(0xA0)).unwrap(), 0);
+        assert_eq!(store.id_for_key(key_of(0xB0)).unwrap(), 1);
+        // The reverse map round-trips.
+        assert_eq!(store.id_key(0).unwrap(), Some(key_of(0xA0)));
+        assert_eq!(store.id_key(2).unwrap(), Some(key_of(0xC0)));
+        assert_eq!(store.id_key(9).unwrap(), None);
     }
 
     /// A `u64` as a 32-byte big-endian word — the query-side counterpart of
