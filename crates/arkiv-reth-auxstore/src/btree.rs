@@ -29,6 +29,7 @@ use alloy_primitives::{Address, B256};
 use arkiv_constants::WORD_LEN;
 
 use crate::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
+use crate::slot::{storage_to_u64, u64_to_storage};
 use crate::storage::IndexStorage;
 
 // ── Slot numbering within a node account ──────────────────────────────
@@ -41,7 +42,6 @@ const VALUES_BASE_SLOT: u64 = KEYS_BASE_SLOT + BTREE_ORDER as u64;
 
 // Layout invariants, checked at compile time so a stray edit to the node order or a
 // field type can't silently corrupt the on-chain encoding:
-const _: () = assert!(size_of::<B256>() == WORD_LEN, "a storage word is a B256");
 const _: () = assert!(
     size_of::<u64>() + size_of::<u16>() + size_of::<u8>() <= WORD_LEN,
     "the node meta word (u64 sibling id + u16 key count + u8 leaf flag) must fit one word",
@@ -54,23 +54,6 @@ const _: () = assert!(
     BTREE_ORDER < u16::MAX as usize,
     "a splitting node holds up to BTREE_ORDER + 1 keys, and the count is a u16",
 );
-
-/// Encode a `u64` right-aligned in a storage word: the low `size_of::<u64>()` bytes
-/// hold the value big-endian, the rest is zero. Node ids and child pointers are
-/// stored this way.
-#[inline]
-fn u64_to_storage(n: u64) -> B256 {
-    let mut buf = [0u8; WORD_LEN];
-    buf[WORD_LEN - size_of::<u64>()..].copy_from_slice(&n.to_be_bytes());
-    B256::from(buf)
-}
-
-/// Read a `u64` back from the low bytes of a right-aligned storage word — the exact
-/// inverse of [`u64_to_storage`]. Decodes child node ids from value words.
-#[inline]
-fn storage_to_u64(word: B256) -> u64 {
-    u64::from_be_bytes(word.0[WORD_LEN - size_of::<u64>()..].try_into().unwrap())
-}
 
 /// Slot holding the `i`-th key.
 #[inline]
@@ -437,19 +420,6 @@ mod tests {
             .into_iter()
             .map(|(k, _)| storage_to_u64(k))
             .collect()
-    }
-
-    #[test]
-    fn u64_storage_roundtrips_and_is_right_aligned() {
-        let w = u64_to_storage(0x0102);
-        assert_eq!(storage_to_u64(w), 0x0102);
-        // High bytes zero; the value sits big-endian in the low size_of::<u64>() bytes.
-        assert_eq!(
-            &w.0[..WORD_LEN - size_of::<u64>()],
-            &[0u8; WORD_LEN - size_of::<u64>()]
-        );
-        assert_eq!(w.0[WORD_LEN - 2], 0x01);
-        assert_eq!(w.0[WORD_LEN - 1], 0x02);
     }
 
     #[test]

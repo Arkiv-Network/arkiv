@@ -39,10 +39,11 @@
 //!
 //! Here so far: [`bitmap`] — the roaring64 entity-id set; [`address`] — the
 //! keccak-derived index bucket addresses; [`storage`] — the [`IndexStorage`] seam
-//! the tier-2 index writes through; [`btree`] — the int-mode B+ tree over that
-//! seam; and [`range`] — the caller-facing int range index (encode a value, scan a
-//! bound). The write path (`apply_delta`) and read path (`evaluate`) that combine
-//! these land next.
+//! the tier-2 index writes through; [`btree`] — the int-mode B+ tree over that seam;
+//! [`range`] — the caller-facing int range index (encode a value, scan a bound); and
+//! [`cascade`] — the str-mode counterpart, a chunk-by-chunk cascade for string
+//! values up to 128 bytes. The write path (`apply_delta`) and read path (`evaluate`)
+//! that combine these land next.
 //!
 //! [`Bitmap`]: bitmap::Bitmap
 //! [`pair_address`]: address::pair_address
@@ -51,8 +52,11 @@
 pub mod address;
 pub mod bitmap;
 pub mod btree;
+pub mod cascade;
 pub mod range;
 pub mod storage;
+
+mod slot;
 
 pub use address::{all_entities_bucket, pair_address};
 pub use bitmap::{Bitmap, BitmapError};
