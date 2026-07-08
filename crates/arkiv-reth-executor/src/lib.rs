@@ -51,12 +51,13 @@ pub mod decode;
 /// The reth write-path bridge: `AccountCode` over the `Database` + `EvmState` diff.
 pub mod state;
 
-pub use arkiv::ArkivExecutor;
+pub use arkiv::{ArkivExecutor, OpEffect};
 pub use decode::{DecodeError, decode_ops, derive_entity_key};
 pub use state::ExecutorState;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
-use alloy_primitives::{Address, Bytes, TxKind, U256, address};
+use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256, address};
+use alloy_sol_types::SolEvent;
 use reth_ethereum::{
     EthPrimitives,
     chainspec::ChainSpec,
@@ -83,7 +84,7 @@ use reth_ethereum::{
     },
 };
 
-use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op};
+use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::state::EntityStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
 
@@ -277,6 +278,7 @@ fn arkiv_entity_transact<DB: Database>(
             gas_used: 0,
             revert: Some(e.to_string()),
             entity_state: state.into_state(),
+            logs: Vec::new(),
         },
     };
 
@@ -299,7 +301,7 @@ fn arkiv_entity_transact<DB: Database>(
         None => ExecutionResult::Success {
             reason: SuccessReason::Stop,
             gas,
-            logs: Vec::new(),
+            logs: outcome.logs,
             output: Output::Call(Bytes::new()),
         },
         Some(reason) => ExecutionResult::Revert {
@@ -312,11 +314,13 @@ fn arkiv_entity_transact<DB: Database>(
 }
 
 /// What running an op batch produced: the gas metered, a revert reason if the batch
-/// failed a business rule, and the entity `EvmState` diff (empty on revert).
+/// failed a business rule, the entity `EvmState` diff (empty on revert), and the
+/// `EntityOperation` logs to emit (empty on revert).
 struct Outcome {
     gas_used: u64,
     revert: Option<String>,
     entity_state: EvmState,
+    logs: Vec<Log>,
 }
 
 /// Run a decoded batch over the reth-backed stores. On success it commits the draft
@@ -335,8 +339,9 @@ fn run_ops<DB: Database>(
 
     let mut store = RethEntityStore::new(CodeBackend::new(state));
     let mut draft = BlockDraft::default();
+    let mut effects = Vec::new();
     let out = ArkivExecutor::new()
-        .apply(env, &mut store, &mut draft, &ops)
+        .apply_with_effects(env, &mut store, &mut draft, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
     match out.status {
@@ -346,17 +351,48 @@ fn run_ops<DB: Database>(
                 .map_err(|e| eyre::eyre!("apply_delta: {e:?}"))?;
             let mut state = store.into_backend().into_inner();
             state.bump_nonce(caller, create_count)?;
+            let logs = effects.iter().map(entity_operation_log).collect();
             Ok(Outcome {
                 gas_used: out.gas_used,
                 revert: None,
                 entity_state: state.into_state(),
+                logs,
             })
         }
         ExecStatus::Reverted => Ok(Outcome {
             gas_used: out.gas_used,
             revert: out.revert,
             entity_state: store.into_backend().into_inner().into_state(),
+            logs: Vec::new(),
         }),
+    }
+}
+
+/// Encode an [`OpEffect`] as the ABI `EntityOperation` log a client indexes. The
+/// entity-hash field is unused for now (`0x0`).
+fn entity_operation_log(effect: &OpEffect) -> Log {
+    let event = arkiv_bindings::IEntityRegistry::EntityOperation {
+        entityKey: B256::from(effect.key),
+        operationType: op_type_byte(effect.kind),
+        owner: Address::from(effect.owner),
+        expiresAt: effect.expires_at.min(u32::MAX as u64) as u32,
+        entityHash: B256::ZERO,
+    };
+    Log {
+        address: ARKIV_ADDRESS,
+        data: event.encode_log_data(),
+    }
+}
+
+fn op_type_byte(kind: OpKind) -> u8 {
+    use arkiv_bindings::{OP_CREATE, OP_DELETE, OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE};
+    match kind {
+        OpKind::Create => OP_CREATE,
+        OpKind::Update => OP_UPDATE,
+        OpKind::ExtendExpiry => OP_EXTEND,
+        OpKind::Transfer => OP_TRANSFER,
+        OpKind::Delete => OP_DELETE,
+        OpKind::Expire => OP_EXPIRE,
     }
 }
 
@@ -509,6 +545,18 @@ mod tests {
         // The sender is touched with its EOA nonce bumped.
         let sender = rs.state.get(&alice).expect("sender account");
         assert_eq!(sender.info.nonce, 1);
+
+        // One EntityOperation log was emitted for the create, at ARKIV_ADDRESS.
+        let logs = rs.result.logs();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].address, ARKIV_ADDRESS);
+        let event =
+            arkiv_bindings::IEntityRegistry::EntityOperation::decode_log_data(&logs[0].data)
+                .unwrap();
+        assert_eq!(event.entityKey, B256::from(key));
+        assert_eq!(event.operationType, arkiv_bindings::OP_CREATE);
+        assert_eq!(event.owner, alice);
+        assert_eq!(event.expiresAt, 60);
     }
 
     /// Undecodable calldata reverts, but the sender is still charged/bumped and no
