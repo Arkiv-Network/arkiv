@@ -28,10 +28,18 @@ const BTREE_HEADER_DOMAIN: &[u8] = b"arkiv.ibth";
 /// Domain tag for a tier-2 int-mode B+ tree node account.
 const BTREE_NODE_DOMAIN: &[u8] = b"arkiv.ibtn";
 
+/// Domain tag for a tier-2 str-mode cascade level account.
+const STR_LEVEL_DOMAIN: &[u8] = b"arkiv.sidx";
+
+/// Domain tag for an enumeration-list account (a cascade level's live keys).
+const LIST_DOMAIN: &[u8] = b"arkiv.list";
+
 const _: () = assert!(
     PAIR_DOMAIN.len() == DOMAIN_TAG_LEN
         && BTREE_HEADER_DOMAIN.len() == DOMAIN_TAG_LEN
-        && BTREE_NODE_DOMAIN.len() == DOMAIN_TAG_LEN,
+        && BTREE_NODE_DOMAIN.len() == DOMAIN_TAG_LEN
+        && STR_LEVEL_DOMAIN.len() == DOMAIN_TAG_LEN
+        && LIST_DOMAIN.len() == DOMAIN_TAG_LEN,
     "every domain tag must be DOMAIN_TAG_LEN bytes",
 );
 
@@ -101,6 +109,36 @@ pub fn btree_node_address(header_addr: Address, node_id: u64) -> Address {
     buf[..DOMAIN_TAG_LEN].copy_from_slice(BTREE_NODE_DOMAIN);
     buf[DOMAIN_TAG_LEN..DOMAIN_TAG_LEN + ADDRESS_LEN].copy_from_slice(header_addr.as_slice());
     buf[DOMAIN_TAG_LEN + ADDRESS_LEN..].copy_from_slice(&node_id.to_be_bytes());
+    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+}
+
+/// Address of the str-mode cascade **level account** for `attr` at `prefix`.
+///
+/// `str_level_address = keccak256("arkiv.sidx" || attr || 0x00 || prefix)[..20]`.
+/// The cascade indexes a string value chunk-by-chunk: level 0 lives at `prefix =
+/// b""`, level 1 at `prefix = chunk0` (32 bytes), and so on. Each level account
+/// holds one storage slot per distinct 32-byte chunk seen at that level. The `0x00`
+/// separator keeps `attr` and `prefix` from colliding (as in [`pair_address`]).
+pub fn str_level_address(attr: &[u8], prefix: &[u8]) -> Address {
+    let mut buf = Vec::with_capacity(STR_LEVEL_DOMAIN.len() + attr.len() + 1 + prefix.len());
+    buf.extend_from_slice(STR_LEVEL_DOMAIN);
+    buf.extend_from_slice(attr);
+    buf.push(0x00);
+    buf.extend_from_slice(prefix);
+    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+}
+
+/// Address of the **enumeration list** companion for an index account.
+///
+/// `list_address_for = keccak256("arkiv.list" || index_addr)[..20]`. EVM storage
+/// isn't range-scannable, so each cascade level account has a companion list that
+/// records, in insertion order, every distinct slot key ever written to it — letting
+/// the reader enumerate a level's live entries. Slot `0` holds the count; slot `i`
+/// (1-based) holds the `i`-th key.
+pub fn list_address_for(index_addr: Address) -> Address {
+    let mut buf = Vec::with_capacity(LIST_DOMAIN.len() + ADDRESS_LEN);
+    buf.extend_from_slice(LIST_DOMAIN);
+    buf.extend_from_slice(index_addr.as_slice());
     Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
 
@@ -176,5 +214,27 @@ mod tests {
         let b = btree_header_address(b"attrB");
         assert_ne!(btree_node_address(a, 1), btree_node_address(a, 2));
         assert_ne!(btree_node_address(a, 1), btree_node_address(b, 1));
+    }
+
+    #[test]
+    fn str_level_golden() {
+        assert_eq!(
+            str_level_address(b"name", b""),
+            address!("0e560da369ae5df4faf8a08707658008ec2a0fc4"),
+        );
+    }
+
+    #[test]
+    fn list_golden() {
+        assert_eq!(
+            list_address_for(Address::from([0x11; 20])),
+            address!("4467d6c452125d3c95ac7dbf3db5c89f125b5652"),
+        );
+    }
+
+    #[test]
+    fn str_levels_are_distinct_per_prefix_and_attr() {
+        assert_ne!(str_level_address(b"a", b""), str_level_address(b"a", b"x"));
+        assert_ne!(str_level_address(b"a", b"x"), str_level_address(b"b", b"x"));
     }
 }
