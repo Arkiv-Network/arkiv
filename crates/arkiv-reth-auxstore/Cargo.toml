@@ -18,5 +18,11 @@ license.workspace = true
 [dependencies]
 arkiv-constants.workspace = true
 arkiv-interfaces.workspace = true
+# For the `AccountCode` reth-state seam (tier-1 bitmaps live in account code) and
+# the shared `SYSTEM_ACCOUNT_ADDRESS` where index bookkeeping (the id→key map)
+# sits. The seam is a generic account-code accessor, not entity data — reusing it
+# means the reth bridge implements it once for both stores. This crate holds no
+# entity data; the dependency is trait- and address-only.
+arkiv-reth-entitystore.workspace = true
 alloy-primitives.workspace = true
 roaring.workspace = true

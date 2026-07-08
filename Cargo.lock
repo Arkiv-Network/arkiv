@@ -1466,6 +1466,7 @@ dependencies = [
  "alloy-primitives",
  "arkiv-constants",
  "arkiv-interfaces",
+ "arkiv-reth-entitystore",
  "roaring",
 ]
 
