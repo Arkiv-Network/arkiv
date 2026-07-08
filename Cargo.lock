@@ -1428,7 +1428,13 @@ version = "0.1.0"
 name = "arkiv-node"
 version = "0.1.0"
 dependencies = [
+ "alloy-contract",
+ "alloy-network",
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "arkiv-bindings",
  "arkiv-interfaces",
  "arkiv-reth-entitystore",
  "arkiv-reth-executor",
@@ -1440,6 +1446,7 @@ dependencies = [
  "reth-node-ethereum",
  "reth-storage-api",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
