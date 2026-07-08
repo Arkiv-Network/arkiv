@@ -1489,6 +1489,7 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-interfaces",
+ "arkiv-reth-auxstore",
  "arkiv-reth-entitystore",
  "eyre",
  "reth-ethereum",
