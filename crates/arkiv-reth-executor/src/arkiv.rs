@@ -20,6 +20,18 @@
 //! The executor works in whole [`Entity`] values throughout; serializing them for
 //! storage is the [`EntityStore`]'s concern, not this crate's.
 //!
+//! ## The index delta
+//!
+//! Besides the entity changes, [`apply`](ArkivExecutor::apply) also stages the
+//! matching **query-index** changes into [`draft.auxiliary`](BlockDraft::auxiliary).
+//! It does this by *diffing* each touched entity's indexable annotations — the
+//! before-the-transaction state against the after — so every op kind is handled
+//! uniformly: a create is all-inserts, a delete all-removes, a transfer swaps one
+//! `$owner` value, an update touches only what changed. The annotation encoding is
+//! the auxiliary store's ([`entity_annotations`]), so the write and read sides agree
+//! by construction. Assigning the compact entity ids the index keys on is the
+//! store's job, not this one's.
+//!
 //! ## Effects
 //!
 //! Decoding raw calldata into [`Op`]s is the host's ABI step (see
@@ -38,7 +50,8 @@ use arkiv_interfaces::execution::{
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
 use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey};
-use arkiv_interfaces::state::EntityStore;
+use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta, EntityStore};
+use arkiv_reth_auxstore::annotation::entity_annotations;
 
 /// What a successfully-applied op did — enough for the host to emit its
 /// entity-operation log. Host-agnostic (spec types only); the reth wiring turns
@@ -184,8 +197,20 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             }
         }
 
-        // Every op succeeded — merge the overlay into the caller's draft,
-        // last-writer-wins per key.
+        // Every op succeeded. First stage the index changes: for each entity this
+        // transaction touched, diff its annotations before vs after. The "before" is
+        // read from the draft + store *without* this transaction's overlay, so the
+        // diff captures the transaction's net effect on the entity.
+        for (key, staged_new) in &tx_state_overlay {
+            let before = self.committed_or_drafted(entities, draft, *key)?;
+            if let Some(entity_delta) = auxiliary_delta(*key, before.as_ref(), staged_new.as_ref())
+            {
+                draft.auxiliary.entities.push(entity_delta);
+            }
+        }
+
+        // Then merge the entity overlay into the caller's draft, last-writer-wins per
+        // key.
         for (key, staged) in tx_state_overlay {
             draft.entities.puts.retain(|e| e.key != key);
             draft.entities.deletes.retain(|k| *k != key);
@@ -374,6 +399,18 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         if let Some(staged) = overlay.get(&key) {
             return Ok(staged.clone());
         }
+        self.committed_or_drafted(entities, draft, key)
+    }
+
+    /// The entity for `key` as of before this transaction: the block's `draft`
+    /// (earlier transactions), then the committed store — **not** this transaction's
+    /// overlay. Used to diff the index changes against the pre-transaction state.
+    fn committed_or_drafted(
+        &self,
+        entities: &mut E,
+        draft: &BlockDraft,
+        key: EntityKey,
+    ) -> Result<Option<Entity>, ExecError> {
         if draft.entities.deletes.contains(&key) {
             return Ok(None);
         }
@@ -381,6 +418,36 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             return Ok(Some(entity.clone()));
         }
         entities.get(key).map_err(ExecError::store)
+    }
+}
+
+/// The index change for one entity: the annotations that its `before → after`
+/// transition adds and removes. `None` when nothing changed (e.g. a create then
+/// delete in the same transaction, which nets to no entity and no index entries).
+///
+/// The diff is symmetric set difference over the entities' full annotation sets, so
+/// it is correct for every op kind without special-casing: whatever the two states
+/// disagree on is exactly what the index must change.
+fn auxiliary_delta(
+    key: EntityKey,
+    before: Option<&Entity>,
+    after: Option<&Entity>,
+) -> Option<AuxiliaryEntityDelta> {
+    let old = before.map(entity_annotations).unwrap_or_default();
+    let new = after.map(entity_annotations).unwrap_or_default();
+
+    let contains = |set: &[AttrEntry], entry: &AttrEntry| set.iter().any(|other| other == entry);
+    let removes: Vec<AttrEntry> = old.iter().filter(|a| !contains(&new, a)).cloned().collect();
+    let inserts: Vec<AttrEntry> = new.iter().filter(|a| !contains(&old, a)).cloned().collect();
+
+    if inserts.is_empty() && removes.is_empty() {
+        None
+    } else {
+        Some(AuxiliaryEntityDelta {
+            entity_key: key,
+            inserts,
+            removes,
+        })
     }
 }
 
@@ -662,6 +729,128 @@ mod tests {
         assert_eq!(out.status, ExecStatus::Ok);
         assert!(draft.entities.puts.is_empty());
         assert_eq!(draft.entities.deletes, vec![[3u8; 32]]);
+        // And no net index change: the entity never existed before and doesn't after.
+        assert!(draft.auxiliary.entities.is_empty());
+    }
+
+    /// A `Create` stages the entity's whole indexable annotation set as inserts
+    /// (seven built-ins + each user attribute) and nothing to remove.
+    #[test]
+    fn create_stages_index_inserts() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        let mut draft = BlockDraft::default();
+        let alice = [0xAA; 20];
+
+        exec.apply(
+            &env(alice, 10),
+            &mut store,
+            &mut draft,
+            &[Op::Create {
+                key: [1u8; 32],
+                expires_at: 50,
+                content_type: b"text/plain".to_vec(),
+                payload: b"y".to_vec(),
+                attributes: vec![Attribute {
+                    key: b"rank".to_vec(),
+                    value_type: arkiv_interfaces::entity::ATTR_UINT,
+                    value: vec![0u8; 32],
+                }],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(draft.auxiliary.entities.len(), 1);
+        let delta = &draft.auxiliary.entities[0];
+        assert_eq!(delta.entity_key, [1u8; 32]);
+        assert!(delta.removes.is_empty());
+        assert_eq!(delta.inserts.len(), 8); // 7 built-ins + rank
+        // $owner is the caller; the user attribute carries through.
+        assert!(
+            delta
+                .inserts
+                .iter()
+                .any(|a| a.attr == b"$owner" && a.value == alice.to_vec())
+        );
+        assert!(delta.inserts.iter().any(|a| a.attr == b"rank"));
+    }
+
+    /// A `Transfer` diffs to a single `$owner` swap — the old owner value out, the
+    /// new one in — and touches nothing else (content, other built-ins unchanged).
+    #[test]
+    fn transfer_stages_only_the_owner_swap() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()], // owner [2; 20]
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let mut draft = BlockDraft::default();
+
+        exec.apply(
+            &env([2u8; 20], 20),
+            &mut store,
+            &mut draft,
+            &[Op::Transfer {
+                key: [7u8; 32],
+                new_owner: [9u8; 20],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(draft.auxiliary.entities.len(), 1);
+        let delta = &draft.auxiliary.entities[0];
+        assert_eq!(delta.removes.len(), 1);
+        assert_eq!(delta.inserts.len(), 1);
+        assert_eq!(delta.removes[0].attr, b"$owner");
+        assert_eq!(delta.removes[0].value, [2u8; 20].to_vec());
+        assert_eq!(delta.inserts[0].attr, b"$owner");
+        assert_eq!(delta.inserts[0].value, [9u8; 20].to_vec());
+    }
+
+    /// An `Update` diffs only what changed: the new `$contentType` in, the old one
+    /// plus every dropped user attribute out. Unchanged built-ins never appear.
+    #[test]
+    fn update_stages_only_changed_annotations() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()], // content text/plain, attrs color + size
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let mut draft = BlockDraft::default();
+
+        exec.apply(
+            &env([2u8; 20], 20),
+            &mut store,
+            &mut draft,
+            &[Op::Update {
+                key: [7u8; 32],
+                content_type: b"application/json".to_vec(),
+                payload: b"world".to_vec(),
+                attributes: Vec::new(), // drops color + size
+            }],
+        )
+        .unwrap();
+
+        let delta = &draft.auxiliary.entities[0];
+        // Out: old $contentType, color, size. In: new $contentType.
+        assert_eq!(delta.removes.len(), 3);
+        assert_eq!(delta.inserts.len(), 1);
+        assert_eq!(delta.inserts[0].attr, b"$contentType");
+        assert_eq!(delta.inserts[0].value, b"application/json");
+        assert!(delta.removes.iter().any(|a| a.attr == b"color"));
+        assert!(delta.removes.iter().any(|a| a.attr == b"size"));
+        assert!(
+            delta
+                .removes
+                .iter()
+                .any(|a| a.attr == b"$contentType" && a.value == b"text/plain")
+        );
     }
 
     /// `Expire` is gated on the clock, not on ownership: it reverts while the
