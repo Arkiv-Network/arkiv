@@ -100,8 +100,13 @@ pub struct BlockAuxiliaryStoreDelta {
 /// for example, removes the old `$owner` value and adds the new one.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuxiliaryEntityDelta {
-    /// The entity, by its index id.
+    /// The entity, by its index id — the compact `u64` the index's bitmaps are
+    /// keyed on. The host assigns it (densely, from a counter) when the entity is
+    /// created.
     pub entity_id: u64,
+    /// The entity's full key. Carried so the index can maintain an `id → key` map
+    /// and answer queries with keys directly, without reading the entity store.
+    pub entity_key: EntityKey,
     /// Values to add to the index.
     pub inserts: Vec<AttrEntry>,
     /// Values to remove from the index.
@@ -109,8 +114,16 @@ pub struct AuxiliaryEntityDelta {
 }
 
 /// One `(attribute, value)` pair in the index.
+///
+/// `value_type` is one of the [`ATTR_*`](crate::entity::ATTR_UINT) tags. The index
+/// needs it to decide whether — and how — the value is *ordered* for range queries:
+/// a [`Uint`](crate::entity::ATTR_UINT) is range-indexed numerically, a
+/// [`String`](crate::entity::ATTR_STRING) lexically, and an
+/// [`entity key`](crate::entity::ATTR_ENTITY_KEY) not at all (equality only). It
+/// does not affect the equality index, which is over the raw `value` bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AttrEntry {
     pub attr: Vec<u8>,
+    pub value_type: u8,
     pub value: Vec<u8>,
 }
