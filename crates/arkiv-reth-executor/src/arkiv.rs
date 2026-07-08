@@ -20,12 +20,13 @@
 //! The executor works in whole [`Entity`] values throughout; serializing them for
 //! storage is the [`EntityStore`]'s concern, not this crate's.
 //!
-//! ## Not yet wired
+//! ## Effects
 //!
-//! Decoding raw transaction calldata into [`Op`]s is the host's ABI step (see the
-//! interface docs); [`decode_ops`] is a placeholder until that lands. The business
-//! logic in [`ArkivExecutor::apply`] is complete and tested against pre-decoded
-//! operations.
+//! Decoding raw calldata into [`Op`]s is the host's ABI step (see
+//! [`decode`](crate::decode)). On success,
+//! [`apply_with_effects`](ArkivExecutor::apply_with_effects) also reports one
+//! [`OpEffect`] per op — the key, kind, owner, and expiry the host turns into
+//! `EntityOperation` logs. The plain [`apply`](ArkivExecutor::apply) discards them.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -33,11 +34,27 @@ use std::collections::BTreeMap;
 
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::execution::{
-    BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, TransactionExecutor,
+    BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
-use arkiv_interfaces::primitives::EntityKey;
+use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey};
 use arkiv_interfaces::state::EntityStore;
+
+/// What a successfully-applied op did — enough for the host to emit its
+/// entity-operation log. Host-agnostic (spec types only); the reth wiring turns
+/// these into ABI event logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpEffect {
+    /// The entity the op targeted.
+    pub key: EntityKey,
+    /// Which operation it was.
+    pub kind: OpKind,
+    /// The entity's owner after the op (the new owner for a transfer; the prior
+    /// owner for a delete/expire).
+    pub owner: Address,
+    /// The entity's expiry after the op.
+    pub expires_at: BlockNumber,
+}
 
 /// The fixed-function entity executor.
 ///
@@ -121,11 +138,26 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         draft: &mut BlockDraft,
         ops: &[Op],
     ) -> Result<ExecOutput, ExecError> {
+        self.apply_with_effects(env, entities, draft, ops, &mut Vec::new())
+    }
+
+    /// Like [`apply`](Self::apply), but on success also records one [`OpEffect`]
+    /// per op into `effects` (in order) — what the host needs to emit the
+    /// entity-operation logs. On a revert, `effects` is left untouched.
+    pub fn apply_with_effects(
+        &self,
+        env: &ExecEnv,
+        entities: &mut E,
+        draft: &mut BlockDraft,
+        ops: &[Op],
+        effects: &mut Vec<OpEffect>,
+    ) -> Result<ExecOutput, ExecError> {
         // Per-transaction overlay: Some(entity) = staged write, None = staged
         // delete. Reads consult it before the draft and the store, so operations
         // in this transaction see each other's effects.
         let mut tx_state_overlay = BTreeMap::<EntityKey, Option<Entity>>::new();
         let mut gas_used = 0u64;
+        let mut staged_effects = Vec::with_capacity(ops.len());
 
         for op in ops {
             // Charge for the op up front. If the batch's cost outruns the gas the
@@ -139,13 +171,16 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     revert: Some("out of gas".into()),
                 });
             }
-            if let Err(reason) = self.stage_op(env, entities, draft, &mut tx_state_overlay, op)? {
-                // Business-rule revert: discard the overlay, leave `draft` as it was.
-                return Ok(ExecOutput {
-                    status: ExecStatus::Reverted,
-                    gas_used,
-                    revert: Some(reason),
-                });
+            match self.stage_op(env, entities, draft, &mut tx_state_overlay, op)? {
+                Ok(effect) => staged_effects.push(effect),
+                Err(reason) => {
+                    // Business-rule revert: discard the overlay, leave `draft` as it was.
+                    return Ok(ExecOutput {
+                        status: ExecStatus::Reverted,
+                        gas_used,
+                        revert: Some(reason),
+                    });
+                }
             }
         }
 
@@ -160,6 +195,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             }
         }
 
+        effects.extend(staged_effects);
         Ok(ExecOutput {
             status: ExecStatus::Ok,
             gas_used,
@@ -167,8 +203,9 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         })
     }
 
-    /// Stage one operation into `overlay`. `Ok(Ok(()))` staged it; `Ok(Err(reason))`
-    /// is a business-rule revert; `Err(_)` is a store fault.
+    /// Stage one operation into `overlay`. `Ok(Ok(effect))` staged it and reports
+    /// what it did; `Ok(Err(reason))` is a business-rule revert; `Err(_)` is a store
+    /// fault.
     fn stage_op(
         &self,
         env: &ExecEnv,
@@ -176,7 +213,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         draft: &BlockDraft,
         overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
         op: &Op,
-    ) -> Result<Result<(), String>, ExecError> {
+    ) -> Result<Result<OpEffect, String>, ExecError> {
         match op {
             Op::Create {
                 key,
@@ -200,29 +237,50 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     attributes: attributes.clone(),
                 };
                 overlay.insert(*key, Some(entity));
-                Ok(Ok(()))
+                Ok(Ok(OpEffect {
+                    key: *key,
+                    kind: OpKind::Create,
+                    owner: env.caller,
+                    expires_at: *expires_at,
+                }))
             }
             Op::Update {
                 key,
                 content_type,
                 payload,
                 attributes,
-            } => self.mutate(env, entities, draft, overlay, *key, |e| {
-                e.content_type = content_type.clone();
-                e.payload = payload.clone();
-                e.attributes = attributes.clone();
-            }),
+            } => self
+                .mutate(env, entities, draft, overlay, *key, |e| {
+                    e.content_type = content_type.clone();
+                    e.payload = payload.clone();
+                    e.attributes = attributes.clone();
+                })
+                .map(|r| {
+                    r.map(|(owner, expires_at)| {
+                        self.effect(*key, OpKind::Update, owner, expires_at)
+                    })
+                }),
             Op::ExtendExpiry {
                 key,
                 new_expires_at,
-            } => self.mutate(env, entities, draft, overlay, *key, |e| {
-                e.expires_at = *new_expires_at;
-            }),
-            Op::Transfer { key, new_owner } => {
-                self.mutate(env, entities, draft, overlay, *key, |e| {
+            } => self
+                .mutate(env, entities, draft, overlay, *key, |e| {
+                    e.expires_at = *new_expires_at;
+                })
+                .map(|r| {
+                    r.map(|(owner, expires_at)| {
+                        self.effect(*key, OpKind::ExtendExpiry, owner, expires_at)
+                    })
+                }),
+            Op::Transfer { key, new_owner } => self
+                .mutate(env, entities, draft, overlay, *key, |e| {
                     e.owner = *new_owner;
                 })
-            }
+                .map(|r| {
+                    r.map(|(owner, expires_at)| {
+                        self.effect(*key, OpKind::Transfer, owner, expires_at)
+                    })
+                }),
             Op::Delete { key } => {
                 let Some(entity) = self.current(entities, draft, overlay, *key)? else {
                     return Ok(Err(format!("entity {} does not exist", hex(key))));
@@ -231,7 +289,12 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     return Ok(Err(format!("caller does not own entity {}", hex(key))));
                 }
                 overlay.insert(*key, None);
-                Ok(Ok(()))
+                Ok(Ok(self.effect(
+                    *key,
+                    OpKind::Delete,
+                    entity.owner,
+                    entity.expires_at,
+                )))
             }
             Op::Expire { key } => {
                 let Some(entity) = self.current(entities, draft, overlay, *key)? else {
@@ -241,8 +304,29 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     return Ok(Err(format!("entity {} has not expired", hex(key))));
                 }
                 overlay.insert(*key, None);
-                Ok(Ok(()))
+                Ok(Ok(self.effect(
+                    *key,
+                    OpKind::Expire,
+                    entity.owner,
+                    entity.expires_at,
+                )))
             }
+        }
+    }
+
+    /// Assemble an [`OpEffect`] (a tiny helper so the op arms stay one-liners).
+    fn effect(
+        &self,
+        key: EntityKey,
+        kind: OpKind,
+        owner: Address,
+        expires_at: BlockNumber,
+    ) -> OpEffect {
+        OpEffect {
+            key,
+            kind,
+            owner,
+            expires_at,
         }
     }
 
@@ -261,7 +345,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
         key: EntityKey,
         edit: impl FnOnce(&mut Entity),
-    ) -> Result<Result<(), String>, ExecError> {
+    ) -> Result<Result<(Address, BlockNumber), String>, ExecError> {
         let Some(mut entity) = self.current(entities, draft, overlay, key)? else {
             return Ok(Err(format!("entity {} does not exist", hex(&key))));
         };
@@ -273,8 +357,9 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         }
         edit(&mut entity);
         entity.last_modified_at_block = env.block_number;
+        let post_op = (entity.owner, entity.expires_at);
         overlay.insert(key, Some(entity));
-        Ok(Ok(()))
+        Ok(Ok(post_op))
     }
 
     /// The current entity for `key`: this transaction's overlay first, then the
