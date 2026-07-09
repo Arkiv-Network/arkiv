@@ -18,6 +18,10 @@ arkiv-interfaces.workspace = true
 # The entity store's `AccountCode` seam, which the reth write-path bridge
 # (state.rs) implements over the Database + EvmState diff.
 arkiv-reth-entitystore.workspace = true
+# The index's annotation encoder: `apply` diffs an entity's annotations to build
+# the auxiliary delta, and this is the one place that maps an entity to its
+# `(attr, value)` index pairs (shared with the query read path).
+arkiv-reth-auxstore.workspace = true
 # The Solidity ABI (Operation[] calldata) the op decoder (decode.rs) parses.
 arkiv-bindings.workspace = true
 
@@ -33,6 +37,10 @@ tracing.workspace = true
 # CodeBackend → ExecutorState → EvmState, and build calldata via the SDK bindings.
 arkiv-interfaces.workspace = true
 arkiv-reth-entitystore.workspace = true
+# The index-write-path test drives apply's draft.auxiliary into a real RethAuxStore
+# and queries it back.
+arkiv-reth-auxstore.workspace = true
 arkiv-bindings.workspace = true
+alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
