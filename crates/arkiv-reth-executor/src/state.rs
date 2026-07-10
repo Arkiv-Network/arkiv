@@ -8,15 +8,20 @@
 //! overlay (with read-your-own-writes), and [`into_state`](ExecutorState::into_state)
 //! hands the diff back for the `ResultAndState`.
 //!
-//! It implements the entity store's [`AccountCode`] seam, so the reth-free
-//! [`CodeBackend`] logic can drive entity writes over it. (The auxiliary index's
-//! storage seam is the same overlay — an `Account`'s storage slots — and joins this
-//! struct later.)
+//! It implements **both** store seams over that one overlay: the entity store's
+//! [`AccountCode`] (an account's code), so the reth-free [`CodeBackend`] logic can
+//! drive entity writes; and the auxiliary index's [`IndexStorage`] (an account's
+//! storage slots), so [`RethAuxStore`] can drive index writes. Both land in the same
+//! [`EvmState`] diff, so one [`into_state`](ExecutorState::into_state) hands reth the
+//! entities and the index together.
 //!
 //! [`Database`]: reth_ethereum::evm::primitives::Database
 //! [`CodeBackend`]: arkiv_reth_entitystore::CodeBackend
+//! [`IndexStorage`]: arkiv_reth_auxstore::IndexStorage
+//! [`RethAuxStore`]: arkiv_reth_auxstore::RethAuxStore
 
-use alloy_primitives::{Address, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use arkiv_reth_auxstore::IndexStorage;
 use arkiv_reth_entitystore::AccountCode;
 use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, nonce_slot};
 use reth_ethereum::evm::{
@@ -107,8 +112,9 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
     }
 
     /// A storage slot's value: the pending diff if it's been written, else the base
-    /// `Database` (zero if never written).
-    pub fn storage(&mut self, addr: Address, slot: U256) -> Result<U256, eyre::Report> {
+    /// `Database` (zero if never written). The `U256` counterpart of the
+    /// [`IndexStorage::storage`](arkiv_reth_auxstore::IndexStorage::storage) seam.
+    pub fn read_slot(&mut self, addr: Address, slot: U256) -> Result<U256, eyre::Report> {
         if let Some(s) = self.state.get(&addr).and_then(|acc| acc.storage.get(&slot)) {
             return Ok(s.present_value);
         }
@@ -117,8 +123,10 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
             .map_err(|e| eyre::eyre!("db.storage({addr}): {e:?}"))
     }
 
-    /// Write a storage slot into the diff.
-    pub fn set_storage(
+    /// Write a storage slot into the diff. The `U256` counterpart of the
+    /// [`IndexStorage::set_storage`](arkiv_reth_auxstore::IndexStorage::set_storage)
+    /// seam.
+    pub fn write_slot(
         &mut self,
         addr: Address,
         slot: U256,
@@ -146,8 +154,10 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
     }
 
     /// Keep `addr` alive against EIP-161 pruning (raise its nonce to ≥ 1). Used to
-    /// materialise the system account on its first storage write.
-    pub fn ensure_account_persists(&mut self, addr: Address) -> Result<(), eyre::Report> {
+    /// materialise the system account on its first storage write. The counterpart of
+    /// the [`IndexStorage::ensure_account_persists`](arkiv_reth_auxstore::IndexStorage::ensure_account_persists)
+    /// seam.
+    pub fn persist_account(&mut self, addr: Address) -> Result<(), eyre::Report> {
         let acc = self.account_mut(addr)?;
         if acc.info.nonce == 0 {
             acc.info.nonce = 1;
@@ -160,17 +170,17 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
     pub fn read_nonce(&mut self, caller: Address) -> Result<u32, eyre::Report> {
         let slot = U256::from_be_bytes(nonce_slot(caller).0);
         Ok(self
-            .storage(SYSTEM_ACCOUNT_ADDRESS, slot)?
+            .read_slot(SYSTEM_ACCOUNT_ADDRESS, slot)?
             .saturating_to::<u32>())
     }
 
     /// Advance `caller`'s minting nonce by `by` (one per entity created), returning
     /// the value it had *before* the bump — the `start_nonce` the batch decoded with.
     pub fn bump_nonce(&mut self, caller: Address, by: u32) -> Result<u32, eyre::Report> {
-        self.ensure_account_persists(SYSTEM_ACCOUNT_ADDRESS)?;
+        self.persist_account(SYSTEM_ACCOUNT_ADDRESS)?;
         let current = self.read_nonce(caller)?;
         let slot = U256::from_be_bytes(nonce_slot(caller).0);
-        self.set_storage(
+        self.write_slot(
             SYSTEM_ACCOUNT_ADDRESS,
             slot,
             U256::from(current.saturating_add(by)),
@@ -226,6 +236,31 @@ impl<DB: Database> AccountCode for ExecutorState<'_, DB> {
         }
         self.stage(addr, info);
         Ok(())
+    }
+}
+
+/// The auxiliary index's storage seam over the same overlay: the tier-2 range
+/// structures and the index's id bookkeeping live in account storage slots. It is a
+/// thin `B256`⇄`U256` adapter over the inherent [`read_slot`](ExecutorState::read_slot)
+/// / [`write_slot`](ExecutorState::write_slot) / [`persist_account`](ExecutorState::persist_account).
+impl<DB: Database> IndexStorage for ExecutorState<'_, DB> {
+    type Error = eyre::Report;
+
+    fn storage(&mut self, addr: Address, slot: B256) -> Result<B256, Self::Error> {
+        let value = self.read_slot(addr, U256::from_be_bytes(slot.0))?;
+        Ok(B256::from(value.to_be_bytes::<32>()))
+    }
+
+    fn set_storage(&mut self, addr: Address, slot: B256, value: B256) -> Result<(), Self::Error> {
+        self.write_slot(
+            addr,
+            U256::from_be_bytes(slot.0),
+            U256::from_be_bytes(value.0),
+        )
+    }
+
+    fn ensure_account_persists(&mut self, addr: Address) -> Result<(), Self::Error> {
+        self.persist_account(addr)
     }
 }
 
@@ -325,9 +360,28 @@ mod tests {
         let mut db = EmptyDB::default();
         let mut state = ExecutorState::new(&mut db);
         let slot = U256::from(7);
-        assert_eq!(state.storage(addr(), slot).unwrap(), U256::ZERO);
-        state.set_storage(addr(), slot, U256::from(42)).unwrap();
-        assert_eq!(state.storage(addr(), slot).unwrap(), U256::from(42));
+        assert_eq!(state.read_slot(addr(), slot).unwrap(), U256::ZERO);
+        state.write_slot(addr(), slot, U256::from(42)).unwrap();
+        assert_eq!(state.read_slot(addr(), slot).unwrap(), U256::from(42));
+    }
+
+    /// The `IndexStorage` (`B256`) seam and the inherent (`U256`) accessor are the
+    /// same overlay: a write through one is visible through the other.
+    #[test]
+    fn index_storage_seam_shares_the_overlay() {
+        let mut db = EmptyDB::default();
+        let mut state = ExecutorState::new(&mut db);
+        let slot = B256::from(U256::from(9));
+        IndexStorage::set_storage(&mut state, addr(), slot, B256::from(U256::from(123))).unwrap();
+        assert_eq!(
+            IndexStorage::storage(&mut state, addr(), slot).unwrap(),
+            B256::from(U256::from(123)),
+        );
+        // Visible through the inherent U256 accessor too.
+        assert_eq!(
+            state.read_slot(addr(), U256::from(9)).unwrap(),
+            U256::from(123)
+        );
     }
 
     #[test]

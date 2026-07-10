@@ -85,7 +85,8 @@ use reth_ethereum::{
 };
 
 use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op, OpKind};
-use arkiv_interfaces::state::EntityStore;
+use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
+use arkiv_reth_auxstore::RethAuxStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
 
 /// The Arkiv address — `0x4400…0044`.
@@ -348,8 +349,17 @@ fn run_ops<DB: Database>(
         ExecStatus::Ok => {
             store
                 .apply_delta(&draft.entities)
-                .map_err(|e| eyre::eyre!("apply_delta: {e:?}"))?;
-            let mut state = store.into_backend().into_inner();
+                .map_err(|e| eyre::eyre!("entity apply_delta: {e:?}"))?;
+            let state = store.into_backend().into_inner();
+
+            // Commit the query-index changes over the same state overlay, so the
+            // index accounts land in the one `EvmState` diff alongside the entities.
+            let mut index = RethAuxStore::new(state);
+            index
+                .apply_delta(&draft.auxiliary)
+                .map_err(|e| eyre::eyre!("index apply_delta: {e:?}"))?;
+            let mut state = index.into_backend();
+
             state.bump_nonce(caller, create_count)?;
             let logs = effects.iter().map(entity_operation_log).collect();
             Ok(Outcome {
@@ -557,6 +567,41 @@ mod tests {
         assert_eq!(event.operationType, arkiv_bindings::OP_CREATE);
         assert_eq!(event.owner, alice);
         assert_eq!(event.expiresAt, 60);
+    }
+
+    /// A create commits the **index** alongside the entity: the new entity's id (0,
+    /// the first ever) lands in both the `$all` bucket and its `$owner` bucket, as
+    /// roaring bitmaps stored in those accounts' code — all in the one returned diff.
+    #[test]
+    fn entity_create_commits_index_accounts() {
+        use arkiv_interfaces::entity::annotations;
+        use arkiv_reth_auxstore::{Bitmap, all_entities_bucket, pair_address};
+
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let rs =
+            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        assert!(rs.result.is_success());
+
+        // Reads the bitmap stored as an index account's code and checks it holds id 0.
+        let bitmap_at = |addr: Address| -> Bitmap {
+            let acc = rs
+                .state
+                .get(&addr)
+                .expect("index bucket account in the diff");
+            let code = acc
+                .info
+                .code
+                .as_ref()
+                .expect("bucket has code")
+                .original_bytes();
+            Bitmap::from_bytes(code.as_ref()).expect("valid bitmap bytes")
+        };
+
+        // Every live entity is in the $all bucket.
+        assert!(bitmap_at(all_entities_bucket()).contains(0));
+        // And in its owner's bucket (owner value = the 20-byte caller address).
+        assert!(bitmap_at(pair_address(annotations::OWNER, alice.as_slice())).contains(0));
     }
 
     /// Undecodable calldata reverts, but the sender is still charged/bumped and no
