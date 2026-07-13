@@ -16,6 +16,8 @@ use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{IEntityRegistry, Operation};
 use arkiv_reth_executor::ARKIV_ADDRESS;
 
+use crate::node::Node;
+
 /// The gas + price every `execute` uses. Gas is set explicitly so the client
 /// skips `eth_estimateGas` — which would fail up-front on a reverting tx, hiding
 /// the revert that [`try_execute`](ArkivClient::try_execute) needs to observe.
@@ -75,6 +77,51 @@ impl<P: Provider> ArkivClient<P> {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
+        }
+    }
+
+    /// Poll `eth_chainId` until it answers or `timeout` elapses; returns whether
+    /// the node became ready. The non-panicking building block behind
+    /// [`wait_ready`](Self::wait_ready) and [`wait_ready_resilient`](Self::wait_ready_resilient).
+    pub async fn ready_within(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.provider.get_chain_id().await.is_ok() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Wait until `node` answers RPC, respawning it if a boot stalls — debug reth
+    /// under heavy parallel load occasionally wedges on start (and a crashed boot,
+    /// e.g. a port collision, would otherwise burn the whole timeout). Tries up to
+    /// `attempts` processes, each given `per_attempt` to come up; a process that
+    /// has already exited is respawned immediately. Panics if every attempt fails.
+    ///
+    /// The client's URL is fixed across respawns, so the same client keeps working.
+    pub async fn wait_ready_resilient(
+        &self,
+        node: &mut Node,
+        attempts: usize,
+        per_attempt: Duration,
+    ) {
+        for attempt in 1..=attempts {
+            // A boot that already crashed can't answer — skip the wait and respawn.
+            if node.has_exited().is_none() && self.ready_within(per_attempt).await {
+                return;
+            }
+            assert!(
+                attempt < attempts,
+                "node RPC not ready after {attempts} attempts of {per_attempt:?}",
+            );
+            node.kill();
+            // Let the OS release the listening ports before the rebind.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            node.restart();
         }
     }
 

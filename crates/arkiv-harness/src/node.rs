@@ -199,6 +199,15 @@ impl Node {
         self.child.is_some()
     }
 
+    /// The exit status if the process has already terminated, or `None` if it is
+    /// still running (non-blocking). Lets a readiness wait tell a crashed boot
+    /// (respawn now) from a slow one (keep waiting).
+    pub fn has_exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
+    }
+
     /// Stop the process but **keep** the datadir — the chain persists for a
     /// [`restart`](Node::restart). Idempotent.
     pub fn kill(&mut self) {
