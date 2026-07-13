@@ -1419,6 +1419,19 @@ dependencies = [
 [[package]]
 name = "arkiv-harness"
 version = "0.1.0"
+dependencies = [
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "arkiv-bindings",
+ "arkiv-reth-executor",
+ "eyre",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "arkiv-interfaces"
@@ -1429,13 +1442,12 @@ name = "arkiv-node"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
- "alloy-contract",
- "alloy-network",
  "alloy-primitives",
  "alloy-provider",
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",
+ "arkiv-harness",
  "arkiv-interfaces",
  "arkiv-query",
  "arkiv-reth-auxstore",

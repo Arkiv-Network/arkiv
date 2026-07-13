@@ -32,17 +32,14 @@ clap.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# The end-to-end test spawns this node binary and drives it like a client:
-# build create calldata (arkiv-bindings), send it (alloy), and read the entity
-# back over arkiv_getEntity. derive_entity_key/ARKIV_ADDRESS come from the executor.
+# The black-box tests spawn this node binary and drive it through the harness:
+# arkiv-harness owns node lifecycle (spawn/kill/restart) + the typed RPC client;
+# the tests build calldata with arkiv-bindings and decode EntityOperation logs.
+arkiv-harness.workspace = true
 arkiv-bindings.workspace = true
-arkiv-reth-executor.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-signer-local.workspace = true
-alloy-network.workspace = true
-alloy-contract.workspace = true
 alloy-sol-types.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
-eyre.workspace = true
