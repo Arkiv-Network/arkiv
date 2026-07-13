@@ -18,8 +18,10 @@ use arkiv_harness::{
     derive_entity_key, result_keys,
 };
 
-/// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
-const READY: Duration = Duration::from_secs(90);
+/// Node-boot readiness: up to this many respawns, each given this long to answer
+/// RPC (debug reth under parallel node-boot load occasionally wedges on start).
+const READY_ATTEMPTS: usize = 3;
+const READY_PER_ATTEMPT: Duration = Duration::from_secs(45);
 
 /// Spawn an `arkiv-node --dev` and a signing client for `key`, ready to drive.
 async fn spawn_dev(
@@ -29,11 +31,15 @@ async fn spawn_dev(
     ArkivClient<impl Provider + Clone>,
     Address,
 ) {
-    let node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-node")).spawn();
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-node")).spawn();
     let signer: PrivateKeySigner = key.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
-    client.wait_ready(READY).await;
+    // Respawn on a stalled boot: many debug-reth nodes booting in parallel across
+    // the suite occasionally wedge one past a fixed timeout.
+    client
+        .wait_ready_resilient(&mut node, READY_ATTEMPTS, READY_PER_ATTEMPT)
+        .await;
     (node, client, caller)
 }
 

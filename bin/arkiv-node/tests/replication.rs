@@ -23,8 +23,10 @@ use arkiv_harness::{
     derive_entity_key, result_keys, sync_follower, write_jwt_secret,
 };
 
-/// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
-const READY: Duration = Duration::from_secs(90);
+/// Node-boot readiness: up to this many respawns, each given this long to answer
+/// RPC (debug reth under parallel node-boot load occasionally wedges on start).
+const READY_ATTEMPTS: usize = 3;
+const READY_PER_ATTEMPT: Duration = Duration::from_secs(45);
 /// How long to wait for the follower to replicate up to the target block.
 const REPLICATE: Duration = Duration::from_secs(60);
 
@@ -47,25 +49,29 @@ async fn follower_replicates_sequencer_state_and_index() {
     let jwt = write_jwt_secret(&jwt_path);
 
     // Sequencer: dev auto-seal. `admin` is enabled so we can read its enode.
-    let seq_node = NodeBuilder::new(bin)
+    let mut seq_node = NodeBuilder::new(bin)
         .jwt_secret(&jwt_path)
         .http_api("eth,net,web3,txpool,admin")
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let sequencer = connect(&seq_node.http_url(), signer);
-    sequencer.wait_ready(READY).await;
+    sequencer
+        .wait_ready_resilient(&mut seq_node, READY_ATTEMPTS, READY_PER_ATTEMPT)
+        .await;
     let enode = sequencer.enode().await;
 
     // Follower: same dev genesis, but NOT `--dev` — it only advances when driven.
     // It dials the sequencer directly since discovery is disabled.
-    let fol_node = NodeBuilder::new(bin)
+    let mut fol_node = NodeBuilder::new(bin)
         .dev(false)
         .jwt_secret(&jwt_path)
         .trusted_peer(enode)
         .spawn();
     let follower = connect_reader(&fol_node.http_url());
-    follower.wait_ready(READY).await;
+    follower
+        .wait_ready_resilient(&mut fol_node, READY_ATTEMPTS, READY_PER_ATTEMPT)
+        .await;
 
     // The CL driver over the follower's authenticated Engine API.
     let engine = EngineClient::new(&fol_node.authrpc_url(), &jwt);

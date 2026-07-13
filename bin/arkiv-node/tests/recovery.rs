@@ -17,6 +17,9 @@ use arkiv_harness::{
 };
 
 const READY: Duration = Duration::from_secs(90);
+/// Initial-boot readiness: respawn a stalled boot (parallel node-boot contention).
+const READY_ATTEMPTS: usize = 3;
+const READY_PER_ATTEMPT: Duration = Duration::from_secs(45);
 
 fn text_plain_mime() -> Mime128 {
     Mime128::encode("text/plain").expect("valid mime")
@@ -35,7 +38,9 @@ async fn state_and_index_survive_kill_and_restart() {
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
-    client.wait_ready(READY).await;
+    client
+        .wait_ready_resilient(&mut node, READY_ATTEMPTS, READY_PER_ATTEMPT)
+        .await;
 
     // Create two entities with attributes, so there is committed state and index.
     client
