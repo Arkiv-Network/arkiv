@@ -96,6 +96,155 @@ fn create_commits_the_entity_as_account_code() {
 }
 
 #[test]
+fn update_recommits_the_entity_as_new_code() {
+    let alice = [0xAA; 20];
+    let key = [5u8; 32];
+
+    let mut db = EmptyDB::default();
+    let mut store = store(&mut db);
+    let exec = ArkivExecutor::new();
+
+    // Create at block 10, then update the payload at block 11 — two commit cycles on
+    // the one store, the second reading the first's committed state.
+    let mut draft = BlockDraft::default();
+    exec.apply(
+        &env(alice, 10),
+        &mut store,
+        &mut draft,
+        &[Op::Create {
+            key,
+            expires_at: 100,
+            content_type: b"text/plain".to_vec(),
+            payload: b"v1".to_vec(),
+            attributes: Vec::new(),
+        }],
+    )
+    .unwrap();
+    store.apply_delta(&draft.entities).unwrap();
+
+    let mut draft = BlockDraft::default();
+    let out = exec
+        .apply(
+            &env(alice, 11),
+            &mut store,
+            &mut draft,
+            &[Op::Update {
+                key,
+                content_type: b"text/plain".to_vec(),
+                payload: b"v2".to_vec(),
+                attributes: Vec::new(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(out.status, ExecStatus::Ok);
+    store.apply_delta(&draft.entities).unwrap();
+
+    // The committed record is the updated one, with lifecycle fields preserved.
+    let got = store.get(key).unwrap().expect("entity present");
+    assert_eq!(got.payload, b"v2");
+    assert_eq!(got.created_at_block, 10, "create block preserved");
+    assert_eq!(
+        got.last_modified_at_block, 11,
+        "update advances lastModified"
+    );
+    let diff = store.into_backend().into_inner().into_state();
+    let code = diff
+        .get(&entity_address(key))
+        .and_then(|a| a.info.code.as_ref())
+        .expect("entity code")
+        .original_bytes();
+    assert_eq!(decode(&code).unwrap(), got, "code is the updated record");
+}
+
+#[test]
+fn transfer_recommits_with_the_new_owner() {
+    let alice = [0xAA; 20];
+    let bob = [0xBB; 20];
+    let key = [6u8; 32];
+
+    let mut db = EmptyDB::default();
+    let mut store = store(&mut db);
+    let exec = ArkivExecutor::new();
+
+    let mut draft = BlockDraft::default();
+    exec.apply(
+        &env(alice, 10),
+        &mut store,
+        &mut draft,
+        &[Op::Create {
+            key,
+            expires_at: 100,
+            content_type: b"x".to_vec(),
+            payload: b"y".to_vec(),
+            attributes: Vec::new(),
+        }],
+    )
+    .unwrap();
+    store.apply_delta(&draft.entities).unwrap();
+
+    let mut draft = BlockDraft::default();
+    exec.apply(
+        &env(alice, 11),
+        &mut store,
+        &mut draft,
+        &[Op::Transfer {
+            key,
+            new_owner: bob,
+        }],
+    )
+    .unwrap();
+    store.apply_delta(&draft.entities).unwrap();
+
+    let got = store.get(key).unwrap().expect("entity present");
+    assert_eq!(got.owner, bob, "owner changed");
+    assert_eq!(got.creator, alice, "creator is immutable");
+}
+
+#[test]
+fn extend_recommits_with_a_higher_expiry() {
+    let alice = [0xAA; 20];
+    let key = [7u8; 32];
+
+    let mut db = EmptyDB::default();
+    let mut store = store(&mut db);
+    let exec = ArkivExecutor::new();
+
+    let mut draft = BlockDraft::default();
+    exec.apply(
+        &env(alice, 10),
+        &mut store,
+        &mut draft,
+        &[Op::Create {
+            key,
+            expires_at: 100,
+            content_type: b"x".to_vec(),
+            payload: b"y".to_vec(),
+            attributes: Vec::new(),
+        }],
+    )
+    .unwrap();
+    store.apply_delta(&draft.entities).unwrap();
+    let before = store.get(key).unwrap().unwrap().expires_at;
+
+    let mut draft = BlockDraft::default();
+    exec.apply(
+        &env(alice, 11),
+        &mut store,
+        &mut draft,
+        &[Op::ExtendExpiry {
+            key,
+            new_expires_at: 500,
+        }],
+    )
+    .unwrap();
+    store.apply_delta(&draft.entities).unwrap();
+
+    let after = store.get(key).unwrap().unwrap().expires_at;
+    assert!(after > before, "extend raises expiry: {before} -> {after}");
+    assert_eq!(after, 500);
+}
+
+#[test]
 fn create_then_delete_commits_a_tombstone() {
     let alice = [0xAA; 20];
     let key = [3u8; 32];
