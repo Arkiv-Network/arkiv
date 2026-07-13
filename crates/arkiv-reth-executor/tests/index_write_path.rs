@@ -316,3 +316,102 @@ fn delete_removes_the_entity_from_queries() {
         .is_empty()
     );
 }
+
+/// An update swaps the entity's old attribute value for the new one in the index:
+/// the executor's before→after diff removes the old bucket entry and inserts the
+/// new, so the old value stops matching and the new one starts.
+#[test]
+fn update_reindexes_attributes() {
+    let exec = ArkivExecutor::<MemEntities>::new();
+    let mut entities = MemEntities::default();
+    let mut index = RethAuxStore::new(MemIndex::default());
+    let alice = [0xAA; 20];
+    let key: EntityKey = [1u8; 32];
+
+    run(
+        &exec,
+        &mut entities,
+        &mut index,
+        alice,
+        10,
+        &[Op::Create {
+            key,
+            expires_at: 500,
+            content_type: b"text/plain".to_vec(),
+            payload: b"y".to_vec(),
+            attributes: vec![Attribute {
+                key: b"rank".to_vec(),
+                value_type: ATTR_UINT,
+                value: uint(10),
+            }],
+        }],
+    );
+    run(
+        &exec,
+        &mut entities,
+        &mut index,
+        alice,
+        11,
+        &[Op::Update {
+            key,
+            content_type: b"text/plain".to_vec(),
+            payload: b"y".to_vec(),
+            attributes: vec![Attribute {
+                key: b"rank".to_vec(),
+                value_type: ATTR_UINT,
+                value: uint(20),
+            }],
+        }],
+    );
+
+    let rank_eq = |n: u64| Query::Eq {
+        key: AnnotKey::User("rank".into()),
+        value: AnnotVal::Uint(word(n)),
+    };
+    assert!(
+        keys(&mut index, &rank_eq(10)).is_empty(),
+        "old rank de-indexed"
+    );
+    assert_eq!(
+        keys(&mut index, &rank_eq(20)),
+        vec![key],
+        "new rank indexed"
+    );
+}
+
+/// The built-in `$expiration` field is range-indexed: entities are findable by a
+/// numeric bound on their expiry block, exactly like a user uint attribute.
+#[test]
+fn expiration_is_range_queryable() {
+    let exec = ArkivExecutor::<MemEntities>::new();
+    let mut entities = MemEntities::default();
+    let mut index = RethAuxStore::new(MemIndex::default());
+    let alice = [0xAA; 20];
+
+    let mut make = |key_byte: u8, expires_at: u64| {
+        run(
+            &exec,
+            &mut entities,
+            &mut index,
+            alice,
+            10,
+            &[Op::Create {
+                key: [key_byte; 32],
+                expires_at,
+                content_type: b"x".to_vec(),
+                payload: b"y".to_vec(),
+                attributes: Vec::new(),
+            }],
+        );
+    };
+    make(1, 50);
+    make(2, 100);
+    make(3, 150);
+
+    // $expiration >= 100 matches the two later-expiring entities, not the first.
+    let by_expiry = Query::Gte {
+        key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+        value: AnnotVal::Uint(word(100)),
+    };
+    assert_eq!(keys(&mut index, &by_expiry), vec![[2u8; 32], [3u8; 32]]);
+}

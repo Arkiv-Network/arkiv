@@ -15,11 +15,14 @@ use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
-use arkiv_bindings::{Attribute, IEntityRegistry, Ident32, Mime128, Operation};
+use alloy_sol_types::SolEvent;
+use arkiv_bindings::{Attribute, IEntityRegistry, Ident32, Mime128, OP_CREATE, Operation};
 use arkiv_reth_executor::{ARKIV_ADDRESS, derive_entity_key};
 
-/// Test-mnemonic account #0 — the account reth's `--dev` mode pre-funds.
+/// Test-mnemonic account #0 — one of the accounts reth's `--dev` mode pre-funds.
 const DEV_PRIVATE_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+/// Test-mnemonic account #1 — also pre-funded by `--dev`; used as a non-owner.
+const DEV_PRIVATE_KEY_1: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 /// reth `--dev` chain id.
 const CHAIN_ID: u64 = 1337;
 
@@ -139,6 +142,24 @@ async fn create_then_get_entity_over_a_live_node() {
     // 2) The key the node minted for this caller's first create (minting nonce 0),
     //    derived independently — the test never learns it from the node.
     let key = B256::from(derive_entity_key(CHAIN_ID, &caller.into_array(), 0));
+
+    // 2a) The create emits exactly one EntityOperation log at ARKIV_ADDRESS,
+    //     carrying the minted key/owner/type — the event surface the committer and
+    //     off-chain indexers consume.
+    let events: Vec<_> = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.inner.address == ARKIV_ADDRESS)
+        .map(|log| {
+            IEntityRegistry::EntityOperation::decode_log(&log.inner)
+                .expect("decode EntityOperation log")
+        })
+        .collect();
+    assert_eq!(events.len(), 1, "one EntityOperation log for one create");
+    assert_eq!(events[0].entityKey, key);
+    assert_eq!(events[0].operationType, OP_CREATE);
+    assert_eq!(events[0].owner, caller);
 
     // 3) Read it back over arkiv_getEntity and check the projection.
     let entity: serde_json::Value = provider
@@ -343,6 +364,59 @@ async fn query_operator_classes_over_a_live_node() {
     }
     assert_eq!(seen, expect(&[0, 1, 2, 3, 4]), "pages must partition $all");
     assert_eq!(pages, 3, "5 entities at 2/page is 3 pages");
+
+    // Built-in fields beyond $owner — all five share creator, content type, and
+    // create block (one batch).
+    assert_eq!(
+        result_keys(&arkiv_query(&provider, &format!("$creator = {caller:#x}"), 100, None).await),
+        expect(&[0, 1, 2, 3, 4]),
+    );
+    assert_eq!(
+        result_keys(&arkiv_query(&provider, "$contentType = \"text/plain\"", 100, None).await),
+        expect(&[0, 1, 2, 3, 4]),
+    );
+    assert_eq!(
+        result_keys(&arkiv_query(&provider, "$createdAtBlock >= 1", 100, None).await),
+        expect(&[0, 1, 2, 3, 4]),
+    );
+
+    // Negation operators.
+    assert_eq!(
+        result_keys(&arkiv_query(&provider, "rank NOT IN (10 50)", 100, None).await),
+        expect(&[1, 2, 3]),
+    );
+    assert_eq!(
+        result_keys(&arkiv_query(&provider, "team !~ \"re*\"", 100, None).await),
+        expect(&[2, 3, 4]),
+    );
+    assert_eq!(
+        result_keys(&arkiv_query(&provider, "NOT (rank = 30)", 100, None).await),
+        expect(&[0, 1, 3, 4]),
+    );
+
+    // Error contract: a malformed query, a zero page size, and an out-of-range
+    // block are client errors — not silently-empty results.
+    let malformed: Result<serde_json::Value, _> = provider
+        .raw_request(
+            "arkiv_query".into(),
+            (serde_json::json!({ "query": "rank = = 30" }),),
+        )
+        .await;
+    assert!(malformed.is_err(), "malformed query must error");
+    let zero_page: Result<serde_json::Value, _> = provider
+        .raw_request(
+            "arkiv_query".into(),
+            (serde_json::json!({ "query": "*", "pageSize": 0 }),),
+        )
+        .await;
+    assert!(zero_page.is_err(), "pageSize 0 must error");
+    let future_block: Result<serde_json::Value, _> = provider
+        .raw_request(
+            "arkiv_query".into(),
+            (serde_json::json!({ "query": "*", "block": 99_999_999u64 }),),
+        )
+        .await;
+    assert!(future_block.is_err(), "a future block must error");
 }
 
 /// Submit `ops` in one `execute` transaction and assert it lands successfully.
@@ -617,4 +691,182 @@ async fn block_timing<P: Provider>(provider: &P) -> serde_json::Value {
         .raw_request("arkiv_getBlockTiming".into(), ())
         .await
         .expect("arkiv_getBlockTiming")
+}
+
+/// Submit `ops` and return whether the transaction succeeded (`true`) or reverted
+/// (`false`) — for ops expected to revert. Gas is set explicitly so the client
+/// skips `eth_estimateGas` (which would fail up-front on a reverting tx) and the
+/// revert surfaces as a status-0 receipt instead.
+async fn try_execute<P: Provider>(provider: &P, ops: Vec<Operation>) -> bool {
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, provider);
+    registry
+        .execute(ops)
+        .gas(8_000_000)
+        .gas_price(1_000_000_000)
+        .send()
+        .await
+        .expect("send ops")
+        .get_receipt()
+        .await
+        .expect("get receipt")
+        .status()
+}
+
+/// Block until the chain reaches `target` block number (or panic after 30s).
+async fn wait_for_block<P: Provider>(provider: &P, target: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = provider.get_block_number().await.expect("block number");
+        if current >= target {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "block {target} not reached in 30s (at {current})",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Ownership is enforced and batches are atomic: a non-owner's writes revert
+/// leaving state untouched, and a batch with one failing op rolls back wholesale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
+    let node = DevNode::spawn();
+
+    let owner_signer: PrivateKeySigner = DEV_PRIVATE_KEY.parse().unwrap();
+    let owner = owner_signer.address();
+    let owner_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(owner_signer))
+        .connect_http(node.http_url().parse().unwrap());
+    wait_for_rpc(&owner_provider).await;
+
+    let stranger_signer: PrivateKeySigner = DEV_PRIVATE_KEY_1.parse().unwrap();
+    let stranger_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(stranger_signer))
+        .connect_http(node.http_url().parse().unwrap());
+
+    // The owner creates one entity.
+    execute(
+        &owner_provider,
+        vec![Operation::create(
+            1000,
+            Bytes::from_static(b"v1"),
+            text_plain_mime(),
+            vec![],
+        )],
+    )
+    .await;
+    let key = B256::from(derive_entity_key(CHAIN_ID, &owner.into_array(), 0));
+    assert_eq!(get_entity(&owner_provider, key).await["payload"], "0x7631"); // "v1"
+
+    // The stranger cannot update or delete the owner's entity — both revert, and the
+    // entity is untouched.
+    assert!(
+        !try_execute(
+            &stranger_provider,
+            vec![Operation::update(
+                key,
+                Bytes::from_static(b"hacked"),
+                text_plain_mime(),
+                vec![]
+            )],
+        )
+        .await,
+        "non-owner update must revert",
+    );
+    assert!(
+        !try_execute(&stranger_provider, vec![Operation::delete(key)]).await,
+        "non-owner delete must revert",
+    );
+    assert_eq!(
+        get_entity(&owner_provider, key).await["payload"],
+        "0x7631",
+        "entity unchanged after failed writes",
+    );
+
+    // Batch atomicity: a batch whose second op reverts (delete of a nonexistent
+    // key) rolls back the whole tx — the create in the same batch does not persist.
+    let phantom = B256::repeat_byte(0xCD);
+    assert!(
+        !try_execute(
+            &owner_provider,
+            vec![
+                Operation::create(
+                    1000,
+                    Bytes::from_static(b"batch"),
+                    text_plain_mime(),
+                    vec![]
+                ),
+                Operation::delete(phantom),
+            ],
+        )
+        .await,
+        "a batch with a failing op must revert wholesale",
+    );
+    let would_be = B256::from(derive_entity_key(CHAIN_ID, &owner.into_array(), 1));
+    assert!(
+        get_entity(&owner_provider, would_be).await.is_null(),
+        "the reverted batch minted no entity",
+    );
+    assert_eq!(
+        entity_count(&owner_provider, None, None).await,
+        1,
+        "count unchanged by the reverted batch",
+    );
+}
+
+/// The explicit `expire` op: rejected while the entity is live, accepted once the
+/// chain passes its expiry block, after which the entity is gone from reads,
+/// queries, and the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_expire_over_a_live_node() {
+    let node = DevNode::spawn();
+
+    let signer: PrivateKeySigner = DEV_PRIVATE_KEY.parse().unwrap();
+    let caller = signer.address();
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_http(node.http_url().parse().unwrap());
+    wait_for_rpc(&provider).await;
+
+    // Create with a short TTL so the expiry block arrives quickly (250ms blocks).
+    execute(
+        &provider,
+        vec![Operation::create(
+            10,
+            Bytes::from_static(b"ttl"),
+            text_plain_mime(),
+            vec![],
+        )],
+    )
+    .await;
+    let key = B256::from(derive_entity_key(CHAIN_ID, &caller.into_array(), 0));
+    let expires_at = get_entity(&provider, key).await["expiresAt"]
+        .as_u64()
+        .unwrap();
+
+    // While live, `expire` reverts.
+    assert!(
+        !try_execute(&provider, vec![Operation::expire(key)]).await,
+        "a live entity cannot be expired",
+    );
+    assert!(!get_entity(&provider, key).await.is_null(), "still live");
+
+    // Once the chain passes the expiry block, `expire` succeeds and the entity is
+    // gone everywhere.
+    wait_for_block(&provider, expires_at + 1).await;
+    assert!(
+        try_execute(&provider, vec![Operation::expire(key)]).await,
+        "expire past the TTL succeeds",
+    );
+    assert!(
+        get_entity(&provider, key).await.is_null(),
+        "expired entity reads null",
+    );
+    assert!(
+        !result_keys(&arkiv_query(&provider, "*", 100, None).await).contains(&format!("{key:#x}")),
+        "expired entity leaves queries",
+    );
+    assert_eq!(entity_count(&provider, None, None).await, 0);
 }
