@@ -91,6 +91,43 @@ impl<P: Provider> ArkivClient<P> {
             .expect("block number")
     }
 
+    /// The hash of the current tip block — the head a CL driver points a follower at.
+    pub async fn tip_hash(&self) -> B256 {
+        self.block_hash("latest").await
+    }
+
+    /// The hash of block `number` (for asserting two chains agree at a fixed height).
+    pub async fn block_hash_at(&self, number: u64) -> B256 {
+        self.block_hash(&format!("0x{number:x}")).await
+    }
+
+    async fn block_hash(&self, block: &str) -> B256 {
+        let response: serde_json::Value = self
+            .provider
+            .raw_request("eth_getBlockByNumber".into(), (block, false))
+            .await
+            .expect("eth_getBlockByNumber");
+        response["hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no block {block}"))
+            .parse()
+            .expect("block hash")
+    }
+
+    /// This node's enode URL (from `admin_nodeInfo`) — needs the `admin` RPC
+    /// module. A follower dials it as a `--trusted-peers` entry.
+    pub async fn enode(&self) -> String {
+        let response: serde_json::Value = self
+            .provider
+            .raw_request("admin_nodeInfo".into(), ())
+            .await
+            .expect("admin_nodeInfo (is the `admin` module enabled?)");
+        response["enode"]
+            .as_str()
+            .expect("enode string")
+            .to_string()
+    }
+
     /// Block until the chain reaches `target`, or panic after `timeout`.
     pub async fn wait_for_block(&self, target: u64, timeout: Duration) {
         let deadline = Instant::now() + timeout;

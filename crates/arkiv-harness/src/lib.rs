@@ -1,9 +1,11 @@
 //! The Arkiv black-box test harness.
 //!
-//! Two layers the tests build on:
+//! Three layers the tests build on:
 //! - [`Node`] / [`NodeBuilder`] — spawn, kill, and restart the real `arkiv-node`
 //!   binary (kill-then-restart on the same datadir proves crash recovery).
 //! - [`ArkivClient`] — a typed `arkiv_*` + `eth_*` RPC client to drive a node.
+//! - [`EngineClient`] / [`sync_follower`] — a minimal CL driver over the Engine
+//!   API that makes a follower replicate a sequencer (proves T2 replication).
 //!
 //! Protocol constants a client needs ([`ARKIV_ADDRESS`], [`derive_entity_key`])
 //! and the `--dev` test identities are re-exported here so a test imports from one
@@ -13,9 +15,11 @@
 use std::path::PathBuf;
 
 mod client;
+mod engine;
 mod node;
 
 pub use client::{ArkivClient, connect, connect_reader, result_keys};
+pub use engine::{EngineClient, sync_follower, write_jwt_secret};
 pub use node::{Node, NodeBuilder};
 
 // Protocol re-exports: build calldata and predict minted keys from one import.
