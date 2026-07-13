@@ -17,9 +17,14 @@ reth-storage-api.workspace = true
 arkiv-reth-executor.workspace = true
 # The entity store + spec types the arkiv_getEntity read path reads through.
 arkiv-reth-entitystore.workspace = true
+# The query index (arkiv_query evaluates against it) + the query-language parser.
+arkiv-reth-auxstore.workspace = true
+arkiv-query.workspace = true
 arkiv-interfaces.workspace = true
 jsonrpsee.workspace = true
 alloy-primitives.workspace = true
+# The `BlockHeader` trait (timestamp/number) for arkiv_getBlockTiming.
+alloy-consensus.workspace = true
 serde.workspace = true
 tokio.workspace = true
 eyre.workspace = true

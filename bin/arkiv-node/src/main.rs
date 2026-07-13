@@ -7,7 +7,8 @@
 //!    the no-EVM entity state transition (a call to `ARKIV_ADDRESS` creates,
 //!    updates, transfers, and expires entities).
 //! 2. **The `arkiv_*` RPC** — the read surface the SDK depends on, injected via
-//!    `extend_rpc_modules` (see [`rpc`]). Today: `arkiv_getEntity`.
+//!    `extend_rpc_modules` (see [`rpc`]): `arkiv_getEntity`, `arkiv_query`,
+//!    `arkiv_getEntityCount`, `arkiv_getBlockTiming`.
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
