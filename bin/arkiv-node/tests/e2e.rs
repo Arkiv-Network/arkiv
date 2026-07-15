@@ -103,6 +103,156 @@ async fn create_then_get_entity_over_a_live_node() {
     assert!(missing.is_null(), "a nonexistent key should read null");
 }
 
+/// The `nonces(address)` view over `eth_call` — the exact call SDKs make
+/// before a create to predict the keys the batch will mint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nonces_view_tracks_creates_over_a_live_node() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+
+    // Fresh accounts have minting nonce 0, whoever asks.
+    assert_eq!(registry.nonces(caller).call().await.unwrap(), 0);
+    let stranger = Address::repeat_byte(0xCD);
+    assert_eq!(registry.nonces(stranger).call().await.unwrap(), 0);
+
+    // Two creates in one batch advance the caller's minting nonce by two.
+    let op = || Operation::create(100, Bytes::from_static(b"n"), text_plain_mime(), vec![]);
+    client.execute(vec![op(), op()]).await;
+    assert_eq!(registry.nonces(caller).call().await.unwrap(), 2);
+    assert_eq!(registry.nonces(stranger).call().await.unwrap(), 0);
+}
+
+/// Business-rule failures surface as ABI-encoded `IEntityRegistry` errors in
+/// the revert data — decodable by the SDK — not as plain strings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_revert_errors_over_a_live_node() {
+    use alloy_sol_types::{SolCall, SolError};
+
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+
+    // Revert data of an eth_call to ARKIV_ADDRESS, from the JSON-RPC error's
+    // `data` field.
+    let revert_of = |ops: Vec<Operation>, from: Address| {
+        let client = &client;
+        async move {
+            let calldata = IEntityRegistry::executeCall { ops }.abi_encode();
+            let err = client
+                .provider()
+                .raw_request::<_, Bytes>(
+                    "eth_call".into(),
+                    (
+                        serde_json::json!({
+                            "from": from,
+                            "to": ARKIV_ADDRESS,
+                            "data": format!("0x{}", alloy_primitives::hex::encode(&calldata)),
+                        }),
+                        "latest",
+                    ),
+                )
+                .await
+                .expect_err("call must revert");
+            err.to_string()
+        }
+    };
+
+    // Update on a key that was never created → EntityNotFound(key).
+    let ghost = B256::repeat_byte(0x42);
+    let update = Operation::update(ghost, Bytes::from_static(b"x"), text_plain_mime(), vec![]);
+    let err = revert_of(vec![update], caller).await;
+    assert!(
+        err.contains(&alloy_primitives::hex::encode(
+            IEntityRegistry::EntityNotFound::SELECTOR
+        )),
+        "expected EntityNotFound revert data, got: {err}"
+    );
+
+    // A stranger updating a real entity → NotOwner(key, caller, owner).
+    let op = Operation::create(100, Bytes::from_static(b"v1"), text_plain_mime(), vec![]);
+    client.execute(vec![op]).await;
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let stranger = Address::repeat_byte(0xCD);
+    let update = Operation::update(key, Bytes::from_static(b"v2"), text_plain_mime(), vec![]);
+    let err = revert_of(vec![update], stranger).await;
+    assert!(
+        err.contains(&alloy_primitives::hex::encode(
+            IEntityRegistry::NotOwner::SELECTOR
+        )),
+        "expected NotOwner revert data, got: {err}"
+    );
+
+    // An empty batch → EmptyBatch().
+    let err = revert_of(vec![], caller).await;
+    assert!(
+        err.contains(&alloy_primitives::hex::encode(
+            IEntityRegistry::EmptyBatch::SELECTOR
+        )),
+        "expected EmptyBatch revert data, got: {err}"
+    );
+
+    // An invalid attribute name (uppercase bytes, as an SDK sends for
+    // "testInvalidKey") → Ident32InvalidByte(position, value).
+    let mut name = [0u8; 32];
+    name[..14].copy_from_slice(b"testInvalidKey");
+    let bad_attr = Attribute {
+        name: alloy_primitives::FixedBytes::from(name).into(),
+        valueType: 2, // ATTR_STRING
+        value: [alloy_primitives::FixedBytes::ZERO; 4],
+    };
+    let create = Operation::create(
+        100,
+        Bytes::from_static(b"x"),
+        text_plain_mime(),
+        vec![bad_attr],
+    );
+    let err = revert_of(vec![create], caller).await;
+    assert!(
+        err.contains(&alloy_primitives::hex::encode(
+            IEntityRegistry::Ident32InvalidByte::SELECTOR
+        )),
+        "expected Ident32InvalidByte revert data, got: {err}"
+    );
+}
+
+/// The SDK's gas flow: eth_estimateGas, then send with exactly that limit. The
+/// estimate must clear the tx-pool's intrinsic floor even for ops the cost
+/// model prices below it (update's 40k base vs create's 80k — the case that
+/// used to be rejected as IntrinsicGasTooLow).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn estimated_gas_is_accepted_by_the_pool() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+
+    // Payload large enough that the EIP-7623 floor (≈40 gas/nonzero byte)
+    // overtakes the cost model's 16/byte for an update.
+    let payload = Bytes::from(vec![0xABu8; 2_000]);
+
+    // Create, estimate-then-send — no explicit gas: alloy fills it from
+    // eth_estimateGas, exactly like the SDK.
+    let create = Operation::create(1000, payload.clone(), text_plain_mime(), vec![]);
+    let receipt = registry
+        .execute(vec![create])
+        .send()
+        .await
+        .expect("create with estimated gas accepted")
+        .get_receipt()
+        .await
+        .expect("create receipt");
+    assert!(receipt.status(), "create must succeed");
+
+    // Update the same entity — the op that used to estimate below the floor.
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let update = Operation::update(key, payload, text_plain_mime(), vec![]);
+    let receipt = registry
+        .execute(vec![update])
+        .send()
+        .await
+        .expect("update with estimated gas accepted by the pool")
+        .get_receipt()
+        .await
+        .expect("update receipt");
+    assert!(receipt.status(), "update must succeed");
+}
+
 /// Every query-operator class — eq, IN, ranges, glob, boolean, negation, built-in
 /// fields, `$all`, pagination — plus the RPC error contract, against a live node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -187,19 +337,20 @@ async fn query_operator_classes_over_a_live_node() {
         expect(&[0, 1, 2, 3, 4])
     );
 
-    // Pagination: two per page partitions $all over three pages.
+    // Pagination: two per page partitions $all over three pages. The cursor is
+    // an opaque hex string echoed back verbatim.
     let mut seen = BTreeSet::new();
-    let mut cursor = None;
+    let mut cursor: Option<String> = None;
     let mut pages = 0;
     loop {
-        let page = client.query("*", 2, cursor).await;
+        let page = client.query("*", 2, cursor.as_deref()).await;
         let keys = result_keys(&page);
-        assert!(keys.len() <= 2, "page larger than pageSize");
+        assert!(keys.len() <= 2, "page larger than resultsPerPage");
         seen.extend(keys);
         pages += 1;
         assert!(pages <= 5, "pagination did not terminate");
-        match page["nextCursor"].as_u64() {
-            Some(next) => cursor = Some(next),
+        match page["cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
             None => break,
         }
     }
@@ -242,27 +393,74 @@ async fn query_operator_classes_over_a_live_node() {
         expect(&[0, 1, 3, 4])
     );
 
-    // Error contract: malformed query, zero page size, out-of-range block.
+    // Error contract: malformed query, out-of-range block, bad atBlock tag.
     assert!(
         client
-            .query_raw(serde_json::json!({ "query": "rank = = 30" }))
+            .query_raw("rank = = 30", serde_json::json!({}))
             .await
             .is_err(),
         "malformed query must error",
     );
     assert!(
         client
-            .query_raw(serde_json::json!({ "query": "*", "pageSize": 0 }))
-            .await
-            .is_err(),
-        "pageSize 0 must error",
-    );
-    assert!(
-        client
-            .query_raw(serde_json::json!({ "query": "*", "block": 99_999_999u64 }))
+            .query_raw("*", serde_json::json!({ "atBlock": "0x5f5e0ff" }))
             .await
             .is_err(),
         "a future block must error",
+    );
+    assert!(
+        client
+            .query_raw("*", serde_json::json!({ "atBlock": "pending" }))
+            .await
+            .is_err(),
+        "non-latest tags must error",
+    );
+
+    // resultsPerPage 0 clamps to 1 rather than erroring (branch/SDK semantics).
+    let clamped = client
+        .query_raw("*", serde_json::json!({ "resultsPerPage": 0 }))
+        .await
+        .expect("resultsPerPage 0 clamps");
+    assert_eq!(result_keys(&clamped).len(), 1);
+
+    // SDK wire shapes: a bare query string with no options object (the exact
+    // form viem sends for key lookups), hex resultsPerPage, and includeData
+    // projection.
+    let bare: serde_json::Value = client
+        .provider()
+        .raw_request("arkiv_query".into(), (format!("$key = {}", k[0]),))
+        .await
+        .expect("bare-string arkiv_query");
+    assert_eq!(result_keys(&bare), expect(&[0]));
+    assert!(
+        bare["blockNumber"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("0x")),
+        "blockNumber is a hex string"
+    );
+
+    let hex_page = client
+        .query_raw("*", serde_json::json!({ "resultsPerPage": "0x2" }))
+        .await
+        .expect("hex resultsPerPage");
+    assert_eq!(result_keys(&hex_page).len(), 2);
+
+    let projected = client
+        .query_raw(
+            &format!("$key = {}", k[0]),
+            serde_json::json!({ "includeData": { "key": true } }),
+        )
+        .await
+        .expect("includeData projection");
+    let entity = &projected["data"][0];
+    assert!(entity["key"].as_str().is_some(), "key requested → present");
+    assert!(
+        entity.get("value").is_none(),
+        "value not requested → absent"
+    );
+    assert!(
+        entity.get("owner").is_none(),
+        "owner not requested → absent"
     );
 }
 

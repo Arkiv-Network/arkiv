@@ -25,6 +25,8 @@ jsonrpsee.workspace = true
 alloy-primitives.workspace = true
 # The `BlockHeader` trait (timestamp/number) for arkiv_getBlockTiming.
 alloy-consensus.workspace = true
+# `BlockNumberOrTag` for the `atBlock` query option.
+alloy-eips.workspace = true
 serde.workspace = true
 tokio.workspace = true
 eyre.workspace = true

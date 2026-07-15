@@ -22,8 +22,9 @@ use core::fmt;
 use alloy_primitives::{Address, FixedBytes, U256, keccak256};
 use alloy_sol_types::SolCall;
 use arkiv_bindings::{
-    ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT, Attribute as AbiAttribute, IEntityRegistry, Mime128,
-    OP_CREATE, OP_DELETE, OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE,
+    ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT, Attribute as AbiAttribute, IEntityRegistry,
+    MAX_ATTRIBUTES, Mime128, OP_CREATE, OP_DELETE, OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE,
+    types::{Ident32ByteError, validate_ident32_bytes},
 };
 use arkiv_interfaces::entity::Attribute;
 use arkiv_interfaces::execution::{ExecEnv, Op};
@@ -89,7 +90,7 @@ pub fn decode_ops(
             }
             OP_TRANSFER => {
                 if op.newOwner == Address::ZERO {
-                    return Err(DecodeError::TransferToZeroAddress);
+                    return Err(DecodeError::TransferToZeroAddress { key });
                 }
                 Op::Transfer {
                     key,
@@ -118,7 +119,30 @@ pub fn derive_entity_key(chain_id: u64, owner: &[u8; 20], nonce: u32) -> EntityK
 }
 
 /// Convert ABI attributes to entity attributes, decoding each value by its type.
+///
+/// Structural rules from the contract: at most [`MAX_ATTRIBUTES`], names are
+/// valid `Ident32`s, and strictly ascending by name (which also enforces name
+/// uniqueness).
 fn convert_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeError> {
+    if attrs.len() > MAX_ATTRIBUTES {
+        return Err(DecodeError::TooManyAttributes {
+            count: attrs.len(),
+            max: MAX_ATTRIBUTES,
+        });
+    }
+    for a in attrs {
+        if let Err(e) = validate_ident32_bytes(&a.name.0) {
+            return Err(match e {
+                Ident32ByteError::Empty => DecodeError::AttributeNameEmpty,
+                Ident32ByteError::InvalidByte { position, value } => {
+                    DecodeError::AttributeNameInvalidByte { position, value }
+                }
+            });
+        }
+    }
+    if attrs.windows(2).any(|w| w[0].name.0 >= w[1].name.0) {
+        return Err(DecodeError::AttributesNotSorted);
+    }
     attrs
         .iter()
         .map(|a| {
@@ -132,7 +156,12 @@ fn convert_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeEr
                 // A string spans up to all four words; trailing zero padding is not
                 // part of the value.
                 ATTR_STRING => pack_words(&a.value),
-                other => return Err(DecodeError::UnknownAttributeType(other)),
+                other => {
+                    return Err(DecodeError::UnknownAttributeType {
+                        name: a.name.0,
+                        value_type: other,
+                    });
+                }
             };
             Ok(Attribute {
                 key: strip_trailing_zeros(a.name.0.to_vec()),
@@ -193,11 +222,19 @@ pub enum DecodeError {
     /// A `Create` or `Extend` gave a zero blocks-to-live.
     ZeroBtl,
     /// A `Transfer` named the zero address as the new owner.
-    TransferToZeroAddress,
+    TransferToZeroAddress { key: EntityKey },
     /// A single-word attribute value carried data past its first word.
     AttributeValueMalformed { value_type: u8, word_index: usize },
     /// An attribute's value type isn't one of the known tags.
-    UnknownAttributeType(u8),
+    UnknownAttributeType { name: [u8; 32], value_type: u8 },
+    /// An op carried more attributes than the protocol allows.
+    TooManyAttributes { count: usize, max: usize },
+    /// Attributes aren't strictly ascending by name (also enforces uniqueness).
+    AttributesNotSorted,
+    /// An attribute name starts with a null byte — an empty identifier.
+    AttributeNameEmpty,
+    /// An attribute name byte is outside the `Ident32` charset for its position.
+    AttributeNameInvalidByte { position: usize, value: u8 },
 }
 
 impl fmt::Display for DecodeError {
@@ -209,7 +246,7 @@ impl fmt::Display for DecodeError {
             DecodeError::EmptyBatch => write!(f, "execute called with an empty batch"),
             DecodeError::InvalidOpType(t) => write!(f, "invalid operation type {t}"),
             DecodeError::ZeroBtl => write!(f, "operation gave a zero blocks-to-live"),
-            DecodeError::TransferToZeroAddress => write!(f, "transfer to the zero address"),
+            DecodeError::TransferToZeroAddress { .. } => write!(f, "transfer to the zero address"),
             DecodeError::AttributeValueMalformed {
                 value_type,
                 word_index,
@@ -217,7 +254,20 @@ impl fmt::Display for DecodeError {
                 f,
                 "attribute value (type {value_type}) has data past word 0 (word {word_index})"
             ),
-            DecodeError::UnknownAttributeType(t) => write!(f, "unknown attribute value type {t}"),
+            DecodeError::UnknownAttributeType { value_type, .. } => {
+                write!(f, "unknown attribute value type {value_type}")
+            }
+            DecodeError::TooManyAttributes { count, max } => {
+                write!(f, "too many attributes ({count} > {max})")
+            }
+            DecodeError::AttributesNotSorted => {
+                write!(f, "attributes not sorted ascending by name")
+            }
+            DecodeError::AttributeNameEmpty => write!(f, "attribute name is empty"),
+            DecodeError::AttributeNameInvalidByte { position, value } => write!(
+                f,
+                "attribute name has invalid byte 0x{value:02x} at position {position}"
+            ),
         }
     }
 }
@@ -349,6 +399,52 @@ mod tests {
         ));
     }
 
+    /// Attribute names must be valid `Ident32`s — an uppercase byte (as an SDK
+    /// sends for `"testInvalidKey"`) reports its exact position and value.
+    #[test]
+    fn rejects_invalid_attribute_name() {
+        let mut name = [0u8; 32];
+        name[..14].copy_from_slice(b"testInvalidKey");
+        let attr = AbiAttribute {
+            name: FixedBytes::from(name).into(),
+            valueType: ATTR_STRING,
+            value: [FixedBytes::ZERO; 4],
+        };
+        let cd = calldata(vec![Operation::create(
+            10,
+            Bytes::new(),
+            empty_mime(),
+            vec![attr],
+        )]);
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            // "testInvalidKey": the first bad byte is 'I' (0x49) at position 4.
+            Err(DecodeError::AttributeNameInvalidByte {
+                position: 4,
+                value: 0x49,
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_attribute_name() {
+        let attr = AbiAttribute {
+            name: FixedBytes::from([0u8; 32]).into(),
+            valueType: ATTR_STRING,
+            value: [FixedBytes::ZERO; 4],
+        };
+        let cd = calldata(vec![Operation::create(
+            10,
+            Bytes::new(),
+            empty_mime(),
+            vec![attr],
+        )]);
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            Err(DecodeError::AttributeNameEmpty)
+        ));
+    }
+
     #[test]
     fn rejects_transfer_to_zero() {
         let cd = calldata(vec![Operation::transfer(
@@ -357,7 +453,7 @@ mod tests {
         )]);
         assert!(matches!(
             decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
-            Err(DecodeError::TransferToZeroAddress)
+            Err(DecodeError::TransferToZeroAddress { .. })
         ));
     }
 

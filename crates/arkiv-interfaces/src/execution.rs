@@ -1,7 +1,7 @@
 //! Running transactions and blocks.
 
-use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
 use crate::entity::Attribute;
 use crate::primitives::{Address, BlockNumber, EntityKey, Gas, Hash};
@@ -38,7 +38,102 @@ pub struct ExecOutput {
     /// filled in.
     pub gas_used: Gas,
     /// Why it reverted, when `status` is [`ExecStatus::Reverted`].
-    pub revert: Option<String>,
+    pub revert: Option<RevertReason>,
+}
+
+/// Why a batch reverted — a structured, host-agnostic reason.
+///
+/// The business logic reports *what* failed with the state it observed; how a
+/// reason is presented on the wire (e.g. ABI-encoded Solidity errors) is the
+/// host's concern. `Display` carries the human-readable message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevertReason {
+    /// A `Create` targeted a key that already exists.
+    AlreadyExists { key: EntityKey },
+    /// The op targeted a key with no live entity.
+    NotFound { key: EntityKey },
+    /// The caller isn't the entity's owner.
+    NotOwner {
+        key: EntityKey,
+        caller: Address,
+        owner: Address,
+    },
+    /// A mutation targeted an entity past its expiry.
+    Expired {
+        key: EntityKey,
+        expires_at: BlockNumber,
+    },
+    /// An `Expire` targeted an entity still within its lifetime.
+    NotExpired {
+        key: EntityKey,
+        expires_at: BlockNumber,
+    },
+    /// An `ExtendExpiry` did not move the expiry forward.
+    ExpiryNotExtended {
+        key: EntityKey,
+        new_expires_at: BlockNumber,
+        current_expires_at: BlockNumber,
+    },
+    /// A `Transfer` named the current owner as the new owner.
+    TransferToSelf { key: EntityKey },
+    /// The batch's cost exceeded the gas supplied.
+    OutOfGas,
+}
+
+impl fmt::Display for RevertReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+            write!(f, "0x")?;
+            for b in bytes {
+                write!(f, "{b:02x}")?;
+            }
+            Ok(())
+        }
+        match self {
+            Self::AlreadyExists { key } => {
+                write!(f, "entity ")?;
+                hex(f, key)?;
+                write!(f, " already exists")
+            }
+            Self::NotFound { key } => {
+                write!(f, "entity ")?;
+                hex(f, key)?;
+                write!(f, " does not exist")
+            }
+            Self::NotOwner { key, .. } => {
+                write!(f, "caller does not own entity ")?;
+                hex(f, key)
+            }
+            Self::Expired { key, .. } => {
+                write!(f, "entity ")?;
+                hex(f, key)?;
+                write!(f, " has expired")
+            }
+            Self::NotExpired { key, .. } => {
+                write!(f, "entity ")?;
+                hex(f, key)?;
+                write!(f, " has not expired")
+            }
+            Self::ExpiryNotExtended {
+                key,
+                new_expires_at,
+                current_expires_at,
+            } => {
+                write!(f, "entity ")?;
+                hex(f, key)?;
+                write!(
+                    f,
+                    " expiry not extended ({new_expires_at} <= {current_expires_at})"
+                )
+            }
+            Self::TransferToSelf { key } => {
+                write!(f, "transfer of entity ")?;
+                hex(f, key)?;
+                write!(f, " to its current owner")
+            }
+            Self::OutOfGas => write!(f, "out of gas"),
+        }
+    }
 }
 
 /// One operation on one entity.

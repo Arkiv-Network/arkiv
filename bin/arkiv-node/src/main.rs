@@ -14,6 +14,7 @@
 
 mod rpc;
 mod snapshot;
+mod view;
 
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use clap::Parser;
