@@ -50,6 +50,7 @@ roaring = "=0.11.4"
 # 2.1.0 adds EthPayloadAttributes::target_gas_limit, a field reth v2.2.0 doesn't
 # set, breaking the workspace build. 2.0.4 keeps the engine crate at 2.0.4.
 alloy-genesis = "=2.0.4"
+alloy-eips = "=2.0.4"
 alloy-sol-types = "1.6.0"
 alloy-provider = "=2.0.4"
 alloy-signer-local = { version = "=2.0.4", features = ["mnemonic"] }
@@ -57,8 +58,9 @@ alloy-network = "=2.0.4"
 alloy-contract = "=2.0.4"
 alloy-rpc-types = "=2.0.4"
 
-# Solidity bindings for the Arkiv EntityRegistry ABI (external, Arkiv-specific).
-arkiv-bindings = { git = "https://github.com/Arkiv-Network/arkiv-contracts.git", rev = "d6ebe18" }
+# Solidity bindings for the Arkiv EntityRegistry ABI, vendored from
+# arkiv-contracts rev d6ebe18 (see crates/arkiv-bindings for the sync story).
+arkiv-bindings = { path = "crates/arkiv-bindings" }
 
 # CLI extras
 tokio = { version = "1", features = ["full"] }

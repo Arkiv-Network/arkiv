@@ -1,7 +1,7 @@
 mod simulate;
 
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::eth::Log as RpcLog;
 use alloy_signer_local::PrivateKeySigner;
@@ -141,23 +141,6 @@ enum Command {
         key: B256,
     },
 
-    /// Query an entity's on-chain commitment.
-    Query {
-        /// Entity key to query.
-        #[arg(long)]
-        key: B256,
-    },
-
-    /// Read the current changeset hash.
-    Hash,
-
-    /// Walk the changeset hash chain from head to genesis.
-    History {
-        /// Maximum number of operations to display (default: all).
-        #[arg(long)]
-        depth: Option<u32>,
-    },
-
     /// Print the current block number, its UNIX timestamp, and seconds since
     /// the previous block. Calls `arkiv_getBlockTiming` on the node.
     BlockTiming,
@@ -213,6 +196,17 @@ fn random_payload(size: usize) -> Bytes {
     let mut buf = vec![0u8; size];
     rng.fill(&mut buf[..]);
     Bytes::from(buf)
+}
+
+/// Predict the entity key the `n`-th CREATE will mint, mirroring the node's
+/// `derive_entity_key`: keccak over (chain id, registry address, owner, nonce).
+fn predict_entity_key(chain_id: u64, registry: Address, owner: Address, nonce: u32) -> B256 {
+    let mut buf = Vec::with_capacity(32 + 20 + 20 + 4);
+    buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
+    buf.extend_from_slice(registry.as_slice());
+    buf.extend_from_slice(owner.as_slice());
+    buf.extend_from_slice(&nonce.to_be_bytes());
+    keccak256(&buf)
 }
 
 fn print_events(logs: &[RpcLog]) {
@@ -811,22 +805,6 @@ async fn main() -> Result<()> {
             print_events(receipt.inner.logs());
         }
 
-        Command::Query { key } => {
-            let result = registry.commitment(key).call().await?;
-            let c = result;
-            println!("creator:    {}", c.creator);
-            println!("owner:      {}", c.owner);
-            println!("created_at: {}", c.createdAt);
-            println!("updated_at: {}", c.updatedAt);
-            println!("expires_at: {}", c.expiresAt);
-            println!("core_hash:  {}", c.coreHash);
-        }
-
-        Command::Hash => {
-            let hash = registry.changeSetHash().call().await?;
-            println!("{hash}");
-        }
-
         Command::BlockTiming => {
             #[derive(Debug, Deserialize)]
             struct BlockTiming {
@@ -840,58 +818,6 @@ async fn main() -> Result<()> {
             println!("block:     {}", t.current_block);
             println!("timestamp: {}", t.current_block_time);
             println!("duration:  {}s", t.duration);
-        }
-
-        Command::History { depth } => {
-            let head = registry.headBlock().call().await?;
-            let genesis = registry.genesisBlock().call().await?;
-
-            if head == genesis {
-                let node = registry.getBlockNode(head).call().await?;
-                if node.txCount == 0 {
-                    println!("No operations recorded.");
-                    return Ok(());
-                }
-            }
-
-            // Collect blocks from head back to genesis
-            let mut block_num = head;
-            let mut blocks = Vec::new();
-            loop {
-                let node = registry.getBlockNode(block_num).call().await?;
-                let prev = node.prevBlock;
-                if node.txCount > 0 {
-                    blocks.push((block_num, node));
-                }
-                if block_num == genesis || prev == 0 {
-                    break;
-                }
-                block_num = prev;
-            }
-
-            // Print chronologically, respecting depth limit on ops
-            blocks.reverse();
-            let max_ops = depth.unwrap_or(u32::MAX);
-            let mut op_count_total: u32 = 0;
-
-            'outer: for (block_num, node) in &blocks {
-                println!("block {}", block_num);
-                for tx_seq in 0..node.txCount {
-                    let op_count = registry.txOpCount(*block_num, tx_seq).call().await?;
-                    println!("  tx {}", tx_seq);
-                    for op_seq in 0..op_count {
-                        if op_count_total >= max_ops {
-                            break 'outer;
-                        }
-                        let hash = registry
-                            .changeSetHashAtOp(*block_num, tx_seq, op_seq)
-                            .call()
-                            .await?;
-                        println!("    op {} -> {}", op_seq, hash);
-                        op_count_total += 1;
-                    }
-                }
-            }
         }
 
         Command::InjectPredeploy { .. } => unreachable!("handled at top of main"),
@@ -908,14 +834,17 @@ async fn main() -> Result<()> {
             // Precompute $N -> entityKey for every CREATE in the batch, before
             // we send execute() (which would mutate the sender's nonce).
             let signer_nonce: u32 = registry.nonces(signer_address).call().await?;
+            let chain_id = provider.get_chain_id().await?;
             let mut refs: HashMap<usize, B256> = HashMap::new();
             let mut create_count: u32 = 0;
             for (i, op) in ops.iter().enumerate() {
                 if matches!(op, BatchOp::Create { .. }) {
-                    let k = registry
-                        .entityKey(signer_address, signer_nonce + create_count)
-                        .call()
-                        .await?;
+                    let k = predict_entity_key(
+                        chain_id,
+                        cli.registry,
+                        signer_address,
+                        signer_nonce + create_count,
+                    );
                     refs.insert(i, k);
                     create_count += 1;
                 }

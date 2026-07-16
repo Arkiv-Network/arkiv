@@ -1,0 +1,13 @@
+[package]
+name = "arkiv-bindings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+# `#[sol(rpc)]` expands to contract-instance helpers used by arkiv-harness's client.
+alloy-contract.workspace = true
+eyre.workspace = true

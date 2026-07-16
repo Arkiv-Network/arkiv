@@ -11,9 +11,10 @@
 //! `arkiv_getBlockTiming`.
 
 use alloy_consensus::BlockHeader;
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, hex};
 use arkiv_interfaces::entity::{Attribute, Entity};
-use arkiv_interfaces::query::{PageParams, Query, QueryStats};
+use arkiv_interfaces::query::{PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
 use arkiv_reth_auxstore::RethAuxStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
@@ -24,9 +25,14 @@ use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StatePr
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::SnapshotAccountCode;
+use crate::view::{
+    EntityData, IncludeData, ResolvedIncludeData, entity_data_from, parse_cursor, ser_u64_hex,
+};
 
 /// Default page size when a `arkiv_query` request omits it.
 const DEFAULT_PAGE_SIZE: u64 = 100;
+/// `resultsPerPage` is clamped to this ceiling.
+const MAX_PAGE_SIZE: u64 = 200;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
 ///
@@ -63,12 +69,18 @@ where
     module.register_async_method("arkiv_query", move |params, _ctx, _ext| {
         let provider = p.clone();
         async move {
-            let request: QueryRequest = params
-                .one()
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            // Positional `[q]` or `[q, options]` — the SDK's wire format.
+            let mut seq = params.sequence();
+            let q: String = seq
+                .next()
+                .map_err(|e| invalid_params(format!("invalid query param: {e}")))?;
+            let options: QueryOptions = seq
+                .optional_next()
+                .map_err(|e| invalid_params(format!("invalid options param: {e}")))?
+                .unwrap_or_default();
             // The parse is pure, but the evaluation hits MDBX — run it off the
             // async runtime.
-            tokio::task::spawn_blocking(move || run_query(&provider, request))
+            tokio::task::spawn_blocking(move || run_query(&provider, &q, &options))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
         }
@@ -140,8 +152,40 @@ where
     Ok(entity.map(EntityView::from_entity))
 }
 
-/// Parse `request.query`, evaluate it against the index (at the tip or as of
-/// `request.block`), and read the matched entities back.
+/// A state snapshot for `atBlock` plus the block number it answers for:
+/// `None`/`"latest"` → the tip (and its number), a hex number → that block's
+/// post-state. Other tags are rejected.
+fn snapshot_for<Provider>(
+    provider: &Provider,
+    at_block: Option<BlockNumberOrTag>,
+) -> Result<(StateProviderBox, u64), ErrorObjectOwned>
+where
+    Provider: StateProviderFactory + BlockNumReader,
+{
+    match at_block {
+        None | Some(BlockNumberOrTag::Latest) => {
+            let n = provider
+                .best_block_number()
+                .map_err(|e| internal_error(format!("best_block_number: {e:?}")))?;
+            let state = provider
+                .latest()
+                .map_err(|e| internal_error(format!("latest state: {e:?}")))?;
+            Ok((state, n))
+        }
+        Some(BlockNumberOrTag::Number(n)) => {
+            let state = provider
+                .history_by_block_number(n)
+                .map_err(|e| internal_error(format!("history_by_block_number({n}): {e:?}")))?;
+            Ok((state, n))
+        }
+        Some(other) => Err(invalid_params(format!(
+            "atBlock tag {other:?} not supported; use a hex block number or 'latest'"
+        ))),
+    }
+}
+
+/// Parse `q`, evaluate it against the index (at the tip or as of
+/// `options.atBlock`), and read the matched entities back.
 ///
 /// One snapshot backs both stores: the index [`evaluate`](AuxiliaryStore::evaluate)
 /// resolves the query to a page of keys, then the same snapshot is recovered
@@ -149,23 +193,24 @@ where
 /// the entities are read from a single consistent state.
 fn run_query<Provider>(
     provider: &Provider,
-    request: QueryRequest,
-) -> Result<QueryResultView, ErrorObjectOwned>
+    q: &str,
+    options: &QueryOptions,
+) -> Result<QueryResponse, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory,
+    Provider: StateProviderFactory + BlockNumReader,
 {
-    let query = arkiv_query::parse(&request.query)
-        .map_err(|e| invalid_params(format!("invalid query: {e:?}")))?;
+    let query =
+        arkiv_query::parse(q).map_err(|e| invalid_params(format!("invalid query: {e:?}")))?;
     let page = PageParams {
-        page_size: request.page_size.unwrap_or(DEFAULT_PAGE_SIZE),
-        cursor: request.cursor,
+        page_size: options
+            .results_per_page
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE),
+        cursor: parse_cursor(options.cursor.as_deref())
+            .map_err(|e| invalid_params(e.to_string()))?,
     };
-    if page.page_size == 0 {
-        return Err(invalid_params("pageSize must be greater than zero".into()));
-    }
 
-    let state = resolve_state(provider, request.block)
-        .map_err(|e| internal_error(format!("state: {e:?}")))?;
+    let (state, block_number) = snapshot_for(provider, options.at_block)?;
 
     let mut index = RethAuxStore::new(SnapshotAccountCode::new(state));
     let matches = index
@@ -174,7 +219,8 @@ where
 
     // Recover the same snapshot to read the matched entities' bytes.
     let mut store = RethEntityStore::new(CodeBackend::new(index.into_backend()));
-    let mut entities = Vec::with_capacity(matches.keys.len());
+    let inc = ResolvedIncludeData::from_options(options.include_data.as_ref());
+    let mut data = Vec::with_capacity(matches.keys.len());
     for key in &matches.keys {
         // A key in the index but missing from the entity store is a store
         // inconsistency, not a normal "no such entity" — surface it.
@@ -187,13 +233,13 @@ where
                     hex_prefixed(key)
                 ))
             })?;
-        entities.push(EntityView::from_entity(entity));
+        data.push(entity_data_from(entity, &inc));
     }
 
-    Ok(QueryResultView {
-        entities,
-        next_cursor: matches.next_cursor,
-        stats: QueryStatsView::from_stats(&matches.stats),
+    Ok(QueryResponse {
+        data,
+        block_number,
+        cursor: matches.next_cursor.map(|c| format!("0x{c:x}")),
     })
 }
 
@@ -206,7 +252,7 @@ where
 fn entity_count<Provider>(
     provider: &Provider,
     request: CountRequest,
-) -> Result<CountView, ErrorObjectOwned>
+) -> Result<u64, ErrorObjectOwned>
 where
     Provider: StateProviderFactory,
 {
@@ -228,9 +274,7 @@ where
             },
         )
         .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
-    Ok(CountView {
-        count: matches.stats.entities_scanned,
-    })
+    Ok(matches.stats.entities_scanned)
 }
 
 /// The chain tip's number, timestamp, and the gap to the previous block —
@@ -266,23 +310,27 @@ where
     })
 }
 
-/// The `arkiv_query` request: a query string, optional paging, and an optional
-/// past block to evaluate against.
+/// The `arkiv_query` options — the SDK's second positional param.
 ///
-/// Sent as a single JSON object (the sole positional param): `{ "query": "...",
-/// "pageSize": 100, "cursor": 42, "block": 128 }`. `pageSize` defaults to
-/// [`DEFAULT_PAGE_SIZE`]; `cursor` is omitted on the first page and echoes a prior
-/// response's `nextCursor` to continue; `block` defaults to the tip.
-#[derive(Debug, Clone, Deserialize)]
+/// The full call is `["<query>", { "atBlock": "0x1a", "resultsPerPage": 100,
+/// "cursor": "0x2a", "includeData": { ... } }]`; the options object and each of
+/// its fields are optional. `resultsPerPage` defaults to [`DEFAULT_PAGE_SIZE`]
+/// and is clamped to `[1, MAX_PAGE_SIZE]`; `cursor` is omitted on the first page
+/// and echoes a prior response's `cursor` to continue; `atBlock` defaults to the
+/// tip.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryRequest {
-    pub query: String,
-    #[serde(default)]
-    pub page_size: Option<u64>,
-    #[serde(default)]
-    pub cursor: Option<u64>,
-    #[serde(default)]
-    pub block: Option<u64>,
+pub struct QueryOptions {
+    /// Block to evaluate against. `None` / `"latest"` reads head state.
+    /// Hex number (`"0x1a"`) reads historical state. Other tags rejected.
+    pub at_block: Option<BlockNumberOrTag>,
+    /// Page size, as a JSON number or hex string; clamped to `[1, MAX_PAGE_SIZE]`.
+    #[serde(default, deserialize_with = "crate::view::de_u64_flexible")]
+    pub results_per_page: Option<u64>,
+    /// Opaque cursor from the previous page response.
+    pub cursor: Option<String>,
+    /// Per-field projection. `None` → include all fields.
+    pub include_data: Option<IncludeData>,
 }
 
 /// The `arkiv_getEntityCount` request: an optional query to filter by (default
@@ -296,21 +344,17 @@ pub struct CountRequest {
     pub block: Option<u64>,
 }
 
-/// The `arkiv_query` response: one page of matched entities, a continuation
-/// cursor, and the work the query did.
+/// The `arkiv_query` response: one page of matched entities, the block the
+/// query evaluated against (hex), and a continuation cursor (hex, absent on
+/// the last page).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryResultView {
-    pub entities: Vec<EntityView>,
-    pub next_cursor: Option<u64>,
-    pub stats: QueryStatsView,
-}
-
-/// The `arkiv_getEntityCount` response.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CountView {
-    pub count: u64,
+pub struct QueryResponse {
+    pub data: Vec<EntityData>,
+    #[serde(serialize_with = "ser_u64_hex")]
+    pub block_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// The `arkiv_getBlockTiming` response.
@@ -327,30 +371,9 @@ pub struct BlockTimingView {
     pub duration: u64,
 }
 
-/// The JSON shape of a query's [`QueryStats`].
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryStatsView {
-    pub entities_scanned: u64,
-    pub entities_returned: u64,
-    pub index_lookups: u64,
-    pub gas_used: u64,
-    pub partial: bool,
-}
-
-impl QueryStatsView {
-    fn from_stats(stats: &QueryStats) -> Self {
-        Self {
-            entities_scanned: stats.entities_scanned,
-            entities_returned: stats.entities_returned,
-            index_lookups: stats.index_lookups,
-            gas_used: stats.gas_used,
-            partial: stats.partial,
-        }
-    }
-}
-
 /// The JSON shape of an entity: byte fields as `0x`-hex, text fields as strings.
+/// Used by `arkiv_getEntity` only — `arkiv_query` answers with the SDK's
+/// [`EntityData`] shape.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityView {

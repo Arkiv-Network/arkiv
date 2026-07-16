@@ -154,41 +154,46 @@ impl<P: Provider> ArkivClient<P> {
             .expect("arkiv_getEntity (historical)")
     }
 
-    /// `arkiv_query` at the tip.
+    /// `arkiv_query` at the tip. `cursor` is the hex string echoed by a prior
+    /// response's `cursor` field.
     pub async fn query(
         &self,
         query: &str,
         page_size: u64,
-        cursor: Option<u64>,
+        cursor: Option<&str>,
     ) -> serde_json::Value {
-        let mut request = serde_json::json!({ "query": query, "pageSize": page_size });
+        let mut options = serde_json::json!({ "resultsPerPage": page_size });
         if let Some(cursor) = cursor {
-            request["cursor"] = serde_json::json!(cursor);
+            options["cursor"] = serde_json::json!(cursor);
         }
-        self.query_raw(request)
+        self.query_raw(query, options)
             .await
             .unwrap_or_else(|e| panic!("arkiv_query {query:?}: {e}"))
     }
 
     /// `arkiv_query` as of a past block.
     pub async fn query_at(&self, query: &str, block: u64) -> serde_json::Value {
-        let request = serde_json::json!({ "query": query, "pageSize": 100, "block": block });
-        self.query_raw(request)
+        let options = serde_json::json!({ "atBlock": format!("0x{block:x}") });
+        self.query_raw(query, options)
             .await
             .unwrap_or_else(|e| panic!("arkiv_query {query:?}@{block}: {e}"))
     }
 
-    /// `arkiv_query` with a raw request object, surfacing RPC errors (for the
-    /// error-contract assertions).
-    pub async fn query_raw(&self, request: serde_json::Value) -> eyre::Result<serde_json::Value> {
+    /// `arkiv_query` with raw positional params (`[q, options]` — the SDK's wire
+    /// shape), surfacing RPC errors (for the error-contract assertions).
+    pub async fn query_raw(
+        &self,
+        query: &str,
+        options: serde_json::Value,
+    ) -> eyre::Result<serde_json::Value> {
         self.provider
-            .raw_request("arkiv_query".into(), (request,))
+            .raw_request("arkiv_query".into(), (query, options))
             .await
             .map_err(|e| eyre::eyre!("{e}"))
     }
 
     /// `arkiv_getEntityCount` — optional query filter (default `$all`) and block
-    /// (default the tip).
+    /// (default the tip). Answers a bare number.
     pub async fn entity_count(&self, query: Option<&str>, block: Option<u64>) -> u64 {
         let mut request = serde_json::json!({});
         if let Some(query) = query {
@@ -197,12 +202,10 @@ impl<P: Provider> ArkivClient<P> {
         if let Some(block) = block {
             request["block"] = serde_json::json!(block);
         }
-        let response: serde_json::Value = self
-            .provider
-            .raw_request("arkiv_getEntityCount".into(), (request,))
+        self.provider
+            .raw_request::<_, u64>("arkiv_getEntityCount".into(), (request,))
             .await
-            .expect("arkiv_getEntityCount");
-        response["count"].as_u64().expect("count u64")
+            .expect("arkiv_getEntityCount")
     }
 
     /// `arkiv_getBlockTiming`.
@@ -217,9 +220,9 @@ impl<P: Provider> ArkivClient<P> {
 /// The set of `key` strings in a query response — order-independent, since the
 /// index returns newest-first but tests assert on membership.
 pub fn result_keys(response: &serde_json::Value) -> BTreeSet<String> {
-    response["entities"]
+    response["data"]
         .as_array()
-        .expect("entities array")
+        .expect("data array")
         .iter()
         .map(|entity| entity["key"].as_str().expect("key string").to_string())
         .collect()

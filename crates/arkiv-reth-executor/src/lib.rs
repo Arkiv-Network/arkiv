@@ -18,7 +18,9 @@
 //! - **Call to [`ARKIV_ADDRESS`]** — the entity engine. The `execute(Operation[])`
 //!   calldata is decoded to entity [`Op`]s and applied by [`ArkivExecutor`] over a
 //!   reth-backed entity store, returning the account diff reth commits (plus the
-//!   sender's gas charge) — see [`arkiv_transact`].
+//!   sender's gas charge) — see [`arkiv_transact`]. The one view function,
+//!   `nonces(address)`, is answered directly from the minting-nonce slot — see
+//!   [`arkiv_nonces_call`].
 //! - **Contract creation** — rejected (neutered): user programs never execute.
 //!
 //! ## Honest scope
@@ -48,6 +50,8 @@
 pub mod arkiv;
 /// ABI op decoding: `execute(Operation[])` calldata → the spec's `Op`s.
 pub mod decode;
+/// Revert-payload encoding: `RevertReason` / `DecodeError` → Solidity error data.
+pub mod revert;
 /// The reth write-path bridge: `AccountCode` over the `Database` + `EvmState` diff.
 pub mod state;
 
@@ -57,7 +61,8 @@ pub use state::ExecutorState;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256, address};
-use alloy_sol_types::SolEvent;
+use alloy_sol_types::{SolCall, SolError, SolEvent};
+use arkiv_bindings::IEntityRegistry;
 use reth_ethereum::{
     EthPrimitives,
     chainspec::ChainSpec,
@@ -68,8 +73,8 @@ use reth_ethereum::{
             MainBuilder, MainContext,
             context::{BlockEnv, CfgEnv, Context, TxEnv},
             context_interface::result::{
-                EVMError, ExecutionResult, HaltReason, Output, ResultAndState, ResultGas,
-                SuccessReason,
+                EVMError, ExecutionResult, HaltReason, OutOfGasError, Output, ResultAndState,
+                ResultGas, SuccessReason,
             },
             inspector::{Inspector, NoOpInspector},
             interpreter::interpreter::EthInterpreter,
@@ -98,6 +103,25 @@ pub const ARKIV_ADDRESS: Address = address!("0x440000000000000000000000000000000
 
 /// Flat gas charged per transaction by the fixed-function executor.
 const ARKIV_TX_GAS: u64 = 21_000;
+
+/// The minimum gas that passes reth's tx-pool `IntrinsicGasTooLow` check.
+///
+/// The pool enforces two conditions (its `validate/eth.rs`):
+///   `gas_limit >= initial_gas`  (21_000 + 4·zero + 16·nonzero calldata bytes)
+///   `gas_limit >= floor_gas`    (EIP-7623 Prague: 21_000 + 10·tokens)
+/// where `tokens = zero + 4·nonzero`. Every gas figure this executor reports is
+/// floored at `max(initial, floor)` so `eth_estimateGas` always returns a value
+/// the pool accepts — otherwise a cheap op (update, delete, …) estimates below
+/// the floor and the SDK's send is rejected before it ever executes.
+fn intrinsic_gas(data: &[u8]) -> u64 {
+    let zero = data.iter().filter(|b| **b == 0).count() as u64;
+    let nonzero = data.len() as u64 - zero;
+    let tokens = zero + 4 * nonzero;
+
+    let initial = 21_000 + 4 * tokens;
+    let floor = 21_000 + 10 * tokens;
+    initial.max(floor)
+}
 
 // ---------------------------------------------------------------------------
 // The no-EVM execution engine
@@ -198,13 +222,20 @@ fn arkiv_transact<DB: Database>(
         }
     };
 
-    // A call to ARKIV_ADDRESS runs the entity state transition.
+    // A call to ARKIV_ADDRESS is either the `nonces(address)` view or the
+    // entity state transition (`execute(Operation[])` — the only other
+    // selector `decode_ops` accepts).
     if to == ARKIV_ADDRESS {
+        if tx.data.starts_with(&IEntityRegistry::noncesCall::SELECTOR) {
+            return arkiv_nonces_call(db, &tx);
+        }
         return arkiv_entity_transact(db, block_number, &tx);
     }
 
-    // Otherwise it's a plain value transfer.
-    let gas_cost = U256::from(ARKIV_TX_GAS).saturating_mul(U256::from(tx.gas_price));
+    // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
+    // intrinsics should the transfer carry data.
+    let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
+    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
     let value_out = if to == tx.caller {
         U256::ZERO
     } else {
@@ -241,7 +272,7 @@ fn arkiv_transact<DB: Database>(
 
     let result = ExecutionResult::Success {
         reason: SuccessReason::Stop,
-        gas: ResultGas::default().with_total_gas_spent(ARKIV_TX_GAS),
+        gas: ResultGas::default().with_total_gas_spent(gas_used),
         logs: Vec::new(),
         output: Output::Call(Bytes::new()),
     };
@@ -260,6 +291,23 @@ fn arkiv_entity_transact<DB: Database>(
     block_number: u64,
     tx: &TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+    // During eth_estimateGas the binary search probes gas limits below the
+    // pool's intrinsic minimum. Halt so the search raises its lower bound;
+    // otherwise it converges on a value the tx-pool later rejects with
+    // IntrinsicGasTooLow. Nothing is staged, so the state stays clean for the
+    // next probe.
+    let floor = intrinsic_gas(&tx.data);
+    if tx.gas_limit < floor {
+        return Ok(ResultAndState::new(
+            ExecutionResult::Halt {
+                reason: HaltReason::OutOfGas(OutOfGasError::Basic),
+                gas: ResultGas::default(),
+                logs: Vec::new(),
+            },
+            EvmState::default(),
+        ));
+    }
+
     let caller = tx.caller;
     let env = ExecEnv {
         caller: caller.into_array(),
@@ -277,14 +325,17 @@ fn arkiv_entity_transact<DB: Database>(
         Ok(ops) => run_ops(state, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
         Err(e) => Outcome {
             gas_used: 0,
-            revert: Some(e.to_string()),
+            revert: Some(revert::decode_revert_data(&e)),
             entity_state: state.into_state(),
             logs: Vec::new(),
         },
     };
 
-    // Sender phase — `db` is free again: charge gas, bump the EOA nonce.
-    let gas_cost = U256::from(outcome.gas_used).saturating_mul(U256::from(tx.gas_price));
+    // Sender phase — `db` is free again: charge gas, bump the EOA nonce. The
+    // charged/reported figure is floored at the pool's intrinsic minimum so a
+    // cheap batch still estimates to a pool-acceptable gas limit.
+    let gas_used = outcome.gas_used.max(floor);
+    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
     let mut sender = db
         .basic(caller)
         .map_err(EVMError::Database)?
@@ -297,7 +348,7 @@ fn arkiv_entity_transact<DB: Database>(
     let mut evm_state = outcome.entity_state;
     evm_state.insert(caller, sender_acc);
 
-    let gas = ResultGas::default().with_total_gas_spent(outcome.gas_used);
+    let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
         None => ExecutionResult::Success {
             reason: SuccessReason::Stop,
@@ -305,21 +356,78 @@ fn arkiv_entity_transact<DB: Database>(
             logs: outcome.logs,
             output: Output::Call(Bytes::new()),
         },
-        Some(reason) => ExecutionResult::Revert {
+        Some(data) => ExecutionResult::Revert {
             gas,
             logs: Vec::new(),
-            output: Bytes::from(reason.into_bytes()),
+            output: data,
         },
     };
     Ok(ResultAndState::new(result, evm_state))
 }
 
-/// What running an op batch produced: the gas metered, a revert reason if the batch
-/// failed a business rule, the entity `EvmState` diff (empty on revert), and the
-/// `EntityOperation` logs to emit (empty on revert).
+/// Answer the `nonces(address)` view: the queried owner's entity-key minting
+/// nonce, ABI-encoded as a `uint32`.
+///
+/// SDKs `eth_call` this before sending creates to predict the keys the batch
+/// will mint (`derive_entity_key(chain_id, owner, nonce + i)`), so it reads
+/// the same system-account slot the execute path mints from. The only state
+/// staged is the sender's flat gas charge + EOA nonce bump — meaningless for
+/// an `eth_call` (the diff is discarded) but keeps reth's sender invariants
+/// intact if the call ever arrives as a mined transaction.
+fn arkiv_nonces_call<DB: Database>(
+    db: &mut DB,
+    tx: &TxEnv,
+) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+    let output = match IEntityRegistry::noncesCall::abi_decode_raw(&tx.data[4..]) {
+        Ok(call) => {
+            let nonce = ExecutorState::new(db)
+                .read_nonce(call.owner)
+                .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
+            Ok(IEntityRegistry::noncesCall::abi_encode_returns(&nonce))
+        }
+        // Malformed args revert with the standard `Error(string)` payload.
+        Err(e) => {
+            Err(alloy_sol_types::Revert::from(format!("invalid nonces calldata: {e}")).abi_encode())
+        }
+    };
+
+    // Sender phase — mirrors the plain-transfer accounting.
+    let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
+    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
+    let mut sender = db
+        .basic(tx.caller)
+        .map_err(EVMError::Database)?
+        .unwrap_or_default();
+    sender.balance = sender.balance.saturating_sub(gas_cost);
+    sender.nonce = sender.nonce.saturating_add(1);
+    let mut sender_acc = Account::from(sender);
+    sender_acc.mark_touch();
+    let mut state = EvmState::default();
+    state.insert(tx.caller, sender_acc);
+
+    let gas = ResultGas::default().with_total_gas_spent(gas_used);
+    let result = match output {
+        Ok(ret) => ExecutionResult::Success {
+            reason: SuccessReason::Return,
+            gas,
+            logs: Vec::new(),
+            output: Output::Call(Bytes::from(ret)),
+        },
+        Err(data) => ExecutionResult::Revert {
+            gas,
+            logs: Vec::new(),
+            output: Bytes::from(data),
+        },
+    };
+    Ok(ResultAndState::new(result, state))
+}
+
+/// What running an op batch produced: the gas metered, the ABI-encoded revert
+/// payload if the batch failed a business rule, the entity `EvmState` diff
+/// (empty on revert), and the `EntityOperation` logs to emit (empty on revert).
 struct Outcome {
     gas_used: u64,
-    revert: Option<String>,
+    revert: Option<Bytes>,
     entity_state: EvmState,
     logs: Vec<Log>,
 }
@@ -371,7 +479,7 @@ fn run_ops<DB: Database>(
         }
         ExecStatus::Reverted => Ok(Outcome {
             gas_used: out.gas_used,
-            revert: out.revert,
+            revert: out.revert.as_ref().map(revert::revert_data),
             entity_state: store.into_backend().into_inner().into_state(),
             logs: Vec::new(),
         }),
@@ -602,6 +710,125 @@ mod tests {
         assert!(bitmap_at(all_entities_bucket()).contains(0));
         // And in its owner's bucket (owner value = the 20-byte caller address).
         assert!(bitmap_at(pair_address(annotations::OWNER, alice.as_slice())).contains(0));
+    }
+
+    fn nonces_calldata(owner: Address) -> Bytes {
+        IEntityRegistry::noncesCall { owner }.abi_encode().into()
+    }
+
+    /// Decode the `uint32` a successful `nonces(address)` call returned.
+    fn nonce_from(rs: &ResultAndState<HaltReason>) -> u32 {
+        assert!(rs.result.is_success());
+        IEntityRegistry::noncesCall::abi_decode_returns(rs.result.output().unwrap())
+            .expect("uint32 return")
+    }
+
+    /// `nonces(owner)` on a fresh chain answers 0 — and stages nothing beyond
+    /// the sender, regardless of who asks about whom.
+    #[test]
+    fn nonces_call_returns_zero_for_fresh_owner() {
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let bob = Address::repeat_byte(0xBB);
+        let rs = arkiv_transact(&mut db, 10, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
+
+        assert_eq!(nonce_from(&rs), 0);
+        // Only the sender (charged/bumped) is in the diff.
+        assert_eq!(rs.state.len(), 1);
+        assert_eq!(rs.state.get(&bob).expect("sender").info.nonce, 1);
+    }
+
+    /// After a create, `nonces` reports 1 for the creator — and still 0 for
+    /// anyone else, proving the *decoded argument* is read, not the caller.
+    #[test]
+    fn nonces_call_reflects_minted_creates() {
+        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let alice = Address::repeat_byte(0xAA);
+        let bob = Address::repeat_byte(0xBB);
+
+        let rs =
+            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        assert!(rs.result.is_success());
+        db.commit(rs.state);
+
+        let rs = arkiv_transact(&mut db, 11, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
+        assert_eq!(nonce_from(&rs), 1);
+        let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, nonces_calldata(bob))).unwrap();
+        assert_eq!(nonce_from(&rs), 0);
+    }
+
+    /// The `nonces` selector with truncated arguments reverts.
+    #[test]
+    fn nonces_call_with_malformed_args_reverts() {
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let mut data = IEntityRegistry::noncesCall::SELECTOR.to_vec();
+        data.extend_from_slice(&[0x01, 0x02]);
+        let rs = arkiv_transact(&mut db, 10, arkiv_tx(alice, data.into())).unwrap();
+        assert!(!rs.result.is_success());
+    }
+
+    /// The reported gas never falls below the tx-pool's intrinsic minimum
+    /// (`max(21000 + 4·tokens, 21000 + 10·tokens)`), even when the cost model
+    /// prices the batch cheaper — otherwise eth_estimateGas quotes a limit the
+    /// pool rejects as IntrinsicGasTooLow.
+    #[test]
+    fn reported_gas_is_floored_at_the_intrinsic_minimum() {
+        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let alice = Address::repeat_byte(0xAA);
+        let rs =
+            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        db.commit(rs.state);
+
+        // An update batch: cheap in the cost model (40k base) but with calldata
+        // whose intrinsic floor exceeds it.
+        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0));
+        let update = IEntityRegistry::executeCall {
+            ops: vec![Operation::update(
+                key,
+                Bytes::from(vec![0xAB; 4_000]), // 4k nonzero bytes → floor ≈ 181k
+                Mime128 {
+                    data: [alloy_primitives::FixedBytes::ZERO; 4],
+                },
+                vec![],
+            )],
+        }
+        .abi_encode();
+        let floor = intrinsic_gas(&update);
+        let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, update.into())).unwrap();
+
+        assert!(rs.result.is_success());
+        assert!(
+            rs.result.tx_gas_used() >= floor,
+            "gas_used {} must cover the intrinsic floor {floor}",
+            rs.result.tx_gas_used(),
+        );
+    }
+
+    /// A gas limit below the intrinsic floor halts out-of-gas without staging
+    /// anything — the shape eth_estimateGas's binary search needs to raise its
+    /// lower bound.
+    #[test]
+    fn gas_limit_below_intrinsic_floor_halts() {
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let data = create_calldata(50, b"hello");
+        let mut tx = arkiv_tx(alice, data.clone());
+        tx.gas_limit = intrinsic_gas(&data) - 1;
+        let rs = arkiv_transact(&mut db, 10, tx).unwrap();
+
+        assert!(matches!(
+            rs.result,
+            ExecutionResult::Halt {
+                reason: HaltReason::OutOfGas(_),
+                ..
+            }
+        ));
+        assert!(rs.state.is_empty(), "a below-floor probe stages nothing");
     }
 
     /// Undecodable calldata reverts, but the sender is still charged/bumped and no

@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::execution::{
-    BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, TransactionExecutor,
+    BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason, TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
 use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey};
@@ -181,7 +181,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 return Ok(ExecOutput {
                     status: ExecStatus::Reverted,
                     gas_used: env.gas_supplied,
-                    revert: Some("out of gas".into()),
+                    revert: Some(RevertReason::OutOfGas),
                 });
             }
             match self.stage_op(env, entities, draft, &mut tx_state_overlay, op)? {
@@ -238,7 +238,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         draft: &BlockDraft,
         overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
         op: &Op,
-    ) -> Result<Result<OpEffect, String>, ExecError> {
+    ) -> Result<Result<OpEffect, RevertReason>, ExecError> {
         match op {
             Op::Create {
                 key,
@@ -248,7 +248,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 attributes,
             } => {
                 if self.current(entities, draft, overlay, *key)?.is_some() {
-                    return Ok(Err(format!("entity {} already exists", hex(key))));
+                    return Ok(Err(RevertReason::AlreadyExists { key: *key }));
                 }
                 let entity = Entity {
                     key: *key,
@@ -275,11 +275,19 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 payload,
                 attributes,
             } => self
-                .mutate(env, entities, draft, overlay, *key, |e| {
-                    e.content_type = content_type.clone();
-                    e.payload = payload.clone();
-                    e.attributes = attributes.clone();
-                })
+                .mutate(
+                    env,
+                    entities,
+                    draft,
+                    overlay,
+                    *key,
+                    |_| Ok(()),
+                    |e| {
+                        e.content_type = content_type.clone();
+                        e.payload = payload.clone();
+                        e.attributes = attributes.clone();
+                    },
+                )
                 .map(|r| {
                     r.map(|(owner, expires_at)| {
                         self.effect(*key, OpKind::Update, owner, expires_at)
@@ -289,18 +297,50 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 key,
                 new_expires_at,
             } => self
-                .mutate(env, entities, draft, overlay, *key, |e| {
-                    e.expires_at = *new_expires_at;
-                })
+                .mutate(
+                    env,
+                    entities,
+                    draft,
+                    overlay,
+                    *key,
+                    // Lifetime must move forward; matching the contract's rule.
+                    |e| {
+                        if *new_expires_at <= e.expires_at {
+                            return Err(RevertReason::ExpiryNotExtended {
+                                key: *key,
+                                new_expires_at: *new_expires_at,
+                                current_expires_at: e.expires_at,
+                            });
+                        }
+                        Ok(())
+                    },
+                    |e| {
+                        e.expires_at = *new_expires_at;
+                    },
+                )
                 .map(|r| {
                     r.map(|(owner, expires_at)| {
                         self.effect(*key, OpKind::ExtendExpiry, owner, expires_at)
                     })
                 }),
             Op::Transfer { key, new_owner } => self
-                .mutate(env, entities, draft, overlay, *key, |e| {
-                    e.owner = *new_owner;
-                })
+                .mutate(
+                    env,
+                    entities,
+                    draft,
+                    overlay,
+                    *key,
+                    // A no-op transfer is a client mistake; matching the contract.
+                    |e| {
+                        if *new_owner == e.owner {
+                            return Err(RevertReason::TransferToSelf { key: *key });
+                        }
+                        Ok(())
+                    },
+                    |e| {
+                        e.owner = *new_owner;
+                    },
+                )
                 .map(|r| {
                     r.map(|(owner, expires_at)| {
                         self.effect(*key, OpKind::Transfer, owner, expires_at)
@@ -308,10 +348,14 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 }),
             Op::Delete { key } => {
                 let Some(entity) = self.current(entities, draft, overlay, *key)? else {
-                    return Ok(Err(format!("entity {} does not exist", hex(key))));
+                    return Ok(Err(RevertReason::NotFound { key: *key }));
                 };
                 if entity.owner != env.caller {
-                    return Ok(Err(format!("caller does not own entity {}", hex(key))));
+                    return Ok(Err(RevertReason::NotOwner {
+                        key: *key,
+                        caller: env.caller,
+                        owner: entity.owner,
+                    }));
                 }
                 overlay.insert(*key, None);
                 Ok(Ok(self.effect(
@@ -323,10 +367,13 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             }
             Op::Expire { key } => {
                 let Some(entity) = self.current(entities, draft, overlay, *key)? else {
-                    return Ok(Err(format!("entity {} does not exist", hex(key))));
+                    return Ok(Err(RevertReason::NotFound { key: *key }));
                 };
                 if entity.expires_at > env.block_number {
-                    return Ok(Err(format!("entity {} has not expired", hex(key))));
+                    return Ok(Err(RevertReason::NotExpired {
+                        key: *key,
+                        expires_at: entity.expires_at,
+                    }));
                 }
                 overlay.insert(*key, None);
                 Ok(Ok(self.effect(
@@ -356,12 +403,13 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     }
 
     /// Shared read-modify-write for [`Op::Update`] / [`Op::ExtendExpiry`] /
-    /// [`Op::Transfer`]: load the entity, check ownership and liveness, mutate,
-    /// re-stage.
+    /// [`Op::Transfer`]: load the entity, check ownership and liveness, run the
+    /// op's own `check` against the loaded entity, mutate, re-stage.
     ///
     /// An expired entity (current block at or past its `expires_at`) is not
     /// mutable — including by [`Op::ExtendExpiry`]: lifetime must be renewed
     /// *before* expiry, not resurrected after it.
+    #[allow(clippy::too_many_arguments)]
     fn mutate(
         &self,
         env: &ExecEnv,
@@ -369,16 +417,27 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         draft: &BlockDraft,
         overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
         key: EntityKey,
+        check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
         edit: impl FnOnce(&mut Entity),
-    ) -> Result<Result<(Address, BlockNumber), String>, ExecError> {
+    ) -> Result<Result<(Address, BlockNumber), RevertReason>, ExecError> {
         let Some(mut entity) = self.current(entities, draft, overlay, key)? else {
-            return Ok(Err(format!("entity {} does not exist", hex(&key))));
+            return Ok(Err(RevertReason::NotFound { key }));
         };
         if entity.owner != env.caller {
-            return Ok(Err(format!("caller does not own entity {}", hex(&key))));
+            return Ok(Err(RevertReason::NotOwner {
+                key,
+                caller: env.caller,
+                owner: entity.owner,
+            }));
         }
         if entity.expires_at <= env.block_number {
-            return Ok(Err(format!("entity {} has expired", hex(&key))));
+            return Ok(Err(RevertReason::Expired {
+                key,
+                expires_at: entity.expires_at,
+            }));
+        }
+        if let Err(reason) = check(&entity) {
+            return Ok(Err(reason));
         }
         edit(&mut entity);
         entity.last_modified_at_block = env.block_number;
@@ -477,17 +536,6 @@ impl fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
-
-/// Lower-hex of a key, for revert messages.
-fn hex(key: &EntityKey) -> String {
-    let mut s = String::with_capacity(2 + key.len() * 2);
-    s.push_str("0x");
-    for b in key {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    s
-}
 
 #[cfg(test)]
 mod tests {
@@ -694,6 +742,93 @@ mod tests {
         let e = &draft.entities.puts[0];
         assert_eq!(e.owner, [9u8; 20]);
         assert_eq!(e.last_modified_at_block, 20);
+    }
+
+    /// A transfer naming the current owner as the new owner reverts
+    /// `TransferToSelf` — mirroring the contract's rule.
+    #[test]
+    fn transfer_to_current_owner_reverts() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        let owner = [2u8; 20];
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()],
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let mut draft = BlockDraft::default();
+
+        let out = exec
+            .apply(
+                &env(owner, 20),
+                &mut store,
+                &mut draft,
+                &[Op::Transfer {
+                    key: [7u8; 32],
+                    new_owner: owner,
+                }],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Reverted);
+        assert_eq!(
+            out.revert,
+            Some(RevertReason::TransferToSelf { key: [7u8; 32] })
+        );
+        assert!(draft.entities.puts.is_empty());
+    }
+
+    /// An extend that doesn't move the expiry forward reverts
+    /// `ExpiryNotExtended` — lifetime must strictly increase.
+    #[test]
+    fn extend_must_increase_expiry() {
+        let exec = ArkivExecutor::<MemStore>::new();
+        let mut store = MemStore::default();
+        let owner = [2u8; 20];
+        store
+            .apply_delta(&BlockEntityStoreDelta {
+                puts: vec![sample_entity()], // expires_at 100
+                deletes: Vec::new(),
+            })
+            .unwrap();
+        let mut draft = BlockDraft::default();
+
+        // Equal expiry is not an extension.
+        let out = exec
+            .apply(
+                &env(owner, 20),
+                &mut store,
+                &mut draft,
+                &[Op::ExtendExpiry {
+                    key: [7u8; 32],
+                    new_expires_at: 100,
+                }],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Reverted);
+        assert_eq!(
+            out.revert,
+            Some(RevertReason::ExpiryNotExtended {
+                key: [7u8; 32],
+                new_expires_at: 100,
+                current_expires_at: 100,
+            })
+        );
+
+        // A later expiry extends.
+        let out = exec
+            .apply(
+                &env(owner, 20),
+                &mut store,
+                &mut draft,
+                &[Op::ExtendExpiry {
+                    key: [7u8; 32],
+                    new_expires_at: 150,
+                }],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(draft.entities.puts[0].expires_at, 150);
     }
 
     /// Operations within one transaction see each other through the overlay: a
@@ -1051,7 +1186,7 @@ mod tests {
 
         assert_eq!(out.status, ExecStatus::Reverted);
         assert_eq!(out.gas_used, cost - 1); // all supplied gas is consumed
-        assert_eq!(out.revert.as_deref(), Some("out of gas"));
+        assert_eq!(out.revert, Some(RevertReason::OutOfGas));
         assert!(draft.entities.puts.is_empty());
     }
 
