@@ -267,7 +267,7 @@ impl<DB: Database> IndexStorage for ExecutorState<'_, DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkiv_interfaces::entity::{ATTR_STRING, ATTR_UINT, Attribute, Entity};
+    use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
     fn addr() -> Address {
@@ -306,16 +306,8 @@ mod tests {
             content_type: b"text/plain".to_vec(),
             payload: b"hello world".to_vec(),
             attributes: vec![
-                Attribute {
-                    key: b"color".to_vec(),
-                    value_type: ATTR_STRING,
-                    value: b"blue".to_vec(),
-                },
-                Attribute {
-                    key: b"size".to_vec(),
-                    value_type: ATTR_UINT,
-                    value: vec![0u8; 32],
-                },
+                Attribute::new(b"color".to_vec(), AttributeValue::Str("blue".into())),
+                Attribute::new(b"size".to_vec(), AttributeValue::u256_from_u64(1)),
             ],
         };
         let encoded = arkiv_reth_entitystore::encode(&entity);

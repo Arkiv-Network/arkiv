@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The attribute type set (`AttributeType`/`AttributeValue`) is the protocol's, not
+# the ABI's: this crate only transports it. Depending on the spec crate keeps one
+# list of `typeId`s instead of a hand-mirrored second one.
+arkiv-interfaces.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 # `#[sol(rpc)]` expands to contract-instance helpers used by arkiv-harness's client.

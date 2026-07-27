@@ -19,6 +19,7 @@
 use alloy_primitives::{Address, B256};
 
 use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::entity::AttributeType;
 
 use crate::address::{list_address_for, str_level_address};
 use crate::range::{Bound, slot_presence, slot_to_val_len};
@@ -59,12 +60,13 @@ pub fn value_chunks(value: &[u8]) -> Vec<B256> {
 pub fn insert<Storage: IndexStorage>(
     storage: &mut Storage,
     attr: &[u8],
+    ty: AttributeType,
     value: &[u8],
 ) -> Result<(), Storage::Error> {
     let presence = slot_presence(value.len());
     let mut prefix: Vec<u8> = Vec::new();
     for chunk in value_chunks(value) {
-        let level_address = str_level_address(attr, &prefix);
+        let level_address = str_level_address(attr, ty, &prefix);
         storage.ensure_account_persists(level_address)?;
         if storage.storage(level_address, chunk)? == B256::ZERO {
             list_append(storage, level_address, chunk)?;
@@ -80,11 +82,12 @@ pub fn insert<Storage: IndexStorage>(
 pub fn remove<Storage: IndexStorage>(
     storage: &mut Storage,
     attr: &[u8],
+    ty: AttributeType,
     value: &[u8],
 ) -> Result<(), Storage::Error> {
     let mut prefix: Vec<u8> = Vec::new();
     for chunk in value_chunks(value) {
-        let level_address = str_level_address(attr, &prefix);
+        let level_address = str_level_address(attr, ty, &prefix);
         storage.set_storage(level_address, chunk, B256::ZERO)?;
         prefix.extend_from_slice(chunk.as_slice());
     }
@@ -95,11 +98,12 @@ pub fn remove<Storage: IndexStorage>(
 pub fn scan<Storage: IndexStorage>(
     storage: &mut Storage,
     attr: &[u8],
+    ty: AttributeType,
     bound: &[u8],
     kind: Bound,
 ) -> Result<Vec<Vec<u8>>, Storage::Error> {
     let mut values = Vec::new();
-    collect_all(storage, attr, &[], &mut values)?;
+    collect_all(storage, attr, ty, &[], &mut values)?;
     values.retain(|value| matches_bound(kind, value, bound));
     Ok(values)
 }
@@ -108,10 +112,11 @@ pub fn scan<Storage: IndexStorage>(
 pub fn glob<Storage: IndexStorage>(
     storage: &mut Storage,
     attr: &[u8],
+    ty: AttributeType,
     prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, Storage::Error> {
     let mut values = Vec::new();
-    collect_all(storage, attr, &[], &mut values)?;
+    collect_all(storage, attr, ty, &[], &mut values)?;
     values.retain(|value| value.starts_with(prefix));
     Ok(values)
 }
@@ -133,11 +138,12 @@ fn matches_bound(kind: Bound, value: &[u8], bound: &[u8]) -> bool {
 fn collect_all<Storage: IndexStorage>(
     storage: &mut Storage,
     attr: &[u8],
+    ty: AttributeType,
     prefix: &[u8],
     values: &mut Vec<Vec<u8>>,
 ) -> Result<(), Storage::Error> {
     let level = prefix.len() / WORD_LEN;
-    let level_address = str_level_address(attr, prefix);
+    let level_address = str_level_address(attr, ty, prefix);
     for (chunk, presence) in list_entries(storage, level_address)? {
         let Some(total_len) = slot_to_val_len(presence) else {
             continue; // zeroed (removed) slot
@@ -150,7 +156,7 @@ fn collect_all<Storage: IndexStorage>(
         } else {
             let mut next_prefix = prefix.to_vec();
             next_prefix.extend_from_slice(chunk.as_slice());
-            collect_all(storage, attr, &next_prefix, values)?;
+            collect_all(storage, attr, ty, &next_prefix, values)?;
         }
     }
     Ok(())
@@ -202,6 +208,8 @@ mod tests {
     use super::*;
     use crate::storage::MemStorage;
 
+    const TY: AttributeType = AttributeType::Str;
+
     fn sorted(mut values: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         values.sort();
         values
@@ -221,22 +229,22 @@ mod tests {
         let mut storage = MemStorage::default();
         let attr = b"fruit";
         for value in [b"apple".as_slice(), b"banana", b"cherry"] {
-            insert(&mut storage, attr, value).unwrap();
+            insert(&mut storage, attr, TY, value).unwrap();
         }
         assert_eq!(
-            sorted(scan(&mut storage, attr, b"banana", Bound::Gt).unwrap()),
+            sorted(scan(&mut storage, attr, TY, b"banana", Bound::Gt).unwrap()),
             vec![b"cherry".to_vec()],
         );
         assert_eq!(
-            sorted(scan(&mut storage, attr, b"banana", Bound::Gte).unwrap()),
+            sorted(scan(&mut storage, attr, TY, b"banana", Bound::Gte).unwrap()),
             vec![b"banana".to_vec(), b"cherry".to_vec()],
         );
         assert_eq!(
-            sorted(scan(&mut storage, attr, b"banana", Bound::Lt).unwrap()),
+            sorted(scan(&mut storage, attr, TY, b"banana", Bound::Lt).unwrap()),
             vec![b"apple".to_vec()],
         );
         assert_eq!(
-            glob(&mut storage, attr, b"ba").unwrap(),
+            glob(&mut storage, attr, TY, b"ba").unwrap(),
             vec![b"banana".to_vec()],
         );
     }
@@ -250,26 +258,26 @@ mod tests {
         a.extend_from_slice(b"-alpha");
         let mut b = vec![b'x'; 40];
         b.extend_from_slice(b"-beta");
-        insert(&mut storage, attr, &a).unwrap();
-        insert(&mut storage, attr, &b).unwrap();
+        insert(&mut storage, attr, TY, &a).unwrap();
+        insert(&mut storage, attr, TY, &b).unwrap();
 
         // Both come back via a prefix glob that only matches at a deeper level.
         assert_eq!(
-            sorted(glob(&mut storage, attr, &[b'x'; 40]).unwrap()),
+            sorted(glob(&mut storage, attr, TY, &[b'x'; 40]).unwrap()),
             sorted(vec![a.clone(), b.clone()]),
         );
-        assert_eq!(glob(&mut storage, attr, &a).unwrap(), vec![a.clone()]);
+        assert_eq!(glob(&mut storage, attr, TY, &a).unwrap(), vec![a.clone()]);
     }
 
     #[test]
     fn removed_values_drop_out() {
         let mut storage = MemStorage::default();
         let attr = b"fruit";
-        insert(&mut storage, attr, b"apple").unwrap();
-        insert(&mut storage, attr, b"banana").unwrap();
-        remove(&mut storage, attr, b"apple").unwrap();
+        insert(&mut storage, attr, TY, b"apple").unwrap();
+        insert(&mut storage, attr, TY, b"banana").unwrap();
+        remove(&mut storage, attr, TY, b"apple").unwrap();
         assert_eq!(
-            scan(&mut storage, attr, b"", Bound::Gte).unwrap(),
+            scan(&mut storage, attr, TY, b"", Bound::Gte).unwrap(),
             vec![b"banana".to_vec()],
         );
     }

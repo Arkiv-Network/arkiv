@@ -129,11 +129,10 @@ mod tests {
     #[test]
     fn writes_charge_for_size_and_attributes() {
         let key = [0u8; 32];
-        let one_attr = vec![Attribute {
-            key: b"k".to_vec(),
-            value_type: 2,
-            value: b"v".to_vec(),
-        }];
+        let one_attr = vec![Attribute::new(
+            b"k".to_vec(),
+            crate::entity::AttributeValue::Str("v".into()),
+        )];
         let cost = PlaceholderCost.op_cost(&Op::Create {
             key,
             expires_at: 1,

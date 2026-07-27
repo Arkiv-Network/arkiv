@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use crate::entity::Entity;
+use crate::entity::{AttributeValue, Entity};
 use crate::primitives::{BlockNumber, EntityKey, Hash};
 use crate::query::{PageParams, Query, QueryMatches};
 
@@ -115,15 +115,25 @@ pub struct AuxiliaryEntityDelta {
 
 /// One `(attribute, value)` pair in the index.
 ///
-/// `value_type` is one of the [`ATTR_*`](crate::entity::ATTR_UINT) tags. The index
-/// needs it to decide whether — and how — the value is *ordered* for range queries:
-/// a [`Uint`](crate::entity::ATTR_UINT) is range-indexed numerically, a
-/// [`String`](crate::entity::ATTR_STRING) lexically, and an
-/// [`entity key`](crate::entity::ATTR_ENTITY_KEY) not at all (equality only). It
-/// does not affect the equality index, which is over the raw `value` bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The value is a typed [`AttributeValue`], not loose bytes, because the index
+/// needs its type twice over: to decide whether — and how — the value is *ordered*
+/// for range queries (a [`U256`](AttributeValue::U256) numerically, a
+/// [`Str`](AttributeValue::Str) lexically, an
+/// [`EntityKey`](AttributeValue::EntityKey) not at all), and to keep the buckets of
+/// different types disjoint. The bytes it is actually keyed on are
+/// [`AttributeValue::index_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrEntry {
     pub attr: Vec<u8>,
-    pub value_type: u8,
-    pub value: Vec<u8>,
+    pub value: AttributeValue,
+}
+
+impl AttrEntry {
+    /// An index entry for `attr` holding `value`.
+    pub fn new(attr: impl Into<Vec<u8>>, value: AttributeValue) -> Self {
+        Self {
+            attr: attr.into(),
+            value,
+        }
+    }
 }

@@ -449,8 +449,8 @@ impl AttributeView {
     fn from_attribute(attribute: Attribute) -> Self {
         Self {
             key: String::from_utf8_lossy(&attribute.key).into_owned(),
-            value_type: attribute.value_type,
-            value: hex_prefixed(&attribute.value),
+            value_type: attribute.value.type_id(),
+            value: hex_prefixed(&attribute.value.encode()),
         }
     }
 }
@@ -470,7 +470,7 @@ fn invalid_params(message: String) -> ErrorObjectOwned {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkiv_interfaces::entity::ATTR_STRING;
+    use arkiv_interfaces::entity::AttributeValue;
 
     #[test]
     fn entity_view_projects_bytes_as_hex_and_text_as_strings() {
@@ -483,11 +483,10 @@ mod tests {
             expires_at: 100,
             content_type: b"text/plain".to_vec(),
             payload: vec![0xDE, 0xAD],
-            attributes: vec![Attribute {
-                key: b"color".to_vec(),
-                value_type: ATTR_STRING,
-                value: b"blue".to_vec(),
-            }],
+            attributes: vec![Attribute::new(
+                b"color".to_vec(),
+                AttributeValue::Str("blue".into()),
+            )],
         };
         let view = EntityView::from_entity(entity);
         assert_eq!(view.key, format!("0x{}", "11".repeat(32)));

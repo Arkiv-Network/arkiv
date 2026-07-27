@@ -84,7 +84,7 @@ pub enum CodeBackendError<E> {
 mod tests {
     use super::*;
     use crate::store::RethEntityStore;
-    use arkiv_interfaces::entity::Attribute;
+    use arkiv_interfaces::entity::{Attribute, AttributeValue};
     use arkiv_interfaces::primitives::EntityKey;
     use arkiv_interfaces::state::{BlockEntityStoreDelta, EntityStore};
     use core::convert::Infallible;
@@ -119,11 +119,10 @@ mod tests {
             expires_at: 100,
             content_type: b"text/plain".to_vec(),
             payload: b"hi".to_vec(),
-            attributes: vec![Attribute {
-                key: b"c".to_vec(),
-                value_type: 2,
-                value: b"blue".to_vec(),
-            }],
+            attributes: vec![Attribute::new(
+                b"c".to_vec(),
+                AttributeValue::Str("blue".into()),
+            )],
             ..Entity::default()
         }
     }

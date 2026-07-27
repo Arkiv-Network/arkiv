@@ -20,6 +20,7 @@
 
 use alloy_primitives::B256;
 use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::entity::AttributeType;
 
 use crate::address::btree_header_address;
 use crate::btree;
@@ -87,10 +88,15 @@ pub enum Bound {
 ///
 /// Idempotent: the value is a distinct key in the tree, so re-recording it just
 /// rewrites the same presence word. Mirrors v1's `tier2_insert` (int mode).
-pub fn insert<S: IndexStorage>(storage: &mut S, attr: &[u8], value: &[u8]) -> Result<(), S::Error> {
+pub fn insert<S: IndexStorage>(
+    storage: &mut S,
+    attr: &[u8],
+    ty: AttributeType,
+    value: &[u8],
+) -> Result<(), S::Error> {
     btree::insert(
         storage,
-        btree_header_address(attr),
+        btree_header_address(attr, ty),
         annot_val_to_slot(value),
         slot_presence(value.len()),
     )
@@ -98,10 +104,15 @@ pub fn insert<S: IndexStorage>(storage: &mut S, attr: &[u8], value: &[u8]) -> Re
 
 /// Record that `attr` no longer has `value` (lazy — the key stays, marked absent).
 /// Mirrors v1's `tier2_remove` (int mode).
-pub fn remove<S: IndexStorage>(storage: &mut S, attr: &[u8], value: &[u8]) -> Result<(), S::Error> {
+pub fn remove<S: IndexStorage>(
+    storage: &mut S,
+    attr: &[u8],
+    ty: AttributeType,
+    value: &[u8],
+) -> Result<(), S::Error> {
     btree::lazy_delete(
         storage,
-        btree_header_address(attr),
+        btree_header_address(attr, ty),
         annot_val_to_slot(value),
     )
 }
@@ -113,10 +124,11 @@ pub fn remove<S: IndexStorage>(storage: &mut S, attr: &[u8], value: &[u8]) -> Re
 pub fn scan<S: IndexStorage>(
     storage: &mut S,
     attr: &[u8],
+    ty: AttributeType,
     bound: &[u8],
     kind: Bound,
 ) -> Result<Vec<Vec<u8>>, S::Error> {
-    let header = btree_header_address(attr);
+    let header = btree_header_address(attr, ty);
     let bound_slot = annot_val_to_slot(bound);
     let mut result = Vec::new();
 
@@ -156,6 +168,8 @@ pub fn scan<S: IndexStorage>(
 mod tests {
     use super::*;
     use crate::storage::MemStorage;
+
+    const TY: AttributeType = AttributeType::U256;
 
     #[test]
     fn presence_encoding_roundtrips_length() {
@@ -198,7 +212,7 @@ mod tests {
         let attr = b"$expiration";
         let vals = [10u64, 20, 30, 40, 50];
         for v in vals {
-            insert(&mut s, attr, &v.to_be_bytes()).unwrap();
+            insert(&mut s, attr, TY, &v.to_be_bytes()).unwrap();
         }
         let as_u64 = |rows: Vec<Vec<u8>>| {
             rows.into_iter()
@@ -207,19 +221,19 @@ mod tests {
         };
         let b30 = 30u64.to_be_bytes();
         assert_eq!(
-            as_u64(scan(&mut s, attr, &b30, Bound::Gt).unwrap()),
+            as_u64(scan(&mut s, attr, TY, &b30, Bound::Gt).unwrap()),
             vec![40, 50]
         );
         assert_eq!(
-            as_u64(scan(&mut s, attr, &b30, Bound::Gte).unwrap()),
+            as_u64(scan(&mut s, attr, TY, &b30, Bound::Gte).unwrap()),
             vec![30, 40, 50]
         );
         assert_eq!(
-            as_u64(scan(&mut s, attr, &b30, Bound::Lt).unwrap()),
+            as_u64(scan(&mut s, attr, TY, &b30, Bound::Lt).unwrap()),
             vec![10, 20]
         );
         assert_eq!(
-            as_u64(scan(&mut s, attr, &b30, Bound::Lte).unwrap()),
+            as_u64(scan(&mut s, attr, TY, &b30, Bound::Lte).unwrap()),
             vec![10, 20, 30]
         );
     }
@@ -229,10 +243,10 @@ mod tests {
         let mut s = MemStorage::default();
         let attr = b"$expiration";
         for v in [10u64, 20, 30] {
-            insert(&mut s, attr, &v.to_be_bytes()).unwrap();
+            insert(&mut s, attr, TY, &v.to_be_bytes()).unwrap();
         }
-        remove(&mut s, attr, &20u64.to_be_bytes()).unwrap();
-        let rows = scan(&mut s, attr, &0u64.to_be_bytes(), Bound::Gte).unwrap();
+        remove(&mut s, attr, TY, &20u64.to_be_bytes()).unwrap();
+        let rows = scan(&mut s, attr, TY, &0u64.to_be_bytes(), Bound::Gte).unwrap();
         let got: Vec<u64> = rows
             .into_iter()
             .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
@@ -246,9 +260,9 @@ mod tests {
         // the presence word carries the true length so short values round-trip.
         let mut s = MemStorage::default();
         let attr = b"tag";
-        insert(&mut s, attr, b"ab").unwrap();
-        insert(&mut s, attr, b"abc").unwrap();
-        let rows = scan(&mut s, attr, b"", Bound::Gte).unwrap();
+        insert(&mut s, attr, TY, b"ab").unwrap();
+        insert(&mut s, attr, TY, b"abc").unwrap();
+        let rows = scan(&mut s, attr, TY, b"", Bound::Gte).unwrap();
         assert_eq!(rows, vec![b"ab".to_vec(), b"abc".to_vec()]);
     }
 }

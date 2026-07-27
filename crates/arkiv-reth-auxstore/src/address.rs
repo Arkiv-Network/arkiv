@@ -14,6 +14,7 @@
 
 use alloy_primitives::{Address, keccak256};
 use arkiv_constants::ADDRESS_LEN;
+use arkiv_interfaces::entity::AttributeType;
 
 /// Every domain tag is this many bytes (`b"arkiv.pair"`, `b"arkiv.ibth"`, …), so
 /// the fixed-size node buffer below can be sized from it.
@@ -54,16 +55,19 @@ pub const BTREE_ORDER: usize = 32;
 
 /// Address of the *pair account* for the `(attr, value)` equality bucket.
 ///
-/// `pair_address = keccak256("arkiv.pair" || attr || 0x00 || value)[:20]`. The
-/// account's contents are the [`Bitmap`](crate::bitmap::Bitmap) of entity ids
+/// `pair_address = keccak256("arkiv.pair" || attr || 0x00 || typeId || value)[:20]`.
+/// The account's contents are the [`Bitmap`](crate::bitmap::Bitmap) of entity ids
 /// carrying this pair. The `0x00` separator prevents prefix collisions between the
-/// attribute and value, so `attr` and `value` must not themselves contain `0x00`
-/// (the precompile enforces this on the write path).
-pub fn pair_address(attr: &[u8], value: &[u8]) -> Address {
-    let mut buf = Vec::with_capacity(PAIR_DOMAIN.len() + attr.len() + 1 + value.len());
+/// attribute and value, so `attr` must not itself contain `0x00` (the precompile
+/// enforces this on the write path); the fixed-width `typeId` that follows it keeps
+/// one name's differently-typed values in disjoint buckets, so `true` and the
+/// `u256` `1` never share one.
+pub fn pair_address(attr: &[u8], ty: AttributeType, value: &[u8]) -> Address {
+    let mut buf = Vec::with_capacity(PAIR_DOMAIN.len() + attr.len() + 2 + value.len());
     buf.extend_from_slice(PAIR_DOMAIN);
     buf.extend_from_slice(attr);
     buf.push(0x00);
+    buf.push(ty.id());
     buf.extend_from_slice(value);
     Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
@@ -73,18 +77,27 @@ pub fn pair_address(attr: &[u8], value: &[u8]) -> Address {
 /// Reading this one bitmap enumerates every entity, and negations (`Neq`, `Not`,
 /// …) are evaluated as "everything in `$all`, minus the matching bitmap".
 pub fn all_entities_bucket() -> Address {
-    pair_address(arkiv_interfaces::entity::annotations::ALL, b"")
+    pair_address(
+        arkiv_interfaces::entity::annotations::ALL,
+        AttributeType::Str,
+        b"",
+    )
 }
 
-/// Address of the **header account** for `attr`'s tier-2 int-mode B+ tree.
+/// Address of the **header account** for the tier-2 B+ tree over `attr`'s `ty`
+/// values.
 ///
-/// `btree_header_address = keccak256("arkiv.ibth" || attr)[:20]`. Slot 0 holds the
-/// tree's header: `[0..8]` = root node id, `[8..16]` = next node id to allocate,
-/// `[16]` = [`BTREE_MAGIC`] — all big-endian.
-pub fn btree_header_address(attr: &[u8]) -> Address {
-    let mut buf = Vec::with_capacity(BTREE_HEADER_DOMAIN.len() + attr.len());
+/// `btree_header_address = keccak256("arkiv.ibth" || attr || 0x00 || typeId)[:20]`.
+/// Slot 0 holds the tree's header: `[0..8]` = root node id, `[8..16]` = next node id
+/// to allocate, `[16]` = [`BTREE_MAGIC`] — all big-endian. One tree per
+/// `(attr, type)`, so its keys are all the same width and their byte order is the
+/// type's value order.
+pub fn btree_header_address(attr: &[u8], ty: AttributeType) -> Address {
+    let mut buf = Vec::with_capacity(BTREE_HEADER_DOMAIN.len() + attr.len() + 2);
     buf.extend_from_slice(BTREE_HEADER_DOMAIN);
     buf.extend_from_slice(attr);
+    buf.push(0x00);
+    buf.push(ty.id());
     Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
 
@@ -112,18 +125,19 @@ pub fn btree_node_address(header_addr: Address, node_id: u64) -> Address {
     Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
 
-/// Address of the str-mode cascade **level account** for `attr` at `prefix`.
+/// Address of the cascade **level account** for `attr`'s `ty` values at `prefix`.
 ///
-/// `str_level_address = keccak256("arkiv.sidx" || attr || 0x00 || prefix)[..20]`.
-/// The cascade indexes a string value chunk-by-chunk: level 0 lives at `prefix =
-/// b""`, level 1 at `prefix = chunk0` (32 bytes), and so on. Each level account
-/// holds one storage slot per distinct 32-byte chunk seen at that level. The `0x00`
-/// separator keeps `attr` and `prefix` from colliding (as in [`pair_address`]).
-pub fn str_level_address(attr: &[u8], prefix: &[u8]) -> Address {
-    let mut buf = Vec::with_capacity(STR_LEVEL_DOMAIN.len() + attr.len() + 1 + prefix.len());
+/// `str_level_address = keccak256("arkiv.sidx" || attr || 0x00 || typeId ||
+/// prefix)[..20]`. The cascade indexes a string value chunk-by-chunk: level 0 lives
+/// at `prefix = b""`, level 1 at `prefix = chunk0` (32 bytes), and so on. Each level
+/// account holds one storage slot per distinct 32-byte chunk seen at that level.
+/// Separator and `typeId` as in [`pair_address`].
+pub fn str_level_address(attr: &[u8], ty: AttributeType, prefix: &[u8]) -> Address {
+    let mut buf = Vec::with_capacity(STR_LEVEL_DOMAIN.len() + attr.len() + 2 + prefix.len());
     buf.extend_from_slice(STR_LEVEL_DOMAIN);
     buf.extend_from_slice(attr);
     buf.push(0x00);
+    buf.push(ty.id());
     buf.extend_from_slice(prefix);
     Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
 }
@@ -152,30 +166,32 @@ mod tests {
     // has moved and every existing bucket is orphaned: it is a hard fork, not a
     // refactor.
 
+    use AttributeType::{Str, U256};
+
     #[test]
     fn pair_address_golden_all() {
         assert_eq!(
-            pair_address(b"$all", b""),
-            address!("6e5ac232ad0532401f1a1b4e84410abe42fd7738"),
+            pair_address(b"$all", Str, b""),
+            address!("c3ce578d786b69868e8f8a848e6063737f9414a0"),
         );
     }
 
     #[test]
     fn pair_address_golden_user_attr() {
         assert_eq!(
-            pair_address(b"color", b"blue"),
-            address!("305e7f4a747af42bfbb1c4e8b33ea4b0526e12d2"),
+            pair_address(b"color", Str, b"blue"),
+            address!("98edbc9a78ec4b98933a20e9a5d1db0e703338bd"),
         );
     }
 
     #[test]
     fn all_entities_bucket_is_all_empty_pair() {
-        assert_eq!(all_entities_bucket(), pair_address(b"$all", b""));
+        assert_eq!(all_entities_bucket(), pair_address(b"$all", Str, b""));
     }
 
     #[test]
     fn is_deterministic() {
-        assert_eq!(pair_address(b"k", b"v"), pair_address(b"k", b"v"));
+        assert_eq!(pair_address(b"k", Str, b"v"), pair_address(b"k", Str, b"v"));
     }
 
     /// The `0x00` separator is what stops the `(attr, value)` split point from
@@ -183,35 +199,59 @@ mod tests {
     /// concatenation and share a bucket.
     #[test]
     fn separator_prevents_prefix_collision() {
-        assert_ne!(pair_address(b"ab", b"c"), pair_address(b"a", b"bc"));
+        assert_ne!(
+            pair_address(b"ab", Str, b"c"),
+            pair_address(b"a", Str, b"bc")
+        );
     }
 
     #[test]
     fn distinct_values_get_distinct_buckets() {
-        assert_ne!(pair_address(b"$owner", b"a"), pair_address(b"$owner", b"b"));
+        assert_ne!(
+            pair_address(b"$owner", Str, b"a"),
+            pair_address(b"$owner", Str, b"b")
+        );
+    }
+
+    /// Same name, same bytes, different type — different bucket. Without this, a
+    /// `bool` `true` and a one-byte string would answer each other's queries.
+    #[test]
+    fn distinct_types_get_distinct_buckets() {
+        assert_ne!(
+            pair_address(b"flag", AttributeType::Bool, &[1]),
+            pair_address(b"flag", Str, &[1]),
+        );
+        assert_ne!(
+            btree_header_address(b"n", AttributeType::Int),
+            btree_header_address(b"n", U256),
+        );
+        assert_ne!(
+            str_level_address(b"s", Str, b""),
+            str_level_address(b"s", AttributeType::Bytes32, b""),
+        );
     }
 
     #[test]
     fn btree_header_golden() {
         assert_eq!(
-            btree_header_address(b"$expiration"),
-            address!("c1833f2adcf10d317185c779bdbc9a787323e104"),
+            btree_header_address(b"$expiration", U256),
+            address!("64898bb577c7810fef10769b6c168d1bdc590c64"),
         );
     }
 
     #[test]
     fn btree_node_golden() {
-        let header = btree_header_address(b"$expiration");
+        let header = btree_header_address(b"$expiration", U256);
         assert_eq!(
             btree_node_address(header, 1),
-            address!("ac874fabef0c4042e0af2486f95e1e08b8502ed4"),
+            address!("28a48678ed4587a96e0e2b69aeead93b9cd38e89"),
         );
     }
 
     #[test]
     fn btree_nodes_are_distinct_per_id_and_tree() {
-        let a = btree_header_address(b"attrA");
-        let b = btree_header_address(b"attrB");
+        let a = btree_header_address(b"attrA", U256);
+        let b = btree_header_address(b"attrB", U256);
         assert_ne!(btree_node_address(a, 1), btree_node_address(a, 2));
         assert_ne!(btree_node_address(a, 1), btree_node_address(b, 1));
     }
@@ -219,8 +259,8 @@ mod tests {
     #[test]
     fn str_level_golden() {
         assert_eq!(
-            str_level_address(b"name", b""),
-            address!("0e560da369ae5df4faf8a08707658008ec2a0fc4"),
+            str_level_address(b"name", Str, b""),
+            address!("dd55be8e46bccf46a682d40d46eaa6b96db429a3"),
         );
     }
 
@@ -234,7 +274,13 @@ mod tests {
 
     #[test]
     fn str_levels_are_distinct_per_prefix_and_attr() {
-        assert_ne!(str_level_address(b"a", b""), str_level_address(b"a", b"x"));
-        assert_ne!(str_level_address(b"a", b"x"), str_level_address(b"b", b"x"));
+        assert_ne!(
+            str_level_address(b"a", Str, b""),
+            str_level_address(b"a", Str, b"x")
+        );
+        assert_ne!(
+            str_level_address(b"a", Str, b"x"),
+            str_level_address(b"b", Str, b"x")
+        );
     }
 }

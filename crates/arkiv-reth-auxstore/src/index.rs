@@ -16,6 +16,7 @@
 
 use alloy_primitives::Address;
 use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::entity::{AttributeType, AttributeValue};
 use arkiv_reth_entitystore::AccountCode;
 
 use crate::address::pair_address;
@@ -47,14 +48,18 @@ where
 pub(crate) fn insert<B, E>(
     backend: &mut B,
     attr: &[u8],
-    value: &[u8],
+    value: &AttributeValue,
     entity_id: u64,
     mode: Mode,
 ) -> Result<(), AuxError<E>>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
-    let pair_addr = pair_address(attr, value);
+    if mode == Mode::None {
+        return Ok(());
+    }
+    let bytes = value.index_bytes();
+    let pair_addr = pair_address(attr, value.attr_type(), &bytes);
     let mut bitmap = read_pair_bitmap(backend, pair_addr)?;
     let was_empty = bitmap.is_empty();
     bitmap.insert(entity_id);
@@ -62,7 +67,7 @@ where
         .set_code(pair_addr, bitmap.to_bytes())
         .map_err(AuxError::Backend)?;
     if was_empty {
-        tier2_insert(backend, attr, value, mode)?;
+        tier2_insert(backend, attr, value.attr_type(), &bytes, mode)?;
     }
     Ok(())
 }
@@ -72,14 +77,18 @@ where
 pub(crate) fn remove<B, E>(
     backend: &mut B,
     attr: &[u8],
-    value: &[u8],
+    value: &AttributeValue,
     entity_id: u64,
     mode: Mode,
 ) -> Result<(), AuxError<E>>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
-    let pair_addr = pair_address(attr, value);
+    if mode == Mode::None {
+        return Ok(());
+    }
+    let bytes = value.index_bytes();
+    let pair_addr = pair_address(attr, value.attr_type(), &bytes);
     let mut bitmap = read_pair_bitmap(backend, pair_addr)?;
     if bitmap.is_empty() {
         return Ok(());
@@ -89,7 +98,7 @@ where
         .set_code(pair_addr, bitmap.to_bytes())
         .map_err(AuxError::Backend)?;
     if bitmap.is_empty() {
-        tier2_remove(backend, attr, value, mode)?;
+        tier2_remove(backend, attr, value.attr_type(), &bytes, mode)?;
     }
     Ok(())
 }
@@ -101,6 +110,7 @@ where
 fn tier2_insert<B, E>(
     backend: &mut B,
     attr: &[u8],
+    ty: AttributeType,
     value: &[u8],
     mode: Mode,
 ) -> Result<(), AuxError<E>>
@@ -108,11 +118,11 @@ where
     B: IndexStorage<Error = E>,
 {
     match mode {
-        Mode::Int if value.len() <= WORD_LEN => {
-            range::insert(backend, attr, value).map_err(AuxError::Backend)
+        Mode::Range if value.len() <= WORD_LEN => {
+            range::insert(backend, attr, ty, value).map_err(AuxError::Backend)
         }
-        Mode::Str if value.len() <= MAX_STR_LEN => {
-            cascade::insert(backend, attr, value).map_err(AuxError::Backend)
+        Mode::Prefix if value.len() <= MAX_STR_LEN => {
+            cascade::insert(backend, attr, ty, value).map_err(AuxError::Backend)
         }
         _ => Ok(()),
     }
@@ -123,6 +133,7 @@ where
 fn tier2_remove<B, E>(
     backend: &mut B,
     attr: &[u8],
+    ty: AttributeType,
     value: &[u8],
     mode: Mode,
 ) -> Result<(), AuxError<E>>
@@ -130,11 +141,11 @@ where
     B: IndexStorage<Error = E>,
 {
     match mode {
-        Mode::Int if value.len() <= WORD_LEN => {
-            range::remove(backend, attr, value).map_err(AuxError::Backend)
+        Mode::Range if value.len() <= WORD_LEN => {
+            range::remove(backend, attr, ty, value).map_err(AuxError::Backend)
         }
-        Mode::Str if value.len() <= MAX_STR_LEN => {
-            cascade::remove(backend, attr, value).map_err(AuxError::Backend)
+        Mode::Prefix if value.len() <= MAX_STR_LEN => {
+            cascade::remove(backend, attr, ty, value).map_err(AuxError::Backend)
         }
         _ => Ok(()),
     }

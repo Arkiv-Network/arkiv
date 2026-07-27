@@ -5,8 +5,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::collections::NonEmptyVec;
-use crate::entity::Entity;
-use crate::primitives::{Address, BlockNumber, EntityKey, Gas};
+use crate::entity::{AttributeValue, Entity};
+use crate::primitives::{BlockNumber, EntityKey, Gas};
 use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, HistoricalEntityStore};
 
 /// A query — a tree of predicates over an entity's attributes.
@@ -69,29 +69,13 @@ pub enum BuiltIn {
     CreatedAtBlock,
 }
 
-/// A value a predicate compares against. Its kind is explicit, so ordering is
-/// well-defined: a [`Uint`](AnnotVal::Uint) is 32-byte big-endian (its bytes sort
-/// numerically), while [`Str`](AnnotVal::Str) and [`Key`](AnnotVal::Key) sort by
-/// their bytes.
+/// A value a predicate compares against.
 ///
-/// Mirrors the attribute value tags [`ATTR_UINT`](crate::entity::ATTR_UINT),
-/// [`ATTR_STRING`](crate::entity::ATTR_STRING), and
-/// [`ATTR_ENTITY_KEY`](crate::entity::ATTR_ENTITY_KEY).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnnotVal {
-    /// A 256-bit unsigned integer, big-endian.
-    Uint([u8; 32]),
-    /// A string / raw bytes (UTF-8 by convention).
-    Str(Vec<u8>),
-    /// An entity key.
-    Key(EntityKey),
-    /// A 20-byte address (e.g. an `$owner` / `$creator` value).
-    ///
-    /// The 20-byte width is an **Ethereum-host convention**, not intrinsic to
-    /// Arkiv. It's enshrined here only so address-valued annotations are
-    /// representable in the AST — treat it as loosely coupled to the host.
-    Addr(Address),
-}
+/// It is exactly the stored [`AttributeValue`], so a predicate and the attribute it
+/// matches speak one type system: the query's bytes are derived the same way the
+/// writer derived the index's ([`AttributeValue::index_bytes`]), and a value of one
+/// type never matches an attribute of another.
+pub type AnnotVal = AttributeValue;
 
 /// Where to start and how many to return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
