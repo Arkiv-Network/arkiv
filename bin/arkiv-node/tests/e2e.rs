@@ -762,3 +762,47 @@ async fn explicit_expire_over_a_live_node() {
     );
     assert_eq!(client.entity_count(None, None).await, 0);
 }
+
+/// A lapsed BTL hides an entity from every read *without* an explicit `expire`
+/// op: the index still carries it until someone prunes it, so the RPC layer
+/// applies the expiry rule itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lapsed_btl_hides_an_entity_from_reads() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+
+    client
+        .execute(vec![Operation::create(
+            10,
+            Bytes::from_static(b"ttl"),
+            text_plain_mime(),
+            vec![],
+        )])
+        .await;
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let expires_at = client.get_entity(key).await["expiresAt"].as_u64().unwrap();
+    assert_eq!(
+        client.entity_count(None, None).await,
+        1,
+        "live before expiry"
+    );
+
+    // Past the expiry block, with no `expire` op run against it.
+    client
+        .wait_for_block(expires_at, Duration::from_secs(30))
+        .await;
+    assert!(
+        client.get_entity(key).await.is_null(),
+        "past-BTL entity reads null"
+    );
+    assert!(
+        !result_keys(&client.query("*", 100, None).await).contains(&format!("{key:#x}")),
+        "past-BTL entity leaves queries",
+    );
+    assert_eq!(client.entity_count(None, None).await, 0, "and the count");
+
+    // History still sees it: at its last live block it was live.
+    assert!(
+        !client.get_entity_at(key, expires_at - 1).await.is_null(),
+        "a historical read before the expiry block still sees it",
+    );
+}

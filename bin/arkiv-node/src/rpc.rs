@@ -12,9 +12,10 @@
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{B256, hex};
+use alloy_primitives::{B256, U256, hex};
 use arkiv_interfaces::entity::{Attribute, Entity};
-use arkiv_interfaces::query::{PageParams, Query};
+use arkiv_interfaces::primitives::BlockNumber;
+use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
 use arkiv_reth_auxstore::RethAuxStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
@@ -61,7 +62,6 @@ where
             tokio::task::spawn_blocking(move || read_entity(&provider, key, block))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
-                .map_err(|e| internal_error(e.to_string()))
         }
     })?;
 
@@ -116,40 +116,66 @@ where
 }
 
 /// A state snapshot as of `block` (its post-state), or the tip when `block` is
-/// `None`. The Arkiv index rides in this same state, so a historical snapshot
-/// answers historical reads and queries without any per-store history machinery.
+/// `None`, plus the block number it answers for. The Arkiv index rides in this
+/// same state, so a historical snapshot answers historical reads and queries
+/// without any per-store history machinery.
 fn resolve_state<Provider>(
     provider: &Provider,
     block: Option<u64>,
-) -> eyre::Result<StateProviderBox>
+) -> Result<(StateProviderBox, u64), ErrorObjectOwned>
 where
-    Provider: StateProviderFactory,
+    Provider: StateProviderFactory + BlockNumReader,
 {
-    match block {
-        Some(number) => provider
-            .history_by_block_number(number)
-            .map_err(|e| eyre::eyre!("history_by_block_number({number}): {e:?}")),
-        None => provider
-            .latest()
-            .map_err(|e| eyre::eyre!("latest state: {e:?}")),
-    }
+    snapshot_for(provider, block.map(BlockNumberOrTag::Number))
 }
 
-/// Read one entity by key, at the tip or as of `block`.
+// ── BTL filtering ─────────────────────────────────────────────────────
+//
+// An entity whose BTL has run out is dead state, but it lingers in the entity
+// store and the index until an explicit `expire` op prunes it. Every read path
+// therefore has to apply the expiry rule itself, or it serves rows that should
+// no longer exist. Both helpers below encode that one rule — the executor's
+// check in `arkiv-reth-executor`'s `mutate` — in the two shapes the read paths
+// need.
+
+/// The rule: an entity is live at `block` while its expiry block is still ahead.
+fn is_live(expires_at: BlockNumber, block: BlockNumber) -> bool {
+    expires_at > block
+}
+
+/// The same rule as a query bound — `query AND $expiration > block`.
+///
+/// `$expiration` is an indexed built-in, so this filters inside the index rather
+/// than after the fact: pages come back full instead of pocked with holes, and
+/// the match-set cardinality behind `arkiv_getEntityCount` excludes dead rows.
+fn live_at(query: Query, block: BlockNumber) -> Query {
+    Query::And(
+        Box::new(query),
+        Box::new(Query::Gt {
+            key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+            value: AnnotVal::Uint(U256::from(block).to_be_bytes()),
+        }),
+    )
+}
+
+/// Read one entity by key, at the tip or as of `block`. A past-BTL entity reads
+/// as absent — see [`is_live`].
 fn read_entity<Provider>(
     provider: &Provider,
     key: B256,
     block: Option<u64>,
-) -> eyre::Result<Option<EntityView>>
+) -> Result<Option<EntityView>, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory,
+    Provider: StateProviderFactory + BlockNumReader,
 {
-    let state = resolve_state(provider, block)?;
+    let (state, block_number) = resolve_state(provider, block)?;
     let mut store = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
     let entity = store
         .get(key.0)
-        .map_err(|e| eyre::eyre!("get entity: {e:?}"))?;
-    Ok(entity.map(EntityView::from_entity))
+        .map_err(|e| internal_error(format!("get entity: {e:?}")))?;
+    Ok(entity
+        .filter(|e| is_live(e.expires_at, block_number))
+        .map(EntityView::from_entity))
 }
 
 /// A state snapshot for `atBlock` plus the block number it answers for:
@@ -191,6 +217,8 @@ where
 /// resolves the query to a page of keys, then the same snapshot is recovered
 /// (`into_backend`) and reused to read those entities' full bytes — so the keys and
 /// the entities are read from a single consistent state.
+///
+/// The query is bounded to entities still live at that block — see [`live_at`].
 fn run_query<Provider>(
     provider: &Provider,
     q: &str,
@@ -214,7 +242,7 @@ where
 
     let mut index = RethAuxStore::new(SnapshotAccountCode::new(state));
     let matches = index
-        .evaluate(&query, page)
+        .evaluate(&live_at(query, block_number), page)
         .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
 
     // Recover the same snapshot to read the matched entities' bytes.
@@ -248,13 +276,14 @@ where
 ///
 /// The count is the full match-set cardinality
 /// ([`entities_scanned`](QueryStats::entities_scanned)), independent of paging, so a
-/// one-key page is enough to read it.
+/// one-key page is enough to read it. Past-BTL entities are excluded — see
+/// [`live_at`].
 fn entity_count<Provider>(
     provider: &Provider,
     request: CountRequest,
 ) -> Result<u64, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory,
+    Provider: StateProviderFactory + BlockNumReader,
 {
     let query = match &request.query {
         Some(text) => {
@@ -262,12 +291,11 @@ where
         }
         None => Query::All,
     };
-    let state = resolve_state(provider, request.block)
-        .map_err(|e| internal_error(format!("state: {e:?}")))?;
+    let (state, block_number) = resolve_state(provider, request.block)?;
     let mut index = RethAuxStore::new(SnapshotAccountCode::new(state));
     let matches = index
         .evaluate(
-            &query,
+            &live_at(query, block_number),
             PageParams {
                 page_size: 1,
                 cursor: None,
