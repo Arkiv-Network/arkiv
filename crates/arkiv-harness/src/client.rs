@@ -16,6 +16,8 @@ use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{IEntityRegistry, Operation};
 use arkiv_reth_executor::ARKIV_ADDRESS;
 
+use crate::node::Node;
+
 /// The gas + price every `execute` uses. Gas is set explicitly so the client
 /// skips `eth_estimateGas` — which would fail up-front on a reverting tx, hiding
 /// the revert that [`try_execute`](ArkivClient::try_execute) needs to observe.
@@ -78,6 +80,51 @@ impl<P: Provider> ArkivClient<P> {
         }
     }
 
+    /// Poll `eth_chainId` until it answers or `timeout` elapses; returns whether
+    /// the node became ready. The non-panicking building block behind
+    /// [`wait_ready`](Self::wait_ready) and [`wait_ready_resilient`](Self::wait_ready_resilient).
+    pub async fn ready_within(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.provider.get_chain_id().await.is_ok() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Wait until `node` answers RPC, respawning it if a boot stalls — debug reth
+    /// under heavy parallel load occasionally wedges on start (and a crashed boot,
+    /// e.g. a port collision, would otherwise burn the whole timeout). Tries up to
+    /// `attempts` processes, each given `per_attempt` to come up; a process that
+    /// has already exited is respawned immediately. Panics if every attempt fails.
+    ///
+    /// The client's URL is fixed across respawns, so the same client keeps working.
+    pub async fn wait_ready_resilient(
+        &self,
+        node: &mut Node,
+        attempts: usize,
+        per_attempt: Duration,
+    ) {
+        for attempt in 1..=attempts {
+            // A boot that already crashed can't answer — skip the wait and respawn.
+            if node.has_exited().is_none() && self.ready_within(per_attempt).await {
+                return;
+            }
+            assert!(
+                attempt < attempts,
+                "node RPC not ready after {attempts} attempts of {per_attempt:?}",
+            );
+            node.kill();
+            // Let the OS release the listening ports before the rebind.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            node.restart();
+        }
+    }
+
     /// The chain id.
     pub async fn chain_id(&self) -> u64 {
         self.provider.get_chain_id().await.expect("chain id")
@@ -89,6 +136,43 @@ impl<P: Provider> ArkivClient<P> {
             .get_block_number()
             .await
             .expect("block number")
+    }
+
+    /// The hash of the current tip block — the head a CL driver points a follower at.
+    pub async fn tip_hash(&self) -> B256 {
+        self.block_hash("latest").await
+    }
+
+    /// The hash of block `number` (for asserting two chains agree at a fixed height).
+    pub async fn block_hash_at(&self, number: u64) -> B256 {
+        self.block_hash(&format!("0x{number:x}")).await
+    }
+
+    async fn block_hash(&self, block: &str) -> B256 {
+        let response: serde_json::Value = self
+            .provider
+            .raw_request("eth_getBlockByNumber".into(), (block, false))
+            .await
+            .expect("eth_getBlockByNumber");
+        response["hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no block {block}"))
+            .parse()
+            .expect("block hash")
+    }
+
+    /// This node's enode URL (from `admin_nodeInfo`) — needs the `admin` RPC
+    /// module. A follower dials it as a `--trusted-peers` entry.
+    pub async fn enode(&self) -> String {
+        let response: serde_json::Value = self
+            .provider
+            .raw_request("admin_nodeInfo".into(), ())
+            .await
+            .expect("admin_nodeInfo (is the `admin` module enabled?)");
+        response["enode"]
+            .as_str()
+            .expect("enode string")
+            .to_string()
     }
 
     /// Block until the chain reaches `target`, or panic after `timeout`.

@@ -57,6 +57,12 @@ alloy-signer-local = { version = "=2.0.4", features = ["mnemonic"] }
 alloy-network = "=2.0.4"
 alloy-contract = "=2.0.4"
 alloy-rpc-types = "=2.0.4"
+# Engine-API stack for the harness's minimal CL driver (T2 replication): a
+# JWT-authenticated (AuthLayer, over the hyper transport) engine client that
+# drives a follower's fork choice. Same 2.0.4 pin as the rest of the alloy stack.
+alloy-rpc-types-engine = { version = "=2.0.4", features = ["jwt"] }
+alloy-rpc-client = { version = "=2.0.4", features = ["hyper"] }
+alloy-transport-http = { version = "=2.0.4", features = ["jwt-auth"] }
 
 # Solidity bindings for the Arkiv EntityRegistry ABI, vendored from
 # arkiv-contracts rev d6ebe18 (see crates/arkiv-bindings for the sync story).

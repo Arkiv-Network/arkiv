@@ -17,6 +17,11 @@ alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
+# The minimal CL driver (engine module): a JWT-authenticated Engine API client
+# that drives a follower's fork choice so it replicates the sequencer (T2).
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-client.workspace = true
+alloy-transport-http.workspace = true
 arkiv-bindings.workspace = true
 # ARKIV_ADDRESS + derive_entity_key: protocol constants a client needs to build
 # calldata and predict minted keys.

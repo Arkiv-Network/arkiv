@@ -25,6 +25,8 @@ pub struct NodeBuilder {
     dev: bool,
     block_time: String,
     http_api: String,
+    jwt_secret: Option<PathBuf>,
+    trusted_peers: Vec<String>,
     extra_args: Vec<String>,
 }
 
@@ -37,6 +39,8 @@ impl NodeBuilder {
             dev: true,
             block_time: "250ms".to_string(),
             http_api: "eth,net,web3,txpool".to_string(),
+            jwt_secret: None,
+            trusted_peers: Vec::new(),
             extra_args: Vec::new(),
         }
     }
@@ -57,6 +61,21 @@ impl NodeBuilder {
     /// The `--http.api` module list.
     pub fn http_api(mut self, http_api: impl Into<String>) -> Self {
         self.http_api = http_api.into();
+        self
+    }
+
+    /// Authenticate the Engine API with the JWT secret at `path` (reth reads the
+    /// hex file — it must already exist). Two nodes sharing one path share the
+    /// secret, so the harness's CL driver can drive the follower's engine.
+    pub fn jwt_secret(mut self, path: impl Into<PathBuf>) -> Self {
+        self.jwt_secret = Some(path.into());
+        self
+    }
+
+    /// Add a `--trusted-peers` enode the node dials directly (used to point a
+    /// follower at the sequencer, since discovery is disabled).
+    pub fn trusted_peer(mut self, enode: impl Into<String>) -> Self {
+        self.trusted_peers.push(enode.into());
         self
     }
 
@@ -108,6 +127,10 @@ impl Node {
         // and the namespace is merged onto the http transport by extend_rpc_modules.
         let mut cmd = Command::new(&self.config.binary);
         cmd.arg("node");
+        // Always the dev genesis, so a `--dev` sequencer and a plain follower share
+        // one chainspec (matching genesis is what lets them peer). `--dev` adds only
+        // the auto-seal miner on top.
+        cmd.args(["--chain", "dev"]);
         if self.config.dev {
             cmd.arg("--dev")
                 .args(["--dev.block-time", &self.config.block_time]);
@@ -128,6 +151,12 @@ impl Node {
             self.datadir.to_str().expect("utf-8 datadir"),
             "--disable-discovery",
         ]);
+        if let Some(jwt) = &self.config.jwt_secret {
+            cmd.args(["--authrpc.jwtsecret", jwt.to_str().expect("utf-8 jwt path")]);
+        }
+        for peer in &self.config.trusted_peers {
+            cmd.args(["--trusted-peers", peer]);
+        }
         cmd.args(&self.config.extra_args);
         cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -150,6 +179,11 @@ impl Node {
         self.authrpc_port
     }
 
+    /// The authenticated Engine API URL (for the harness's CL driver).
+    pub fn authrpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.authrpc_port)
+    }
+
     /// The devp2p listener port.
     pub fn p2p_port(&self) -> u16 {
         self.p2p_port
@@ -163,6 +197,15 @@ impl Node {
     /// Whether the process is currently running.
     pub fn is_running(&self) -> bool {
         self.child.is_some()
+    }
+
+    /// The exit status if the process has already terminated, or `None` if it is
+    /// still running (non-blocking). Lets a readiness wait tell a crashed boot
+    /// (respawn now) from a slow one (keep waiting).
+    pub fn has_exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
     }
 
     /// Stop the process but **keep** the datadir — the chain persists for a
