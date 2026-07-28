@@ -80,6 +80,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: golemnetwork/arkiv-node
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=tag
             type=sha
@@ -98,6 +100,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: golemnetwork/arkiv-committer
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=tag
             type=sha
