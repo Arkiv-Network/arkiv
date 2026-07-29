@@ -1,26 +1,30 @@
-//! Encoding helpers — Rust types → [`Operation`] / [`Attribute`] calldata.
+//! Encoding helpers — Rust types ↔ [`Operation`] / [`Attribute`] calldata.
 //!
-//! These methods are the primary interface for building `execute()` calldata.
 //! Each op type has a constructor that accepts only the fields relevant to
 //! that op and zeros the rest, so callers never need to know the full flat
 //! struct layout.
 //!
 //! # Attributes
 //!
-//! [`Attribute`] constructors handle the `bytes32[4]` value packing for each
-//! `valueType`. The contract requires attributes to be sorted ascending by
-//! name for deterministic hashing and name-uniqueness enforcement;
+//! [`Attribute::from_value`] and [`Attribute::to_value`] are the only place the
+//! `AttributeValue` ↔ `bytes32[4]` wire mapping is written down, in both
+//! directions. The contract requires attributes sorted ascending by name;
 //! [`Operation::create`] and [`Operation::update`] sort automatically.
-//! Call [`Attribute::sort`] before passing a pre-built slice to the raw
-//! struct if you bypass the factory methods.
 
-use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
-use eyre::{Result, bail};
+use core::fmt;
+
+use alloy_primitives::{Address, B256, Bytes, FixedBytes};
+use arkiv_interfaces::entity::{AttributeType, AttributeValue};
 
 use crate::{
-    ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT, Attribute, Ident32, Mime128, OP_CREATE, OP_DELETE,
-    OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE, Operation,
+    Attribute, Ident32, Mime128, OP_CREATE, OP_DELETE, OP_EXPIRE, OP_EXTEND, OP_TRANSFER,
+    OP_UPDATE, Operation,
 };
+
+/// The longest `string` value: the four words of `Attribute.value`.
+pub const MAX_STRING_BYTES: usize = 4 * WORD;
+
+const WORD: usize = 32;
 
 // -----------------------------------------------------------------------------
 // Operation constructors
@@ -114,46 +118,73 @@ impl Operation {
 // -----------------------------------------------------------------------------
 
 impl Attribute {
-    /// Build a `ATTR_UINT` attribute. Value is right-aligned in `data[0]`.
-    pub fn uint(name: Ident32, value: U256) -> Self {
-        let mut v = [FixedBytes::ZERO; 4];
-        v[0] = FixedBytes::from(value.to_be_bytes::<32>());
-        Self {
-            name: name.0,
-            valueType: ATTR_UINT,
-            value: v,
-        }
-    }
-
-    /// Build an `ATTR_STRING` attribute from raw bytes.
+    /// The ABI attribute carrying `value` under `name`.
     ///
-    /// At most 128 bytes; the protocol treats the value as opaque — UTF-8
-    /// is convention only. Bytes are left-aligned across the four slots.
-    pub fn string(name: Ident32, value: &[u8]) -> Result<Self> {
-        if value.len() > 128 {
-            bail!("ATTR_STRING value exceeds 128 bytes ({})", value.len());
-        }
-        let mut v = [FixedBytes::ZERO; 4];
-        for (i, chunk) in value.chunks(32).enumerate() {
-            let mut buf = [0u8; 32];
-            buf[..chunk.len()].copy_from_slice(chunk);
-            v[i] = FixedBytes::from(buf);
+    /// Single-word types occupy `value[0]` in their standard ABI encoding
+    /// (right-aligned and sign-extended where Solidity would); a `string` is
+    /// left-aligned across up to all four words.
+    pub fn from_value(name: Ident32, value: &AttributeValue) -> Result<Self, AttrAbiError> {
+        let mut words = [FixedBytes::ZERO; 4];
+        match value {
+            AttributeValue::Bool(b) => words[0].0[WORD - 1] = u8::from(*b),
+            AttributeValue::Int(n) => {
+                let mut w = [if *n < 0 { 0xFF } else { 0x00 }; WORD];
+                w[WORD - 4..].copy_from_slice(&n.to_be_bytes());
+                words[0] = FixedBytes::from(w);
+            }
+            AttributeValue::U256(w)
+            | AttributeValue::Decimal(w)
+            | AttributeValue::Bytes32(w)
+            | AttributeValue::EntityKey(w) => words[0] = FixedBytes::from(*w),
+            AttributeValue::EthereumAddress(a) => words[0].0[WORD - 20..].copy_from_slice(a),
+            AttributeValue::Str(s) => {
+                if s.len() > MAX_STRING_BYTES {
+                    return Err(AttrAbiError::StringTooLong(s.len()));
+                }
+                for (i, chunk) in s.as_bytes().chunks(WORD).enumerate() {
+                    words[i].0[..chunk.len()].copy_from_slice(chunk);
+                }
+            }
+            AttributeValue::Bytes(_) => return Err(AttrAbiError::SystemOnlyType),
         }
         Ok(Self {
             name: name.0,
-            valueType: ATTR_STRING,
-            value: v,
+            valueType: value.type_id(),
+            value: words,
         })
     }
 
-    /// Build an `ATTR_ENTITY_KEY` attribute. Key is stored in `data[0]`.
-    pub fn entity_key(name: Ident32, key: B256) -> Self {
-        let mut v = [FixedBytes::ZERO; 4];
-        v[0] = key;
-        Self {
-            name: name.0,
-            valueType: ATTR_ENTITY_KEY,
-            value: v,
+    /// Read the attribute's value back, rejecting anything a well-formed ABI
+    /// encoder would not have produced.
+    pub fn to_value(&self) -> Result<AttributeValue, AttrAbiError> {
+        let ty = self.wire_type()?;
+        match ty {
+            // A string spans the whole word array; every other type is one word,
+            // so the rest must be untouched.
+            AttributeType::Str => decode_string(&self.value),
+            _ => {
+                self.reject_spilled_words()?;
+                decode_word(ty, self.value[0].0)
+            }
+        }
+    }
+
+    /// The declared type, if a client is allowed to send it at all.
+    fn wire_type(&self) -> Result<AttributeType, AttrAbiError> {
+        let ty = AttributeType::from_id(self.valueType)
+            .ok_or(AttrAbiError::UnknownType(self.valueType))?;
+        if ty.is_user_settable() {
+            Ok(ty)
+        } else {
+            Err(AttrAbiError::SystemOnlyType)
+        }
+    }
+
+    /// Reject a single-word value carrying data in the words after the first.
+    fn reject_spilled_words(&self) -> Result<(), AttrAbiError> {
+        match self.value[1..].iter().position(|w| *w != FixedBytes::ZERO) {
+            Some(i) => Err(AttrAbiError::NonZeroPadding { word: i + 1 }),
+            None => Ok(()),
         }
     }
 
@@ -166,6 +197,120 @@ impl Attribute {
         attrs.sort_by_key(|a| a.name);
     }
 }
+
+/// Decode a one-word value of type `ty` from its ABI word.
+fn decode_word(ty: AttributeType, w: [u8; WORD]) -> Result<AttributeValue, AttrAbiError> {
+    match ty {
+        AttributeType::Bool => decode_bool(w),
+        AttributeType::Int => decode_int(w),
+        AttributeType::EthereumAddress => {
+            zero_prefix(&w, WORD - 20)?;
+            Ok(AttributeValue::EthereumAddress(
+                w[WORD - 20..].try_into().unwrap(),
+            ))
+        }
+        AttributeType::U256 => Ok(AttributeValue::U256(w)),
+        AttributeType::Decimal => Ok(AttributeValue::Decimal(w)),
+        AttributeType::Bytes32 => Ok(AttributeValue::Bytes32(w)),
+        AttributeType::EntityKey => Ok(AttributeValue::EntityKey(w)),
+        // Neither reaches here: `str` is handled by the caller, and `bytes` is
+        // rejected by `wire_type`.
+        AttributeType::Str | AttributeType::Bytes => Err(AttrAbiError::SystemOnlyType),
+    }
+}
+
+/// An ABI `bool`: right-aligned, and only 0 or 1.
+fn decode_bool(w: [u8; WORD]) -> Result<AttributeValue, AttrAbiError> {
+    zero_prefix(&w, WORD - 1)?;
+    match w[WORD - 1] {
+        0 => Ok(AttributeValue::Bool(false)),
+        1 => Ok(AttributeValue::Bool(true)),
+        other => Err(AttrAbiError::BadBool(other)),
+    }
+}
+
+/// An ABI `int32`: right-aligned, with the leading bytes sign-extended from the
+/// value's top bit.
+fn decode_int(w: [u8; WORD]) -> Result<AttributeValue, AttrAbiError> {
+    let fill = if w[WORD - 4] & 0x80 == 0 { 0x00 } else { 0xFF };
+    if w[..WORD - 4].iter().any(|b| *b != fill) {
+        return Err(AttrAbiError::BadSignExtension);
+    }
+    Ok(AttributeValue::Int(i32::from_be_bytes(
+        w[WORD - 4..].try_into().unwrap(),
+    )))
+}
+
+/// An ABI `string`: the words packed back together, trailing padding dropped.
+fn decode_string(words: &[FixedBytes<32>; 4]) -> Result<AttributeValue, AttrAbiError> {
+    String::from_utf8(pack_words(words))
+        .map(AttributeValue::Str)
+        .map_err(|_| AttrAbiError::NotUtf8)
+}
+
+/// The four words concatenated, with trailing zero padding removed — how a
+/// `string` or a [`Mime128`] is read back out of its fixed-size word array.
+pub fn pack_words(words: &[FixedBytes<32>; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 * WORD);
+    for w in words {
+        out.extend_from_slice(w.as_slice());
+    }
+    while matches!(out.last(), Some(0)) {
+        out.pop();
+    }
+    out
+}
+
+/// Check that a right-aligned value's leading `len` bytes are zero padding.
+fn zero_prefix(word: &[u8; WORD], len: usize) -> Result<(), AttrAbiError> {
+    if word[..len].iter().any(|b| *b != 0) {
+        Err(AttrAbiError::NonZeroValuePadding)
+    } else {
+        Ok(())
+    }
+}
+
+/// Why an attribute value didn't survive the ABI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrAbiError {
+    /// The `valueType` byte names no type.
+    UnknownType(u8),
+    /// `bytes` — system-only, never carried in an attribute array.
+    SystemOnlyType,
+    /// A single-word value carried data past its first word.
+    NonZeroPadding { word: usize },
+    /// A right-aligned value's leading padding wasn't zero.
+    NonZeroValuePadding,
+    /// A `bool` word held something other than 0 or 1.
+    BadBool(u8),
+    /// An `int32` wasn't sign-extended across its word.
+    BadSignExtension,
+    /// A `string` value wasn't valid UTF-8.
+    NotUtf8,
+    /// A `string` value exceeded [`MAX_STRING_BYTES`].
+    StringTooLong(usize),
+}
+
+impl fmt::Display for AttrAbiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownType(t) => write!(f, "unknown attribute value type {t}"),
+            Self::SystemOnlyType => write!(f, "attribute value type is system-only"),
+            Self::NonZeroPadding { word } => {
+                write!(f, "attribute value has data past word 0 (word {word})")
+            }
+            Self::NonZeroValuePadding => write!(f, "attribute value has non-zero leading padding"),
+            Self::BadBool(b) => write!(f, "bool value must be 0 or 1, got {b}"),
+            Self::BadSignExtension => write!(f, "int value is not sign-extended"),
+            Self::NotUtf8 => write!(f, "string value is not valid UTF-8"),
+            Self::StringTooLong(n) => {
+                write!(f, "string value exceeds {MAX_STRING_BYTES} bytes ({n})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AttrAbiError {}
 
 #[cfg(test)]
 mod tests {
@@ -188,12 +333,13 @@ mod tests {
         assert_eq!(op.newOwner, Address::ZERO);
     }
 
+    fn u256(name_: &str, n: u64) -> Attribute {
+        Attribute::from_value(name(name_), &AttributeValue::u256_from_u64(n)).unwrap()
+    }
+
     #[test]
     fn create_sorts_attributes() {
-        let attrs = vec![
-            Attribute::uint(name("z.attr"), U256::from(1)),
-            Attribute::uint(name("a.attr"), U256::from(2)),
-        ];
+        let attrs = vec![u256("z.attr", 1), u256("a.attr", 2)];
         let op = Operation::create(100, Bytes::new(), Mime128::default(), attrs);
         // a.attr < z.attr lexicographically
         assert!(op.attributes[0].name < op.attributes[1].name);
@@ -241,56 +387,125 @@ mod tests {
     // Attribute constructors
     // -------------------------------------------------------------------------
 
+    /// Every type survives the round trip through its ABI words.
     #[test]
-    fn uint_attr_packs_value_in_slot_zero() {
-        let attr = Attribute::uint(name("count"), U256::from(42));
-        assert_eq!(attr.valueType, ATTR_UINT);
+    fn values_round_trip_through_the_wire() {
+        let values = [
+            AttributeValue::Bool(true),
+            AttributeValue::Bool(false),
+            AttributeValue::Int(-42),
+            AttributeValue::Int(i32::MIN),
+            AttributeValue::Int(i32::MAX),
+            AttributeValue::u256_from_u64(42),
+            AttributeValue::Decimal([0xFF; 32]),
+            AttributeValue::Bytes32([0x5A; 32]),
+            AttributeValue::Str("hello".into()),
+            AttributeValue::Str("é".repeat(64)), // 128 bytes, the maximum
+            AttributeValue::EthereumAddress([0x11; 20]),
+            AttributeValue::EntityKey([0x77; 32]),
+        ];
+        for value in values {
+            let attr = Attribute::from_value(name("a"), &value).unwrap();
+            assert_eq!(attr.valueType, value.type_id());
+            assert_eq!(attr.to_value().unwrap(), value, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn single_word_types_leave_the_upper_words_zero() {
+        let attr =
+            Attribute::from_value(name("count"), &AttributeValue::u256_from_u64(42)).unwrap();
+        assert_eq!(attr.value[0].0[31], 42);
+        assert!(attr.value[1..].iter().all(|w| *w == FixedBytes::ZERO));
+    }
+
+    #[test]
+    fn string_packs_left_aligned() {
+        let attr = Attribute::from_value(name("title"), &AttributeValue::Str("hi".into())).unwrap();
+        assert_eq!(&attr.value[0].0[..2], b"hi");
+        assert_eq!(attr.value[1], FixedBytes::ZERO);
+    }
+
+    #[test]
+    fn rejects_oversized_and_system_only_values() {
+        let long = AttributeValue::Str("x".repeat(MAX_STRING_BYTES + 1));
         assert_eq!(
-            attr.value[0],
-            FixedBytes::from(U256::from(42).to_be_bytes::<32>())
+            Attribute::from_value(name("big"), &long),
+            Err(AttrAbiError::StringTooLong(MAX_STRING_BYTES + 1))
         );
-        assert_eq!(attr.value[1], FixedBytes::ZERO);
+        assert!(
+            Attribute::from_value(
+                name("full"),
+                &AttributeValue::Str("x".repeat(MAX_STRING_BYTES))
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            Attribute::from_value(name("p"), &AttributeValue::Bytes(vec![1])),
+            Err(AttrAbiError::SystemOnlyType)
+        );
     }
 
+    /// Malformed words a hand-rolled encoder could produce are rejected, not
+    /// silently truncated.
     #[test]
-    fn string_attr_packs_bytes_left_aligned() {
-        let attr = Attribute::string(name("title"), b"hello").unwrap();
-        assert_eq!(attr.valueType, ATTR_STRING);
-        let expected: [u8; 32] = {
-            let mut buf = [0u8; 32];
-            buf[..5].copy_from_slice(b"hello");
-            buf
+    fn to_value_rejects_malformed_words() {
+        let with = |ty: AttributeType, words: [FixedBytes<32>; 4]| Attribute {
+            name: name("a").0,
+            valueType: ty.id(),
+            value: words,
         };
-        assert_eq!(attr.value[0], FixedBytes::from(expected));
-        assert_eq!(attr.value[1], FixedBytes::ZERO);
-    }
+        let word = |bytes: [u8; 32]| {
+            let mut w = [FixedBytes::ZERO; 4];
+            w[0] = FixedBytes::from(bytes);
+            w
+        };
 
-    #[test]
-    fn string_attr_rejects_over_128_bytes() {
-        assert!(Attribute::string(name("big"), &[0u8; 129]).is_err());
-    }
+        let mut two = [0u8; 32];
+        two[31] = 2;
+        assert_eq!(
+            with(AttributeType::Bool, word(two)).to_value(),
+            Err(AttrAbiError::BadBool(2))
+        );
 
-    #[test]
-    fn string_attr_accepts_exactly_128_bytes() {
-        assert!(Attribute::string(name("full"), &[0u8; 128]).is_ok());
-    }
+        // An int32 whose upper bytes don't match its sign bit.
+        let mut bad_int = [0u8; 32];
+        bad_int[0] = 0xFF;
+        assert_eq!(
+            with(AttributeType::Int, word(bad_int)).to_value(),
+            Err(AttrAbiError::BadSignExtension)
+        );
 
-    #[test]
-    fn entity_key_attr_packs_key_in_slot_zero() {
-        let key = B256::repeat_byte(0x77);
-        let attr = Attribute::entity_key(name("linked.to"), key);
-        assert_eq!(attr.valueType, ATTR_ENTITY_KEY);
-        assert_eq!(attr.value[0], key);
-        assert_eq!(attr.value[1], FixedBytes::ZERO);
+        // An address with junk in its leading padding.
+        assert_eq!(
+            with(AttributeType::EthereumAddress, word([0xAB; 32])).to_value(),
+            Err(AttrAbiError::NonZeroValuePadding)
+        );
+
+        // A single-word type carrying data in a later word.
+        let mut spilled = [FixedBytes::ZERO; 4];
+        spilled[2] = FixedBytes::from([1u8; 32]);
+        assert_eq!(
+            with(AttributeType::U256, spilled).to_value(),
+            Err(AttrAbiError::NonZeroPadding { word: 2 })
+        );
+
+        assert_eq!(
+            with(AttributeType::Str, word([0xFF; 32])).to_value(),
+            Err(AttrAbiError::NotUtf8)
+        );
+
+        let unknown = Attribute {
+            name: name("a").0,
+            valueType: 99,
+            value: [FixedBytes::ZERO; 4],
+        };
+        assert_eq!(unknown.to_value(), Err(AttrAbiError::UnknownType(99)));
     }
 
     #[test]
     fn sort_orders_by_name_ascending() {
-        let mut attrs = vec![
-            Attribute::uint(name("z.last"), U256::ZERO),
-            Attribute::uint(name("a.first"), U256::ZERO),
-            Attribute::uint(name("m.mid"), U256::ZERO),
-        ];
+        let mut attrs = vec![u256("z.last", 0), u256("a.first", 0), u256("m.mid", 0)];
         Attribute::sort(&mut attrs);
         assert!(attrs[0].name < attrs[1].name);
         assert!(attrs[1].name < attrs[2].name);

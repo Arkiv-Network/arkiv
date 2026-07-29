@@ -77,7 +77,9 @@ pub fn decode_revert_data(e: &DecodeError) -> Bytes {
             entityKey: B256::from(*key),
         }
         .abi_encode(),
-        DecodeError::UnknownAttributeType { name, value_type } => E::InvalidValueType {
+        DecodeError::InvalidAttributeValue {
+            name, value_type, ..
+        } => E::InvalidValueType {
             name: (*name).into(),
             valueType: *value_type,
         }
@@ -95,10 +97,9 @@ pub fn decode_revert_data(e: &DecodeError) -> Bytes {
         }
         .abi_encode(),
         // Structural faults with no ABI counterpart.
-        DecodeError::CalldataTooShort
-        | DecodeError::UnknownSelector(_)
-        | DecodeError::Abi(_)
-        | DecodeError::AttributeValueMalformed { .. } => Revert::from(e.to_string()).abi_encode(),
+        DecodeError::CalldataTooShort | DecodeError::UnknownSelector(_) | DecodeError::Abi(_) => {
+            Revert::from(e.to_string()).abi_encode()
+        }
     }
     .into()
 }

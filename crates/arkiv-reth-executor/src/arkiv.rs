@@ -540,7 +540,7 @@ impl std::error::Error for ExecError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkiv_interfaces::entity::Attribute;
+    use arkiv_interfaces::entity::{Attribute, AttributeValue};
     use arkiv_interfaces::state::BlockEntityStoreDelta;
     use core::convert::Infallible;
 
@@ -605,16 +605,8 @@ mod tests {
             content_type: b"text/plain".to_vec(),
             payload: b"hello".to_vec(),
             attributes: vec![
-                Attribute {
-                    key: b"color".to_vec(),
-                    value_type: arkiv_interfaces::entity::ATTR_STRING,
-                    value: b"blue".to_vec(),
-                },
-                Attribute {
-                    key: b"size".to_vec(),
-                    value_type: arkiv_interfaces::entity::ATTR_UINT,
-                    value: vec![0u8; 32],
-                },
+                Attribute::new(b"color".to_vec(), AttributeValue::Str("blue".into())),
+                Attribute::new(b"size".to_vec(), AttributeValue::u256_from_u64(1)),
             ],
         }
     }
@@ -886,11 +878,10 @@ mod tests {
                 expires_at: 50,
                 content_type: b"text/plain".to_vec(),
                 payload: b"y".to_vec(),
-                attributes: vec![Attribute {
-                    key: b"rank".to_vec(),
-                    value_type: arkiv_interfaces::entity::ATTR_UINT,
-                    value: vec![0u8; 32],
-                }],
+                attributes: vec![Attribute::new(
+                    b"rank".to_vec(),
+                    AttributeValue::u256_from_u64(0),
+                )],
             }],
         )
         .unwrap();
@@ -905,7 +896,7 @@ mod tests {
             delta
                 .inserts
                 .iter()
-                .any(|a| a.attr == b"$owner" && a.value == alice.to_vec())
+                .any(|a| a.attr == b"$owner" && a.value == AttributeValue::EthereumAddress(alice))
         );
         assert!(delta.inserts.iter().any(|a| a.attr == b"rank"));
     }
@@ -940,9 +931,15 @@ mod tests {
         assert_eq!(delta.removes.len(), 1);
         assert_eq!(delta.inserts.len(), 1);
         assert_eq!(delta.removes[0].attr, b"$owner");
-        assert_eq!(delta.removes[0].value, [2u8; 20].to_vec());
+        assert_eq!(
+            delta.removes[0].value,
+            AttributeValue::EthereumAddress([2u8; 20])
+        );
         assert_eq!(delta.inserts[0].attr, b"$owner");
-        assert_eq!(delta.inserts[0].value, [9u8; 20].to_vec());
+        assert_eq!(
+            delta.inserts[0].value,
+            AttributeValue::EthereumAddress([9u8; 20])
+        );
     }
 
     /// An `Update` diffs only what changed: the new `$contentType` in, the old one
@@ -977,14 +974,15 @@ mod tests {
         assert_eq!(delta.removes.len(), 3);
         assert_eq!(delta.inserts.len(), 1);
         assert_eq!(delta.inserts[0].attr, b"$contentType");
-        assert_eq!(delta.inserts[0].value, b"application/json");
+        assert_eq!(
+            delta.inserts[0].value,
+            AttributeValue::Str("application/json".into())
+        );
         assert!(delta.removes.iter().any(|a| a.attr == b"color"));
         assert!(delta.removes.iter().any(|a| a.attr == b"size"));
         assert!(
-            delta
-                .removes
-                .iter()
-                .any(|a| a.attr == b"$contentType" && a.value == b"text/plain")
+            delta.removes.iter().any(|a| a.attr == b"$contentType"
+                && a.value == AttributeValue::Str("text/plain".into()))
         );
     }
 

@@ -1340,6 +1340,7 @@ dependencies = [
  "alloy-contract",
  "alloy-primitives",
  "alloy-sol-types",
+ "arkiv-interfaces",
  "eyre",
 ]
 

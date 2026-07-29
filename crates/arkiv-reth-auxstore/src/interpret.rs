@@ -17,11 +17,12 @@
 //! ([`store`](crate::store)) maps the surviving ids back to keys.
 
 use arkiv_interfaces::collections::NonEmptyVec;
+use arkiv_interfaces::entity::AttributeType;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, Query};
 use arkiv_reth_entitystore::AccountCode;
 
 use crate::address::{all_entities_bucket, pair_address};
-use crate::annotation::{self, Mode};
+use crate::annotation::{self, QueryCapabilities};
 use crate::bitmap::Bitmap;
 use crate::error::AuxError;
 use crate::index::read_pair_bitmap;
@@ -96,8 +97,13 @@ where
     B: AccountCode<Error = E>,
 {
     let attr = annotation::attr_bytes(key);
-    let value = annotation::value_bytes(value);
-    read_pair_bitmap(backend, pair_address(&attr, &value))
+    read_pair_bitmap(backend, value_pair_address(&attr, value))
+}
+
+/// The bucket a query value's own type and bytes name — the same address the
+/// writer derived for an equal attribute value.
+fn value_pair_address(attr: &[u8], value: &AnnotVal) -> alloy_primitives::Address {
+    pair_address(attr, value.attr_type(), &value.index_bytes())
 }
 
 /// The union of pair bitmaps for `key` equal to any of `values`.
@@ -112,8 +118,7 @@ where
     let attr = annotation::attr_bytes(key);
     let mut hits = Bitmap::new();
     for value in values.iter() {
-        let value = annotation::value_bytes(value);
-        let bucket = read_pair_bitmap(backend, pair_address(&attr, &value))?;
+        let bucket = read_pair_bitmap(backend, value_pair_address(&attr, value))?;
         hits.union_with(&bucket);
     }
     Ok(hits)
@@ -131,18 +136,21 @@ where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
     let attr = annotation::attr_bytes(key);
-    let mode = annotation::mode_for(&attr, annotation::value_type(value));
-    let bound_bytes = annotation::value_bytes(value);
-    let values = match mode {
-        Mode::Int => range::scan(backend, &attr, &bound_bytes, bound).map_err(AuxError::Backend)?,
-        Mode::Str => {
-            cascade::scan(backend, &attr, &bound_bytes, bound).map_err(AuxError::Backend)?
+    let ty = value.attr_type();
+    let capabilities = annotation::capabilities_for(&attr, ty);
+    let bound_bytes = value.index_bytes();
+    let values = match capabilities {
+        QueryCapabilities::EqualityAndRange => {
+            range::scan(backend, &attr, ty, &bound_bytes, bound).map_err(AuxError::Backend)?
+        }
+        QueryCapabilities::EqualityAndPrefix => {
+            cascade::scan(backend, &attr, ty, &bound_bytes, bound).map_err(AuxError::Backend)?
         }
         // A range over an unordered attribute has no tier-2 index to scan; the parser
         // rejects such queries, so if one reaches here it simply matches nothing.
-        Mode::Equality => Vec::new(),
+        QueryCapabilities::Equality | QueryCapabilities::None => Vec::new(),
     };
-    union_pair_bitmaps(backend, &attr, values)
+    union_pair_bitmaps(backend, &attr, ty, values)
 }
 
 /// Resolve a glob predicate: a str-mode prefix scan, then union the pair bitmaps.
@@ -155,15 +163,17 @@ where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
     let attr = annotation::attr_bytes(key);
-    let prefix = annotation::value_bytes(value);
-    let values = cascade::glob(backend, &attr, &prefix).map_err(AuxError::Backend)?;
-    union_pair_bitmaps(backend, &attr, values)
+    let ty = value.attr_type();
+    let prefix = value.index_bytes();
+    let values = cascade::glob(backend, &attr, ty, &prefix).map_err(AuxError::Backend)?;
+    union_pair_bitmaps(backend, &attr, ty, values)
 }
 
 /// Union the tier-1 pair bitmaps of `attr` for each value a tier-2 scan returned.
 fn union_pair_bitmaps<B, E>(
     backend: &mut B,
     attr: &[u8],
+    ty: AttributeType,
     values: Vec<Vec<u8>>,
 ) -> Result<Bitmap, AuxError<E>>
 where
@@ -171,7 +181,7 @@ where
 {
     let mut hits = Bitmap::new();
     for value in &values {
-        let bucket = read_pair_bitmap(backend, pair_address(attr, value))?;
+        let bucket = read_pair_bitmap(backend, pair_address(attr, ty, value))?;
         hits.union_with(&bucket);
     }
     Ok(hits)

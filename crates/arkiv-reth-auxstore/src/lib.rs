@@ -72,7 +72,7 @@ mod interpret;
 mod slot;
 
 pub use address::{all_entities_bucket, pair_address};
-pub use annotation::Mode;
+pub use annotation::QueryCapabilities;
 pub use bitmap::{Bitmap, BitmapError};
 pub use error::AuxError;
 pub use range::Bound;

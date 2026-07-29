@@ -2,9 +2,11 @@
 //!
 //! The query language is part of the Arkiv *specification* (it defines the
 //! database), so it lives here — host-agnostic, `no_std`, zero-dep. Parsing
-//! produces a **typed** [`Query`] AST ([`AnnotVal`] carries `Uint`/`Str`/`Key`/
-//! `Addr`, not host index bytes); turning those values into a particular index's
-//! byte layout is the host's job, in the evaluator.
+//! produces a **typed** [`Query`] AST — its values are
+//! [`AttributeValue`](arkiv_interfaces::entity::AttributeValue)s, the same type an
+//! entity stores, so a predicate and the attribute it matches share one type
+//! system; turning a value into a particular index's byte layout is the host's
+//! job, in the evaluator.
 //!
 //! Grammar:
 //!
@@ -33,7 +35,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
-use arkiv_constants::WORD_LEN;
 use arkiv_interfaces::collections::NonEmptyVec;
 use arkiv_interfaces::entity::annotations;
 use arkiv_interfaces::primitives::{Address, EntityKey};
@@ -292,7 +293,7 @@ impl Parser {
                 "only a single trailing '*' is supported in a glob pattern",
             ));
         }
-        Ok(AnnotVal::Str(prefix.as_bytes().to_vec()))
+        Ok(AnnotVal::Str(prefix.into()))
     }
 
     fn parse_literal(&mut self) -> Result<Literal, ParseError> {
@@ -311,7 +312,7 @@ impl Parser {
 fn value_for_key(key: &AnnotKey, lit: Literal) -> Result<AnnotVal, ParseError> {
     Ok(match (key, lit) {
         (AnnotKey::BuiltIn(BuiltIn::Owner | BuiltIn::Creator), Literal::Address(a)) => {
-            AnnotVal::Addr(a)
+            AnnotVal::EthereumAddress(a)
         }
         (AnnotKey::BuiltIn(BuiltIn::Owner | BuiltIn::Creator), _) => {
             return Err(ParseError::msg(
@@ -319,9 +320,9 @@ fn value_for_key(key: &AnnotKey, lit: Literal) -> Result<AnnotVal, ParseError> {
             ));
         }
 
-        (AnnotKey::BuiltIn(BuiltIn::Key), Literal::EntityKey(b)) => AnnotVal::Key(b),
+        (AnnotKey::BuiltIn(BuiltIn::Key), Literal::EntityKey(b)) => AnnotVal::EntityKey(b),
         (AnnotKey::BuiltIn(BuiltIn::Key), Literal::String(s)) => {
-            AnnotVal::Key(decode_key_string(&s)?)
+            AnnotVal::EntityKey(decode_key_string(&s)?)
         }
         (AnnotKey::BuiltIn(BuiltIn::Key), _) => {
             return Err(ParseError::msg(
@@ -330,7 +331,7 @@ fn value_for_key(key: &AnnotKey, lit: Literal) -> Result<AnnotVal, ParseError> {
         }
 
         (AnnotKey::BuiltIn(BuiltIn::Expiration | BuiltIn::CreatedAtBlock), Literal::Number(n)) => {
-            AnnotVal::Uint(u64_to_be32(n))
+            AnnotVal::u256_from_u64(n)
         }
         (AnnotKey::BuiltIn(BuiltIn::Expiration | BuiltIn::CreatedAtBlock), _) => {
             return Err(ParseError::msg(
@@ -338,17 +339,15 @@ fn value_for_key(key: &AnnotKey, lit: Literal) -> Result<AnnotVal, ParseError> {
             ));
         }
 
-        (AnnotKey::BuiltIn(BuiltIn::ContentType), Literal::String(s)) => {
-            AnnotVal::Str(s.into_bytes())
-        }
+        (AnnotKey::BuiltIn(BuiltIn::ContentType), Literal::String(s)) => AnnotVal::Str(s),
         (AnnotKey::BuiltIn(BuiltIn::ContentType), _) => {
             return Err(ParseError::msg("$contentType requires a string"));
         }
 
-        (AnnotKey::User(_), Literal::Number(n)) => AnnotVal::Uint(u64_to_be32(n)),
-        (AnnotKey::User(_), Literal::String(s)) => AnnotVal::Str(s.into_bytes()),
-        (AnnotKey::User(_), Literal::Address(a)) => AnnotVal::Addr(a),
-        (AnnotKey::User(_), Literal::EntityKey(b)) => AnnotVal::Key(b),
+        (AnnotKey::User(_), Literal::Number(n)) => AnnotVal::u256_from_u64(n),
+        (AnnotKey::User(_), Literal::String(s)) => AnnotVal::Str(s),
+        (AnnotKey::User(_), Literal::Address(a)) => AnnotVal::EthereumAddress(a),
+        (AnnotKey::User(_), Literal::EntityKey(b)) => AnnotVal::EntityKey(b),
     })
 }
 
@@ -390,20 +389,6 @@ fn decode_key_string(s: &str) -> Result<EntityKey, ParseError> {
     Ok(out)
 }
 
-/// A `u64` as a 32-byte big-endian [`AnnotVal::Uint`] payload — **right**-aligned
-/// (its low 8 bytes), so it compares equal to a uint annotation carrying the same
-/// number:
-///
-/// ```text
-///   byte:  0 .............. 24 ............ 32
-///          | 0 (padding)      | n (u64 be)   |
-/// ```
-fn u64_to_be32(n: u64) -> [u8; WORD_LEN] {
-    let mut buf = [0u8; WORD_LEN];
-    buf[WORD_LEN - size_of::<u64>()..].copy_from_slice(&n.to_be_bytes());
-    buf
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,14 +411,14 @@ mod tests {
             parse("color = \"blue\"").unwrap(),
             Query::Eq {
                 key: AnnotKey::User("color".to_string()),
-                value: AnnotVal::Str(b"blue".to_vec()),
+                value: AnnotVal::Str("blue".into()),
             }
         );
         assert_eq!(
             parse("age = 42").unwrap(),
             Query::Eq {
                 key: AnnotKey::User("age".to_string()),
-                value: AnnotVal::Uint(u64_to_be32(42)),
+                value: AnnotVal::u256_from_u64(42),
             }
         );
     }
@@ -445,7 +430,7 @@ mod tests {
             parse(&alloc::format!("$owner = {addr}")).unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                value: AnnotVal::Addr([0x11; 20]),
+                value: AnnotVal::EthereumAddress([0x11; 20]),
             }
         );
         // Wrong literal type for a built-in is a parse error.
@@ -458,7 +443,7 @@ mod tests {
         let k = alloc::format!("0x{}", "ab".repeat(32)); // 64 hex
         let want = Query::Eq {
             key: AnnotKey::BuiltIn(BuiltIn::Key),
-            value: AnnotVal::Key([0xab; 32]),
+            value: AnnotVal::EntityKey([0xab; 32]),
         };
         assert_eq!(parse(&alloc::format!("$key = {k}")).unwrap(), want);
         assert_eq!(parse(&alloc::format!("$key = \"{k}\"")).unwrap(), want);
@@ -470,7 +455,7 @@ mod tests {
             parse("$expiration = 100").unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-                value: AnnotVal::Uint(u64_to_be32(100)),
+                value: AnnotVal::u256_from_u64(100),
             }
         );
     }
@@ -481,10 +466,7 @@ mod tests {
             parse("color IN (\"a\" \"b\")").unwrap(),
             Query::In {
                 key: AnnotKey::User("color".to_string()),
-                values: nev(vec![
-                    AnnotVal::Str(b"a".to_vec()),
-                    AnnotVal::Str(b"b".to_vec())
-                ]),
+                values: nev(vec![AnnotVal::Str("a".into()), AnnotVal::Str("b".into())]),
             }
         );
         assert!(matches!(
@@ -500,7 +482,7 @@ mod tests {
             parse("$expiration > 50").unwrap(),
             Query::Gt {
                 key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-                value: AnnotVal::Uint(u64_to_be32(50)),
+                value: AnnotVal::u256_from_u64(50),
             }
         );
         assert!(matches!(parse("n <= 9").unwrap(), Query::Lte { .. }));
@@ -515,7 +497,7 @@ mod tests {
             parse("name ~ \"pre*\"").unwrap(),
             Query::Glob {
                 key: AnnotKey::User("name".to_string()),
-                value: AnnotVal::Str(b"pre".to_vec()),
+                value: AnnotVal::Str("pre".into()),
             }
         );
         assert!(matches!(
@@ -609,14 +591,14 @@ mod tests {
             parse("x = \"a\\nb\\t\\\"\\\\\"").unwrap(),
             Query::Eq {
                 key: AnnotKey::User("x".to_string()),
-                value: AnnotVal::Str(b"a\nb\t\"\\".to_vec()),
+                value: AnnotVal::Str("a\nb\t\"\\".into()),
             }
         );
         assert_eq!(
             parse("x = \"\"").unwrap(),
             Query::Eq {
                 key: AnnotKey::User("x".to_string()),
-                value: AnnotVal::Str(Vec::new()),
+                value: AnnotVal::Str(String::new()),
             }
         );
         assert!(parse("x = \"bad\\q\"").is_err()); // unknown escape
@@ -629,7 +611,7 @@ mod tests {
             parse("a = 0").unwrap(),
             Query::Eq {
                 key: AnnotKey::User("a".to_string()),
-                value: AnnotVal::Uint([0u8; 32]),
+                value: AnnotVal::U256([0u8; 32]),
             }
         );
         // u64::MAX parses; one past it is a lex error.
@@ -640,7 +622,7 @@ mod tests {
     #[test]
     fn uint_layout_is_big_endian() {
         let Query::Eq {
-            value: AnnotVal::Uint(bytes),
+            value: AnnotVal::U256(bytes),
             ..
         } = parse("a = 258").unwrap()
         else {
@@ -660,14 +642,14 @@ mod tests {
             parse(&alloc::format!("$creator = {addr}")).unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Creator),
-                value: AnnotVal::Addr(_)
+                value: AnnotVal::EthereumAddress(_)
             }
         ));
         assert!(matches!(
             parse("$createdAtBlock = 7").unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::CreatedAtBlock),
-                value: AnnotVal::Uint(_)
+                value: AnnotVal::U256(_)
             }
         ));
         assert!(matches!(
@@ -681,7 +663,7 @@ mod tests {
             parse(&alloc::format!("$key = {key}")).unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Key),
-                value: AnnotVal::Key(_)
+                value: AnnotVal::EntityKey(_)
             }
         ));
         // Each built-in rejects the wrong literal type.
@@ -699,14 +681,14 @@ mod tests {
         assert!(matches!(
             parse(&alloc::format!("who = {addr}")).unwrap(),
             Query::Eq {
-                value: AnnotVal::Addr(_),
+                value: AnnotVal::EthereumAddress(_),
                 ..
             }
         ));
         assert!(matches!(
             parse(&alloc::format!("ref = {key}")).unwrap(),
             Query::Eq {
-                value: AnnotVal::Key(_),
+                value: AnnotVal::EntityKey(_),
                 ..
             }
         ));
@@ -727,9 +709,9 @@ mod tests {
             Query::In {
                 key: AnnotKey::User("m".to_string()),
                 values: nev(vec![
-                    AnnotVal::Uint(u64_to_be32(1)),
-                    AnnotVal::Str(b"two".to_vec()),
-                    AnnotVal::Addr([0xcd; 20]),
+                    AnnotVal::u256_from_u64(1),
+                    AnnotVal::Str("two".into()),
+                    AnnotVal::EthereumAddress([0xcd; 20]),
                 ]),
             }
         );
@@ -744,7 +726,7 @@ mod tests {
             parse("n ~ \"*\"").unwrap(),
             Query::Glob {
                 key: AnnotKey::User("n".to_string()),
-                value: AnnotVal::Str(Vec::new()),
+                value: AnnotVal::Str(String::new()),
             }
         );
         // Only a single trailing star.

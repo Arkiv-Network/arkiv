@@ -12,7 +12,7 @@ use std::convert::Infallible;
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_interfaces::entity::{ATTR_UINT, Attribute};
+use arkiv_interfaces::entity::{Attribute, AttributeValue};
 use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
@@ -100,17 +100,9 @@ fn env(caller: [u8; 20], block: u64) -> ExecEnv {
     }
 }
 
-/// A `u64` as a 32-byte big-endian word — the canonical uint index encoding.
-fn uint(n: u64) -> Vec<u8> {
-    let mut buf = [0u8; 32];
-    buf[24..].copy_from_slice(&n.to_be_bytes());
-    buf.to_vec()
-}
-
-fn word(n: u64) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    buf[24..].copy_from_slice(&n.to_be_bytes());
-    buf
+/// A `u64` as a `u256` attribute value.
+fn uint(n: u64) -> AttributeValue {
+    AttributeValue::u256_from_u64(n)
 }
 
 /// Run `ops` under `caller`/`block` and commit both the entity and index changes
@@ -169,11 +161,7 @@ fn create_is_queryable_by_its_attributes() {
             expires_at: 50,
             content_type: b"text/plain".to_vec(),
             payload: b"y".to_vec(),
-            attributes: vec![Attribute {
-                key: b"rank".to_vec(),
-                value_type: ATTR_UINT,
-                value: uint(42),
-            }],
+            attributes: vec![Attribute::new(b"rank".to_vec(), uint(42))],
         }],
     );
 
@@ -183,7 +171,7 @@ fn create_is_queryable_by_its_attributes() {
             &mut index,
             &Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                value: AnnotVal::Addr(alice),
+                value: AnnotVal::EthereumAddress(alice),
             }
         ),
         vec![key],
@@ -194,7 +182,7 @@ fn create_is_queryable_by_its_attributes() {
             &mut index,
             &Query::Eq {
                 key: AnnotKey::User("rank".into()),
-                value: AnnotVal::Uint(word(42)),
+                value: AnnotVal::u256_from_u64(42),
             }
         ),
         vec![key],
@@ -205,7 +193,7 @@ fn create_is_queryable_by_its_attributes() {
             &mut index,
             &Query::Gte {
                 key: AnnotKey::User("rank".into()),
-                value: AnnotVal::Uint(word(42)),
+                value: AnnotVal::u256_from_u64(42),
             }
         ),
         vec![key],
@@ -215,7 +203,7 @@ fn create_is_queryable_by_its_attributes() {
             &mut index,
             &Query::Gt {
                 key: AnnotKey::User("rank".into()),
-                value: AnnotVal::Uint(word(42)),
+                value: AnnotVal::u256_from_u64(42),
             }
         )
         .is_empty()
@@ -263,7 +251,7 @@ fn transfer_moves_the_entity_between_owner_queries() {
 
     let owned_by = |owner: [u8; 20]| Query::Eq {
         key: AnnotKey::BuiltIn(BuiltIn::Owner),
-        value: AnnotVal::Addr(owner),
+        value: AnnotVal::EthereumAddress(owner),
     };
     assert!(keys(&mut index, &owned_by(alice)).is_empty());
     assert_eq!(keys(&mut index, &owned_by(bob)), vec![key]);
@@ -310,7 +298,7 @@ fn delete_removes_the_entity_from_queries() {
             &mut index,
             &Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                value: AnnotVal::Addr(alice),
+                value: AnnotVal::EthereumAddress(alice),
             }
         )
         .is_empty()
@@ -339,11 +327,7 @@ fn update_reindexes_attributes() {
             expires_at: 500,
             content_type: b"text/plain".to_vec(),
             payload: b"y".to_vec(),
-            attributes: vec![Attribute {
-                key: b"rank".to_vec(),
-                value_type: ATTR_UINT,
-                value: uint(10),
-            }],
+            attributes: vec![Attribute::new(b"rank".to_vec(), uint(10))],
         }],
     );
     run(
@@ -356,17 +340,13 @@ fn update_reindexes_attributes() {
             key,
             content_type: b"text/plain".to_vec(),
             payload: b"y".to_vec(),
-            attributes: vec![Attribute {
-                key: b"rank".to_vec(),
-                value_type: ATTR_UINT,
-                value: uint(20),
-            }],
+            attributes: vec![Attribute::new(b"rank".to_vec(), uint(20))],
         }],
     );
 
     let rank_eq = |n: u64| Query::Eq {
         key: AnnotKey::User("rank".into()),
-        value: AnnotVal::Uint(word(n)),
+        value: AnnotVal::u256_from_u64(n),
     };
     assert!(
         keys(&mut index, &rank_eq(10)).is_empty(),
@@ -411,7 +391,7 @@ fn expiration_is_range_queryable() {
     // $expiration >= 100 matches the two later-expiring entities, not the first.
     let by_expiry = Query::Gte {
         key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-        value: AnnotVal::Uint(word(100)),
+        value: AnnotVal::u256_from_u64(100),
     };
     assert_eq!(keys(&mut index, &by_expiry), vec![[2u8; 32], [3u8; 32]]);
 }

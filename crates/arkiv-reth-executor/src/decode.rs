@@ -19,11 +19,12 @@
 
 use core::fmt;
 
-use alloy_primitives::{Address, FixedBytes, U256, keccak256};
+use alloy_primitives::{Address, U256, keccak256};
 use alloy_sol_types::SolCall;
 use arkiv_bindings::{
-    ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT, Attribute as AbiAttribute, IEntityRegistry,
-    MAX_ATTRIBUTES, Mime128, OP_CREATE, OP_DELETE, OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE,
+    Attribute as AbiAttribute, IEntityRegistry, MAX_ATTRIBUTES, Mime128, OP_CREATE, OP_DELETE,
+    OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE,
+    encode::{AttrAbiError, pack_words},
     types::{Ident32ByteError, validate_ident32_bytes},
 };
 use arkiv_interfaces::entity::Attribute;
@@ -146,56 +147,24 @@ fn convert_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeEr
     attrs
         .iter()
         .map(|a| {
-            let value = match a.valueType {
-                // A 256-bit uint / an entity key each occupy exactly one word; the
-                // upper three words must be zero.
-                ATTR_UINT | ATTR_ENTITY_KEY => {
-                    reject_non_zero_upper_words(a)?;
-                    a.value[0].as_slice().to_vec()
-                }
-                // A string spans up to all four words; trailing zero padding is not
-                // part of the value.
-                ATTR_STRING => pack_words(&a.value),
-                other => {
-                    return Err(DecodeError::UnknownAttributeType {
-                        name: a.name.0,
-                        value_type: other,
-                    });
-                }
-            };
+            let value = a
+                .to_value()
+                .map_err(|reason| DecodeError::InvalidAttributeValue {
+                    name: a.name.0,
+                    value_type: a.valueType,
+                    reason,
+                })?;
             Ok(Attribute {
                 key: strip_trailing_zeros(a.name.0.to_vec()),
-                value_type: a.valueType,
                 value,
             })
         })
         .collect()
 }
 
-/// Reject an attribute whose value claims one word but carries data in the others.
-fn reject_non_zero_upper_words(a: &AbiAttribute) -> Result<(), DecodeError> {
-    for (word_index, word) in a.value.iter().enumerate().skip(1) {
-        if *word != FixedBytes::ZERO {
-            return Err(DecodeError::AttributeValueMalformed {
-                value_type: a.valueType,
-                word_index,
-            });
-        }
-    }
-    Ok(())
-}
-
 /// The four 32-byte words concatenated, with trailing zero padding removed.
 fn mime128_to_bytes(m: &Mime128) -> Vec<u8> {
     pack_words(&m.data)
-}
-
-fn pack_words(words: &[FixedBytes<32>; 4]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-    for w in words {
-        out.extend_from_slice(w.as_slice());
-    }
-    strip_trailing_zeros(out)
 }
 
 fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
@@ -223,10 +192,12 @@ pub enum DecodeError {
     ZeroBtl,
     /// A `Transfer` named the zero address as the new owner.
     TransferToZeroAddress { key: EntityKey },
-    /// A single-word attribute value carried data past its first word.
-    AttributeValueMalformed { value_type: u8, word_index: usize },
-    /// An attribute's value type isn't one of the known tags.
-    UnknownAttributeType { name: [u8; 32], value_type: u8 },
+    /// An attribute's value isn't a well-formed encoding of its declared type.
+    InvalidAttributeValue {
+        name: [u8; 32],
+        value_type: u8,
+        reason: AttrAbiError,
+    },
     /// An op carried more attributes than the protocol allows.
     TooManyAttributes { count: usize, max: usize },
     /// Attributes aren't strictly ascending by name (also enforces uniqueness).
@@ -247,16 +218,9 @@ impl fmt::Display for DecodeError {
             DecodeError::InvalidOpType(t) => write!(f, "invalid operation type {t}"),
             DecodeError::ZeroBtl => write!(f, "operation gave a zero blocks-to-live"),
             DecodeError::TransferToZeroAddress { .. } => write!(f, "transfer to the zero address"),
-            DecodeError::AttributeValueMalformed {
-                value_type,
-                word_index,
-            } => write!(
-                f,
-                "attribute value (type {value_type}) has data past word 0 (word {word_index})"
-            ),
-            DecodeError::UnknownAttributeType { value_type, .. } => {
-                write!(f, "unknown attribute value type {value_type}")
-            }
+            DecodeError::InvalidAttributeValue {
+                value_type, reason, ..
+            } => write!(f, "invalid attribute value (type {value_type}): {reason}"),
             DecodeError::TooManyAttributes { count, max } => {
                 write!(f, "too many attributes ({count} > {max})")
             }
@@ -277,8 +241,8 @@ impl std::error::Error for DecodeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{B256, Bytes};
-    use arkiv_bindings::{Attribute as AbiAttribute, Ident32, Operation};
+    use alloy_primitives::{B256, Bytes, FixedBytes};
+    use arkiv_bindings::{AttributeType, AttributeValue, Ident32, Operation};
 
     fn empty_mime() -> Mime128 {
         Mime128 {
@@ -337,7 +301,8 @@ mod tests {
 
     #[test]
     fn decodes_a_uint_attribute() {
-        let attr = AbiAttribute::uint(Ident32::encode("age").unwrap(), U256::from(42));
+        let value = AttributeValue::u256_from_u64(42);
+        let attr = AbiAttribute::from_value(Ident32::encode("age").unwrap(), &value).unwrap();
         let cd = calldata(vec![Operation::create(
             1,
             Bytes::new(),
@@ -350,8 +315,64 @@ mod tests {
         };
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].key, b"age");
-        assert_eq!(attributes[0].value_type, ATTR_UINT);
-        assert_eq!(attributes[0].value, U256::from(42).to_be_bytes::<32>());
+        assert_eq!(attributes[0].value, value);
+    }
+
+    /// Every user-settable type reaches the [`Op`] as the value the client sent.
+    #[test]
+    fn decodes_every_attribute_type() {
+        let values = [
+            AttributeValue::Bool(true),
+            AttributeValue::Int(-9),
+            AttributeValue::u256_from_u64(7),
+            AttributeValue::Decimal([0xFF; 32]),
+            AttributeValue::Bytes32([0x5A; 32]),
+            AttributeValue::Str("blue".into()),
+            AttributeValue::EthereumAddress([0x11; 20]),
+            AttributeValue::EntityKey([0x22; 32]),
+        ];
+        // Names must be strictly ascending, so index them.
+        let attrs: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| AbiAttribute::from_value(Ident32::encode(&format!("a{i}")).unwrap(), v))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let cd = calldata(vec![Operation::create(
+            1,
+            Bytes::new(),
+            empty_mime(),
+            attrs,
+        )]);
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let Op::Create { attributes, .. } = &ops[0] else {
+            panic!("expected create");
+        };
+        let decoded: Vec<_> = attributes.iter().map(|a| a.value.clone()).collect();
+        assert_eq!(decoded, values);
+    }
+
+    /// `bytes` is system-only, and unknown tags are unknown — both revert as an
+    /// invalid value type rather than decoding to something.
+    #[test]
+    fn rejects_system_only_and_unknown_attribute_types() {
+        for value_type in [AttributeType::Bytes.id(), 99] {
+            let attr = AbiAttribute {
+                name: FixedBytes::right_padding_from(b"a"),
+                valueType: value_type,
+                value: [FixedBytes::ZERO; 4],
+            };
+            let cd = calldata(vec![Operation::create(
+                1,
+                Bytes::new(),
+                empty_mime(),
+                vec![attr],
+            )]);
+            assert!(matches!(
+                decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+                Err(DecodeError::InvalidAttributeValue { .. })
+            ));
+        }
     }
 
     #[test]
@@ -407,7 +428,7 @@ mod tests {
         name[..14].copy_from_slice(b"testInvalidKey");
         let attr = AbiAttribute {
             name: FixedBytes::from(name).into(),
-            valueType: ATTR_STRING,
+            valueType: AttributeType::Str.id(),
             value: [FixedBytes::ZERO; 4],
         };
         let cd = calldata(vec![Operation::create(
@@ -430,7 +451,7 @@ mod tests {
     fn rejects_empty_attribute_name() {
         let attr = AbiAttribute {
             name: FixedBytes::from([0u8; 32]).into(),
-            valueType: ATTR_STRING,
+            valueType: AttributeType::Str.id(),
             value: [FixedBytes::ZERO; 4],
         };
         let cd = calldata(vec![Operation::create(

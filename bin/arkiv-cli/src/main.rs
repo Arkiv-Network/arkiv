@@ -269,8 +269,24 @@ enum BatchAttributeValue {
     String {
         string: String,
     },
+    Bool {
+        bool: bool,
+    },
+    Int {
+        int: i32,
+    },
     Uint {
         uint: U256,
+    },
+    /// A fixed-18-decimal value, as a decimal string (`"1.5"`).
+    Decimal {
+        decimal: String,
+    },
+    Bytes32 {
+        bytes32: B256,
+    },
+    Address {
+        address: Address,
     },
     EntityKey {
         #[serde(rename = "entityKey")]
@@ -331,13 +347,63 @@ fn build_attribute(
 ) -> Result<Attribute> {
     let name = Ident32::encode(&attr.name)
         .map_err(|e| eyre::eyre!("invalid attribute name '{}': {}", attr.name, e))?;
-    Ok(match &attr.value {
-        BatchAttributeValue::Uint { uint } => Attribute::uint(name, *uint),
-        BatchAttributeValue::String { string } => Attribute::string(name, string.as_bytes())?,
-        BatchAttributeValue::EntityKey { entity_key } => {
-            Attribute::entity_key(name, resolve(entity_key)?)
+    let value = match &attr.value {
+        BatchAttributeValue::Bool { bool } => AttributeValue::Bool(*bool),
+        BatchAttributeValue::Int { int } => AttributeValue::Int(*int),
+        BatchAttributeValue::Uint { uint } => AttributeValue::U256(uint.to_be_bytes()),
+        BatchAttributeValue::Decimal { decimal } => parse_decimal_value(decimal)?,
+        BatchAttributeValue::Bytes32 { bytes32 } => AttributeValue::Bytes32(bytes32.0),
+        BatchAttributeValue::String { string } => AttributeValue::Str(string.clone()),
+        BatchAttributeValue::Address { address } => {
+            AttributeValue::EthereumAddress(address.into_array())
         }
-    })
+        BatchAttributeValue::EntityKey { entity_key } => {
+            AttributeValue::EntityKey(resolve(entity_key)?.0)
+        }
+    };
+    Attribute::from_value(name, &value)
+        .map_err(|e| eyre::eyre!("invalid value for attribute '{}': {}", attr.name, e))
+}
+
+/// Parse a decimal string (`"-1.5"`) into a fixed-scale `decimal` value: the
+/// number multiplied by `10^DECIMAL_SCALE`, as a two's-complement `int256`.
+fn parse_decimal_value(text: &str) -> Result<AttributeValue> {
+    let (negative, digits) = split_sign(text);
+    let magnitude = parse_scaled_magnitude(digits)
+        .map_err(|e| eyre::eyre!("invalid decimal value '{}': {}", text, e))?;
+    let signed = if negative {
+        U256::ZERO.wrapping_sub(magnitude)
+    } else {
+        magnitude
+    };
+    Ok(AttributeValue::Decimal(signed.to_be_bytes()))
+}
+
+/// Split a leading sign off a decimal literal.
+fn split_sign(text: &str) -> (bool, &str) {
+    match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    }
+}
+
+/// `"1.5"` → `1_500_000_000_000_000_000`: the digits with the decimal point
+/// removed, right-padded to exactly [`DECIMAL_SCALE`] fractional places.
+fn parse_scaled_magnitude(digits: &str) -> Result<U256> {
+    let scale = DECIMAL_SCALE as usize;
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if frac.len() > scale {
+        bail!("more than {scale} decimal places");
+    }
+    if whole.is_empty() && frac.is_empty() {
+        bail!("no digits");
+    }
+    let mantissa = format!(
+        "{}{frac}{}",
+        if whole.is_empty() { "0" } else { whole },
+        "0".repeat(scale - frac.len()),
+    );
+    mantissa.parse::<U256>().map_err(Into::into)
 }
 
 /// Build the contract's `Attribute[]` from batch entries, sorted by name
@@ -470,14 +536,37 @@ fn parse_cli_attribute(raw: &str) -> Result<BatchAttribute> {
         Some("string" | "str") => BatchAttributeValue::String {
             string: parse_cli_string_value(value)?,
         },
+        Some("bool") => BatchAttributeValue::Bool {
+            bool: value
+                .parse()
+                .map_err(|_| eyre::eyre!("invalid bool value '{}'; expected true or false", value))?,
+        },
+        Some("int") => BatchAttributeValue::Int {
+            int: value
+                .parse()
+                .map_err(|e| eyre::eyre!("invalid int value '{}': {}", value, e))?,
+        },
         Some("uint" | "u256") => BatchAttributeValue::Uint {
             uint: parse_cli_uint_value(value)?,
+        },
+        Some("decimal") => BatchAttributeValue::Decimal {
+            decimal: value.to_string(),
+        },
+        Some("bytes32") => BatchAttributeValue::Bytes32 {
+            bytes32: value
+                .parse()
+                .map_err(|e| eyre::eyre!("invalid bytes32 value '{}': {}", value, e))?,
+        },
+        Some("address") => BatchAttributeValue::Address {
+            address: value
+                .parse()
+                .map_err(|e| eyre::eyre!("invalid address value '{}': {}", value, e))?,
         },
         Some("entityKey" | "entity-key" | "key") => BatchAttributeValue::EntityKey {
             entity_key: EntityKeyRef::Literal(parse_cli_entity_key_value(value)?),
         },
         Some(other) => bail!(
-            "unknown attribute type '{}'; expected string, uint, or entityKey",
+            "unknown attribute type '{}'; expected bool, int, uint, decimal, bytes32, string, address, or entityKey",
             other
         ),
         None if is_quoted(value) => BatchAttributeValue::String {

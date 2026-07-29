@@ -39,7 +39,7 @@ use arkiv_interfaces::state::{AuxiliaryStore, BlockAuxiliaryStoreDelta};
 use arkiv_reth_entitystore::AccountCode;
 use arkiv_reth_entitystore::layout::SYSTEM_ACCOUNT_ADDRESS;
 
-use crate::annotation::mode_for;
+use crate::annotation::capabilities_for;
 use crate::error::AuxError;
 use crate::slot::{storage_to_u64, u64_to_storage};
 use crate::storage::IndexStorage;
@@ -195,23 +195,23 @@ where
         for entity in &delta.entities {
             let entity_id = self.id_for_key(entity.entity_key)?;
             for entry in &entity.inserts {
-                let mode = mode_for(&entry.attr, entry.value_type);
+                let capabilities = capabilities_for(&entry.attr, entry.value.attr_type());
                 index::insert(
                     &mut self.backend,
                     &entry.attr,
                     &entry.value,
                     entity_id,
-                    mode,
+                    capabilities,
                 )?;
             }
             for entry in &entity.removes {
-                let mode = mode_for(&entry.attr, entry.value_type);
+                let capabilities = capabilities_for(&entry.attr, entry.value.attr_type());
                 index::remove(
                     &mut self.backend,
                     &entry.attr,
                     &entry.value,
                     entity_id,
-                    mode,
+                    capabilities,
                 )?;
             }
         }
@@ -235,10 +235,10 @@ mod tests {
 
     use alloy_primitives::Address;
     use arkiv_interfaces::collections::NonEmptyVec;
+    use arkiv_interfaces::entity::AttributeValue;
     use arkiv_interfaces::entity::annotations::{
         ALL, CONTENT_TYPE, CREATED_AT_BLOCK, CREATOR, EXPIRATION, KEY, OWNER,
     };
-    use arkiv_interfaces::entity::{ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT};
     use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn};
     use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta};
 
@@ -286,19 +286,8 @@ mod tests {
 
     // ── delta builders (a stand-in for what the executor will produce) ────────
 
-    fn entry(attr: &[u8], value_type: u8, value: Vec<u8>) -> AttrEntry {
-        AttrEntry {
-            attr: attr.to_vec(),
-            value_type,
-            value,
-        }
-    }
-
-    /// A `u64` as a 32-byte big-endian word — the canonical uint index encoding.
-    fn uint(n: u64) -> Vec<u8> {
-        let mut buf = [0u8; 32];
-        buf[24..].copy_from_slice(&n.to_be_bytes());
-        buf.to_vec()
+    fn entry(attr: &[u8], value: AttributeValue) -> AttrEntry {
+        AttrEntry::new(attr, value)
     }
 
     fn key_of(byte: u8) -> EntityKey {
@@ -313,7 +302,7 @@ mod tests {
         key: EntityKey,
         owner: [u8; 20],
         expires: u64,
-        content_type: Vec<u8>,
+        content_type: String,
         attributes: Vec<AttrEntry>,
     }
 
@@ -322,13 +311,16 @@ mod tests {
     /// allocates the entity id itself on first sight of the key.
     fn create(entity: &NewEntity) -> AuxiliaryEntityDelta {
         let mut inserts = vec![
-            entry(ALL, ATTR_STRING, Vec::new()),
-            entry(CREATOR, ATTR_ENTITY_KEY, entity.owner.to_vec()),
-            entry(OWNER, ATTR_ENTITY_KEY, entity.owner.to_vec()),
-            entry(KEY, ATTR_ENTITY_KEY, entity.key.to_vec()),
-            entry(CREATED_AT_BLOCK, ATTR_UINT, uint(1)),
-            entry(EXPIRATION, ATTR_UINT, uint(entity.expires)),
-            entry(CONTENT_TYPE, ATTR_STRING, entity.content_type.clone()),
+            entry(ALL, AttributeValue::Str(String::new())),
+            entry(CREATOR, AttributeValue::EthereumAddress(entity.owner)),
+            entry(OWNER, AttributeValue::EthereumAddress(entity.owner)),
+            entry(KEY, AttributeValue::EntityKey(entity.key)),
+            entry(CREATED_AT_BLOCK, AttributeValue::u256_from_u64(1)),
+            entry(EXPIRATION, AttributeValue::u256_from_u64(entity.expires)),
+            entry(
+                CONTENT_TYPE,
+                AttributeValue::Str(entity.content_type.clone()),
+            ),
         ];
         inserts.extend(entity.attributes.iter().cloned());
         AuxiliaryEntityDelta {
@@ -358,20 +350,20 @@ mod tests {
     fn owner_is(owner: [u8; 20]) -> Query {
         Query::Eq {
             key: AnnotKey::BuiltIn(BuiltIn::Owner),
-            value: AnnotVal::Addr(owner),
+            value: AnnotVal::EthereumAddress(owner),
         }
     }
 
     fn user_uint(name: &str, value: u64) -> Vec<AttrEntry> {
-        vec![entry(name.as_bytes(), ATTR_UINT, uint(value))]
+        vec![entry(name.as_bytes(), AttributeValue::u256_from_u64(value))]
     }
 
     fn user_str(name: &str, value: &str) -> Vec<AttrEntry> {
-        vec![entry(
-            name.as_bytes(),
-            ATTR_STRING,
-            value.as_bytes().to_vec(),
-        )]
+        vec![entry(name.as_bytes(), AttributeValue::Str(value.into()))]
+    }
+
+    fn user_int(name: &str, value: i32) -> Vec<AttrEntry> {
+        vec![entry(name.as_bytes(), AttributeValue::Int(value))]
     }
 
     fn sample(key: u8, owner: u8, expires: u64, attributes: Vec<AttrEntry>) -> NewEntity {
@@ -379,7 +371,7 @@ mod tests {
             key: key_of(key),
             owner: addr_of(owner),
             expires,
-            content_type: b"text/plain".to_vec(),
+            content_type: "text/plain".into(),
             attributes,
         }
     }
@@ -440,7 +432,7 @@ mod tests {
         );
         let q = Query::Neq {
             key: AnnotKey::BuiltIn(BuiltIn::Owner),
-            value: AnnotVal::Addr(addr_of(1)),
+            value: AnnotVal::EthereumAddress(addr_of(1)),
         };
         assert_eq!(matching(&mut store, &q), vec![key_of(0xB0)]);
     }
@@ -459,8 +451,8 @@ mod tests {
         let q = Query::In {
             key: AnnotKey::BuiltIn(BuiltIn::Owner),
             values: NonEmptyVec {
-                first: AnnotVal::Addr(addr_of(1)),
-                rest: vec![AnnotVal::Addr(addr_of(3))],
+                first: AnnotVal::EthereumAddress(addr_of(1)),
+                rest: vec![AnnotVal::EthereumAddress(addr_of(3))],
             },
         };
         assert_eq!(matching(&mut store, &q), vec![key_of(0xA0), key_of(0xC0)]);
@@ -479,12 +471,12 @@ mod tests {
         );
         let gt = |n: u64| Query::Gt {
             key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-            value: AnnotVal::Uint(word(n)),
+            value: word(n),
         };
         assert_eq!(matching(&mut store, &gt(20)), vec![key_of(0xC0)]);
         let lte = Query::Lte {
             key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-            value: AnnotVal::Uint(word(20)),
+            value: word(20),
         };
         assert_eq!(matching(&mut store, &lte), vec![key_of(0xA0), key_of(0xB0)]);
     }
@@ -502,9 +494,83 @@ mod tests {
         );
         let q = Query::Gte {
             key: AnnotKey::User("rank".into()),
-            value: AnnotVal::Uint(word(15)),
+            value: word(15),
         };
         assert_eq!(matching(&mut store, &q), vec![key_of(0xB0), key_of(0xC0)]);
+    }
+
+    /// Signed values are range-scanned in numeric order, negatives included —
+    /// what the biased index encoding buys.
+    #[test]
+    fn int_range_spans_negatives() {
+        let mut store = RethAuxStore::new(MemBackend::default());
+        apply(
+            &mut store,
+            vec![
+                create(&sample(0xA0, 1, 100, user_int("delta", -5))),
+                create(&sample(0xB0, 1, 100, user_int("delta", 0))),
+                create(&sample(0xC0, 1, 100, user_int("delta", 5))),
+            ],
+        );
+        let gte = |n: i32| Query::Gte {
+            key: AnnotKey::User("delta".into()),
+            value: AnnotVal::Int(n),
+        };
+        assert_eq!(
+            matching(&mut store, &gte(-5)),
+            vec![key_of(0xA0), key_of(0xB0), key_of(0xC0)]
+        );
+        assert_eq!(
+            matching(&mut store, &gte(0)),
+            vec![key_of(0xB0), key_of(0xC0)]
+        );
+        let lt_zero = Query::Lt {
+            key: AnnotKey::User("delta".into()),
+            value: AnnotVal::Int(0),
+        };
+        assert_eq!(matching(&mut store, &lt_zero), vec![key_of(0xA0)]);
+    }
+
+    /// One attribute name holding two types keeps two disjoint buckets: a `bool`
+    /// `true` and a one-byte string with the same byte don't answer each other.
+    #[test]
+    fn same_name_different_types_do_not_collide() {
+        let mut store = RethAuxStore::new(MemBackend::default());
+        let flag = |v: AttributeValue| vec![entry(b"flag", v)];
+        apply(
+            &mut store,
+            vec![
+                create(&sample(0xA0, 1, 100, flag(AttributeValue::Bool(true)))),
+                create(&sample(
+                    0xB0,
+                    1,
+                    100,
+                    flag(AttributeValue::Str("\u{1}".into())),
+                )),
+                create(&sample(
+                    0xC0,
+                    1,
+                    100,
+                    flag(AttributeValue::u256_from_u64(1)),
+                )),
+            ],
+        );
+        let eq = |v: AttributeValue| Query::Eq {
+            key: AnnotKey::User("flag".into()),
+            value: v,
+        };
+        assert_eq!(
+            matching(&mut store, &eq(AttributeValue::Bool(true))),
+            vec![key_of(0xA0)]
+        );
+        assert_eq!(
+            matching(&mut store, &eq(AttributeValue::Str("\u{1}".into()))),
+            vec![key_of(0xB0)]
+        );
+        assert_eq!(
+            matching(&mut store, &eq(AttributeValue::u256_from_u64(1))),
+            vec![key_of(0xC0)]
+        );
     }
 
     #[test]
@@ -520,12 +586,12 @@ mod tests {
         );
         let gt = Query::Gt {
             key: AnnotKey::User("name".into()),
-            value: AnnotVal::Str(b"apple".to_vec()),
+            value: AnnotVal::Str("apple".into()),
         };
         assert_eq!(matching(&mut store, &gt), vec![key_of(0xB0), key_of(0xC0)]);
         let glob = Query::Glob {
             key: AnnotKey::User("name".into()),
-            value: AnnotVal::Str(b"b".to_vec()),
+            value: AnnotVal::Str("b".into()),
         };
         assert_eq!(
             matching(&mut store, &glob),
@@ -549,7 +615,7 @@ mod tests {
             Box::new(owner_is(addr_of(1))),
             Box::new(Query::Gt {
                 key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-                value: AnnotVal::Uint(word(20)),
+                value: word(20),
             }),
         );
         assert_eq!(matching(&mut store, &and), vec![key_of(0xB0)]);
@@ -559,7 +625,7 @@ mod tests {
             Box::new(owner_is(addr_of(2))),
             Box::new(Query::Lt {
                 key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-                value: AnnotVal::Uint(word(20)),
+                value: word(20),
             }),
         );
         assert_eq!(matching(&mut store, &or), vec![key_of(0xA0), key_of(0xC0)]);
@@ -593,7 +659,7 @@ mod tests {
         // The shared user value's bitmap still holds B0, so the value survives.
         let q = Query::Eq {
             key: AnnotKey::User("rank".into()),
-            value: AnnotVal::Uint(word(5)),
+            value: word(5),
         };
         assert_eq!(matching(&mut store, &q), vec![key_of(0xB0)]);
     }
@@ -652,8 +718,8 @@ mod tests {
         // A transfer removes the old $owner value and inserts the new one.
         let transfer = AuxiliaryEntityDelta {
             entity_key: key_of(0xA0),
-            inserts: vec![entry(OWNER, ATTR_ENTITY_KEY, addr_of(2).to_vec())],
-            removes: vec![entry(OWNER, ATTR_ENTITY_KEY, addr_of(1).to_vec())],
+            inserts: vec![entry(OWNER, AttributeValue::EthereumAddress(addr_of(2)))],
+            removes: vec![entry(OWNER, AttributeValue::EthereumAddress(addr_of(1)))],
         };
         apply(&mut store, vec![transfer]);
 
@@ -689,11 +755,8 @@ mod tests {
         assert_eq!(store.id_key(9).unwrap(), None);
     }
 
-    /// A `u64` as a 32-byte big-endian word — the query-side counterpart of
-    /// [`uint`], for building `AnnotVal::Uint` bounds.
-    fn word(n: u64) -> [u8; 32] {
-        let mut buf = [0u8; 32];
-        buf[24..].copy_from_slice(&n.to_be_bytes());
-        buf
+    /// A `u64` as a `u256` query bound.
+    fn word(n: u64) -> AnnotVal {
+        AnnotVal::u256_from_u64(n)
     }
 }

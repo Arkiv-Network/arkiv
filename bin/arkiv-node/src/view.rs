@@ -6,7 +6,7 @@
 //! from the query index.
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use arkiv_interfaces::entity::{ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT, Entity};
+use arkiv_interfaces::entity::{AttributeValue, DECIMAL_SCALE, Entity};
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 
@@ -90,10 +90,8 @@ impl ResolvedIncludeData {
 
 /// Wire attribute in RPC responses.
 ///
-/// `value`'s encoding depends on `value_type`:
-/// - `ATTR_UINT` → decimal `U256` string (e.g. `"42"`)
-/// - `ATTR_STRING` → UTF-8 string
-/// - `ATTR_ENTITY_KEY` → `0x`-prefixed hex of the 32-byte key
+/// `value` renders by type: numbers as decimal strings, strings as themselves,
+/// and the byte-shaped types (`bytes32`, `address`, `entity_key`) as `0x` hex.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attribute {
@@ -151,8 +149,8 @@ pub fn entity_data_from(e: Entity, inc: &ResolvedIncludeData) -> EntityData {
             .into_iter()
             .map(|a| Attribute {
                 key: String::from_utf8_lossy(&a.key).into_owned(),
-                value_type: a.value_type,
-                value: format_attribute_value(a.value_type, &a.value),
+                value_type: a.value.type_id(),
+                value: format_attribute_value(&a.value),
             })
             .collect()
     } else {
@@ -178,14 +176,50 @@ pub fn entity_data_from(e: Entity, inc: &ResolvedIncludeData) -> EntityData {
     }
 }
 
-/// Format a raw attribute value as a human-readable string for the wire.
-pub fn format_attribute_value(value_type: u8, bytes: &[u8]) -> String {
-    match value_type {
-        ATTR_UINT => U256::from_be_slice(bytes).to_string(),
-        ATTR_STRING => String::from_utf8_lossy(bytes).into_owned(),
-        ATTR_ENTITY_KEY => alloy_primitives::hex::encode_prefixed(bytes),
-        _ => String::new(),
+/// Format an attribute value as a human-readable string for the wire.
+pub fn format_attribute_value(value: &AttributeValue) -> String {
+    match value {
+        AttributeValue::Bool(b) => b.to_string(),
+        AttributeValue::Int(n) => n.to_string(),
+        AttributeValue::U256(w) => U256::from_be_bytes(*w).to_string(),
+        AttributeValue::Decimal(w) => format_decimal(*w),
+        AttributeValue::Str(s) => s.clone(),
+        AttributeValue::Bytes32(w) | AttributeValue::EntityKey(w) => {
+            alloy_primitives::hex::encode_prefixed(w)
+        }
+        AttributeValue::EthereumAddress(a) => alloy_primitives::hex::encode_prefixed(a),
+        AttributeValue::Bytes(b) => alloy_primitives::hex::encode_prefixed(b),
     }
+}
+
+/// Render a fixed-scale `decimal` (a two's-complement `int256` scaled by
+/// `10^DECIMAL_SCALE`) as a plain decimal string, without trailing zeros.
+fn format_decimal(word: [u8; 32]) -> String {
+    let (sign, magnitude) = split_sign(word);
+    let scale = U256::from(10u8).pow(U256::from(DECIMAL_SCALE));
+    let whole = magnitude / scale;
+    match trimmed_fraction(magnitude % scale) {
+        Some(frac) => format!("{sign}{whole}.{frac}"),
+        None => format!("{sign}{whole}"),
+    }
+}
+
+/// Split a two's-complement `int256` into its sign prefix and absolute value.
+fn split_sign(word: [u8; 32]) -> (&'static str, U256) {
+    let raw = U256::from_be_bytes(word);
+    if word[0] & 0x80 == 0 {
+        ("", raw)
+    } else {
+        ("-", U256::ZERO.wrapping_sub(raw))
+    }
+}
+
+/// The fractional digits, zero-padded to the scale and stripped of trailing
+/// zeros — `None` when nothing is left, i.e. the value is a whole number.
+fn trimmed_fraction(remainder: U256) -> Option<String> {
+    let digits = format!("{remainder:0width$}", width = DECIMAL_SCALE as usize);
+    let trimmed = digits.trim_end_matches('0');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Parse a hex cursor string (`"0x1a"`) into a `u64` page cursor.
@@ -251,25 +285,60 @@ where
 mod tests {
     use super::*;
 
+    /// One rendering per type, the shape the SDK reads.
     #[test]
-    fn format_uint_value_is_decimal_string() {
-        let bytes = U256::from(123_456_789u64).to_be_bytes::<32>();
-        assert_eq!(format_attribute_value(ATTR_UINT, &bytes), "123456789");
+    fn values_render_by_type() {
+        let mut key = [0u8; 32];
+        key[0] = 0xab;
+        key[1] = 0xcd;
+        let cases = [
+            (AttributeValue::Bool(true), "true"),
+            (AttributeValue::Int(-42), "-42"),
+            (AttributeValue::u256_from_u64(123_456_789), "123456789"),
+            (AttributeValue::Str("hello".into()), "hello"),
+            (
+                AttributeValue::EntityKey(key),
+                "0xabcd000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                AttributeValue::EthereumAddress([0x11; 20]),
+                "0x1111111111111111111111111111111111111111",
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(format_attribute_value(&value), expected, "{value:?}");
+        }
     }
 
+    /// Decimals render as fixed-point, sign and fraction included.
     #[test]
-    fn format_string_value_is_utf8() {
-        assert_eq!(format_attribute_value(ATTR_STRING, b"hello"), "hello");
-    }
-
-    #[test]
-    fn format_entity_key_value_is_prefixed_hex() {
-        let mut k = [0u8; 32];
-        k[0] = 0xab;
-        k[1] = 0xcd;
+    fn decimals_render_as_fixed_point() {
+        let scaled = |n: i128| {
+            let raw =
+                U256::from(n.unsigned_abs()) * U256::from(10u8).pow(U256::from(DECIMAL_SCALE));
+            let word = if n < 0 {
+                U256::ZERO.wrapping_sub(raw)
+            } else {
+                raw
+            };
+            AttributeValue::Decimal(word.to_be_bytes())
+        };
+        assert_eq!(format_attribute_value(&scaled(3)), "3");
+        assert_eq!(format_attribute_value(&scaled(-3)), "-3");
+        // 1.5 = 1_500_000_000_000_000_000 at scale 18.
+        let mut half = U256::from(1_500_000_000_000_000_000u64);
         assert_eq!(
-            format_attribute_value(ATTR_ENTITY_KEY, &k),
-            "0xabcd000000000000000000000000000000000000000000000000000000000000"
+            format_attribute_value(&AttributeValue::Decimal(half.to_be_bytes())),
+            "1.5"
+        );
+        half = U256::ZERO.wrapping_sub(half);
+        assert_eq!(
+            format_attribute_value(&AttributeValue::Decimal(half.to_be_bytes())),
+            "-1.5"
+        );
+        assert_eq!(
+            format_attribute_value(&AttributeValue::Decimal([0u8; 32])),
+            "0"
         );
     }
 
@@ -306,12 +375,12 @@ mod tests {
     fn attribute_serializes_camel_case() {
         let attr = Attribute {
             key: "score".to_string(),
-            value_type: ATTR_UINT,
+            value_type: AttributeValue::u256_from_u64(42).type_id(),
             value: "42".to_string(),
         };
         let json = serde_json::to_value(&attr).expect("serialize");
         assert_eq!(json["key"], "score");
-        assert_eq!(json["valueType"], 1);
+        assert_eq!(json["valueType"], 3);
         assert_eq!(json["value"], "42");
         assert!(json.get("value_type").is_none());
     }

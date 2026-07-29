@@ -402,6 +402,7 @@ mod tests {
     use super::*;
     use crate::address::btree_header_address;
     use crate::storage::MemStorage;
+    use arkiv_interfaces::entity::AttributeType;
 
     fn slot(n: u64) -> B256 {
         // A distinct, order-preserving key for id `n` (big-endian in the low bytes).
@@ -425,14 +426,14 @@ mod tests {
     #[test]
     fn empty_tree_iterates_empty() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         assert!(iter_from(&mut s, hdr, B256::ZERO).unwrap().is_empty());
     }
 
     #[test]
     fn single_insert_roundtrips() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         insert(&mut s, hdr, slot(42), present()).unwrap();
         assert_eq!(keys_in_order(&mut s, hdr), vec![42]);
     }
@@ -440,7 +441,7 @@ mod tests {
     #[test]
     fn stays_sorted_regardless_of_insert_order() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         for n in [5u64, 1, 9, 3, 7, 2, 8, 4, 6] {
             insert(&mut s, hdr, slot(n), present()).unwrap();
         }
@@ -452,7 +453,7 @@ mod tests {
     #[test]
     fn splits_past_order_and_keeps_all_keys_ordered() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         let n = (BTREE_ORDER as u64) * 4 + 1; // force several splits / a taller tree
         // Insert descending so splits happen on the busy end.
         for k in (1..=n).rev() {
@@ -467,7 +468,7 @@ mod tests {
     #[test]
     fn iter_from_respects_lower_bound() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         for n in 1..=50u64 {
             insert(&mut s, hdr, slot(n), present()).unwrap();
         }
@@ -482,7 +483,7 @@ mod tests {
     #[test]
     fn lazy_delete_hides_key() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         for n in [1u64, 2, 3] {
             insert(&mut s, hdr, slot(n), present()).unwrap();
         }
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn reinsert_after_delete_restores_key() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         insert(&mut s, hdr, slot(2), present()).unwrap();
         lazy_delete(&mut s, hdr, slot(2)).unwrap();
         assert!(keys_in_order(&mut s, hdr).is_empty());
@@ -504,7 +505,7 @@ mod tests {
     #[test]
     fn duplicate_insert_updates_in_place() {
         let mut s = MemStorage::default();
-        let hdr = btree_header_address(b"k");
+        let hdr = btree_header_address(b"k", AttributeType::U256);
         insert(&mut s, hdr, slot(7), u64_to_storage(1)).unwrap();
         insert(&mut s, hdr, slot(7), u64_to_storage(2)).unwrap();
         let entries = iter_from(&mut s, hdr, B256::ZERO).unwrap();
@@ -516,8 +517,8 @@ mod tests {
     #[test]
     fn distinct_trees_are_independent() {
         let mut s = MemStorage::default();
-        let a = btree_header_address(b"attrA");
-        let b = btree_header_address(b"attrB");
+        let a = btree_header_address(b"attrA", AttributeType::U256);
+        let b = btree_header_address(b"attrB", AttributeType::U256);
         insert(&mut s, a, slot(1), present()).unwrap();
         insert(&mut s, b, slot(2), present()).unwrap();
         assert_eq!(keys_in_order(&mut s, a), vec![1]);

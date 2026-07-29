@@ -20,7 +20,9 @@ use alloy_primitives::{Address, B256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 
 use arkiv_interfaces::codec::EntityCodec;
-use arkiv_interfaces::entity::{Attribute, Entity};
+use arkiv_interfaces::entity::{
+    Attribute, AttributeType, AttributeValue, AttributeValueError, Entity,
+};
 
 /// Marker byte before an entity record — the EVM `INVALID` opcode, so a `CALL` to
 /// an entity account halts.
@@ -75,7 +77,7 @@ fn decode_v0(mut body: &[u8]) -> Result<Entity, RecordError> {
     if !body.is_empty() {
         return Err(RecordError::TrailingBytes);
     }
-    Ok(rlp.into_entity())
+    rlp.into_entity()
 }
 
 /// Why decoding an entity record failed.
@@ -89,6 +91,10 @@ pub enum RecordError {
     Rlp(alloy_rlp::Error),
     /// Extra bytes followed the RLP body.
     TrailingBytes,
+    /// An attribute's `typeId` names no type.
+    UnknownAttributeType(u8),
+    /// An attribute's bytes don't decode as its declared type.
+    AttributeValue(AttributeValueError),
 }
 
 impl fmt::Display for RecordError {
@@ -102,6 +108,10 @@ impl fmt::Display for RecordError {
             }
             RecordError::Rlp(e) => write!(f, "entity RLP decode failed: {e}"),
             RecordError::TrailingBytes => write!(f, "trailing bytes after the entity record"),
+            RecordError::UnknownAttributeType(t) => {
+                write!(f, "unknown attribute value type {t}")
+            }
+            RecordError::AttributeValue(e) => write!(f, "invalid attribute value: {e}"),
         }
     }
 }
@@ -147,6 +157,8 @@ struct EntityRlp {
     last_modified_at_block: u64,
 }
 
+/// An attribute on-code: its `typeId` byte, then the value's canonical storage
+/// bytes ([`AttributeValue::encode`]).
 #[derive(RlpEncodable, RlpDecodable)]
 struct AttributeRlp {
     key: Vec<u8>,
@@ -169,8 +181,8 @@ impl EntityRlp {
         }
     }
 
-    fn into_entity(self) -> Entity {
-        Entity {
+    fn into_entity(self) -> Result<Entity, RecordError> {
+        Ok(Entity {
             key: self.key.into(),
             creator: self.creator.into(),
             owner: self.owner.into(),
@@ -183,8 +195,8 @@ impl EntityRlp {
                 .attributes
                 .into_iter()
                 .map(AttributeRlp::into_attr)
-                .collect(),
-        }
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -192,24 +204,24 @@ impl AttributeRlp {
     fn from_attr(a: &Attribute) -> Self {
         Self {
             key: a.key.clone(),
-            value_type: a.value_type,
-            value: a.value.clone(),
+            value_type: a.value.type_id(),
+            value: a.value.encode(),
         }
     }
-    fn into_attr(self) -> Attribute {
-        Attribute {
+    fn into_attr(self) -> Result<Attribute, RecordError> {
+        let ty = AttributeType::from_id(self.value_type)
+            .ok_or(RecordError::UnknownAttributeType(self.value_type))?;
+        let value = AttributeValue::decode(ty, &self.value).map_err(RecordError::AttributeValue)?;
+        Ok(Attribute {
             key: self.key,
-            value_type: self.value_type,
-            value: self.value,
-        }
+            value,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkiv_interfaces::entity::{ATTR_ENTITY_KEY, ATTR_STRING, ATTR_UINT};
-
     fn sample() -> Entity {
         Entity {
             key: [7u8; 32],
@@ -221,21 +233,14 @@ mod tests {
             content_type: b"text/plain".to_vec(),
             payload: b"hello world".to_vec(),
             attributes: vec![
-                Attribute {
-                    key: b"color".to_vec(),
-                    value_type: ATTR_STRING,
-                    value: b"blue".to_vec(),
-                },
-                Attribute {
-                    key: b"size".to_vec(),
-                    value_type: ATTR_UINT,
-                    value: vec![0u8; 32],
-                },
-                Attribute {
-                    key: b"ref".to_vec(),
-                    value_type: ATTR_ENTITY_KEY,
-                    value: vec![9u8; 32],
-                },
+                Attribute::new(b"color".to_vec(), AttributeValue::Str("blue".into())),
+                Attribute::new(b"size".to_vec(), AttributeValue::u256_from_u64(7)),
+                Attribute::new(b"ref".to_vec(), AttributeValue::EntityKey([9u8; 32])),
+                Attribute::new(b"live".to_vec(), AttributeValue::Bool(true)),
+                Attribute::new(b"delta".to_vec(), AttributeValue::Int(-3)),
+                Attribute::new(b"price".to_vec(), AttributeValue::Decimal([0xFE; 32])),
+                Attribute::new(b"hash".to_vec(), AttributeValue::Bytes32([0x5A; 32])),
+                Attribute::new(b"who".to_vec(), AttributeValue::EthereumAddress([4u8; 20])),
             ],
         }
     }
@@ -305,6 +310,31 @@ mod tests {
         assert!(matches!(
             decode(&bytes[..bytes.len() - 1]),
             Err(RecordError::Rlp(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unknown_attribute_type() {
+        let rlp = EntityRlp {
+            payload: Vec::new(),
+            creator: Address::ZERO,
+            created_at_block: 0,
+            owner: Address::ZERO,
+            expires_at: 0,
+            content_type: Vec::new(),
+            key: B256::ZERO,
+            attributes: vec![AttributeRlp {
+                key: b"x".to_vec(),
+                value_type: 99,
+                value: Vec::new(),
+            }],
+            last_modified_at_block: 0,
+        };
+        let mut body = Vec::new();
+        rlp.encode(&mut body);
+        assert!(matches!(
+            decode_v0(&body),
+            Err(RecordError::UnknownAttributeType(99))
         ));
     }
 

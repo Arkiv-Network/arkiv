@@ -9,9 +9,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use alloy_primitives::{B256, Bytes, U256};
+use alloy_primitives::{B256, Bytes};
 use alloy_signer_local::PrivateKeySigner;
-use arkiv_bindings::{Attribute, Ident32, Mime128, Operation};
+use arkiv_bindings::{Attribute, AttributeValue, Ident32, Mime128, Operation};
 use arkiv_harness::{
     DEV_CHAIN_ID, DEV_KEY_0, NodeBuilder, connect, derive_entity_key, result_keys,
 };
@@ -22,10 +22,13 @@ fn text_plain_mime() -> Mime128 {
     Mime128::encode("text/plain").expect("valid mime")
 }
 
-fn attrs(rank: u64, team: &[u8]) -> Vec<Attribute> {
+fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
+    let attr = |name: &str, value: AttributeValue| {
+        Attribute::from_value(Ident32::encode(name).unwrap(), &value).unwrap()
+    };
     vec![
-        Attribute::uint(Ident32::encode("rank").unwrap(), U256::from(rank)),
-        Attribute::string(Ident32::encode("team").unwrap(), team).unwrap(),
+        attr("rank", AttributeValue::u256_from_u64(rank)),
+        attr("team", AttributeValue::Str(team.into())),
     ]
 }
 
@@ -44,13 +47,13 @@ async fn state_and_index_survive_kill_and_restart() {
                 1000,
                 Bytes::from_static(b"alpha"),
                 text_plain_mime(),
-                attrs(10, b"red"),
+                attrs(10, "red"),
             ),
             Operation::create(
                 1000,
                 Bytes::from_static(b"beta"),
                 text_plain_mime(),
-                attrs(20, b"blue"),
+                attrs(20, "blue"),
             ),
         ])
         .await;

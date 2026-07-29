@@ -682,7 +682,7 @@ mod tests {
     /// roaring bitmaps stored in those accounts' code — all in the one returned diff.
     #[test]
     fn entity_create_commits_index_accounts() {
-        use arkiv_interfaces::entity::annotations;
+        use arkiv_interfaces::entity::{AttributeType, annotations};
         use arkiv_reth_auxstore::{Bitmap, all_entities_bucket, pair_address};
 
         let mut db = EmptyDB::default();
@@ -709,7 +709,14 @@ mod tests {
         // Every live entity is in the $all bucket.
         assert!(bitmap_at(all_entities_bucket()).contains(0));
         // And in its owner's bucket (owner value = the 20-byte caller address).
-        assert!(bitmap_at(pair_address(annotations::OWNER, alice.as_slice())).contains(0));
+        assert!(
+            bitmap_at(pair_address(
+                annotations::OWNER,
+                AttributeType::EthereumAddress,
+                alice.as_slice()
+            ))
+            .contains(0)
+        );
     }
 
     fn nonces_calldata(owner: Address) -> Bytes {

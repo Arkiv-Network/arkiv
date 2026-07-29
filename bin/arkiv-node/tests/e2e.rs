@@ -8,11 +8,14 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::Provider;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
-use arkiv_bindings::{Attribute, IEntityRegistry, Ident32, Mime128, OP_CREATE, Operation};
+use arkiv_bindings::{
+    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Mime128, OP_CREATE,
+    Operation,
+};
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, NodeBuilder, connect,
     derive_entity_key, result_keys,
@@ -43,10 +46,13 @@ fn text_plain_mime() -> Mime128 {
 
 /// A `rank` (uint) + `team` (string) attribute pair — the two axes the query
 /// matrix filters on.
-fn attrs(rank: u64, team: &[u8]) -> Vec<Attribute> {
+fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
+    let attr = |name: &str, value: AttributeValue| {
+        Attribute::from_value(Ident32::encode(name).unwrap(), &value).unwrap()
+    };
     vec![
-        Attribute::uint(Ident32::encode("rank").unwrap(), U256::from(rank)),
-        Attribute::string(Ident32::encode("team").unwrap(), team).unwrap(),
+        attr("rank", AttributeValue::u256_from_u64(rank)),
+        attr("team", AttributeValue::Str(team.into())),
     ]
 }
 
@@ -195,7 +201,7 @@ async fn typed_revert_errors_over_a_live_node() {
     name[..14].copy_from_slice(b"testInvalidKey");
     let bad_attr = Attribute {
         name: alloy_primitives::FixedBytes::from(name).into(),
-        valueType: 2, // ATTR_STRING
+        valueType: AttributeType::Str.id(),
         value: [alloy_primitives::FixedBytes::ZERO; 4],
     };
     let create = Operation::create(
@@ -263,16 +269,11 @@ async fn query_operator_classes_over_a_live_node() {
     let payload = Bytes::from_static(b"x");
     client
         .execute(vec![
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(10, b"red")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(20, b"red")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(30, b"blue")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(40, b"blue")),
-            Operation::create(
-                1000,
-                payload.clone(),
-                text_plain_mime(),
-                attrs(50, b"green"),
-            ),
+            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(10, "red")),
+            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(20, "red")),
+            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(30, "blue")),
+            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(40, "blue")),
+            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(50, "green")),
         ])
         .await;
 
@@ -480,25 +481,25 @@ async fn write_path_ops_over_a_live_node() {
                 1000,
                 Bytes::from_static(b"v1"),
                 text_plain_mime(),
-                attrs(10, b"red"),
+                attrs(10, "red"),
             ),
             Operation::create(
                 1000,
                 Bytes::from_static(b"e1"),
                 text_plain_mime(),
-                attrs(20, b"red"),
+                attrs(20, "red"),
             ),
             Operation::create(
                 1000,
                 Bytes::from_static(b"e2"),
                 text_plain_mime(),
-                attrs(30, b"blue"),
+                attrs(30, "blue"),
             ),
             Operation::create(
                 1000,
                 Bytes::from_static(b"e3"),
                 text_plain_mime(),
-                attrs(40, b"blue"),
+                attrs(40, "blue"),
             ),
         ])
         .await;
@@ -510,7 +511,7 @@ async fn write_path_ops_over_a_live_node() {
             key(0),
             Bytes::from_static(b"v2"),
             text_plain_mime(),
-            attrs(100, b"gold"),
+            attrs(100, "gold"),
         )])
         .await;
     let e0 = client.get_entity(key(0)).await;
@@ -596,7 +597,7 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
             1000,
             Bytes::from_static(b"v1"),
             text_plain_mime(),
-            attrs(10, b"red"),
+            attrs(10, "red"),
         )])
         .await;
     let created = client.get_entity(key).await["createdAtBlock"]
@@ -608,7 +609,7 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
             key,
             Bytes::from_static(b"v2"),
             text_plain_mime(),
-            attrs(100, b"red"),
+            attrs(100, "red"),
         )])
         .await;
 
