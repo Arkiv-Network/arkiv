@@ -12,7 +12,7 @@
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{B256, U256, hex};
+use alloy_primitives::{B256, hex};
 use arkiv_interfaces::entity::{Attribute, Entity};
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
@@ -153,7 +153,7 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
         Box::new(query),
         Box::new(Query::Gt {
             key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-            value: AnnotVal::Uint(U256::from(block).to_be_bytes()),
+            value: AnnotVal::u256_from_u64(block),
         }),
     )
 }
