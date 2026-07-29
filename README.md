@@ -13,7 +13,7 @@ bin/arkiv-committer/     committer entrypoint (DA stub — owner Piotr)
 crates/arkiv-harness/    shared config types
 crates/arkiv-da/         frozen DA format — zstd-compressed RLP block (contract C2)
 crates/arkiv-committer/  committer config + run loop (stub)
-docker/                  arkiv-node + arkiv-committer Dockerfiles (debian-slim)
+docker/                  arkiv-reth + arkiv-committer Dockerfiles (debian-slim)
 kurtosis/                arkiv-chain.yaml (ethereum-package args) + base-chain/ + committer/ packages
 scripts/kurtosis/        up / down helpers
 ```
@@ -24,7 +24,7 @@ Needs Rust, Docker, and the [kurtosis](https://docs.kurtosis.com/install) CLI.
 
 ```sh
 cargo build --workspace        # build
-scripts/kurtosis/up.py         # build arkiv-node image, run devnet
+scripts/kurtosis/up.py         # build arkiv-reth image, run devnet
 scripts/kurtosis/down.py       # tear down
 ```
 
@@ -36,7 +36,7 @@ Scaffold only — the workspace builds and the devnet is wired; real harness log
 
 ## Development
 
-CI runs two workflows: `rust.yml` (`cargo fmt --check`, `cargo build --workspace`, and `cargo nextest run --workspace`, with cargo caching, then a Docker build that pushes `golemnetwork/arkiv-node` and `golemnetwork/arkiv-committer` on `main` pushes and `v*` tags) and `lint.yml` (black over the Python scripts).
+CI runs two workflows: `rust.yml` (`cargo fmt --check`, `cargo build --workspace`, and `cargo nextest run --workspace`, with cargo caching, then a Docker build that pushes `ghcr.io/arkiv-network/arkiv-reth` and `ghcr.io/arkiv-network/arkiv-committer` on `main` pushes and `v*` tags) and `lint.yml` (black over the Python scripts).
 
 The Python helper scripts are formatted with [black](https://black.readthedocs.io); config lives in `pyproject.toml`.
 
@@ -44,7 +44,7 @@ Enable the local pre-commit hook with `pip install pre-commit && pre-commit inst
 
 ## Releasing
 
-Every merged commit on `main` is pushed to DockerHub automatically as `golemnetwork/arkiv-node` and `golemnetwork/arkiv-committer`, tagged `sha-<short-commit>` and `latest`. To cut a versioned release, tag a commit with `vX.Y.Z` — the same images get pushed with that version tag.
+Every merged commit on `main` is pushed to GHCR automatically as `ghcr.io/arkiv-network/arkiv-reth` and `ghcr.io/arkiv-network/arkiv-committer`, tagged `sha-<short-commit>` and `latest`. To cut a versioned release, tag a commit with `vX.Y.Z` — the same images get pushed with that version tag. The packages are private, so pulling needs `docker login ghcr.io` with a GitHub token carrying `read:packages`.
 
 **CLI** — tag the tip of main and push the tag:
 
@@ -56,4 +56,4 @@ git push origin v0.2.0
 
 **GitHub UI** — [Releases](https://github.com/Arkiv-Network/arkiv/releases) → *Draft a new release* → *Choose a tag* → type the new `vX.Y.Z` and pick *Create new tag on publish* (target: `main`) → *Publish release*.
 
-Either way, the build shows up under [Actions → rust](https://github.com/Arkiv-Network/arkiv/actions/workflows/rust.yml); images appear on DockerHub when the `docker` job finishes (~1 h, cold build).
+Either way, the build shows up under [Actions → rust](https://github.com/Arkiv-Network/arkiv/actions/workflows/rust.yml); images appear on GHCR when the `docker` job finishes (~1 h, cold build).

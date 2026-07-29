@@ -50,7 +50,7 @@ if subprocess.run(["docker", "buildx", "inspect", BUILDER], capture_output=True)
     run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
 
 print("==> build images")
-buildx("arkiv-node:dev", "docker/arkiv-node.Dockerfile")
+buildx("arkiv-reth:dev", "docker/arkiv-reth.Dockerfile")
 buildx("arkiv-committer:dev", "docker/arkiv-committer.Dockerfile")
 
 print(f"==> Arkiv chain (ethereum-package) -> enclave {enclave}")
