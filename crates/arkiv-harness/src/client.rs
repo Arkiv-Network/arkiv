@@ -176,6 +176,7 @@ impl<P: Provider> ArkivClient<P> {
         // the watcher and the polling that follows it both ask only about this
         // one hash.
         let tx_hash = *pending.tx_hash();
+        let submitted_at = self.height().await;
         let deadline = Instant::now() + RECEIPT_TIMEOUT;
         let watch_error = match pending
             .with_timeout(Some(RECEIPT_WATCH_TIMEOUT))
@@ -198,9 +199,10 @@ impl<P: Provider> ArkivClient<P> {
             }
             assert!(
                 Instant::now() < deadline,
-                "no receipt for {tx_hash} in {RECEIPT_TIMEOUT:?} at block {} \
-                 (watcher: {watch_error})",
+                "no receipt for {tx_hash} in {RECEIPT_TIMEOUT:?}: submitted at block \
+                 {submitted_at}, chain now at block {}, tx in pool: {} (watcher: {watch_error})",
                 self.height().await,
+                self.pool_state(tx_hash).await,
             );
             tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
         }
@@ -213,6 +215,52 @@ impl<P: Provider> ArkivClient<P> {
             Ok(number) => number.to_string(),
             Err(e) => format!("<unknown: {e}>"),
         }
+    }
+
+    /// Where the node's transaction pool holds `tx_hash` — `pending` (ready to
+    /// be mined), `queued` (parked behind a nonce gap) or `absent` (dropped, or
+    /// already mined) — followed by the pool's totals. Reports an RPC error in
+    /// place of whichever half it could not read.
+    async fn pool_state(&self, tx_hash: B256) -> String {
+        let status = match self
+            .provider
+            .raw_request::<_, serde_json::Value>("txpool_status".into(), ())
+            .await
+        {
+            Ok(status) => format!(
+                "{} pending / {} queued",
+                quantity(&status["pending"]),
+                quantity(&status["queued"])
+            ),
+            Err(e) => format!("<unknown: {e}>"),
+        };
+        let content = match self
+            .provider
+            .raw_request::<_, serde_json::Value>("txpool_content".into(), ())
+            .await
+        {
+            Ok(content) => content,
+            Err(e) => return format!("<unknown: {e}> (status: {status})"),
+        };
+
+        let wanted = tx_hash.to_string();
+        let holds = |group: &serde_json::Value| {
+            group
+                .as_object()
+                .into_iter()
+                .flat_map(|by_sender| by_sender.values())
+                .filter_map(serde_json::Value::as_object)
+                .flat_map(|by_nonce| by_nonce.values())
+                .any(|tx| tx["hash"].as_str() == Some(wanted.as_str()))
+        };
+        let group = if holds(&content["pending"]) {
+            "pending"
+        } else if holds(&content["queued"]) {
+            "queued"
+        } else {
+            "absent"
+        };
+        format!("{group} (status: {status})")
     }
 
     // ── arkiv_* reads ────────────────────────────────────────────────────────
@@ -294,6 +342,14 @@ impl<P: Provider> ArkivClient<P> {
             .await
             .expect("arkiv_getBlockTiming")
     }
+}
+
+/// A JSON-RPC quantity rendered for a message: the node's hex string without
+/// its JSON quotes, or the raw JSON if it answered with something else.
+fn quantity(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToOwned::to_owned)
 }
 
 /// Whether a submission error is the node rejecting the transaction's nonce as
