@@ -4,6 +4,7 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -55,15 +56,17 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
 
-  # Pushes both images to DockerHub on main commits and `v*` tags. The two
-  # builds run sequentially in one job: the Dockerfiles' builder stages are
-  # identical up to the final `cargo build --bin` and share BuildKit cache
-  # mounts within a run, so the committer build reuses the node build's
-  # dependency compilation.
+  # Builds both images, pushing them to DockerHub on main commits and `v*`
+  # tags; manual dispatch runs build and refresh the caches without pushing
+  # image tags. The Dockerfiles' cargo-chef stages are identical up to the
+  # final `cargo build --bin`, so dependency compilation is a single shared
+  # layer: the two sequential builds hit it through the buildx builder's local
+  # cache within a run, and through the per-image `buildcache` tag on DockerHub
+  # across runs.
   docker:
     runs-on: ubuntu-latest
     needs: [fmt, test]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 120
     permissions:
       contents: read
@@ -90,11 +93,11 @@ jobs:
         with:
           context: .
           file: docker/arkiv-node.Dockerfile
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta-node.outputs.tags }}
           labels: ${{ steps.meta-node.outputs.labels }}
-          cache-from: type=gha,scope=arkiv-node
-          cache-to: type=gha,scope=arkiv-node,mode=max
+          cache-from: type=registry,ref=golemnetwork/arkiv-node:buildcache
+          cache-to: type=registry,ref=golemnetwork/arkiv-node:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
 
       - id: meta-committer
         uses: docker/metadata-action@v5
@@ -110,8 +113,8 @@ jobs:
         with:
           context: .
           file: docker/arkiv-committer.Dockerfile
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta-committer.outputs.tags }}
           labels: ${{ steps.meta-committer.outputs.labels }}
-          cache-from: type=gha,scope=arkiv-committer
-          cache-to: type=gha,scope=arkiv-committer,mode=max
+          cache-from: type=registry,ref=golemnetwork/arkiv-committer:buildcache
+          cache-to: type=registry,ref=golemnetwork/arkiv-committer:buildcache,mode=max,image-manifest=true,oci-mediatypes=true

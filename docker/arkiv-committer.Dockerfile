@@ -4,26 +4,39 @@
 # debian-slim — same toolchain as docker/arkiv-node.Dockerfile (reth's deps are
 # pulled transitively via arkiv-da, so the native build deps are identical).
 
-# ---- builder ----
-FROM rust:1.94-slim-bookworm AS builder
+# ---- chef ----
+# This stage, the planner stage and the cook step below are byte-identical
+# across the arkiv-node and arkiv-committer Dockerfiles, so both builds resolve
+# to the same layer digests and share one dependency compilation. Edit them in
+# lockstep.
+FROM rust:1.94-slim-bookworm AS chef
 WORKDIR /build
 
-# Native deps for the reth/alloy transitive stack: libclang for bindgen, plus
-# clang/cmake/git/build-essential (also covers zstd-sys' bundled libzstd).
+# Native deps for the reth/alloy stack: libclang for bindgen (reth-mdbx-sys),
+# plus clang/cmake/git/build-essential (also covers zstd-sys' bundled libzstd).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         pkg-config libclang-dev clang cmake git build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+RUN cargo install cargo-chef --locked --version 0.1.77
 
-# target/ and the cargo caches are cache mounts (unmounted after RUN), so copy
-# the finished binary to a real layer path for stage 2 to COPY --from.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --locked --bin arkiv-committer \
-    && cp target/release/arkiv-committer /build/arkiv-committer
+# ---- planner ----
+# `cargo chef prepare` distills the workspace manifests into recipe.json, which
+# is byte-identical across source edits that leave Cargo.toml/Cargo.lock alone.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- builder ----
+# Cooking the recipe compiles the whole workspace's third-party dependency tree
+# into an ordinary layer; only manifest, lockfile or toolchain changes
+# invalidate it. The workspace crates then build on top of that target/ dir.
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --locked --bin arkiv-committer
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
@@ -32,7 +45,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 715 -m -s /usr/sbin/nologin arkiv
 
-COPY --from=builder /build/arkiv-committer /usr/local/bin/arkiv-committer
+COPY --from=builder /build/target/release/arkiv-committer /usr/local/bin/arkiv-committer
 
 USER arkiv
 WORKDIR /home/arkiv
