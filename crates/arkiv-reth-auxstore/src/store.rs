@@ -39,7 +39,7 @@ use arkiv_interfaces::state::{AuxiliaryStore, BlockAuxiliaryStoreDelta};
 use arkiv_reth_entitystore::AccountCode;
 use arkiv_reth_entitystore::layout::SYSTEM_ACCOUNT_ADDRESS;
 
-use crate::annotation::mode_for;
+use crate::annotation::capabilities_for;
 use crate::error::AuxError;
 use crate::slot::{storage_to_u64, u64_to_storage};
 use crate::storage::IndexStorage;
@@ -195,23 +195,23 @@ where
         for entity in &delta.entities {
             let entity_id = self.id_for_key(entity.entity_key)?;
             for entry in &entity.inserts {
-                let mode = mode_for(&entry.attr, entry.value.attr_type());
+                let capabilities = capabilities_for(&entry.attr, entry.value.attr_type());
                 index::insert(
                     &mut self.backend,
                     &entry.attr,
                     &entry.value,
                     entity_id,
-                    mode,
+                    capabilities,
                 )?;
             }
             for entry in &entity.removes {
-                let mode = mode_for(&entry.attr, entry.value.attr_type());
+                let capabilities = capabilities_for(&entry.attr, entry.value.attr_type());
                 index::remove(
                     &mut self.backend,
                     &entry.attr,
                     &entry.value,
                     entity_id,
-                    mode,
+                    capabilities,
                 )?;
             }
         }

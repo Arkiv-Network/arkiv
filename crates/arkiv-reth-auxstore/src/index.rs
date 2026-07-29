@@ -10,7 +10,7 @@
 //!   exist, not which entities carry them, so it is only touched when a value's
 //!   bitmap crosses the empty boundary: an insert that makes a value first appear
 //!   ([`was_empty`]) adds it to the tier-2 index; a remove that empties a value's
-//!   bitmap drops it. Equality-only attributes ([`Mode::Equality`]) have no tier-2.
+//!   bitmap drops it. Equality-only attributes ([`QueryCapabilities::Equality`]) have no tier-2.
 //!
 //! [`was_empty`]: insert
 
@@ -20,7 +20,7 @@ use arkiv_interfaces::entity::{AttributeType, AttributeValue};
 use arkiv_reth_entitystore::AccountCode;
 
 use crate::address::pair_address;
-use crate::annotation::Mode;
+use crate::annotation::QueryCapabilities;
 use crate::bitmap::Bitmap;
 use crate::cascade::{self, MAX_STR_LEN};
 use crate::error::AuxError;
@@ -50,12 +50,12 @@ pub(crate) fn insert<B, E>(
     attr: &[u8],
     value: &AttributeValue,
     entity_id: u64,
-    mode: Mode,
+    capabilities: QueryCapabilities,
 ) -> Result<(), AuxError<E>>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
-    if mode == Mode::None {
+    if capabilities == QueryCapabilities::None {
         return Ok(());
     }
     let bytes = value.index_bytes();
@@ -67,7 +67,7 @@ where
         .set_code(pair_addr, bitmap.to_bytes())
         .map_err(AuxError::Backend)?;
     if was_empty {
-        tier2_insert(backend, attr, value.attr_type(), &bytes, mode)?;
+        tier2_insert(backend, attr, value.attr_type(), &bytes, capabilities)?;
     }
     Ok(())
 }
@@ -79,12 +79,12 @@ pub(crate) fn remove<B, E>(
     attr: &[u8],
     value: &AttributeValue,
     entity_id: u64,
-    mode: Mode,
+    capabilities: QueryCapabilities,
 ) -> Result<(), AuxError<E>>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
-    if mode == Mode::None {
+    if capabilities == QueryCapabilities::None {
         return Ok(());
     }
     let bytes = value.index_bytes();
@@ -98,13 +98,13 @@ where
         .set_code(pair_addr, bitmap.to_bytes())
         .map_err(AuxError::Backend)?;
     if bitmap.is_empty() {
-        tier2_remove(backend, attr, value.attr_type(), &bytes, mode)?;
+        tier2_remove(backend, attr, value.attr_type(), &bytes, capabilities)?;
     }
     Ok(())
 }
 
 /// Record `value` in `attr`'s ordered tier-2 index. A no-op for
-/// [`Mode::Equality`], or for a value too long for its mode's structure — such a
+/// [`QueryCapabilities::Equality`], or for a value too long for its mode's structure — such a
 /// value stays equality-indexed (upstream validation keeps values within these
 /// limits; the guard just avoids a panic if one slips through).
 fn tier2_insert<B, E>(
@@ -112,16 +112,16 @@ fn tier2_insert<B, E>(
     attr: &[u8],
     ty: AttributeType,
     value: &[u8],
-    mode: Mode,
+    capabilities: QueryCapabilities,
 ) -> Result<(), AuxError<E>>
 where
     B: IndexStorage<Error = E>,
 {
-    match mode {
-        Mode::Range if value.len() <= WORD_LEN => {
+    match capabilities {
+        QueryCapabilities::EqualityAndRange if value.len() <= WORD_LEN => {
             range::insert(backend, attr, ty, value).map_err(AuxError::Backend)
         }
-        Mode::Prefix if value.len() <= MAX_STR_LEN => {
+        QueryCapabilities::EqualityAndPrefix if value.len() <= MAX_STR_LEN => {
             cascade::insert(backend, attr, ty, value).map_err(AuxError::Backend)
         }
         _ => Ok(()),
@@ -135,16 +135,16 @@ fn tier2_remove<B, E>(
     attr: &[u8],
     ty: AttributeType,
     value: &[u8],
-    mode: Mode,
+    capabilities: QueryCapabilities,
 ) -> Result<(), AuxError<E>>
 where
     B: IndexStorage<Error = E>,
 {
-    match mode {
-        Mode::Range if value.len() <= WORD_LEN => {
+    match capabilities {
+        QueryCapabilities::EqualityAndRange if value.len() <= WORD_LEN => {
             range::remove(backend, attr, ty, value).map_err(AuxError::Backend)
         }
-        Mode::Prefix if value.len() <= MAX_STR_LEN => {
+        QueryCapabilities::EqualityAndPrefix if value.len() <= MAX_STR_LEN => {
             cascade::remove(backend, attr, ty, value).map_err(AuxError::Backend)
         }
         _ => Ok(()),

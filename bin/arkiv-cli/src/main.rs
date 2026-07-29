@@ -368,23 +368,8 @@ fn build_attribute(
 /// Parse a decimal string (`"-1.5"`) into a fixed-scale `decimal` value: the
 /// number multiplied by `10^DECIMAL_SCALE`, as a two's-complement `int256`.
 fn parse_decimal_value(text: &str) -> Result<AttributeValue> {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
-    };
-    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
-    let scale = DECIMAL_SCALE as usize;
-    if frac.len() > scale {
-        bail!("decimal value '{text}' has more than {scale} decimal places");
-    }
-    if whole.is_empty() && frac.is_empty() {
-        bail!("decimal value '{text}' has no digits");
-    }
-    let mut mantissa = String::from(if whole.is_empty() { "0" } else { whole });
-    mantissa.push_str(frac);
-    mantissa.push_str(&"0".repeat(scale - frac.len()));
-    let magnitude = mantissa
-        .parse::<U256>()
+    let (negative, digits) = split_sign(text);
+    let magnitude = parse_scaled_magnitude(digits)
         .map_err(|e| eyre::eyre!("invalid decimal value '{}': {}", text, e))?;
     let signed = if negative {
         U256::ZERO.wrapping_sub(magnitude)
@@ -392,6 +377,33 @@ fn parse_decimal_value(text: &str) -> Result<AttributeValue> {
         magnitude
     };
     Ok(AttributeValue::Decimal(signed.to_be_bytes()))
+}
+
+/// Split a leading sign off a decimal literal.
+fn split_sign(text: &str) -> (bool, &str) {
+    match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    }
+}
+
+/// `"1.5"` → `1_500_000_000_000_000_000`: the digits with the decimal point
+/// removed, right-padded to exactly [`DECIMAL_SCALE`] fractional places.
+fn parse_scaled_magnitude(digits: &str) -> Result<U256> {
+    let scale = DECIMAL_SCALE as usize;
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if frac.len() > scale {
+        bail!("more than {scale} decimal places");
+    }
+    if whole.is_empty() && frac.is_empty() {
+        bail!("no digits");
+    }
+    let mantissa = format!(
+        "{}{frac}{}",
+        if whole.is_empty() { "0" } else { whole },
+        "0".repeat(scale - frac.len()),
+    );
+    mantissa.parse::<U256>().map_err(Into::into)
 }
 
 /// Build the contract's `Attribute[]` from batch entries, sorted by name

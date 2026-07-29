@@ -22,7 +22,7 @@ use arkiv_interfaces::query::{AnnotKey, AnnotVal, Query};
 use arkiv_reth_entitystore::AccountCode;
 
 use crate::address::{all_entities_bucket, pair_address};
-use crate::annotation::{self, Mode};
+use crate::annotation::{self, QueryCapabilities};
 use crate::bitmap::Bitmap;
 use crate::error::AuxError;
 use crate::index::read_pair_bitmap;
@@ -137,18 +137,18 @@ where
 {
     let attr = annotation::attr_bytes(key);
     let ty = value.attr_type();
-    let mode = annotation::mode_for(&attr, ty);
+    let capabilities = annotation::capabilities_for(&attr, ty);
     let bound_bytes = value.index_bytes();
-    let values = match mode {
-        Mode::Range => {
+    let values = match capabilities {
+        QueryCapabilities::EqualityAndRange => {
             range::scan(backend, &attr, ty, &bound_bytes, bound).map_err(AuxError::Backend)?
         }
-        Mode::Prefix => {
+        QueryCapabilities::EqualityAndPrefix => {
             cascade::scan(backend, &attr, ty, &bound_bytes, bound).map_err(AuxError::Backend)?
         }
         // A range over an unordered attribute has no tier-2 index to scan; the parser
         // rejects such queries, so if one reaches here it simply matches nothing.
-        Mode::Equality | Mode::None => Vec::new(),
+        QueryCapabilities::Equality | QueryCapabilities::None => Vec::new(),
     };
     union_pair_bitmaps(backend, &attr, ty, values)
 }

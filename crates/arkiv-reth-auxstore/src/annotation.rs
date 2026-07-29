@@ -28,7 +28,7 @@ use arkiv_interfaces::state::AttrEntry;
 /// What an attribute can be queried by — the spec's indexing column, and with it
 /// the physical structures the value is recorded in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub enum QueryCapabilities {
     /// Not indexed — `bytes`, the system-only `$payload` type.
     None,
     /// Equality only: a tier-1 pair bitmap, no ordered tier-2 index. For values
@@ -37,31 +37,32 @@ pub enum Mode {
     Equality,
     /// Equality + range: numerically ordered, so `<`/`>` scan the tier-2 B+ tree.
     /// The numeric types (`int`, `u256`, `decimal`) and the built-in block numbers.
-    Range,
+    EqualityAndRange,
     /// Equality + prefix: lexically ordered, so `<`/`>` and glob scan the tier-2
     /// cascade. Strings, and the `$contentType` built-in.
-    Prefix,
+    EqualityAndPrefix,
 }
 
-/// The [`Mode`] for `attr` carrying a value of type `ty`.
+/// What `attr` can be queried by when it carries a value of type `ty`.
 ///
-/// Built-in fields have a fixed mode by name; user attributes are classified by
-/// their type. Single source of truth for both index maintenance and query
-/// evaluation.
-pub fn mode_for(attr: &[u8], ty: AttributeType) -> Mode {
+/// Built-in fields are fixed by name; user attributes are classified by their
+/// type. Single source of truth for both index maintenance and query evaluation.
+pub fn capabilities_for(attr: &[u8], ty: AttributeType) -> QueryCapabilities {
     use annotations::{ALL, CONTENT_TYPE, CREATED_AT_BLOCK, CREATOR, EXPIRATION, KEY, OWNER};
     match attr {
-        ALL | OWNER | CREATOR | KEY => Mode::Equality,
-        EXPIRATION | CREATED_AT_BLOCK => Mode::Range,
-        CONTENT_TYPE => Mode::Prefix,
+        ALL | OWNER | CREATOR | KEY => QueryCapabilities::Equality,
+        EXPIRATION | CREATED_AT_BLOCK => QueryCapabilities::EqualityAndRange,
+        CONTENT_TYPE => QueryCapabilities::EqualityAndPrefix,
         _ => match ty {
-            AttributeType::Int | AttributeType::U256 | AttributeType::Decimal => Mode::Range,
-            AttributeType::Str => Mode::Prefix,
-            AttributeType::Bytes => Mode::None,
+            AttributeType::Int | AttributeType::U256 | AttributeType::Decimal => {
+                QueryCapabilities::EqualityAndRange
+            }
+            AttributeType::Str => QueryCapabilities::EqualityAndPrefix,
+            AttributeType::Bytes => QueryCapabilities::None,
             AttributeType::Bool
             | AttributeType::Bytes32
             | AttributeType::EthereumAddress
-            | AttributeType::EntityKey => Mode::Equality,
+            | AttributeType::EntityKey => QueryCapabilities::Equality,
         },
     }
 }
@@ -134,17 +135,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtins_have_fixed_modes_regardless_of_value_type() {
-        // Every built-in's mode is by name; the type argument is ignored.
+    fn builtins_have_fixed_capabilities_regardless_of_value_type() {
+        // Every built-in is fixed by name; the type argument is ignored.
         for id in 1..=9u8 {
             let ty = AttributeType::from_id(id).unwrap();
-            assert_eq!(mode_for(annotations::OWNER, ty), Mode::Equality);
-            assert_eq!(mode_for(annotations::CREATOR, ty), Mode::Equality);
-            assert_eq!(mode_for(annotations::KEY, ty), Mode::Equality);
-            assert_eq!(mode_for(annotations::ALL, ty), Mode::Equality);
-            assert_eq!(mode_for(annotations::EXPIRATION, ty), Mode::Range);
-            assert_eq!(mode_for(annotations::CREATED_AT_BLOCK, ty), Mode::Range);
-            assert_eq!(mode_for(annotations::CONTENT_TYPE, ty), Mode::Prefix);
+            assert_eq!(
+                capabilities_for(annotations::OWNER, ty),
+                QueryCapabilities::Equality
+            );
+            assert_eq!(
+                capabilities_for(annotations::CREATOR, ty),
+                QueryCapabilities::Equality
+            );
+            assert_eq!(
+                capabilities_for(annotations::KEY, ty),
+                QueryCapabilities::Equality
+            );
+            assert_eq!(
+                capabilities_for(annotations::ALL, ty),
+                QueryCapabilities::Equality
+            );
+            assert_eq!(
+                capabilities_for(annotations::EXPIRATION, ty),
+                QueryCapabilities::EqualityAndRange
+            );
+            assert_eq!(
+                capabilities_for(annotations::CREATED_AT_BLOCK, ty),
+                QueryCapabilities::EqualityAndRange
+            );
+            assert_eq!(
+                capabilities_for(annotations::CONTENT_TYPE, ty),
+                QueryCapabilities::EqualityAndPrefix
+            );
         }
     }
 
@@ -152,18 +174,18 @@ mod tests {
     #[test]
     fn user_attrs_are_classified_by_type() {
         let expected = [
-            (AttributeType::Bool, Mode::Equality),
-            (AttributeType::Int, Mode::Range),
-            (AttributeType::U256, Mode::Range),
-            (AttributeType::Decimal, Mode::Range),
-            (AttributeType::Bytes32, Mode::Equality),
-            (AttributeType::Bytes, Mode::None),
-            (AttributeType::Str, Mode::Prefix),
-            (AttributeType::EthereumAddress, Mode::Equality),
-            (AttributeType::EntityKey, Mode::Equality),
+            (AttributeType::Bool, QueryCapabilities::Equality),
+            (AttributeType::Int, QueryCapabilities::EqualityAndRange),
+            (AttributeType::U256, QueryCapabilities::EqualityAndRange),
+            (AttributeType::Decimal, QueryCapabilities::EqualityAndRange),
+            (AttributeType::Bytes32, QueryCapabilities::Equality),
+            (AttributeType::Bytes, QueryCapabilities::None),
+            (AttributeType::Str, QueryCapabilities::EqualityAndPrefix),
+            (AttributeType::EthereumAddress, QueryCapabilities::Equality),
+            (AttributeType::EntityKey, QueryCapabilities::Equality),
         ];
-        for (ty, mode) in expected {
-            assert_eq!(mode_for(b"user", ty), mode, "{ty:?}");
+        for (ty, expect) in expected {
+            assert_eq!(capabilities_for(b"user", ty), expect, "{ty:?}");
         }
     }
 

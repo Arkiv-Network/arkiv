@@ -157,52 +157,35 @@ impl Attribute {
     /// Read the attribute's value back, rejecting anything a well-formed ABI
     /// encoder would not have produced.
     pub fn to_value(&self) -> Result<AttributeValue, AttrAbiError> {
+        let ty = self.wire_type()?;
+        match ty {
+            // A string spans the whole word array; every other type is one word,
+            // so the rest must be untouched.
+            AttributeType::Str => decode_string(&self.value),
+            _ => {
+                self.reject_spilled_words()?;
+                decode_word(ty, self.value[0].0)
+            }
+        }
+    }
+
+    /// The declared type, if a client is allowed to send it at all.
+    fn wire_type(&self) -> Result<AttributeType, AttrAbiError> {
         let ty = AttributeType::from_id(self.valueType)
             .ok_or(AttrAbiError::UnknownType(self.valueType))?;
-        if !ty.is_user_settable() {
-            return Err(AttrAbiError::SystemOnlyType);
+        if ty.is_user_settable() {
+            Ok(ty)
+        } else {
+            Err(AttrAbiError::SystemOnlyType)
         }
-        if ty != AttributeType::Str
-            && let Some(i) = self.value[1..].iter().position(|w| *w != FixedBytes::ZERO)
-        {
-            return Err(AttrAbiError::NonZeroPadding { word: i + 1 });
+    }
+
+    /// Reject a single-word value carrying data in the words after the first.
+    fn reject_spilled_words(&self) -> Result<(), AttrAbiError> {
+        match self.value[1..].iter().position(|w| *w != FixedBytes::ZERO) {
+            Some(i) => Err(AttrAbiError::NonZeroPadding { word: i + 1 }),
+            None => Ok(()),
         }
-        let w = self.value[0].0;
-        let value = match ty {
-            AttributeType::Bool => {
-                zero_prefix(&w, WORD - 1)?;
-                match w[WORD - 1] {
-                    0 => AttributeValue::Bool(false),
-                    1 => AttributeValue::Bool(true),
-                    other => return Err(AttrAbiError::BadBool(other)),
-                }
-            }
-            AttributeType::Int => {
-                let fill = if w[WORD - 4] & 0x80 == 0 { 0x00 } else { 0xFF };
-                if w[..WORD - 4].iter().any(|b| *b != fill) {
-                    return Err(AttrAbiError::BadSignExtension);
-                }
-                AttributeValue::Int(i32::from_be_bytes(w[WORD - 4..].try_into().unwrap()))
-            }
-            AttributeType::U256 => AttributeValue::U256(w),
-            AttributeType::Decimal => AttributeValue::Decimal(w),
-            AttributeType::Bytes32 => AttributeValue::Bytes32(w),
-            AttributeType::EntityKey => AttributeValue::EntityKey(w),
-            AttributeType::EthereumAddress => {
-                zero_prefix(&w, WORD - 20)?;
-                AttributeValue::EthereumAddress(w[WORD - 20..].try_into().unwrap())
-            }
-            AttributeType::Str => {
-                let bytes = pack_words(&self.value);
-                match String::from_utf8(bytes) {
-                    Ok(s) => AttributeValue::Str(s),
-                    Err(_) => return Err(AttrAbiError::NotUtf8),
-                }
-            }
-            // Rejected above: `bytes` is system-only and never on the wire.
-            AttributeType::Bytes => return Err(AttrAbiError::SystemOnlyType),
-        };
-        Ok(value)
     }
 
     /// Sort attributes by name ascending.
@@ -213,6 +196,56 @@ impl Attribute {
     pub fn sort(attrs: &mut [Self]) {
         attrs.sort_by_key(|a| a.name);
     }
+}
+
+/// Decode a one-word value of type `ty` from its ABI word.
+fn decode_word(ty: AttributeType, w: [u8; WORD]) -> Result<AttributeValue, AttrAbiError> {
+    match ty {
+        AttributeType::Bool => decode_bool(w),
+        AttributeType::Int => decode_int(w),
+        AttributeType::EthereumAddress => {
+            zero_prefix(&w, WORD - 20)?;
+            Ok(AttributeValue::EthereumAddress(
+                w[WORD - 20..].try_into().unwrap(),
+            ))
+        }
+        AttributeType::U256 => Ok(AttributeValue::U256(w)),
+        AttributeType::Decimal => Ok(AttributeValue::Decimal(w)),
+        AttributeType::Bytes32 => Ok(AttributeValue::Bytes32(w)),
+        AttributeType::EntityKey => Ok(AttributeValue::EntityKey(w)),
+        // Neither reaches here: `str` is handled by the caller, and `bytes` is
+        // rejected by `wire_type`.
+        AttributeType::Str | AttributeType::Bytes => Err(AttrAbiError::SystemOnlyType),
+    }
+}
+
+/// An ABI `bool`: right-aligned, and only 0 or 1.
+fn decode_bool(w: [u8; WORD]) -> Result<AttributeValue, AttrAbiError> {
+    zero_prefix(&w, WORD - 1)?;
+    match w[WORD - 1] {
+        0 => Ok(AttributeValue::Bool(false)),
+        1 => Ok(AttributeValue::Bool(true)),
+        other => Err(AttrAbiError::BadBool(other)),
+    }
+}
+
+/// An ABI `int32`: right-aligned, with the leading bytes sign-extended from the
+/// value's top bit.
+fn decode_int(w: [u8; WORD]) -> Result<AttributeValue, AttrAbiError> {
+    let fill = if w[WORD - 4] & 0x80 == 0 { 0x00 } else { 0xFF };
+    if w[..WORD - 4].iter().any(|b| *b != fill) {
+        return Err(AttrAbiError::BadSignExtension);
+    }
+    Ok(AttributeValue::Int(i32::from_be_bytes(
+        w[WORD - 4..].try_into().unwrap(),
+    )))
+}
+
+/// An ABI `string`: the words packed back together, trailing padding dropped.
+fn decode_string(words: &[FixedBytes<32>; 4]) -> Result<AttributeValue, AttrAbiError> {
+    String::from_utf8(pack_words(words))
+        .map(AttributeValue::Str)
+        .map_err(|_| AttrAbiError::NotUtf8)
 }
 
 /// The four words concatenated, with trailing zero padding removed — how a

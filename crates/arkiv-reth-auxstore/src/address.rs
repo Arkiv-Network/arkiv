@@ -161,23 +161,40 @@ mod tests {
     use super::*;
     use alloy_primitives::address;
 
-    // Golden vectors — cross-checked against an independent keccak (`cast keccak`).
-    // If either of these assertions ever changes, the on-chain index address space
-    // has moved and every existing bucket is orphaned: it is a hard fork, not a
-    // refactor.
-
     use AttributeType::{Str, U256};
 
+    // ── Pinned addresses ──────────────────────────────────────────────
+    //
+    // The tests below pin where buckets live, not that the derivation is
+    // self-consistent. **A failure here is not a broken test** — it means the
+    // index address space moved, so every bucket already written on chain is
+    // orphaned. That is a hard fork, and the only correct responses are to
+    // revert the change or to migrate deliberately.
+    //
+    // They exist because nothing else catches this. Renaming a domain tag or
+    // reordering the preimage leaves every structural test below passing while
+    // silently relocating the whole index.
+    //
+    // To re-pin after an intended change, recompute with an independent keccak
+    // rather than copying what the code now returns — otherwise the vector just
+    // restates the bug:
+    //
+    //     cast keccak 0x$(printf 'arkiv.pair$all\x00\x07' | xxd -p -c 256)
+
+    /// Where the `$all` marker's bucket lives — the bitmap every query with a
+    /// negation reads.
     #[test]
-    fn pair_address_golden_all() {
+    fn all_marker_bucket_address_is_pinned() {
         assert_eq!(
             pair_address(b"$all", Str, b""),
             address!("c3ce578d786b69868e8f8a848e6063737f9414a0"),
         );
     }
 
+    /// Where an ordinary `(name, value)` bucket lives, covering the attribute
+    /// and value halves of the preimage that `$all` (empty value) does not.
     #[test]
-    fn pair_address_golden_user_attr() {
+    fn user_attribute_bucket_address_is_pinned() {
         assert_eq!(
             pair_address(b"color", Str, b"blue"),
             address!("98edbc9a78ec4b98933a20e9a5d1db0e703338bd"),

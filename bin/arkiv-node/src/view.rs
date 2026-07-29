@@ -195,27 +195,31 @@ pub fn format_attribute_value(value: &AttributeValue) -> String {
 /// Render a fixed-scale `decimal` (a two's-complement `int256` scaled by
 /// `10^DECIMAL_SCALE`) as a plain decimal string, without trailing zeros.
 fn format_decimal(word: [u8; 32]) -> String {
-    let raw = U256::from_be_bytes(word);
-    let negative = word[0] & 0x80 != 0;
-    let magnitude = if negative {
-        U256::ZERO.wrapping_sub(raw)
-    } else {
-        raw
-    };
+    let (sign, magnitude) = split_sign(word);
     let scale = U256::from(10u8).pow(U256::from(DECIMAL_SCALE));
     let whole = magnitude / scale;
-    let frac = format!(
-        "{:0width$}",
-        magnitude % scale,
-        width = DECIMAL_SCALE as usize
-    );
-    let frac = frac.trim_end_matches('0');
-    let sign = if negative { "-" } else { "" };
-    if frac.is_empty() {
-        format!("{sign}{whole}")
-    } else {
-        format!("{sign}{whole}.{frac}")
+    match trimmed_fraction(magnitude % scale) {
+        Some(frac) => format!("{sign}{whole}.{frac}"),
+        None => format!("{sign}{whole}"),
     }
+}
+
+/// Split a two's-complement `int256` into its sign prefix and absolute value.
+fn split_sign(word: [u8; 32]) -> (&'static str, U256) {
+    let raw = U256::from_be_bytes(word);
+    if word[0] & 0x80 == 0 {
+        ("", raw)
+    } else {
+        ("-", U256::ZERO.wrapping_sub(raw))
+    }
+}
+
+/// The fractional digits, zero-padded to the scale and stripped of trailing
+/// zeros — `None` when nothing is left, i.e. the value is a whole number.
+fn trimmed_fraction(remainder: U256) -> Option<String> {
+    let digits = format!("{remainder:0width$}", width = DECIMAL_SCALE as usize);
+    let trimmed = digits.trim_end_matches('0');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Parse a hex cursor string (`"0x1a"`) into a `u64` page cursor.
