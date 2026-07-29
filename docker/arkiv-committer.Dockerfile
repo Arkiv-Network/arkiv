@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.7
 #
 # Builds the arkiv-committer service on a glibc builder and ships it on
-# debian-slim — same toolchain as docker/arkiv-node.Dockerfile (reth's deps are
+# debian-slim — same toolchain as docker/arkiv-reth.Dockerfile (reth's deps are
 # pulled transitively via arkiv-da, so the native build deps are identical).
 
 # ---- chef ----
 # This stage, the planner stage and the cook step below are byte-identical
-# across the arkiv-node and arkiv-committer Dockerfiles, so both builds resolve
+# across the arkiv-reth and arkiv-committer Dockerfiles, so both builds resolve
 # to the same layer digests and share one dependency compilation. Edit them in
 # lockstep.
 FROM rust:1.94-slim-bookworm AS chef

@@ -8,9 +8,9 @@
 # Schema: https://github.com/ethpandaops/ethereum-package#configuration
 
 participants:
-  # EL is our custom arkiv-node image, driven as a standard reth client.
+  # EL is our custom arkiv-reth image, driven as a standard reth client.
   - el_type: reth
-    el_image: arkiv-node:dev
+    el_image: arkiv-reth:dev
     cl_type: lighthouse
   # To test watcher keep-up, add a second follower participant here.
 
