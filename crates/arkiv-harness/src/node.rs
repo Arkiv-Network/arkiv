@@ -127,6 +127,10 @@ impl Node {
             "--datadir",
             self.datadir.to_str().expect("utf-8 datadir"),
             "--disable-discovery",
+            // reth's IPC endpoint has a single fixed default path, so nodes
+            // running side by side would collide on it. Callers reach the node
+            // over HTTP.
+            "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
         cmd.stdout(Stdio::null())

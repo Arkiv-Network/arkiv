@@ -22,6 +22,23 @@ use arkiv_reth_executor::ARKIV_ADDRESS;
 const EXECUTE_GAS: u64 = 8_000_000;
 const EXECUTE_GAS_PRICE: u128 = 1_000_000_000;
 
+/// How many times [`send`](ArkivClient::send) submits one batch of ops, and the
+/// pause between attempts. A submission the node rejects for a stale nonce
+/// consumed nothing, so re-submitting runs the nonce filler against the chain as
+/// it now stands.
+const SUBMIT_ATTEMPTS: u32 = 3;
+const SUBMIT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// How long the provider's watcher waits for the transaction to land before the
+/// client takes over and polls `eth_getTransactionReceipt` itself, at
+/// [`RECEIPT_POLL_INTERVAL`].
+const RECEIPT_WATCH_TIMEOUT: Duration = Duration::from_secs(15);
+const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The whole budget for a receipt, measured from a successful submission. It
+/// covers the watcher and the polling that follows it.
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A typed RPC client bound to one node.
 pub struct ArkivClient<P> {
     provider: P,
@@ -113,7 +130,12 @@ impl<P: Provider> ArkivClient<P> {
     /// returning the receipt (for its logs).
     pub async fn execute(&self, ops: Vec<Operation>) -> TransactionReceipt {
         let receipt = self.send(ops).await;
-        assert!(receipt.status(), "transaction reverted");
+        assert!(
+            receipt.status(),
+            "transaction {} reverted in block {:?}",
+            receipt.transaction_hash,
+            receipt.block_number,
+        );
         receipt
     }
 
@@ -123,17 +145,74 @@ impl<P: Provider> ArkivClient<P> {
         self.send(ops).await.status()
     }
 
+    /// Submit `ops` as one `execute` transaction and wait for its receipt,
+    /// panicking if either stage fails.
+    ///
+    /// Every failure names the transaction hash, once one exists, and the chain
+    /// height at the time, which separates a rejected transaction from a chain
+    /// that stopped producing blocks.
     async fn send(&self, ops: Vec<Operation>) -> TransactionReceipt {
-        IEntityRegistry::new(ARKIV_ADDRESS, &self.provider)
-            .execute(ops)
-            .gas(EXECUTE_GAS)
-            .gas_price(EXECUTE_GAS_PRICE)
-            .send()
-            .await
-            .expect("send ops")
+        let registry = IEntityRegistry::new(ARKIV_ADDRESS, &self.provider);
+        let mut attempt = 1;
+        let pending = loop {
+            let call = registry
+                .execute(ops.clone())
+                .gas(EXECUTE_GAS)
+                .gas_price(EXECUTE_GAS_PRICE);
+            match call.send().await {
+                Ok(pending) => break pending,
+                Err(e) if is_nonce_too_low(&e) && attempt < SUBMIT_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(SUBMIT_RETRY_BACKOFF).await;
+                }
+                Err(e) => panic!(
+                    "send ops failed on attempt {attempt}/{SUBMIT_ATTEMPTS} at block {}: {e}",
+                    self.height().await
+                ),
+            }
+        };
+
+        // The nonce is spent from here on, so the transaction is never re-sent:
+        // the watcher and the polling that follows it both ask only about this
+        // one hash.
+        let tx_hash = *pending.tx_hash();
+        let deadline = Instant::now() + RECEIPT_TIMEOUT;
+        let watch_error = match pending
+            .with_timeout(Some(RECEIPT_WATCH_TIMEOUT))
             .get_receipt()
             .await
-            .expect("get receipt")
+        {
+            Ok(receipt) => return receipt,
+            Err(e) => e,
+        };
+
+        loop {
+            if let Some(receipt) = self
+                .provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .ok()
+                .flatten()
+            {
+                return receipt;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no receipt for {tx_hash} in {RECEIPT_TIMEOUT:?} at block {} \
+                 (watcher: {watch_error})",
+                self.height().await,
+            );
+            tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+        }
+    }
+
+    /// The tip block number for a failure message, or why it is unavailable —
+    /// an unreachable node is itself part of the diagnosis.
+    async fn height(&self) -> String {
+        match self.provider.get_block_number().await {
+            Ok(number) => number.to_string(),
+            Err(e) => format!("<unknown: {e}>"),
+        }
     }
 
     // ── arkiv_* reads ────────────────────────────────────────────────────────
@@ -215,6 +294,12 @@ impl<P: Provider> ArkivClient<P> {
             .await
             .expect("arkiv_getBlockTiming")
     }
+}
+
+/// Whether a submission error is the node rejecting the transaction's nonce as
+/// already used — the one submission failure a retry can clear.
+fn is_nonce_too_low(error: &impl std::fmt::Display) -> bool {
+    error.to_string().to_lowercase().contains("nonce too low")
 }
 
 /// The set of `key` strings in a query response — order-independent, since the
