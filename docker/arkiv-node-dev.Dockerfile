@@ -1,16 +1,13 @@
 # syntax=docker/dockerfile:1.7
 #
-# Production image: the node binary only, no dev mode baked in. The deployment
-# supplies the full `node ...` command and chain spec/genesis.
-#
-# Built on a glibc builder and shipped on debian-slim. Alpine/musl was attempted
-# first but reth-tasks does not compile against musl's sched_param (extra
-# sched_ss_* fields); glibc is reth's supported platform, so we use it.
+# Dev image: `arkiv-node` + `arkiv-cli`, defaulting to an auto-sealing dev node
+# (`arkiv-node node --dev`) listening on 0.0.0.0 — for local development and
+# testcontainers-based tests in other projects. Override CMD to change flags;
+# `arkiv-cli` is on PATH for `docker exec`.
 
 # ---- builder ----
-# NOTE: keep this stage byte-identical with docker/arkiv-node-dev.Dockerfile so
-# BuildKit serves it from cache when both images are built on one builder. That
-# is why arkiv-cli is compiled here too, even though only the dev image ships it.
+# NOTE: keep this stage byte-identical with docker/arkiv-node.Dockerfile so
+# BuildKit serves it from cache when both images are built on one builder.
 FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /build
 
@@ -39,12 +36,18 @@ RUN apt-get update \
     && mkdir -p /data && chown arkiv:arkiv /data
 
 COPY --from=builder /build/arkiv-node /usr/local/bin/arkiv-node
-# ethpandaops/ethereum-package's reth launcher runs a binary named `reth`;
-# alias it so the image drops into a kurtosis `el_type: reth` participant.
-RUN ln -sf /usr/local/bin/arkiv-node /usr/local/bin/reth
+COPY --from=builder /build/arkiv-cli /usr/local/bin/arkiv-cli
 
 USER arkiv
 WORKDIR /home/arkiv
 # EL JSON-RPC / WS, Engine API, p2p
 EXPOSE 8545 8546 8551 30303 30303/udp
 ENTRYPOINT ["arkiv-node"]
+# `arkiv` must NOT appear in --http.api/--ws.api: reth rejects unknown module
+# names; the arkiv_* namespace is merged onto both transports at launch.
+# 250ms block time matches the harness/e2e default so time-based behavior
+# (e.g. BTL expiry) advances without traffic.
+CMD ["node", "--dev", "--dev.block-time", "250ms", \
+     "--http", "--http.addr", "0.0.0.0", "--http.api", "eth,net,web3,txpool", \
+     "--ws", "--ws.addr", "0.0.0.0", "--ws.api", "eth,net,web3,txpool", \
+     "--datadir", "/data"]

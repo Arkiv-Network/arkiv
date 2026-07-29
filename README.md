@@ -13,7 +13,7 @@ bin/arkiv-committer/     committer entrypoint (DA stub — owner Piotr)
 crates/arkiv-harness/    shared config types
 crates/arkiv-da/         frozen DA format — zstd-compressed RLP block (contract C2)
 crates/arkiv-committer/  committer config + run loop (stub)
-docker/                  arkiv-node + arkiv-committer Dockerfiles (debian-slim)
+docker/                  arkiv-node (prod), arkiv-node-dev (+ arkiv-cli, runs --dev), arkiv-committer Dockerfiles
 kurtosis/                arkiv-chain.yaml (ethereum-package args) + base-chain/ + committer/ packages
 scripts/kurtosis/        up / down helpers
 ```
@@ -36,7 +36,7 @@ Scaffold only — the workspace builds and the devnet is wired; real harness log
 
 ## Development
 
-CI runs two workflows: `rust.yml` (`cargo fmt --check` + `cargo build --workspace`, with cargo caching) and `lint.yml` (black over the Python scripts).
+CI runs two workflows: `rust.yml` (`cargo fmt --check`, `cargo build --workspace`, `cargo nextest run --workspace`, then builds the two Docker images and pushes them to `ghcr.io/arkiv-network/{arkiv,arkiv-dev}` on main) and `lint.yml` (black over the Python scripts).
 
 The Python helper scripts are formatted with [black](https://black.readthedocs.io); config lives in `pyproject.toml`.
 

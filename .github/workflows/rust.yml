@@ -1,5 +1,12 @@
 name: rust
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fmt:
@@ -42,3 +49,62 @@ jobs:
       # nextest is the test runner; installed from a prebuilt binary.
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
+
+  # Builds both images (prod `arkiv`, dev `arkiv-dev` with arkiv-cli) and pushes
+  # them to GHCR on pushes to main; PRs build without pushing. One job,
+  # sequential builds: the Dockerfiles share a byte-identical builder stage, so
+  # the second image's compile is a BuildKit cache hit.
+  docker:
+    runs-on: ubuntu-latest
+    needs: [fmt, test]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Skipped on PRs so fork PRs (whose GITHUB_TOKEN lacks packages:write) don't fail.
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Lowercase required by GHCR (the org is Arkiv-Network).
+          images: ghcr.io/arkiv-network/arkiv
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/arkiv-node.Dockerfile
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=arkiv
+          cache-to: type=gha,scope=arkiv,mode=max
+
+      - id: meta-dev
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/arkiv-network/arkiv-dev
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/arkiv-node-dev.Dockerfile
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta-dev.outputs.tags }}
+          labels: ${{ steps.meta-dev.outputs.labels }}
+          cache-from: type=gha,scope=arkiv-dev
+          cache-to: type=gha,scope=arkiv-dev,mode=max
