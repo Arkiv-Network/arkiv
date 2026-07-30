@@ -32,11 +32,11 @@ async fn spawn_dev(
     ArkivClient<impl Provider + Clone>,
     Address,
 ) {
-    let node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-node")).spawn();
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-node")).spawn();
     let signer: PrivateKeySigner = key.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
-    client.wait_ready(READY).await;
+    node.wait_ready(&client, READY).await;
     (node, client, caller)
 }
 
