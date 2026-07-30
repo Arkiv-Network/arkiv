@@ -1,4 +1,4 @@
-//! `arkiv-node`: a reth Ethereum node with the Arkiv entity engine wired in.
+//! `arkiv-reth`: a reth Ethereum node with the Arkiv entity engine wired in.
 //!
 //! This is the assembly point. We keep reth as the host (networking, txpool,
 //! JSON-RPC, MDBX, engine/Engine API, sync) and add two things on top:
@@ -30,7 +30,7 @@ fn main() {
     }
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
-        info!(target: "arkiv-node", "Launching arkiv-node (reth host + Arkiv entity engine)");
+        info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
         let handle = builder
             // Standard Ethereum node types (primitives, chainspec, payload, storage).
             .with_types::<EthereumNode>()
@@ -42,7 +42,7 @@ fn main() {
             .extend_rpc_modules(|ctx| {
                 let module = rpc::arkiv_module(ctx.provider().clone())?;
                 ctx.modules.merge_configured(module)?;
-                info!(target: "arkiv-node", "arkiv_* RPC namespace registered");
+                info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                 Ok(())
             })
             .launch_with_debug_capabilities()

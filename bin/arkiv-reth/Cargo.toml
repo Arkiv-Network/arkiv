@@ -1,12 +1,12 @@
 [package]
-name = "arkiv-node"
+name = "arkiv-reth"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "arkiv-node"
+name = "arkiv-reth"
 path = "src/main.rs"
 
 [dependencies]

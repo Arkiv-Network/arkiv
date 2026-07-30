@@ -1,5 +1,5 @@
 # Args for ethpandaops/ethereum-package — the Arkiv chain.
-# arkiv-node EL + lighthouse CL; genesis / JWT / validators generated for us.
+# arkiv-reth EL + lighthouse CL; genesis / JWT / validators generated for us.
 #
 # Run directly (the local wrapper approach fails: kurtosis can't import a remote
 # package from a local one, so we run ethereum-package remotely and add the base

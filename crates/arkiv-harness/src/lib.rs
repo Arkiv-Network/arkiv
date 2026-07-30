@@ -1,7 +1,7 @@
 //! The Arkiv black-box test harness.
 //!
 //! Two layers the tests build on:
-//! - [`Node`] / [`NodeBuilder`] — spawn, kill, and restart the real `arkiv-node`
+//! - [`Node`] / [`NodeBuilder`] — spawn, kill, and restart the real `arkiv-reth`
 //!   binary (kill-then-restart on the same datadir proves crash recovery).
 //! - [`ArkivClient`] — a typed `arkiv_*` + `eth_*` RPC client to drive a node.
 //!
