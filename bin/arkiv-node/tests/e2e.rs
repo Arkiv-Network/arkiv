@@ -725,10 +725,11 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
 async fn explicit_expire_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
-    // Short TTL so the expiry block arrives quickly (250ms blocks).
+    // A TTL long enough to outlive the checks made while the entity is live, yet
+    // short enough that the expiry block arrives in ~15s at 250ms blocks.
     client
         .execute(vec![Operation::create(
-            10,
+            60,
             Bytes::from_static(b"ttl"),
             text_plain_mime(),
             vec![],
@@ -771,9 +772,11 @@ async fn explicit_expire_over_a_live_node() {
 async fn lapsed_btl_hides_an_entity_from_reads() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
+    // A TTL long enough to outlive the liveness check below, yet short enough
+    // that the expiry block arrives in ~15s at 250ms blocks.
     client
         .execute(vec![Operation::create(
-            10,
+            60,
             Bytes::from_static(b"ttl"),
             text_plain_mime(),
             vec![],

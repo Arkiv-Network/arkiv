@@ -5,6 +5,7 @@
 //! **keeping** the datadir, and [`Node::restart`] relaunches on the same ports and
 //! datadir, so a test can prove crash recovery (state resumes after a restart).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -15,6 +16,9 @@ static NODE_SEQ: AtomicU16 = AtomicU16::new(0);
 const HTTP_BASE: u16 = 18000;
 const AUTHRPC_BASE: u16 = 28000;
 const P2P_BASE: u16 = 38000;
+
+/// How much of the node's log a panicking test gets to see.
+const LOG_TAIL_LINES: usize = 150;
 
 /// How to launch an `arkiv-node`. Ports and the datadir are allocated
 /// automatically at [`spawn`](NodeBuilder::spawn); everything else has a
@@ -72,13 +76,15 @@ impl NodeBuilder {
     }
 }
 
-/// A running `arkiv-node`. Killed and its datadir removed on drop.
+/// A running `arkiv-node`. Killed and its datadir and log removed on drop; a
+/// drop while the thread is panicking prints the tail of the log first.
 pub struct Node {
     config: NodeBuilder,
     http_port: u16,
     authrpc_port: u16,
     p2p_port: u16,
     datadir: PathBuf,
+    log_path: PathBuf,
     child: Option<Child>,
 }
 
@@ -87,8 +93,10 @@ impl Node {
         // A per-process, per-node offset so nodes never share a port or datadir.
         let seq = NODE_SEQ.fetch_add(1, Ordering::Relaxed);
         let offset = (std::process::id() % 1000) as u16 + seq;
-        let datadir =
-            std::env::temp_dir().join(format!("arkiv-harness-{}-{seq}", std::process::id()));
+        let name = format!("arkiv-harness-{}-{seq}", std::process::id());
+        let datadir = std::env::temp_dir().join(&name);
+        // A sibling of the datadir, so wiping the datadir mid-run keeps the log.
+        let log_path = std::env::temp_dir().join(format!("{name}.log"));
         let _ = std::fs::remove_dir_all(&datadir);
 
         let mut node = Self {
@@ -97,6 +105,7 @@ impl Node {
             authrpc_port: AUTHRPC_BASE + offset,
             p2p_port: P2P_BASE + offset,
             datadir,
+            log_path,
             child: None,
         };
         node.child = Some(node.spawn_process());
@@ -127,12 +136,42 @@ impl Node {
             "--datadir",
             self.datadir.to_str().expect("utf-8 datadir"),
             "--disable-discovery",
+            // reth's IPC endpoint has a single fixed default path, so nodes
+            // running side by side would collide on it. Callers reach the node
+            // over HTTP.
+            "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
-        cmd.stdout(Stdio::null())
-            .stderr(Stdio::null())
+
+        // Both streams go to one file, freshly truncated, so its tail is the
+        // current run's output.
+        let log = File::create(&self.log_path).expect("create node log");
+        let log_err = log.try_clone().expect("clone node log handle");
+        cmd.stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err))
             .spawn()
             .expect("spawn arkiv-node binary")
+    }
+
+    /// Print the tail of the node's log to stderr, so a failing test's captured
+    /// output carries the node's own account of the run. Best-effort: a log that
+    /// cannot be read simply goes unreported.
+    fn dump_log(&self) {
+        let Ok(log) = std::fs::read_to_string(&self.log_path) else {
+            return;
+        };
+        let lines: Vec<&str> = log.lines().collect();
+        let from = lines.len().saturating_sub(LOG_TAIL_LINES);
+        eprintln!(
+            "── node on port {} — last {} of {} log lines ({}) ──",
+            self.http_port,
+            lines.len() - from,
+            lines.len(),
+            self.log_path.display(),
+        );
+        for line in &lines[from..] {
+            eprintln!("{line}");
+        }
     }
 
     /// The node's HTTP JSON-RPC URL.
@@ -160,6 +199,11 @@ impl Node {
         &self.datadir
     }
 
+    /// The file holding the node's stdout and stderr for the current process.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
     /// Whether the process is currently running.
     pub fn is_running(&self) -> bool {
         self.child.is_some()
@@ -183,7 +227,11 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.dump_log();
+        }
         self.kill();
         let _ = std::fs::remove_dir_all(&self.datadir);
+        let _ = std::fs::remove_file(&self.log_path);
     }
 }

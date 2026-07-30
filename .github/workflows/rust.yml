@@ -13,6 +13,7 @@ concurrency:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
@@ -22,6 +23,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # reth binaries are large; linking them with debug info OOMs the runner's
     # linker (ld bus error). This job only checks the workspace compiles, so
     # drop debug info to keep peak linker memory under the ~7 GB limit.
@@ -40,6 +42,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # Same reasoning as `build`: drop debug info so linking the reth test
     # binaries doesn't OOM the runner's linker.
     env:
