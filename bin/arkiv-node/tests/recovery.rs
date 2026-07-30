@@ -38,7 +38,7 @@ async fn state_and_index_survive_kill_and_restart() {
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
-    client.wait_ready(READY).await;
+    node.wait_ready(&client, READY).await;
 
     // Create two entities with attributes, so there is committed state and index.
     client
@@ -77,7 +77,7 @@ async fn state_and_index_survive_kill_and_restart() {
     // A brief pause so the OS releases the listening ports before the rebind.
     tokio::time::sleep(Duration::from_secs(1)).await;
     node.restart();
-    client.wait_ready(READY).await;
+    node.wait_ready(&client, READY).await;
 
     // The safe head resumed: the entities and their index survive byte-identical.
     assert_eq!(

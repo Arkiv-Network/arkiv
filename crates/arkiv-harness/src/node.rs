@@ -1,24 +1,30 @@
 //! Spawning, killing, and restarting the `arkiv-node` binary for black-box tests.
 //!
 //! [`NodeBuilder`] configures a launch; [`Node`] is the running process — killed
-//! and its datadir removed on drop. [`Node::kill`] stops the process while
+//! and its datadir removed on drop. Ports are assigned by the OS at spawn and
+//! reused for the node's whole life. [`Node::kill`] stops the process while
 //! **keeping** the datadir, and [`Node::restart`] relaunches on the same ports and
 //! datadir, so a test can prove crash recovery (state resumes after a restart).
 
 use std::fs::File;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
-/// Per-process, per-node offset so nodes never collide on ports or datadir.
+use alloy_provider::Provider;
+
+use crate::ArkivClient;
+
+/// Per-process, per-node counter so nodes never share a datadir or log file.
 static NODE_SEQ: AtomicU16 = AtomicU16::new(0);
-
-const HTTP_BASE: u16 = 18000;
-const AUTHRPC_BASE: u16 = 28000;
-const P2P_BASE: u16 = 38000;
 
 /// How much of the node's log a panicking test gets to see.
 const LOG_TAIL_LINES: usize = 150;
+
+/// How often [`Node::wait_ready`] checks the process and its RPC.
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How to launch an `arkiv-node`. Ports and the datadir are allocated
 /// automatically at [`spawn`](NodeBuilder::spawn); everything else has a
@@ -90,24 +96,30 @@ pub struct Node {
 
 impl Node {
     fn start(config: NodeBuilder) -> Self {
-        // A per-process, per-node offset so nodes never share a port or datadir.
+        // A per-process, per-node sequence number so nodes never share a datadir.
         let seq = NODE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let offset = (std::process::id() % 1000) as u16 + seq;
         let name = format!("arkiv-harness-{}-{seq}", std::process::id());
         let datadir = std::env::temp_dir().join(&name);
         // A sibling of the datadir, so wiping the datadir mid-run keeps the log.
         let log_path = std::env::temp_dir().join(format!("{name}.log"));
         let _ = std::fs::remove_dir_all(&datadir);
 
+        // Three ports the OS certifies as free. Their listeners hold them until
+        // the node is about to bind, so no other process can take one meanwhile.
+        let (http, http_port) = reserve_port();
+        let (authrpc, authrpc_port) = reserve_port();
+        let (p2p, p2p_port) = reserve_port();
+
         let mut node = Self {
             config,
-            http_port: HTTP_BASE + offset,
-            authrpc_port: AUTHRPC_BASE + offset,
-            p2p_port: P2P_BASE + offset,
+            http_port,
+            authrpc_port,
+            p2p_port,
             datadir,
             log_path,
             child: None,
         };
+        drop((http, authrpc, p2p));
         node.child = Some(node.spawn_process());
         node
     }
@@ -209,6 +221,32 @@ impl Node {
         self.child.is_some()
     }
 
+    /// Block until `client` gets an answer to `eth_chainId`, or panic — as soon
+    /// as the process exits, or after `timeout`.
+    ///
+    /// Watching the process turns a node that dies at startup into an immediate
+    /// failure naming its exit status, rather than a wait for the full timeout.
+    /// The log tail the panic-time [`Drop`] prints carries the node's own reason.
+    pub async fn wait_ready(&mut self, client: &ArkivClient<impl Provider>, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let child = self.child.as_mut().expect("node is running");
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("node exited during startup ({status})");
+            }
+            match client.provider().get_chain_id().await {
+                Ok(_) => return,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "node RPC not ready in {timeout:?}: {e}"
+                    );
+                    tokio::time::sleep(READY_POLL_INTERVAL).await;
+                }
+            }
+        }
+    }
+
     /// Stop the process but **keep** the datadir — the chain persists for a
     /// [`restart`](Node::restart). Idempotent.
     pub fn kill(&mut self) {
@@ -223,6 +261,14 @@ impl Node {
         assert!(self.child.is_none(), "kill the node before restart");
         self.child = Some(self.spawn_process());
     }
+}
+
+/// Take a free port from the OS. The listener holds the port until it is
+/// dropped, which is what makes the port exclusively this node's.
+fn reserve_port() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let port = listener.local_addr().expect("listener address").port();
+    (listener, port)
 }
 
 impl Drop for Node {
