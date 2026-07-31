@@ -390,7 +390,7 @@ fn expiration_is_range_queryable() {
 
     // $expiration >= 100 matches the two later-expiring entities, not the first.
     let by_expiry = Query::Gte {
-        key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+        key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
         value: AnnotVal::u256_from_u64(100),
     };
     assert_eq!(keys(&mut index, &by_expiry), vec![[2u8; 32], [3u8; 32]]);

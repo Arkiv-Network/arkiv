@@ -288,54 +288,57 @@ async fn query_operator_classes_over_a_live_node() {
     let expect =
         |idxs: &[usize]| -> BTreeSet<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
 
-    // eq (user uint), eq ($owner), !=, IN, ranges, glob, AND/OR, $all.
+    // Typed equality (user u256 and $owner), ranges, STARTSWITH, AND/OR, `*`.
     assert_eq!(
-        result_keys(&client.query("rank = 30", 100, None).await),
+        result_keys(&client.query("rank = u256(30)", 100, None).await),
         expect(&[2])
     );
     assert_eq!(
         result_keys(
             &client
-                .query(&format!("$owner = {caller:#x}"), 100, None)
+                .query(&format!("$owner = addr({caller:#x})"), 100, None)
                 .await
         ),
         expect(&[0, 1, 2, 3, 4]),
     );
     assert_eq!(
-        result_keys(&client.query("rank != 30", 100, None).await),
-        expect(&[0, 1, 3, 4])
-    );
-    assert_eq!(
-        result_keys(&client.query("rank IN (10 50)", 100, None).await),
+        result_keys(
+            &client
+                .query("rank = u256(10) OR rank = u256(50)", 100, None)
+                .await
+        ),
         expect(&[0, 4])
     );
     assert_eq!(
-        result_keys(&client.query("rank >= 40", 100, None).await),
+        result_keys(&client.query("rank >= u256(40)", 100, None).await),
         expect(&[3, 4])
     );
     assert_eq!(
-        result_keys(&client.query("rank < 30", 100, None).await),
+        result_keys(&client.query("rank < u256(30)", 100, None).await),
         expect(&[0, 1])
     );
     assert_eq!(
-        result_keys(&client.query("team ~ \"re*\"", 100, None).await),
+        result_keys(&client.query("team STARTSWITH str('re')", 100, None).await),
         expect(&[0, 1])
     );
     assert_eq!(
         result_keys(
             &client
-                .query("rank >= 20 && team = \"blue\"", 100, None)
+                .query("rank >= u256(20) AND team = str('blue')", 100, None)
                 .await
         ),
         expect(&[2, 3]),
     );
     assert_eq!(
-        result_keys(&client.query("rank = 10 || rank = 50", 100, None).await),
-        expect(&[0, 4])
-    );
-    assert_eq!(
         result_keys(&client.query("*", 100, None).await),
         expect(&[0, 1, 2, 3, 4])
+    );
+
+    // A predicate asserts the attribute's *type*: `rank` is a u256, so the same
+    // number tagged i32 addresses a different bucket and matches nothing.
+    assert!(
+        result_keys(&client.query("rank = i32(30)", 100, None).await).is_empty(),
+        "an i32 predicate must not match a u256 attribute",
     );
 
     // Pagination: two per page partitions $all over three pages. The cursor is
@@ -362,7 +365,7 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(
         result_keys(
             &client
-                .query(&format!("$creator = {caller:#x}"), 100, None)
+                .query(&format!("$creator = addr({caller:#x})"), 100, None)
                 .await
         ),
         expect(&[0, 1, 2, 3, 4]),
@@ -370,38 +373,57 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(
         result_keys(
             &client
-                .query("$contentType = \"text/plain\"", 100, None)
+                .query("$contentType = str('text/plain')", 100, None)
                 .await
         ),
         expect(&[0, 1, 2, 3, 4]),
     );
+    // Block heights take bare literals — their type is protocol-fixed.
     assert_eq!(
-        result_keys(&client.query("$createdAtBlock >= 1", 100, None).await),
+        result_keys(&client.query("$createdAt >= 1", 100, None).await),
         expect(&[0, 1, 2, 3, 4]),
     );
 
-    // Negation operators.
+    // NOT is the only negation, and it is the full complement.
     assert_eq!(
-        result_keys(&client.query("rank NOT IN (10 50)", 100, None).await),
+        result_keys(
+            &client
+                .query("NOT (rank = u256(10) OR rank = u256(50))", 100, None)
+                .await
+        ),
         expect(&[1, 2, 3])
     );
     assert_eq!(
-        result_keys(&client.query("team !~ \"re*\"", 100, None).await),
+        result_keys(
+            &client
+                .query("NOT team STARTSWITH str('re')", 100, None)
+                .await
+        ),
         expect(&[2, 3, 4])
     );
     assert_eq!(
-        result_keys(&client.query("NOT (rank = 30)", 100, None).await),
+        result_keys(&client.query("NOT (rank = u256(30))", 100, None).await),
         expect(&[0, 1, 3, 4])
     );
 
-    // Error contract: malformed query, out-of-range block, bad atBlock tag.
-    assert!(
-        client
-            .query_raw("rank = = 30", serde_json::json!({}))
-            .await
-            .is_err(),
-        "malformed query must error",
-    );
+    // Error contract: the parser's rejections reach the caller as errors.
+    for rejected in [
+        "rank = = u256(30)",                      // malformed
+        "rank = 30",                              // untagged user value
+        "rank != u256(30)",                       // != is not in the language
+        "team >= str('blue')",                    // range on an unordered type
+        "rank >= u256(20) && team = str('blue')", // removed symbol operator
+        "exists(rank)",                           // reserved, unimplemented
+        "rank = i32(2147483648)",                 // literal out of range
+    ] {
+        assert!(
+            client
+                .query_raw(rejected, serde_json::json!({}))
+                .await
+                .is_err(),
+            "query must be rejected: {rejected}",
+        );
+    }
     assert!(
         client
             .query_raw("*", serde_json::json!({ "atBlock": "0x5f5e0ff" }))
@@ -429,7 +451,7 @@ async fn query_operator_classes_over_a_live_node() {
     // projection.
     let bare: serde_json::Value = client
         .provider()
-        .raw_request("arkiv_query".into(), (format!("$key = {}", k[0]),))
+        .raw_request("arkiv_query".into(), (format!("$key = key({})", k[0]),))
         .await
         .expect("bare-string arkiv_query");
     assert_eq!(result_keys(&bare), expect(&[0]));
@@ -448,7 +470,7 @@ async fn query_operator_classes_over_a_live_node() {
 
     let projected = client
         .query_raw(
-            &format!("$key = {}", k[0]),
+            &format!("$key = key({})", k[0]),
             serde_json::json!({ "includeData": { "key": true } }),
         )
         .await
@@ -521,12 +543,12 @@ async fn write_path_ops_over_a_live_node() {
         "update should advance lastModifiedAtBlock",
     );
     assert_eq!(
-        result_keys(&client.query("rank = 100", 100, None).await),
+        result_keys(&client.query("rank = u256(100)", 100, None).await),
         BTreeSet::from([ks(0)]),
         "e0 findable by its new rank",
     );
     assert!(
-        result_keys(&client.query("rank = 10", 100, None).await).is_empty(),
+        result_keys(&client.query("rank = u256(10)", 100, None).await).is_empty(),
         "e0's old rank is de-indexed",
     );
 
@@ -551,14 +573,18 @@ async fn write_path_ops_over_a_live_node() {
         Some(format!("{bob:#x}").as_str()),
     );
     assert_eq!(
-        result_keys(&client.query(&format!("$owner = {bob:#x}"), 100, None).await),
+        result_keys(
+            &client
+                .query(&format!("$owner = addr({bob:#x})"), 100, None)
+                .await
+        ),
         BTreeSet::from([ks(2)]),
         "e2 now in bob's bucket",
     );
     assert!(
         !result_keys(
             &client
-                .query(&format!("$owner = {caller:#x}"), 100, None)
+                .query(&format!("$owner = addr({caller:#x})"), 100, None)
                 .await
         )
         .contains(&ks(2)),
@@ -616,10 +642,10 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
     // The tip reflects the update.
     assert_eq!(client.get_entity(key).await["payload"], "0x7632"); // "v2"
     assert_eq!(
-        result_keys(&client.query("rank = 100", 100, None).await),
+        result_keys(&client.query("rank = u256(100)", 100, None).await),
         BTreeSet::from([ks.clone()]),
     );
-    assert!(result_keys(&client.query("rank = 10", 100, None).await).is_empty());
+    assert!(result_keys(&client.query("rank = u256(10)", 100, None).await).is_empty());
 
     // As of the create block, both the entity and the query see the ORIGINAL state.
     assert_eq!(
@@ -627,12 +653,12 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
         "0x7631"
     ); // "v1"
     assert_eq!(
-        result_keys(&client.query_at("rank = 10", created).await),
+        result_keys(&client.query_at("rank = u256(10)", created).await),
         BTreeSet::from([ks.clone()]),
         "historical query sees the original rank",
     );
     assert!(
-        result_keys(&client.query_at("rank = 100", created).await).is_empty(),
+        result_keys(&client.query_at("rank = u256(100)", created).await).is_empty(),
         "the updated rank did not exist yet at the create block",
     );
 

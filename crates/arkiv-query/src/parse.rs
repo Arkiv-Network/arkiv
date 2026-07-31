@@ -1,789 +1,939 @@
-//! Recursive-descent parser for the Arkiv query language: text → [`Query`].
-//!
-//! The query language is part of the Arkiv *specification* (it defines the
-//! database), so it lives here — host-agnostic, `no_std`, zero-dep. Parsing
-//! produces a **typed** [`Query`] AST — its values are
-//! [`AttributeValue`](arkiv_interfaces::entity::AttributeValue)s, the same type an
-//! entity stores, so a predicate and the attribute it matches share one type
-//! system; turning a value into a particular index's byte layout is the host's
-//! job, in the evaluator.
-//!
-//! Grammar:
+//! Recursive-descent parser: tokens → [`Query`].
 //!
 //! ```text
-//! TopLevel  → '*' | '$all' | Or
-//! Or        → And (('||' | 'OR') And)*
-//! And       → Term (('&&' | 'AND') Term)*
-//! Term      → '(' Or ')' | ('NOT' | '!') '(' Or ')' | Predicate
-//! Predicate → Var '=' Value | Var '!=' Value
-//!           | Var ('NOT')? 'IN' '(' Value+ ')'
-//!           | Var ('>' | '>=' | '<' | '<=') Value
-//!           | Var ('~' | '!~') StringLit          (pattern ends with '*')
-//! Var       → Ident | '$owner' | '$creator' | '$key'
-//!           | '$expiration' | '$contentType' | '$createdAtBlock'
-//! Value     → Number | String | Address | EntityKey
+//! top        → '*' | expr
+//! expr       → andExpr { OR andExpr }
+//! andExpr    → unary { AND unary }
+//! unary      → NOT unary | primary
+//! primary    → '(' expr ')' | predicate
+//! predicate  → attrRef compOp value | attrRef STARTSWITH strValue
 //! ```
 //!
-//! Per-key value types are checked at parse time: `$owner`/`$creator` take an
-//! address, `$key` an entity key (or a `0x…64hex` string), `$expiration`/
-//! `$createdAtBlock` a number, `$contentType` a string; user keys accept any
-//! literal. Range operators are rejected on address / entity-key values (no
-//! meaningful ordering).
+//! Precedence, tightest first: `NOT`, `AND`, `OR`.
+//!
+//! Two jobs beyond shape. First, **typing**: a value carries its own type, and
+//! this is where a value is checked against the attribute it is compared to
+//! (`$owner` takes an address) and against its operator (only the numeric types
+//! are ordered). A range operator on an equality-only type is an error here, not
+//! an empty result later — the spec is explicit that the two must not be
+//! confused. Second, **limits**: length, predicate count and nesting depth are
+//! bounded, because `parse` runs on unauthenticated RPC input.
 
 use alloc::boxed::Box;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt;
 
-use arkiv_interfaces::collections::NonEmptyVec;
-use arkiv_interfaces::entity::annotations;
-use arkiv_interfaces::primitives::{Address, EntityKey};
+use arkiv_interfaces::entity::{AttributeType, AttributeValue};
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query};
 
-use crate::lexer::{KEY_HEX_LEN, KEY_LEN, Token, hex_to_bytes, tokenize};
+use crate::error::{ParseError, ParseErrorKind};
+use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
+use crate::limits;
+use crate::literal;
 
-/// Why a query string failed to parse.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError {
-    /// Human-readable description.
-    pub message: String,
-    /// Byte offset into the input where the failure was detected, when known
-    /// (lexer errors carry one; parser errors generally do not).
-    pub position: Option<usize>,
-}
-
-impl ParseError {
-    pub(crate) fn at(position: usize, message: &str) -> Self {
-        Self {
-            message: message.to_string(),
-            position: Some(position),
-        }
-    }
-    pub(crate) fn msg(message: &str) -> Self {
-        Self {
-            message: message.to_string(),
-            position: None,
-        }
-    }
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.position {
-            Some(p) => write!(f, "query parse error at byte {p}: {}", self.message),
-            None => write!(f, "query parse error: {}", self.message),
-        }
-    }
-}
-
-impl core::error::Error for ParseError {}
-
-/// Parse a query string into a [`Query`] AST. See the [module docs](self) for the
-/// grammar.
+/// Parse a query string into a [`Query`] AST. See the [module docs](self).
 pub fn parse(input: &str) -> Result<Query, ParseError> {
+    if input.len() > limits::MAX_QUERY_BYTES {
+        return Err(ParseError::whole(
+            ParseErrorKind::Limit,
+            "query is too long",
+        ));
+    }
     let tokens = tokenize(input)?;
-    Parser::new(tokens).parse_top_level()
-}
-
-/// A literal value before it is typed against its key.
-enum Literal {
-    Number(u64),
-    String(String),
-    Address(Address),
-    EntityKey(EntityKey),
+    Parser::new(tokens, input.len()).parse_top_level()
 }
 
 struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<SpannedToken>,
     pos: usize,
+    /// Byte offset one past the input, for "unexpected end of query" errors.
+    end: usize,
+    depth: usize,
+    predicates: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+    fn new(tokens: Vec<SpannedToken>, end: usize) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            end,
+            depth: 0,
+            predicates: 0,
+        }
     }
 
-    fn peek(&self) -> Option<&Token> {
+    fn peek(&self) -> Option<&SpannedToken> {
         self.tokens.get(self.pos)
     }
 
-    fn advance(&mut self) -> Option<Token> {
-        let t = self.tokens.get(self.pos).cloned()?;
-        self.pos += 1;
-        Some(t)
+    fn peek_token(&self) -> Option<&Token> {
+        self.peek().map(|spanned| &spanned.token)
     }
 
-    fn expect(&mut self, expected: &Token, what: &str) -> Result<(), ParseError> {
-        match self.advance() {
-            Some(t) if &t == expected => Ok(()),
-            _ => Err(ParseError::msg(what)),
-        }
+    fn advance(&mut self) -> Option<SpannedToken> {
+        let spanned = self.tokens.get(self.pos).cloned()?;
+        self.pos += 1;
+        Some(spanned)
+    }
+
+    /// Where the next token starts, or the end of input.
+    fn next_position(&self) -> usize {
+        self.peek().map_or(self.end, |spanned| spanned.start)
     }
 
     fn parse_top_level(&mut self) -> Result<Query, ParseError> {
-        // Standalone `*` / `$all` only at top level.
-        let is_all = matches!(self.peek(), Some(Token::Star))
-            || matches!(self.peek(), Some(Token::DollarTerm(n)) if n.as_bytes() == &annotations::ALL[1..]);
-        if is_all {
+        if self.tokens.is_empty() {
+            return Err(ParseError::syntax(
+                0,
+                "empty query — write a predicate, or * to match every entity",
+            ));
+        }
+        if matches!(self.peek_token(), Some(Token::Star)) {
             self.advance();
-            if self.peek().is_some() {
-                return Err(ParseError::msg("expected end of input after '*' / '$all'"));
+            if let Some(spanned) = self.peek() {
+                return Err(ParseError::syntax(
+                    spanned.start,
+                    "* matches every entity and cannot be combined with other predicates",
+                ));
             }
             return Ok(Query::All);
         }
-        let q = self.parse_or()?;
-        if self.peek().is_some() {
-            return Err(ParseError::msg("unexpected trailing input"));
+        let query = self.parse_expr()?;
+        if let Some(spanned) = self.peek() {
+            return Err(ParseError::syntax(
+                spanned.start,
+                "unexpected trailing input — did you mean to join these with AND or OR?",
+            ));
         }
-        Ok(q)
+        Ok(query)
     }
 
-    fn parse_or(&mut self) -> Result<Query, ParseError> {
-        let mut q = self.parse_and()?;
-        while matches!(self.peek(), Some(Token::Or)) {
+    fn parse_expr(&mut self) -> Result<Query, ParseError> {
+        let mut query = self.parse_and()?;
+        while matches!(self.peek_token(), Some(Token::Or)) {
             self.advance();
-            let rhs = self.parse_and()?;
-            q = Query::Or(Box::new(q), Box::new(rhs));
+            let right = self.parse_and()?;
+            query = Query::Or(Box::new(query), Box::new(right));
         }
-        Ok(q)
+        Ok(query)
     }
 
     fn parse_and(&mut self) -> Result<Query, ParseError> {
-        let mut q = self.parse_term()?;
-        while matches!(self.peek(), Some(Token::And)) {
+        let mut query = self.parse_unary()?;
+        while matches!(self.peek_token(), Some(Token::And)) {
             self.advance();
-            let rhs = self.parse_term()?;
-            q = Query::And(Box::new(q), Box::new(rhs));
+            let right = self.parse_unary()?;
+            query = Query::And(Box::new(query), Box::new(right));
         }
-        Ok(q)
+        Ok(query)
     }
 
-    fn parse_term(&mut self) -> Result<Query, ParseError> {
-        // `NOT (...)` — parens required so `NOT a = b` isn't ambiguous.
-        if matches!(self.peek(), Some(Token::Not)) {
-            self.advance();
-            self.expect(&Token::LParen, "expected '(' after NOT")?;
-            let inner = self.parse_or()?;
-            self.expect(&Token::RParen, "expected ')' to close NOT group")?;
-            return Ok(Query::Not(Box::new(inner)));
+    fn parse_unary(&mut self) -> Result<Query, ParseError> {
+        let Some(spanned) = self.peek() else {
+            return Err(ParseError::syntax(self.end, "expected a predicate"));
+        };
+        if spanned.token != Token::Not {
+            return self.parse_primary();
         }
-        if matches!(self.peek(), Some(Token::LParen)) {
-            self.advance();
-            let inner = self.parse_or()?;
-            self.expect(&Token::RParen, "expected ')' to close group")?;
-            return Ok(inner);
+        let start = spanned.start;
+        self.advance();
+        self.descend(start)?;
+        // NOT binds tighter than AND, so it takes the next unary, not the
+        // whole conjunction: `NOT a = true AND b = true` is `(NOT a) AND b`.
+        let inner = self.parse_unary()?;
+        self.depth -= 1;
+        Ok(Query::Not(Box::new(inner)))
+    }
+
+    fn parse_primary(&mut self) -> Result<Query, ParseError> {
+        let Some(spanned) = self.peek() else {
+            return Err(ParseError::syntax(self.end, "expected a predicate"));
+        };
+        if spanned.token != Token::LParen {
+            return self.parse_predicate();
         }
-        self.parse_predicate()
+        let start = spanned.start;
+        self.advance();
+        self.descend(start)?;
+        let inner = self.parse_expr()?;
+        match self.advance() {
+            Some(SpannedToken {
+                token: Token::RParen,
+                ..
+            }) => {}
+            _ => {
+                return Err(ParseError::syntax(start, "unclosed group — expected ')'"));
+            }
+        }
+        self.depth -= 1;
+        Ok(inner)
+    }
+
+    /// Enter one level of nesting, enforcing the depth bound.
+    fn descend(&mut self, position: usize) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > limits::MAX_NESTING_DEPTH {
+            return Err(ParseError::at(
+                position,
+                ParseErrorKind::Limit,
+                "query is nested too deeply",
+            ));
+        }
+        Ok(())
     }
 
     fn parse_predicate(&mut self) -> Result<Query, ParseError> {
-        let key = self.parse_annot_key()?;
-        match self.peek() {
-            Some(Token::Eq) => {
-                self.advance();
-                let value = self.parse_value(&key)?;
-                Ok(Query::Eq { key, value })
+        self.predicates += 1;
+        if self.predicates > limits::MAX_PREDICATES {
+            return Err(ParseError::at(
+                self.next_position(),
+                ParseErrorKind::Limit,
+                "query has too many predicates",
+            ));
+        }
+
+        let key = self.parse_attr_ref()?;
+        let Some(operator) = self.advance() else {
+            return Err(ParseError::syntax(
+                self.end,
+                "expected a comparison operator (= < <= > >= STARTSWITH) after the attribute",
+            ));
+        };
+
+        match operator.token {
+            Token::Eq | Token::Lt | Token::Lte | Token::Gt | Token::Gte => {
+                let (value, position) = self.parse_value(&key)?;
+                check_operator(&operator.token, &value, position)?;
+                Ok(comparison(&operator.token, key, value))
             }
-            Some(Token::Neq) => {
-                self.advance();
-                let value = self.parse_value(&key)?;
-                Ok(Query::Neq { key, value })
+            Token::StartsWith => {
+                let (value, position) = self.parse_value(&key)?;
+                if !matches!(value, AttributeValue::Str(_)) {
+                    return Err(ParseError::type_error(
+                        position,
+                        "STARTSWITH matches a string prefix — write str('…')",
+                    ));
+                }
+                Ok(Query::StartsWith { key, value })
             }
-            Some(Token::Not) => {
-                self.advance();
-                self.expect(&Token::In, "expected IN after NOT in a predicate")?;
-                let values = self.parse_value_list(&key)?;
-                Ok(Query::NotIn { key, values })
-            }
-            Some(Token::In) => {
-                self.advance();
-                let values = self.parse_value_list(&key)?;
-                Ok(Query::In { key, values })
-            }
-            Some(Token::Gt) => {
-                let value = self.range_value(&key)?;
-                Ok(Query::Gt { key, value })
-            }
-            Some(Token::Gte) => {
-                let value = self.range_value(&key)?;
-                Ok(Query::Gte { key, value })
-            }
-            Some(Token::Lt) => {
-                let value = self.range_value(&key)?;
-                Ok(Query::Lt { key, value })
-            }
-            Some(Token::Lte) => {
-                let value = self.range_value(&key)?;
-                Ok(Query::Lte { key, value })
-            }
-            Some(Token::Tilde) => {
-                self.advance();
-                let value = self.parse_glob_pattern(&key)?;
-                Ok(Query::Glob { key, value })
-            }
-            Some(Token::NotTilde) => {
-                self.advance();
-                let value = self.parse_glob_pattern(&key)?;
-                Ok(Query::NotGlob { key, value })
-            }
-            _ => Err(ParseError::msg(
-                "expected an operator (=, !=, >, >=, <, <=, ~, !~, IN, NOT IN) after the key",
+            Token::Neq => Err(ParseError::type_error(
+                operator.start,
+                "!= is not part of the query language — write NOT (attr = value) for the complement",
+            )),
+            _ => Err(ParseError::syntax(
+                operator.start,
+                "expected a comparison operator (= < <= > >= STARTSWITH)",
             )),
         }
     }
 
-    /// Consume the (already-peeked) range operator and parse its value, rejecting
-    /// value types with no meaningful ordering.
-    fn range_value(&mut self, key: &AnnotKey) -> Result<AnnotVal, ParseError> {
-        self.advance(); // the range operator
-        if matches!(self.peek(), Some(Token::Address(_) | Token::EntityKey(_))) {
-            return Err(ParseError::msg(
-                "range operators (>, >=, <, <=) are not supported on address / entity-key values",
-            ));
-        }
-        self.parse_value(key)
-    }
-
-    fn parse_annot_key(&mut self) -> Result<AnnotKey, ParseError> {
-        match self.advance() {
-            Some(Token::DollarTerm(name)) => builtin_from_dollar(&name)
-                .map(AnnotKey::BuiltIn)
-                .ok_or_else(|| ParseError::msg("unknown or non-queryable built-in field")),
-            Some(Token::Ident(s)) => Ok(AnnotKey::User(s)),
-            _ => Err(ParseError::msg("expected an annotation key")),
-        }
-    }
-
-    fn parse_value(&mut self, key: &AnnotKey) -> Result<AnnotVal, ParseError> {
-        let lit = self.parse_literal()?;
-        value_for_key(key, lit)
-    }
-
-    fn parse_value_list(&mut self, key: &AnnotKey) -> Result<NonEmptyVec<AnnotVal>, ParseError> {
-        self.expect(&Token::LParen, "expected '(' to start an IN value list")?;
-        let mut vals = Vec::new();
-        while !matches!(self.peek(), Some(Token::RParen)) {
-            if self.peek().is_none() {
-                return Err(ParseError::msg("unterminated IN value list"));
+    fn parse_attr_ref(&mut self) -> Result<AnnotKey, ParseError> {
+        let Some(spanned) = self.advance() else {
+            return Err(ParseError::syntax(self.end, "expected an attribute name"));
+        };
+        match spanned.token {
+            Token::Name(name) => {
+                validate_user_name(&name, spanned.start)?;
+                Ok(AnnotKey::User(name))
             }
-            vals.push(self.parse_value(key)?);
+            Token::SysName(name) => builtin_from_name(&name, spanned.start).map(AnnotKey::BuiltIn),
+            Token::Exists => Err(ParseError::type_error(
+                spanned.start,
+                "exists(…) is not supported — the index has no per-attribute presence set in this version",
+            )),
+            Token::TypeOf => Err(ParseError::type_error(
+                spanned.start,
+                "typeof(…) is not supported — a value predicate already asserts the attribute's type",
+            )),
+            Token::And
+            | Token::Or
+            | Token::Not
+            | Token::True
+            | Token::False
+            | Token::StartsWith => Err(ParseError::syntax(
+                spanned.start,
+                "a reserved word cannot be used as an attribute name",
+            )),
+            _ => Err(ParseError::syntax(
+                spanned.start,
+                "expected an attribute name",
+            )),
         }
-        self.advance(); // ')'
-        NonEmptyVec::from_vec(vals)
-            .ok_or_else(|| ParseError::msg("IN / NOT IN value list must be non-empty"))
     }
 
-    fn parse_glob_pattern(&mut self, key: &AnnotKey) -> Result<AnnotVal, ParseError> {
-        match key {
-            AnnotKey::BuiltIn(BuiltIn::ContentType) | AnnotKey::User(_) => {}
-            AnnotKey::BuiltIn(_) => {
-                return Err(ParseError::msg(
-                    "glob ('~' / '!~') is only supported on string-valued keys",
+    /// Read the value a predicate compares against, and check it suits the
+    /// attribute. Returns the value and where it started.
+    fn parse_value(&mut self, key: &AnnotKey) -> Result<(AnnotVal, usize), ParseError> {
+        let Some(spanned) = self.advance() else {
+            return Err(ParseError::syntax(
+                self.end,
+                "expected a value, e.g. i32(10) or str('Bob')",
+            ));
+        };
+        let position = spanned.start;
+        let value = match spanned.token {
+            Token::Tagged {
+                tag,
+                body,
+                body_start,
+            } => literal::parse_tagged(tag, &body, body_start)?,
+            Token::True => AttributeValue::Bool(true),
+            Token::False => AttributeValue::Bool(false),
+            Token::Int(text) => bare_int_value(key, &text, position)?,
+            Token::Str(content) => bare_str_value(key, content, position)?,
+            _ => {
+                return Err(ParseError::syntax(
+                    position,
+                    "expected a value, e.g. i32(10) or str('Bob')",
                 ));
             }
-        }
-        let Literal::String(s) = self.parse_literal()? else {
-            return Err(ParseError::msg("glob pattern must be a string literal"));
         };
-        let Some(prefix) = s.strip_suffix('*') else {
-            return Err(ParseError::msg("glob pattern must end in '*'"));
-        };
-        if prefix.contains('*') {
-            return Err(ParseError::msg(
-                "only a single trailing '*' is supported in a glob pattern",
-            ));
-        }
-        Ok(AnnotVal::Str(prefix.into()))
-    }
-
-    fn parse_literal(&mut self) -> Result<Literal, ParseError> {
-        match self.advance() {
-            Some(Token::Number(n)) => Ok(Literal::Number(n)),
-            Some(Token::StringLit(s)) => Ok(Literal::String(s)),
-            Some(Token::Address(a)) => Ok(Literal::Address(a)),
-            Some(Token::EntityKey(b)) => Ok(Literal::EntityKey(b)),
-            _ => Err(ParseError::msg("expected a literal value")),
-        }
+        check_value_type(key, &value, position)?;
+        Ok((value, position))
     }
 }
 
-/// Type a literal against its key, producing a spec [`AnnotVal`]. Per-key rules
-/// mirror the write side; user keys accept any literal.
-fn value_for_key(key: &AnnotKey, lit: Literal) -> Result<AnnotVal, ParseError> {
-    Ok(match (key, lit) {
-        (AnnotKey::BuiltIn(BuiltIn::Owner | BuiltIn::Creator), Literal::Address(a)) => {
-            AnnotVal::EthereumAddress(a)
-        }
-        (AnnotKey::BuiltIn(BuiltIn::Owner | BuiltIn::Creator), _) => {
-            return Err(ParseError::msg(
-                "$owner / $creator require an address literal (0x + 40 hex)",
-            ));
-        }
-
-        (AnnotKey::BuiltIn(BuiltIn::Key), Literal::EntityKey(b)) => AnnotVal::EntityKey(b),
-        (AnnotKey::BuiltIn(BuiltIn::Key), Literal::String(s)) => {
-            AnnotVal::EntityKey(decode_key_string(&s)?)
-        }
-        (AnnotKey::BuiltIn(BuiltIn::Key), _) => {
-            return Err(ParseError::msg(
-                "$key requires an entity-key literal (0x + 64 hex)",
-            ));
-        }
-
-        (AnnotKey::BuiltIn(BuiltIn::Expiration | BuiltIn::CreatedAtBlock), Literal::Number(n)) => {
-            AnnotVal::u256_from_u64(n)
-        }
-        (AnnotKey::BuiltIn(BuiltIn::Expiration | BuiltIn::CreatedAtBlock), _) => {
-            return Err(ParseError::msg(
-                "$expiration / $createdAtBlock require a number",
-            ));
-        }
-
-        (AnnotKey::BuiltIn(BuiltIn::ContentType), Literal::String(s)) => AnnotVal::Str(s),
-        (AnnotKey::BuiltIn(BuiltIn::ContentType), _) => {
-            return Err(ParseError::msg("$contentType requires a string"));
-        }
-
-        (AnnotKey::User(_), Literal::Number(n)) => AnnotVal::u256_from_u64(n),
-        (AnnotKey::User(_), Literal::String(s)) => AnnotVal::Str(s),
-        (AnnotKey::User(_), Literal::Address(a)) => AnnotVal::EthereumAddress(a),
-        (AnnotKey::User(_), Literal::EntityKey(b)) => AnnotVal::EntityKey(b),
-    })
-}
-
-/// Resolve a `$term` name (the text after the `$`) to a built-in field, if it is
-/// one. Names come from the spec's [`annotations`] constants (minus the `$`), so
-/// the parser and the store agree on the vocabulary. `$all` is deliberately not a
-/// field — it is the all-selector, handled at the top level.
-fn builtin_from_dollar(name: &str) -> Option<BuiltIn> {
-    let n = name.as_bytes();
-    if n == &annotations::OWNER[1..] {
-        Some(BuiltIn::Owner)
-    } else if n == &annotations::CREATOR[1..] {
-        Some(BuiltIn::Creator)
-    } else if n == &annotations::KEY[1..] {
-        Some(BuiltIn::Key)
-    } else if n == &annotations::EXPIRATION[1..] {
-        Some(BuiltIn::Expiration)
-    } else if n == &annotations::CONTENT_TYPE[1..] {
-        Some(BuiltIn::ContentType)
-    } else if n == &annotations::CREATED_AT_BLOCK[1..] {
-        Some(BuiltIn::CreatedAtBlock)
-    } else {
-        None
+/// Build the comparison node for an already-validated operator.
+fn comparison(operator: &Token, key: AnnotKey, value: AnnotVal) -> Query {
+    match operator {
+        Token::Eq => Query::Eq { key, value },
+        Token::Lt => Query::Lt { key, value },
+        Token::Lte => Query::Lte { key, value },
+        Token::Gt => Query::Gt { key, value },
+        Token::Gte => Query::Gte { key, value },
+        // `parse_predicate` only reaches here with the five above.
+        _ => unreachable!("comparison called with a non-comparison operator"),
     }
 }
 
-/// Decode a `0x…64hex` string into a 32-byte entity key (the JS SDK sends `$key`
-/// values quoted).
-fn decode_key_string(s: &str) -> Result<EntityKey, ParseError> {
-    let stripped = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .ok_or_else(|| ParseError::msg("$key string must be 0x-prefixed"))?;
-    if stripped.len() != KEY_HEX_LEN {
-        return Err(ParseError::msg("$key string must be a 32-byte hex key"));
+/// An untagged number: system attributes only, where the type is protocol-fixed.
+fn bare_int_value(key: &AnnotKey, text: &str, position: usize) -> Result<AnnotVal, ParseError> {
+    match key {
+        AnnotKey::BuiltIn(BuiltIn::ExpiresAt | BuiltIn::CreatedAt) => {
+            literal::parse_bare_block_number(text, position)
+        }
+        AnnotKey::BuiltIn(_) => Err(ParseError::type_error(
+            position,
+            "this system attribute is not a number",
+        )),
+        AnnotKey::User(_) => Err(ParseError::type_error(
+            position,
+            "untagged numbers are only valid for system attributes — write i32(…), u256(…) or dec(…)",
+        )),
     }
-    let mut out = [0u8; KEY_LEN];
-    hex_to_bytes(stripped, &mut out).map_err(|()| ParseError::msg("invalid hex in $key string"))?;
-    Ok(out)
+}
+
+/// An untagged string: system attributes only. `$key`, `$owner` and `$creator`
+/// accept their hex forms quoted, which is how the JS SDK spells them.
+fn bare_str_value(
+    key: &AnnotKey,
+    content: String,
+    position: usize,
+) -> Result<AnnotVal, ParseError> {
+    match key {
+        AnnotKey::BuiltIn(BuiltIn::ContentType) => {
+            literal::validate_str_len(&content, position)?;
+            Ok(AttributeValue::Str(content))
+        }
+        AnnotKey::BuiltIn(BuiltIn::Owner | BuiltIn::Creator) => {
+            literal::parse_addr(&content, position).map(AttributeValue::EthereumAddress)
+        }
+        AnnotKey::BuiltIn(BuiltIn::Key) => {
+            literal::parse_word_hex(&content, position, "key").map(AttributeValue::EntityKey)
+        }
+        AnnotKey::BuiltIn(_) => Err(ParseError::type_error(
+            position,
+            "this system attribute is not a string",
+        )),
+        AnnotKey::User(_) => Err(ParseError::type_error(
+            position,
+            "untagged strings are only valid for system attributes — write str('…')",
+        )),
+    }
+}
+
+/// The type a system attribute is fixed to carry.
+fn builtin_type(field: BuiltIn) -> AttributeType {
+    match field {
+        BuiltIn::Owner | BuiltIn::Creator => AttributeType::EthereumAddress,
+        BuiltIn::Key => AttributeType::EntityKey,
+        BuiltIn::ExpiresAt | BuiltIn::CreatedAt => AttributeType::U256,
+        BuiltIn::ContentType => AttributeType::Str,
+    }
+}
+
+/// A system attribute's type is protocol-fixed, so a mismatched literal is an
+/// error rather than a query that silently matches nothing.
+fn check_value_type(key: &AnnotKey, value: &AnnotVal, position: usize) -> Result<(), ParseError> {
+    let AnnotKey::BuiltIn(field) = key else {
+        return Ok(());
+    };
+    let expected = builtin_type(*field);
+    if value.attr_type() == expected {
+        return Ok(());
+    }
+    Err(ParseError::type_error(
+        position,
+        alloc::format!(
+            "this system attribute holds {}, but the value is {}",
+            expected.name(),
+            value.attr_type().name(),
+        ),
+    ))
+}
+
+/// The operator × type matrix: only the numeric types are ordered.
+fn check_operator(operator: &Token, value: &AnnotVal, position: usize) -> Result<(), ParseError> {
+    let ordered = matches!(
+        value.attr_type(),
+        AttributeType::Int | AttributeType::U256 | AttributeType::Decimal
+    );
+    let is_range = matches!(operator, Token::Lt | Token::Lte | Token::Gt | Token::Gte);
+    if is_range && !ordered {
+        return Err(ParseError::type_error(
+            position,
+            alloc::format!(
+                "{} values have no ordering — only i32, u256 and dec support < <= > >=",
+                value.attr_type().name(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// User attribute names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, and never
+/// one of the language's own words.
+///
+/// The charset is the lexer's business; what is left is the length cap and the
+/// reserved names. Type tags are only tags in front of a `(`, so a bare `str`
+/// arrives here as an ordinary name and has to be rejected by hand.
+fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
+    if name.len() > limits::MAX_ATTRIBUTE_NAME_BYTES {
+        return Err(ParseError::syntax(
+            position,
+            "attribute names are limited to 32 bytes",
+        ));
+    }
+    if let Some(tag) = TypeTag::from_name(name) {
+        return Err(ParseError::syntax(
+            position,
+            alloc::format!(
+                "{} is a type name and cannot be an attribute name",
+                tag.name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a `$name` to its built-in field.
+///
+/// Names are case-sensitive, like every other attribute. Fields the spec lists
+/// but this version cannot serve get their own message, so a client can tell
+/// "not yet" from "no such thing".
+fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError> {
+    match name {
+        "owner" => Ok(BuiltIn::Owner),
+        "creator" => Ok(BuiltIn::Creator),
+        "key" => Ok(BuiltIn::Key),
+        "expiresAt" => Ok(BuiltIn::ExpiresAt),
+        "createdAt" => Ok(BuiltIn::CreatedAt),
+        "contentType" => Ok(BuiltIn::ContentType),
+
+        "updatedAt" => Err(ParseError::type_error(
+            position,
+            "$updatedAt is not queryable — it is returned by projections only",
+        )),
+        "creationFlags" => Err(ParseError::type_error(
+            position,
+            "$creationFlags is not queryable — it is returned by projections only",
+        )),
+        "payload" => Err(ParseError::type_error(
+            position,
+            "$payload is not queryable — bytes values carry no index",
+        )),
+
+        // The pre-spec spellings, named so an old query says what to change.
+        "expiration" => Err(ParseError::type_error(
+            position,
+            "unknown system attribute $expiration — it is now $expiresAt",
+        )),
+        "createdAtBlock" => Err(ParseError::type_error(
+            position,
+            "unknown system attribute $createdAtBlock — it is now $createdAt",
+        )),
+
+        _ => Err(ParseError::type_error(
+            position,
+            alloc::format!(
+                "unknown system attribute ${name} — expected $key, $owner, $creator, \
+                 $expiresAt, $createdAt or $contentType"
+            ),
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    use alloc::format;
+    use alloc::string::ToString;
 
-    fn nev(vals: Vec<AnnotVal>) -> NonEmptyVec<AnnotVal> {
-        NonEmptyVec::from_vec(vals).unwrap()
+    fn user(name: &str) -> AnnotKey {
+        AnnotKey::User(name.to_string())
     }
 
-    #[test]
-    fn all_selectors() {
-        assert_eq!(parse("*").unwrap(), Query::All);
-        assert_eq!(parse("$all").unwrap(), Query::All);
-        assert!(parse("$all && a = 1").is_err()); // not valid mid-expression
+    fn built_in(field: BuiltIn) -> AnnotKey {
+        AnnotKey::BuiltIn(field)
     }
 
+    /// The error kind a bad query produces.
+    fn kind_of(query: &str) -> ParseErrorKind {
+        parse(query).unwrap_err().kind
+    }
+
+    fn addr_hex(byte: &str) -> String {
+        format!("0x{}", byte.repeat(20))
+    }
+
+    fn word_hex(byte: &str) -> String {
+        format!("0x{}", byte.repeat(32))
+    }
+
+    // ── the typed literals ──────────────────────────────────────────────
+
     #[test]
-    fn user_eq_types_by_literal() {
+    fn every_tag_parses_to_its_own_type() {
         assert_eq!(
-            parse("color = \"blue\"").unwrap(),
+            parse("level = i32(10)").unwrap(),
             Query::Eq {
-                key: AnnotKey::User("color".to_string()),
-                value: AnnotVal::Str("blue".into()),
+                key: user("level"),
+                value: AttributeValue::Int(10),
             }
         );
         assert_eq!(
-            parse("age = 42").unwrap(),
+            parse("balance = u256(1000000)").unwrap(),
             Query::Eq {
-                key: AnnotKey::User("age".to_string()),
-                value: AnnotVal::u256_from_u64(42),
+                key: user("balance"),
+                value: AttributeValue::u256_from_u64(1_000_000),
             }
         );
-    }
-
-    #[test]
-    fn builtin_owner_takes_address() {
-        let addr = "0x1111111111111111111111111111111111111111";
         assert_eq!(
-            parse(&alloc::format!("$owner = {addr}")).unwrap(),
+            parse("name = str('Bob')").unwrap(),
             Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                value: AnnotVal::EthereumAddress([0x11; 20]),
+                key: user("name"),
+                value: AttributeValue::Str("Bob".into()),
             }
         );
-        // Wrong literal type for a built-in is a parse error.
-        assert!(parse("$owner = 42").is_err());
-        assert!(parse("$expiration = \"foo\"").is_err());
-    }
-
-    #[test]
-    fn builtin_key_accepts_hex_and_string() {
-        let k = alloc::format!("0x{}", "ab".repeat(32)); // 64 hex
-        let want = Query::Eq {
-            key: AnnotKey::BuiltIn(BuiltIn::Key),
-            value: AnnotVal::EntityKey([0xab; 32]),
-        };
-        assert_eq!(parse(&alloc::format!("$key = {k}")).unwrap(), want);
-        assert_eq!(parse(&alloc::format!("$key = \"{k}\"")).unwrap(), want);
-    }
-
-    #[test]
-    fn expiration_number_is_uint() {
         assert_eq!(
-            parse("$expiration = 100").unwrap(),
+            parse("flagged = true").unwrap(),
             Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-                value: AnnotVal::u256_from_u64(100),
+                key: user("flagged"),
+                value: AttributeValue::Bool(true),
             }
         );
-    }
-
-    #[test]
-    fn in_and_not_in() {
         assert_eq!(
-            parse("color IN (\"a\" \"b\")").unwrap(),
-            Query::In {
-                key: AnnotKey::User("color".to_string()),
-                values: nev(vec![AnnotVal::Str("a".into()), AnnotVal::Str("b".into())]),
+            parse("flagged = false").unwrap(),
+            Query::Eq {
+                key: user("flagged"),
+                value: AttributeValue::Bool(false),
             }
         );
         assert!(matches!(
-            parse("color NOT IN (\"a\")").unwrap(),
-            Query::NotIn { .. }
-        ));
-        assert!(parse("color IN ()").is_err());
-    }
-
-    #[test]
-    fn ranges_drop_mode_and_reject_unordered() {
-        assert_eq!(
-            parse("$expiration > 50").unwrap(),
-            Query::Gt {
-                key: AnnotKey::BuiltIn(BuiltIn::Expiration),
-                value: AnnotVal::u256_from_u64(50),
-            }
-        );
-        assert!(matches!(parse("n <= 9").unwrap(), Query::Lte { .. }));
-        // No ordering on addresses / keys.
-        let addr = "0x2222222222222222222222222222222222222222";
-        assert!(parse(&alloc::format!("$owner > {addr}")).is_err());
-    }
-
-    #[test]
-    fn glob_strips_star_and_is_string_only() {
-        assert_eq!(
-            parse("name ~ \"pre*\"").unwrap(),
-            Query::Glob {
-                key: AnnotKey::User("name".to_string()),
-                value: AnnotVal::Str("pre".into()),
-            }
-        );
-        assert!(matches!(
-            parse("name !~ \"p*\"").unwrap(),
-            Query::NotGlob { .. }
-        ));
-        assert!(parse("name ~ \"nostar\"").is_err()); // must end with '*'
-        assert!(parse("$expiration ~ \"x*\"").is_err()); // not string-valued
-    }
-
-    #[test]
-    fn boolean_structure_and_precedence() {
-        // AND binds tighter than OR: `a=1 || b=2 && c=3` → a=1 OR (b=2 AND c=3).
-        let q = parse("a = 1 || b = 2 && c = 3").unwrap();
-        assert!(matches!(q, Query::Or(_, rhs) if matches!(*rhs, Query::And(_, _))));
-        assert!(matches!(parse("NOT (a = 1)").unwrap(), Query::Not(_)));
-        assert!(matches!(parse("!(a = 1)").unwrap(), Query::Not(_)));
-        // NOT requires parens.
-        assert!(parse("NOT a = 1").is_err());
-    }
-
-    #[test]
-    fn lexer_errors_surface_with_positions() {
-        assert!(parse("\"unterminated").is_err());
-        assert!(parse("a = 0xabc").is_err()); // hex not 40 or 64
-        assert!(parse("$bogus = 1").is_err()); // unknown built-in
-        let e = parse("a = @").unwrap_err();
-        assert!(e.position.is_some());
-    }
-
-    #[test]
-    fn neq_and_every_range_op() {
-        assert!(matches!(parse("a != 1").unwrap(), Query::Neq { .. }));
-        assert!(matches!(parse("a > 1").unwrap(), Query::Gt { .. }));
-        assert!(matches!(parse("a >= 1").unwrap(), Query::Gte { .. }));
-        assert!(matches!(parse("a < 1").unwrap(), Query::Lt { .. }));
-        assert!(matches!(parse("a <= 1").unwrap(), Query::Lte { .. }));
-    }
-
-    #[test]
-    fn boolean_associativity_and_grouping() {
-        // AND tighter than OR, both left-associative.
-        assert!(matches!(
-            parse("a=1 && b=2 || c=3").unwrap(),
-            Query::Or(l, _) if matches!(*l, Query::And(_, _))
-        ));
-        assert!(matches!(
-            parse("a=1 || b=2 || c=3").unwrap(),
-            Query::Or(l, _) if matches!(*l, Query::Or(_, _))
-        ));
-        assert!(matches!(
-            parse("a=1 && b=2 && c=3").unwrap(),
-            Query::And(l, _) if matches!(*l, Query::And(_, _))
-        ));
-        // Parens override precedence.
-        assert!(matches!(
-            parse("(a=1 || b=2) && c=3").unwrap(),
-            Query::And(l, _) if matches!(*l, Query::Or(_, _))
-        ));
-        // Redundant nesting collapses.
-        assert!(matches!(parse("((a = 1))").unwrap(), Query::Eq { .. }));
-        assert!(matches!(
-            parse("NOT (a=1 && b=2)").unwrap(),
-            Query::Not(inner) if matches!(*inner, Query::And(_, _))
-        ));
-    }
-
-    #[test]
-    fn keyword_case_and_operator_aliases() {
-        // `&&`==AND, `||`==OR, `!`==NOT, case-insensitive keywords.
-        assert_eq!(parse("a=1 && b=2").unwrap(), parse("a=1 AND b=2").unwrap());
-        assert_eq!(parse("a=1 && b=2").unwrap(), parse("a=1 and b=2").unwrap());
-        assert_eq!(parse("a=1 || b=2").unwrap(), parse("a=1 Or b=2").unwrap());
-        assert_eq!(parse("!(a=1)").unwrap(), parse("not (a=1)").unwrap());
-        assert_eq!(parse("a in (1)").unwrap(), parse("a IN (1)").unwrap());
-        assert_eq!(
-            parse("a NOT IN (1)").unwrap(),
-            parse("a not in (1)").unwrap()
-        );
-    }
-
-    #[test]
-    fn whitespace_is_insignificant() {
-        assert_eq!(parse("   a   =   1   ").unwrap(), parse("a=1").unwrap());
-        assert_eq!(parse("a=1\t&&\nb=2").unwrap(), parse("a=1 && b=2").unwrap());
-    }
-
-    #[test]
-    fn string_escapes_and_empty() {
-        assert_eq!(
-            parse("x = \"a\\nb\\t\\\"\\\\\"").unwrap(),
+            parse(&format!("parent = key({})", word_hex("ab"))).unwrap(),
             Query::Eq {
-                key: AnnotKey::User("x".to_string()),
-                value: AnnotVal::Str("a\nb\t\"\\".into()),
+                value: AttributeValue::EntityKey(_),
+                ..
             }
-        );
-        assert_eq!(
-            parse("x = \"\"").unwrap(),
+        ));
+        assert!(matches!(
+            parse(&format!("hash = bytes32({})", word_hex("cd"))).unwrap(),
             Query::Eq {
-                key: AnnotKey::User("x".to_string()),
-                value: AnnotVal::Str(String::new()),
+                value: AttributeValue::Bytes32(_),
+                ..
             }
-        );
-        assert!(parse("x = \"bad\\q\"").is_err()); // unknown escape
-        assert!(parse("x = \"trailing\\").is_err()); // trailing backslash
+        ));
+        assert!(matches!(
+            parse(&format!("who = addr({})", addr_hex("ab"))).unwrap(),
+            Query::Eq {
+                value: AttributeValue::EthereumAddress(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("score = dec(3.5)").unwrap(),
+            Query::Eq {
+                value: AttributeValue::Decimal(_),
+                ..
+            }
+        ));
     }
 
+    /// The point of the type system: same name, same digits, different type —
+    /// and therefore a different predicate that can never match the other.
     #[test]
-    fn number_bounds() {
-        assert_eq!(
-            parse("a = 0").unwrap(),
-            Query::Eq {
-                key: AnnotKey::User("a".to_string()),
-                value: AnnotVal::U256([0u8; 32]),
-            }
-        );
-        // u64::MAX parses; one past it is a lex error.
-        assert!(parse(&alloc::format!("a = {}", u64::MAX)).is_ok());
-        assert!(parse("a = 18446744073709551616").is_err());
-    }
-
-    #[test]
-    fn uint_layout_is_big_endian() {
-        let Query::Eq {
-            value: AnnotVal::U256(bytes),
-            ..
-        } = parse("a = 258").unwrap()
+    fn the_same_number_under_two_tags_is_two_different_predicates() {
+        let as_i32 = parse("level = i32(10)").unwrap();
+        let as_u256 = parse("level = u256(10)").unwrap();
+        assert_ne!(as_i32, as_u256);
+        let (Query::Eq { value: left, .. }, Query::Eq { value: right, .. }) = (&as_i32, &as_u256)
         else {
-            panic!("expected uint");
+            panic!("expected two equalities");
         };
-        let mut want = [0u8; 32];
-        want[30] = 0x01; // 258 = 0x0102
-        want[31] = 0x02;
-        assert_eq!(bytes, want);
+        assert_ne!(left.attr_type(), right.attr_type());
+        // And their index bytes differ, so they hash to different buckets.
+        assert_ne!(left.index_bytes(), right.index_bytes());
     }
 
     #[test]
-    fn every_builtin_type_check() {
-        let addr = alloc::format!("0x{}", "cd".repeat(20));
-        let key = alloc::format!("0x{}", "ab".repeat(32));
+    fn a_bare_number_is_not_a_user_value() {
+        // This is the whole reason tags exist: an untagged 10 has no type.
+        let err = parse("level = 10").unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::Type);
+        assert!(err.message.contains("i32(…)"), "{err}");
+        // Same for bare strings.
+        assert_eq!(kind_of("name = 'Bob'"), ParseErrorKind::Type);
+    }
+
+    #[test]
+    fn literal_validation_errors_are_their_own_kind() {
+        assert_eq!(kind_of("level = i32(2147483648)"), ParseErrorKind::Literal);
+        assert_eq!(
+            kind_of("score = dec(0.1234567890123456789)"),
+            ParseErrorKind::Literal
+        );
+        assert_eq!(kind_of("who = addr(0xdead)"), ParseErrorKind::Literal);
+        assert_eq!(kind_of("parent = key(0xdead)"), ParseErrorKind::Literal);
+    }
+
+    // ── the operator × type matrix ──────────────────────────────────────
+
+    #[test]
+    fn ranges_are_allowed_on_the_numeric_types() {
+        for query in [
+            "level > i32(1)",
+            "level >= i32(1)",
+            "level < i32(1)",
+            "level <= i32(1)",
+            "balance > u256(1)",
+            "score >= dec(3.5)",
+        ] {
+            assert!(parse(query).is_ok(), "{query}");
+        }
+    }
+
+    #[test]
+    fn ranges_are_rejected_on_the_unordered_types() {
+        let unordered = [
+            "flagged > true".to_string(),
+            "name > str('a')".to_string(),
+            format!("who > addr({})", addr_hex("ab")),
+            format!("parent > key({})", word_hex("ab")),
+            format!("hash > bytes32({})", word_hex("ab")),
+        ];
+        for query in unordered {
+            let err = parse(&query).unwrap_err();
+            assert_eq!(err.kind, ParseErrorKind::Type, "{query}");
+            assert!(err.message.contains("no ordering"), "{query}: {err}");
+        }
+    }
+
+    #[test]
+    fn startswith_takes_strings_only() {
+        assert_eq!(
+            parse("desc STARTSWITH str('ab')").unwrap(),
+            Query::StartsWith {
+                key: user("desc"),
+                value: AttributeValue::Str("ab".into()),
+            }
+        );
+        // Case-insensitive, like every keyword.
+        assert!(parse("desc startswith str('ab')").is_ok());
+        assert_eq!(kind_of("level STARTSWITH i32(1)"), ParseErrorKind::Type);
+        assert_eq!(kind_of("flagged STARTSWITH true"), ParseErrorKind::Type);
+    }
+
+    // ── system attributes ───────────────────────────────────────────────
+
+    #[test]
+    fn system_attributes_resolve_and_type_check() {
+        assert_eq!(
+            parse(&format!("$owner = addr({})", addr_hex("ab"))).unwrap(),
+            Query::Eq {
+                key: built_in(BuiltIn::Owner),
+                value: AttributeValue::EthereumAddress([0xab; 20]),
+            }
+        );
         assert!(matches!(
-            parse(&alloc::format!("$creator = {addr}")).unwrap(),
+            parse(&format!("$creator = addr({})", addr_hex("cd"))).unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Creator),
-                value: AnnotVal::EthereumAddress(_)
+                ..
             }
         ));
         assert!(matches!(
-            parse("$createdAtBlock = 7").unwrap(),
-            Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::CreatedAtBlock),
-                value: AnnotVal::U256(_)
-            }
-        ));
-        assert!(matches!(
-            parse("$contentType = \"text/plain\"").unwrap(),
-            Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::ContentType),
-                value: AnnotVal::Str(_)
-            }
-        ));
-        assert!(matches!(
-            parse(&alloc::format!("$key = {key}")).unwrap(),
+            parse(&format!("$key = key({})", word_hex("ab"))).unwrap(),
             Query::Eq {
                 key: AnnotKey::BuiltIn(BuiltIn::Key),
-                value: AnnotVal::EntityKey(_)
-            }
-        ));
-        // Each built-in rejects the wrong literal type.
-        assert!(parse("$creator = 5").is_err());
-        assert!(parse("$createdAtBlock = \"x\"").is_err());
-        assert!(parse("$contentType = 5").is_err());
-        assert!(parse("$key = 5").is_err());
-        assert!(parse("$key = \"0xdead\"").is_err()); // short key string
-    }
-
-    #[test]
-    fn user_key_accepts_any_literal() {
-        let addr = alloc::format!("0x{}", "cd".repeat(20));
-        let key = alloc::format!("0x{}", "ab".repeat(32));
-        assert!(matches!(
-            parse(&alloc::format!("who = {addr}")).unwrap(),
-            Query::Eq {
-                value: AnnotVal::EthereumAddress(_),
                 ..
             }
         ));
-        assert!(matches!(
-            parse(&alloc::format!("ref = {key}")).unwrap(),
-            Query::Eq {
-                value: AnnotVal::EntityKey(_),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn in_list_variants() {
-        // Three values, then a single value.
-        assert!(matches!(
-            parse("c IN (1 2 3)").unwrap(),
-            Query::In { values, .. } if values.len() == 3
-        ));
-        assert!(matches!(parse("c IN (1)").unwrap(), Query::In { .. }));
-        // User key accepts a mixed-type list.
-        let addr = alloc::format!("0x{}", "cd".repeat(20));
         assert_eq!(
-            parse(&alloc::format!("m IN (1 \"two\" {addr})")).unwrap(),
-            Query::In {
-                key: AnnotKey::User("m".to_string()),
-                values: nev(vec![
-                    AnnotVal::u256_from_u64(1),
-                    AnnotVal::Str("two".into()),
-                    AnnotVal::EthereumAddress([0xcd; 20]),
-                ]),
+            parse("$contentType = str('text/plain')").unwrap(),
+            Query::Eq {
+                key: built_in(BuiltIn::ContentType),
+                value: AttributeValue::Str("text/plain".into()),
             }
         );
-        // A built-in still type-checks each element.
-        assert!(parse("$expiration IN (1 \"two\")").is_err());
     }
 
     #[test]
-    fn glob_edges() {
-        // Bare `*` → empty prefix (matches any value of that attribute).
+    fn block_heights_take_bare_literals_and_range_freely() {
         assert_eq!(
-            parse("n ~ \"*\"").unwrap(),
-            Query::Glob {
-                key: AnnotKey::User("n".to_string()),
-                value: AnnotVal::Str(String::new()),
+            parse("$expiresAt < 1200000").unwrap(),
+            Query::Lt {
+                key: built_in(BuiltIn::ExpiresAt),
+                value: AttributeValue::u256_from_u64(1_200_000),
             }
         );
-        // Only a single trailing star.
-        assert!(parse("n ~ \"a*b*\"").is_err());
-        // $contentType (a built-in string) supports glob.
         assert!(matches!(
-            parse("$contentType ~ \"text/*\"").unwrap(),
-            Query::Glob {
-                key: AnnotKey::BuiltIn(BuiltIn::ContentType),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn range_on_strings_ok_but_keys_rejected() {
-        assert!(matches!(
-            parse("name >= \"abc\"").unwrap(),
+            parse("$createdAt >= 7").unwrap(),
             Query::Gte {
-                value: AnnotVal::Str(_),
+                key: AnnotKey::BuiltIn(BuiltIn::CreatedAt),
                 ..
             }
         ));
-        let key = alloc::format!("0x{}", "ab".repeat(32));
-        assert!(parse(&alloc::format!("ref < {key}")).is_err());
     }
 
     #[test]
-    fn malformed_and_incomplete_inputs() {
-        assert!(parse("").is_err()); // empty
-        assert!(parse("a =").is_err()); // missing value
-        assert!(parse("= 1").is_err()); // missing key
-        assert!(parse("a").is_err()); // no operator
-        assert!(parse("a = 1 &&").is_err()); // dangling connective
-        assert!(parse("(a = 1").is_err()); // unbalanced paren
-        assert!(parse("a = = 1").is_err()); // double operator
-        assert!(parse("a = 1 b = 2").is_err()); // missing connective
-    }
-
-    #[test]
-    fn any_dollar_term_lexes_parser_resolves_builtins() {
-        // Every `$term` lexes; only the parser rejects unknown / non-field ones,
-        // so adding a future built-in (e.g. `$recipient`) never touches the lexer.
-        let e = parse("$recipient = 5").unwrap_err();
-        assert!(
-            e.position.is_none(),
-            "unknown built-in is a parse error, not a lex error"
+    fn system_attributes_accept_their_quoted_hex_forms() {
+        // The JS SDK spells these as strings.
+        assert_eq!(
+            parse(&format!("$owner = '{}'", addr_hex("ab"))).unwrap(),
+            parse(&format!("$owner = addr({})", addr_hex("ab"))).unwrap(),
         );
-        // `$all` is the all-selector, not a queryable field.
-        assert!(parse("$all = 1").is_err());
-        // The known built-ins still resolve.
+        assert_eq!(
+            parse(&format!("$key = '{}'", word_hex("ab"))).unwrap(),
+            parse(&format!("$key = key({})", word_hex("ab"))).unwrap(),
+        );
+        assert_eq!(
+            parse("$contentType = 'text/plain'").unwrap(),
+            parse("$contentType = str('text/plain')").unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_system_attribute_rejects_the_wrong_type() {
+        assert_eq!(kind_of("$owner = i32(5)"), ParseErrorKind::Type);
+        assert_eq!(kind_of("$expiresAt = str('soon')"), ParseErrorKind::Type);
+        assert_eq!(kind_of("$contentType = i32(1)"), ParseErrorKind::Type);
+        assert_eq!(kind_of("$key = true"), ParseErrorKind::Type);
+    }
+
+    #[test]
+    fn unqueryable_and_renamed_system_attributes_say_so() {
+        for (query, hint) in [
+            ("$updatedAt > 1", "projections only"),
+            ("$creationFlags = true", "projections only"),
+            ("$payload = str('x')", "no index"),
+            ("$expiration > 1", "$expiresAt"),
+            ("$createdAtBlock > 1", "$createdAt"),
+            ("$nope = true", "unknown system attribute"),
+        ] {
+            let err = parse(query).unwrap_err();
+            assert_eq!(err.kind, ParseErrorKind::Type, "{query}");
+            assert!(err.message.contains(hint), "{query}: {err}");
+        }
+    }
+
+    // ── what this version deliberately leaves out ───────────────────────
+
+    #[test]
+    fn cut_operators_name_their_replacement() {
+        let err = parse("level != i32(10)").unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::Type);
+        assert!(err.message.contains("NOT (attr = value)"), "{err}");
+
+        let err = parse("exists(reviewedBy)").unwrap_err();
+        assert!(err.message.contains("presence"), "{err}");
+
+        let err = parse("typeof(level) = i32").unwrap_err();
+        assert!(err.message.contains("not supported"), "{err}");
+    }
+
+    #[test]
+    fn the_removed_symbol_operators_are_gone() {
+        for query in [
+            "a = true && b = true",
+            "a = true || b = true",
+            "!(a = true)",
+            "name ~ 'ab*'",
+        ] {
+            assert!(parse(query).is_err(), "{query}");
+        }
+        // IN is gone too — write it as an OR chain.
+        assert!(parse("color IN (str('a') str('b'))").is_err());
+    }
+
+    // ── boolean structure ───────────────────────────────────────────────
+
+    #[test]
+    fn precedence_is_not_then_and_then_or() {
+        // AND binds tighter than OR.
         assert!(matches!(
-            parse("$owner = 0x1111111111111111111111111111111111111111").unwrap(),
-            Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                ..
-            }
+            parse("a = true OR b = true AND c = true").unwrap(),
+            Query::Or(_, right) if matches!(*right, Query::And(_, _))
         ));
+        // NOT binds tighter than AND, and needs no parentheses.
+        assert!(matches!(
+            parse("NOT a = true AND b = true").unwrap(),
+            Query::And(left, _) if matches!(*left, Query::Not(_))
+        ));
+        // Parentheses override.
+        assert!(matches!(
+            parse("(a = true OR b = true) AND c = true").unwrap(),
+            Query::And(left, _) if matches!(*left, Query::Or(_, _))
+        ));
+    }
+
+    #[test]
+    fn connectives_are_left_associative() {
+        assert!(matches!(
+            parse("a = true AND b = true AND c = true").unwrap(),
+            Query::And(left, _) if matches!(*left, Query::And(_, _))
+        ));
+        assert!(matches!(
+            parse("a = true OR b = true OR c = true").unwrap(),
+            Query::Or(left, _) if matches!(*left, Query::Or(_, _))
+        ));
+    }
+
+    #[test]
+    fn nested_nots_and_groups_collapse_cleanly() {
+        assert!(matches!(
+            parse("NOT NOT a = true").unwrap(),
+            Query::Not(inner) if matches!(*inner, Query::Not(_))
+        ));
+        assert!(matches!(parse("((a = true))").unwrap(), Query::Eq { .. }));
+    }
+
+    #[test]
+    fn the_star_selector_stands_alone() {
+        assert_eq!(parse("*").unwrap(), Query::All);
+        assert_eq!(parse("  *  ").unwrap(), Query::All);
+        assert!(parse("* AND a = true").is_err());
+        // `$all` was an internal name, not part of the language.
+        assert!(parse("$all").is_err());
+    }
+
+    // ── lexical surface ─────────────────────────────────────────────────
+
+    #[test]
+    fn comments_and_whitespace_are_insignificant() {
+        let spread = "
+            level >= i32(10)   -- at least ten
+        AND name  =  str('Bob') -- and named Bob
+        ";
+        assert_eq!(
+            parse(spread).unwrap(),
+            parse("level >= i32(10) AND name = str('Bob')").unwrap(),
+        );
+    }
+
+    #[test]
+    fn attribute_names_are_case_sensitive() {
+        assert_ne!(
+            parse("Level = true").unwrap(),
+            parse("level = true").unwrap()
+        );
+    }
+
+    #[test]
+    fn reserved_and_type_names_cannot_be_attributes() {
+        // Keywords lex as keywords, so they never reach an attribute position.
+        assert_eq!(kind_of("and = true"), ParseErrorKind::Syntax);
+        assert_eq!(kind_of("not = true"), ParseErrorKind::Syntax);
+        // A type name is only a tag before `(`; bare, it is rejected by name.
+        let err = parse("str = true").unwrap_err();
+        assert!(err.message.contains("type name"), "{err}");
+    }
+
+    #[test]
+    fn over_long_attribute_names_are_rejected() {
+        let long = "a".repeat(limits::MAX_ATTRIBUTE_NAME_BYTES + 1);
+        assert!(parse(&format!("{long} = true")).is_err());
+        let at_limit = "a".repeat(limits::MAX_ATTRIBUTE_NAME_BYTES);
+        assert!(parse(&format!("{at_limit} = true")).is_ok());
+    }
+
+    #[test]
+    fn malformed_queries_are_syntax_errors_with_positions() {
+        for query in [
+            "",
+            "level =",
+            "= i32(1)",
+            "level",
+            "level = i32(1) AND",
+            "(level = i32(1)",
+            "level = = i32(1)",
+            "level = i32(1) name = str('x')",
+        ] {
+            let err = parse(query).unwrap_err();
+            assert_eq!(err.kind, ParseErrorKind::Syntax, "{query}: {err}");
+            assert!(err.position.is_some(), "{query} should carry a position");
+        }
+    }
+
+    // ── limits ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn oversized_queries_are_limit_errors() {
+        let long = format!("name = str('{}')", "a".repeat(limits::MAX_QUERY_BYTES));
+        assert_eq!(parse(&long).unwrap_err().kind, ParseErrorKind::Limit);
+
+        let many = (0..=limits::MAX_PREDICATES)
+            .map(|index| format!("a{index} = true"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" AND ");
+        assert_eq!(parse(&many).unwrap_err().kind, ParseErrorKind::Limit);
+
+        // Deep nesting is bounded, so neither the parser nor the evaluator can
+        // be driven into unbounded recursion from an RPC call.
+        let depth = limits::MAX_NESTING_DEPTH + 1;
+        let deep = format!("{}a = true{}", "(".repeat(depth), ")".repeat(depth));
+        assert_eq!(parse(&deep).unwrap_err().kind, ParseErrorKind::Limit);
+        let nots = format!("{}a = true", "NOT ".repeat(depth));
+        assert_eq!(parse(&nots).unwrap_err().kind, ParseErrorKind::Limit);
+    }
+
+    #[test]
+    fn error_kinds_map_to_the_spec_codes() {
+        assert_eq!(ParseErrorKind::Syntax.rpc_code(), -32001);
+        assert_eq!(ParseErrorKind::Type.rpc_code(), -32002);
+        assert_eq!(ParseErrorKind::Literal.rpc_code(), -32003);
+        assert_eq!(ParseErrorKind::Limit.rpc_code(), -32004);
+    }
+
+    /// The spec's worked example, minus the predicates this version cuts.
+    #[test]
+    fn the_specs_example_query_parses() {
+        let query = format!(
+            "    level       >= i32(10)
+             AND balance     >  u256(1000000)
+             AND score       >= dec(3.5)
+             AND score       <= dec(5)
+             AND name        =  str('Bob')
+             AND desc        STARTSWITH str('ab')
+             AND parent      =  key({})
+             AND hash        =  bytes32({})
+             AND flagged     =  true
+             AND $owner      =  addr({})
+             AND $expiresAt  <  1200000",
+            word_hex("12"),
+            word_hex("45"),
+            addr_hex("ab"),
+        );
+        assert!(parse(&query).is_ok(), "{:?}", parse(&query).unwrap_err());
     }
 }

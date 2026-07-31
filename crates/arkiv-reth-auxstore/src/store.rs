@@ -234,7 +234,6 @@ mod tests {
     use std::collections::HashMap;
 
     use alloy_primitives::Address;
-    use arkiv_interfaces::collections::NonEmptyVec;
     use arkiv_interfaces::entity::AttributeValue;
     use arkiv_interfaces::entity::annotations::{
         ALL, CONTENT_TYPE, CREATED_AT_BLOCK, CREATOR, EXPIRATION, KEY, OWNER,
@@ -419,8 +418,11 @@ mod tests {
         );
     }
 
+    /// `NOT` is the language's only negation, and it is the full complement:
+    /// everything live except the match, including entities that never carried
+    /// the attribute at all.
     #[test]
-    fn neq_is_all_minus_the_match() {
+    fn not_is_all_minus_the_match() {
         let mut store = RethAuxStore::new(MemBackend::default());
         apply(
             &mut store,
@@ -430,15 +432,14 @@ mod tests {
                 create(&sample(0xC0, 1, 100, vec![])),
             ],
         );
-        let q = Query::Neq {
-            key: AnnotKey::BuiltIn(BuiltIn::Owner),
-            value: AnnotVal::EthereumAddress(addr_of(1)),
-        };
+        let q = Query::Not(Box::new(owner_is(addr_of(1))));
         assert_eq!(matching(&mut store, &q), vec![key_of(0xB0)]);
     }
 
+    /// The language dropped `IN`; an `OR` chain is the same query and costs the
+    /// same — a union of the two values' bitmaps.
     #[test]
-    fn in_unions_the_values() {
+    fn or_unions_the_values() {
         let mut store = RethAuxStore::new(MemBackend::default());
         apply(
             &mut store,
@@ -448,13 +449,10 @@ mod tests {
                 create(&sample(0xC0, 3, 100, vec![])),
             ],
         );
-        let q = Query::In {
-            key: AnnotKey::BuiltIn(BuiltIn::Owner),
-            values: NonEmptyVec {
-                first: AnnotVal::EthereumAddress(addr_of(1)),
-                rest: vec![AnnotVal::EthereumAddress(addr_of(3))],
-            },
-        };
+        let q = Query::Or(
+            Box::new(owner_is(addr_of(1))),
+            Box::new(owner_is(addr_of(3))),
+        );
         assert_eq!(matching(&mut store, &q), vec![key_of(0xA0), key_of(0xC0)]);
     }
 
@@ -470,12 +468,12 @@ mod tests {
             ],
         );
         let gt = |n: u64| Query::Gt {
-            key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+            key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
             value: word(n),
         };
         assert_eq!(matching(&mut store, &gt(20)), vec![key_of(0xC0)]);
         let lte = Query::Lte {
-            key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+            key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
             value: word(20),
         };
         assert_eq!(matching(&mut store, &lte), vec![key_of(0xA0), key_of(0xB0)]);
@@ -573,8 +571,11 @@ mod tests {
         );
     }
 
+    /// `STARTSWITH` walks the tier-2 string cascade for the matching values and
+    /// unions their bitmaps. Strings are prefix-indexed, not range-indexed — the
+    /// language has no `<`/`>` for them.
     #[test]
-    fn str_range_and_glob_on_a_user_string_attribute() {
+    fn startswith_on_a_user_string_attribute() {
         let mut store = RethAuxStore::new(MemBackend::default());
         apply(
             &mut store,
@@ -584,18 +585,22 @@ mod tests {
                 create(&sample(0xC0, 1, 100, user_str("name", "blueberry"))),
             ],
         );
-        let gt = Query::Gt {
+        let starts_with = |prefix: &str| Query::StartsWith {
             key: AnnotKey::User("name".into()),
-            value: AnnotVal::Str("apple".into()),
-        };
-        assert_eq!(matching(&mut store, &gt), vec![key_of(0xB0), key_of(0xC0)]);
-        let glob = Query::Glob {
-            key: AnnotKey::User("name".into()),
-            value: AnnotVal::Str("b".into()),
+            value: AnnotVal::Str(prefix.into()),
         };
         assert_eq!(
-            matching(&mut store, &glob),
+            matching(&mut store, &starts_with("b")),
             vec![key_of(0xB0), key_of(0xC0)]
+        );
+        assert_eq!(
+            matching(&mut store, &starts_with("blue")),
+            vec![key_of(0xC0)]
+        );
+        // An empty prefix matches every value of that attribute.
+        assert_eq!(
+            matching(&mut store, &starts_with("")),
+            vec![key_of(0xA0), key_of(0xB0), key_of(0xC0)]
         );
     }
 
@@ -614,7 +619,7 @@ mod tests {
         let and = Query::And(
             Box::new(owner_is(addr_of(1))),
             Box::new(Query::Gt {
-                key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+                key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
                 value: word(20),
             }),
         );
@@ -624,7 +629,7 @@ mod tests {
         let or = Query::Or(
             Box::new(owner_is(addr_of(2))),
             Box::new(Query::Lt {
-                key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+                key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
                 value: word(20),
             }),
         );

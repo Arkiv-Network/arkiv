@@ -78,15 +78,22 @@ pub fn attr_bytes(key: &AnnotKey) -> Vec<u8> {
 
 /// The built-in annotation name for a [`BuiltIn`] field — the `attr` its pair
 /// buckets are keyed under.
+///
+/// The query language's spelling and the indexed byte string are **deliberately
+/// decoupled**: `$expiresAt` is stored under `$expiration`, and `$createdAt`
+/// under `$createdAtBlock`. The annotation bytes go into every bucket's keccak
+/// preimage, so renaming one relocates all of that attribute's on-chain state —
+/// a hard fork. Aligning the two spellings is worth doing, but only batched with
+/// other consensus changes, never as a rename.
 pub fn builtin_attr(field: BuiltIn) -> &'static [u8] {
     use annotations::{CONTENT_TYPE, CREATED_AT_BLOCK, CREATOR, EXPIRATION, KEY, OWNER};
     match field {
         BuiltIn::Owner => OWNER,
         BuiltIn::Creator => CREATOR,
         BuiltIn::Key => KEY,
-        BuiltIn::Expiration => EXPIRATION,
+        BuiltIn::ExpiresAt => EXPIRATION,
         BuiltIn::ContentType => CONTENT_TYPE,
-        BuiltIn::CreatedAtBlock => CREATED_AT_BLOCK,
+        BuiltIn::CreatedAt => CREATED_AT_BLOCK,
     }
 }
 
