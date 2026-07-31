@@ -1,4 +1,4 @@
-//! End-to-end tests: spawn the real `arkiv-node` binary and drive it like a
+//! End-to-end tests: spawn the real `arkiv-reth` binary and drive it like a
 //! client, through the [`arkiv_harness`] node + RPC-client layer.
 //!
 //! Black-box: it exercises the wired executor (decode → apply → commit), the
@@ -24,7 +24,7 @@ use arkiv_harness::{
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
 
-/// Spawn an `arkiv-node --dev` and a signing client for `key`, ready to drive.
+/// Spawn an `arkiv-reth --dev` and a signing client for `key`, ready to drive.
 async fn spawn_dev(
     key: &str,
 ) -> (
@@ -32,7 +32,7 @@ async fn spawn_dev(
     ArkivClient<impl Provider + Clone>,
     Address,
 ) {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-node")).spawn();
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
     let signer: PrivateKeySigner = key.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);

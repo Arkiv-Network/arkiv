@@ -1,4 +1,4 @@
-//! Spawning, killing, and restarting the `arkiv-node` binary for black-box tests.
+//! Spawning, killing, and restarting the `arkiv-reth` binary for black-box tests.
 //!
 //! [`NodeBuilder`] configures a launch; [`Node`] is the running process — killed
 //! and its datadir removed on drop. Ports are assigned by the OS at spawn and
@@ -26,7 +26,7 @@ const LOG_TAIL_LINES: usize = 150;
 /// How often [`Node::wait_ready`] checks the process and its RPC.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How to launch an `arkiv-node`. Ports and the datadir are allocated
+/// How to launch an `arkiv-reth`. Ports and the datadir are allocated
 /// automatically at [`spawn`](NodeBuilder::spawn); everything else has a
 /// dev-friendly default you can override.
 #[derive(Debug, Clone)]
@@ -39,8 +39,8 @@ pub struct NodeBuilder {
 }
 
 impl NodeBuilder {
-    /// A dev-mode node from the `arkiv-node` binary at `binary` (tests pass
-    /// `env!("CARGO_BIN_EXE_arkiv-node")`).
+    /// A dev-mode node from the `arkiv-reth` binary at `binary` (tests pass
+    /// `env!("CARGO_BIN_EXE_arkiv-reth")`).
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
@@ -82,7 +82,7 @@ impl NodeBuilder {
     }
 }
 
-/// A running `arkiv-node`. Killed and its datadir and log removed on drop; a
+/// A running `arkiv-reth`. Killed and its datadir and log removed on drop; a
 /// drop while the thread is panicking prints the tail of the log first.
 pub struct Node {
     config: NodeBuilder,
@@ -162,7 +162,7 @@ impl Node {
         cmd.stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()
-            .expect("spawn arkiv-node binary")
+            .expect("spawn arkiv-reth binary")
     }
 
     /// Print the tail of the node's log to stderr, so a failing test's captured

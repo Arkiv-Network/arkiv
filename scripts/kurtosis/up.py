@@ -2,7 +2,7 @@
 """Build the service images and bring up the devnet in one kurtosis enclave.
 
 Additive runs into the same enclave (kurtosis can't import a remote package from
-a local one): the Arkiv chain (remote ethereum-package = arkiv-node EL +
+a local one): the Arkiv chain (remote ethereum-package = arkiv-reth EL +
 lighthouse CL), the base chain (local package = plain reth --dev), and the
 committer (local package = DA stub that connects the two).
 

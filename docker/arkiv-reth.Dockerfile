@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Builds the dummy arkiv-node (vanilla reth) on a glibc builder and ships it on
+# Builds the dummy arkiv-reth (vanilla reth) on a glibc builder and ships it on
 # debian-slim. Alpine/musl was attempted first but reth-tasks does not compile
 # against musl's sched_param (extra sched_ss_* fields); glibc is reth's
 # supported platform, so we use it.
@@ -37,7 +37,7 @@ FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --locked --bin arkiv-node
+RUN cargo build --release --locked --bin arkiv-reth
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
@@ -47,13 +47,13 @@ RUN apt-get update \
     && useradd -u 714 -m -s /usr/sbin/nologin arkiv \
     && mkdir -p /data && chown arkiv:arkiv /data
 
-COPY --from=builder /build/target/release/arkiv-node /usr/local/bin/arkiv-node
+COPY --from=builder /build/target/release/arkiv-reth /usr/local/bin/arkiv-reth
 # ethpandaops/ethereum-package's reth launcher runs a binary named `reth`;
 # alias it so the image drops into a kurtosis `el_type: reth` participant.
-RUN ln -sf /usr/local/bin/arkiv-node /usr/local/bin/reth
+RUN ln -sf /usr/local/bin/arkiv-reth /usr/local/bin/reth
 
 USER arkiv
 WORKDIR /home/arkiv
 # EL JSON-RPC / WS, Engine API, p2p
 EXPOSE 8545 8546 8551 30303 30303/udp
-ENTRYPOINT ["arkiv-node"]
+ENTRYPOINT ["arkiv-reth"]

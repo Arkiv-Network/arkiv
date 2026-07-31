@@ -9,7 +9,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-# Node lifecycle (spawn/kill/restart of the arkiv-node binary) + a typed RPC
+# Node lifecycle (spawn/kill/restart of the arkiv-reth binary) + a typed RPC
 # client the black-box tests drive nodes through.
 alloy-primitives.workspace = true
 alloy-provider.workspace = true

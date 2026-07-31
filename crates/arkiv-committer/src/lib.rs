@@ -16,7 +16,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "arkiv-committer",
-    about = "Post arkiv-node blocks to the base-chain inbox as DA"
+    about = "Post arkiv-reth blocks to the base-chain inbox as DA"
 )]
 pub struct CommitterConfig {
     /// Sequencer EL JSON-RPC (`eth_*`) — the canonical block source.

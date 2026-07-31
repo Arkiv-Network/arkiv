@@ -34,7 +34,7 @@ fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn state_and_index_survive_kill_and_restart() {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-node")).spawn();
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);

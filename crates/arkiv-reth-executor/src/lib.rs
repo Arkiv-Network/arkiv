@@ -1,6 +1,6 @@
 //! Arkiv execution seam for reth — **no-EVM** executor.
 //!
-//! This crate owns the one component arkiv-node overrides on top of reth's host:
+//! This crate owns the one component arkiv-reth overrides on top of reth's host:
 //! the **executor** (`evm_config`). reth injects it via
 //! `EthereumNode::components().executor(ArkivExecutorBuilder)` — no fork of reth.
 //!
@@ -566,7 +566,7 @@ impl EvmFactory for ArkivEvmFactory {
 }
 
 /// Builds the Arkiv block executor: reth's stock Ethereum block executor driven
-/// by [`ArkivEvmFactory`]. This is the type arkiv-node hands to
+/// by [`ArkivEvmFactory`]. This is the type arkiv-reth hands to
 /// `EthereumNode::components().executor(..)`.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]

@@ -2,12 +2,12 @@
 
 Black-box test harness for the Arkiv database-chain. Stands up a devnet with kurtosis and drives it from the outside.
 
-The EL is a dummy `arkiv-node` (vanilla reth for now), standing in for the real arkiv-op-reth execution client.
+The EL is a dummy `arkiv-reth` (vanilla reth for now), standing in for the real arkiv-op-reth execution client.
 
 ## Layout
 
 ```
-bin/arkiv-node/          dummy EL — vanilla reth wrapper
+bin/arkiv-reth/          dummy EL — vanilla reth wrapper
 bin/arkiv-test-harness/  black-box driver (skeleton)
 bin/arkiv-committer/     committer entrypoint (DA stub — owner Piotr)
 crates/arkiv-harness/    shared config types
@@ -28,7 +28,7 @@ scripts/kurtosis/up.py         # build arkiv-reth image, run devnet
 scripts/kurtosis/down.py       # tear down
 ```
 
-`up.py` brings up the stack in one enclave via additive kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-node EL + lighthouse CL), a plain-reth **base chain** below it (DA / settlement substrate), and the **committer** wired to both. Separate runs because kurtosis can't import a remote package from a local one.
+`up.py` brings up the stack in one enclave via additive kurtosis runs: the **Arkiv chain** (`ethereum-package` — arkiv-reth EL + lighthouse CL), a plain-reth **base chain** below it (DA / settlement substrate), and the **committer** wired to both. Separate runs because kurtosis can't import a remote package from a local one.
 
 The committer (`arkiv-committer`) is **leg-work, not the committer itself** (owner Piotr): it links the frozen DA format (`arkiv-da` — `DA_VERSION || zstd(rlp(block))`), self-checks the round-trip, and heartbeats. The real poll-block → encode → post-to-inbox loop drops into the same slot; it waits on the inbox contract (Contracts) and the functional-MVP go-ahead.
 

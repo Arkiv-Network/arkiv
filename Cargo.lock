@@ -1433,7 +1433,15 @@ name = "arkiv-interfaces"
 version = "0.1.0"
 
 [[package]]
-name = "arkiv-node"
+name = "arkiv-query"
+version = "0.1.0"
+dependencies = [
+ "arkiv-constants",
+ "arkiv-interfaces",
+]
+
+[[package]]
+name = "arkiv-reth"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
@@ -1460,14 +1468,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "arkiv-query"
-version = "0.1.0"
-dependencies = [
- "arkiv-constants",
- "arkiv-interfaces",
 ]
 
 [[package]]
