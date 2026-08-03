@@ -20,19 +20,19 @@ use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
 use arkiv_reth_auxstore::RethAuxStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
 use jsonrpsee::RpcModule;
-use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE};
-use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
+use jsonrpsee::types::ErrorObjectOwned;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
 use serde::{Deserialize, Serialize};
 
+use crate::cursor;
+use crate::errors::{block_unavailable, cursor_error, internal_error, invalid_params, query_error};
 use crate::snapshot::SnapshotAccountCode;
-use crate::view::{
-    EntityData, IncludeData, ResolvedIncludeData, entity_data_from, parse_cursor, ser_u64_hex,
-};
+use crate::view::{EntityData, Projection, Select, entity_data_from, ser_u64_hex};
 
-/// Default page size when a `arkiv_query` request omits it.
+/// Default page size when an `arkiv_query` request omits `limit`.
 const DEFAULT_PAGE_SIZE: u64 = 100;
-/// `resultsPerPage` is clamped to this ceiling.
+/// The largest `limit` the node will serve. Asking for more is an error, not a
+/// silent trim — a caller that thinks it received a full page would page wrong.
 const MAX_PAGE_SIZE: u64 = 200;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
@@ -188,20 +188,26 @@ fn snapshot_for<Provider>(
 where
     Provider: StateProviderFactory + BlockNumReader,
 {
+    let tip = provider
+        .best_block_number()
+        .map_err(|e| internal_error(format!("best_block_number: {e:?}")))?;
+
     match at_block {
         None | Some(BlockNumberOrTag::Latest) => {
-            let n = provider
-                .best_block_number()
-                .map_err(|e| internal_error(format!("best_block_number: {e:?}")))?;
             let state = provider
                 .latest()
                 .map_err(|e| internal_error(format!("latest state: {e:?}")))?;
-            Ok((state, n))
+            Ok((state, tip))
         }
         Some(BlockNumberOrTag::Number(n)) => {
+            // Ahead of the tip is unanswerable; so is a block whose history the
+            // node has pruned. Both are "outside the retained range" to a caller.
+            if n > tip {
+                return Err(block_unavailable(n, tip, "ahead of the chain tip"));
+            }
             let state = provider
                 .history_by_block_number(n)
-                .map_err(|e| internal_error(format!("history_by_block_number({n}): {e:?}")))?;
+                .map_err(|_| block_unavailable(n, tip, "state for this block is not retained"))?;
             Ok((state, n))
         }
         Some(other) => Err(invalid_params(format!(
@@ -227,27 +233,33 @@ fn run_query<Provider>(
 where
     Provider: StateProviderFactory + BlockNumReader,
 {
-    let query =
-        arkiv_query::parse(q).map_err(|e| invalid_params(format!("invalid query: {e:?}")))?;
-    let page = PageParams {
-        page_size: options
-            .results_per_page
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE),
-        cursor: parse_cursor(options.cursor.as_deref())
-            .map_err(|e| invalid_params(e.to_string()))?,
-    };
+    let query = arkiv_query::parse(q).map_err(|e| query_error(&e))?;
+    let projection = Projection::resolve(options.select.as_ref()).map_err(invalid_params)?;
+    let page_size = resolve_limit(options.limit)?;
 
+    // Resolve the block before the cursor: a cursor is bound to the block it was
+    // issued against, so "latest" has to become a number first.
     let (state, block_number) = snapshot_for(provider, options.at_block)?;
+
+    let binding = cursor::binding(q, block_number, &projection.fingerprint());
+    let resume_from = match options.cursor.as_deref() {
+        None => None,
+        Some(text) => Some(cursor::decode(text, binding).map_err(|e| cursor_error(e.message()))?),
+    };
 
     let mut index = RethAuxStore::new(SnapshotAccountCode::new(state));
     let matches = index
-        .evaluate(&live_at(query, block_number), page)
+        .evaluate(
+            &live_at(query, block_number),
+            PageParams {
+                page_size,
+                cursor: resume_from,
+            },
+        )
         .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
 
     // Recover the same snapshot to read the matched entities' bytes.
     let mut store = RethEntityStore::new(CodeBackend::new(index.into_backend()));
-    let inc = ResolvedIncludeData::from_options(options.include_data.as_ref());
     let mut data = Vec::with_capacity(matches.keys.len());
     for key in &matches.keys {
         // A key in the index but missing from the entity store is a store
@@ -261,14 +273,29 @@ where
                     hex_prefixed(key)
                 ))
             })?;
-        data.push(entity_data_from(entity, &inc));
+        data.push(entity_data_from(entity, &projection));
     }
 
     Ok(QueryResponse {
         data,
         block_number,
-        cursor: matches.next_cursor.map(|c| format!("0x{c:x}")),
+        cursor: matches
+            .next_cursor
+            .map(|entity_id| cursor::encode(entity_id, binding)),
     })
+}
+
+/// The page size to serve. Over the ceiling is an error: trimming silently would
+/// leave a caller believing it had seen a full page.
+fn resolve_limit(requested: Option<u64>) -> Result<u64, ErrorObjectOwned> {
+    match requested {
+        None => Ok(DEFAULT_PAGE_SIZE),
+        Some(0) => Err(invalid_params("limit must be at least 1".to_string())),
+        Some(limit) if limit > MAX_PAGE_SIZE => Err(invalid_params(format!(
+            "limit {limit} exceeds the node maximum of {MAX_PAGE_SIZE}"
+        ))),
+        Some(limit) => Ok(limit),
+    }
 }
 
 /// Count the entities matching `request.query` (default `$all`), at the tip or as
@@ -286,9 +313,7 @@ where
     Provider: StateProviderFactory + BlockNumReader,
 {
     let query = match &request.query {
-        Some(text) => {
-            arkiv_query::parse(text).map_err(|e| invalid_params(format!("invalid query: {e:?}")))?
-        }
+        Some(text) => arkiv_query::parse(text).map_err(|e| query_error(&e))?,
         None => Query::All,
     };
     let (state, block_number) = resolve_state(provider, request.block)?;
@@ -340,25 +365,24 @@ where
 
 /// The `arkiv_query` options — the SDK's second positional param.
 ///
-/// The full call is `["<query>", { "atBlock": "0x1a", "resultsPerPage": 100,
-/// "cursor": "0x2a", "includeData": { ... } }]`; the options object and each of
-/// its fields are optional. `resultsPerPage` defaults to [`DEFAULT_PAGE_SIZE`]
-/// and is clamped to `[1, MAX_PAGE_SIZE]`; `cursor` is omitted on the first page
-/// and echoes a prior response's `cursor` to continue; `atBlock` defaults to the
-/// tip.
+/// The full call is `["<query>", { "atBlock": "0x8e1ff", "select": { … },
+/// "limit": "0x64", "cursor": "b64:…" }]`; the options object and each of its
+/// fields are optional.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryOptions {
-    /// Block to evaluate against. `None` / `"latest"` reads head state.
-    /// Hex number (`"0x1a"`) reads historical state. Other tags rejected.
+    /// Block to evaluate against. `None` / `"latest"` reads head state; a hex
+    /// number reads historical state, and must be within the retained range.
     pub at_block: Option<BlockNumberOrTag>,
-    /// Page size, as a JSON number or hex string; clamped to `[1, MAX_PAGE_SIZE]`.
+    /// Fields to return. Absent means [`Projection::default`] — the key alone.
+    pub select: Option<Select>,
+    /// Page size, as a hex quantity or a JSON number. Defaults to
+    /// [`DEFAULT_PAGE_SIZE`]; above [`MAX_PAGE_SIZE`] is an error.
     #[serde(default, deserialize_with = "crate::view::de_u64_flexible")]
-    pub results_per_page: Option<u64>,
-    /// Opaque cursor from the previous page response.
+    pub limit: Option<u64>,
+    /// Opaque cursor from the previous page, bound to that page's query, block
+    /// and projection.
     pub cursor: Option<String>,
-    /// Per-field projection. `None` → include all fields.
-    pub include_data: Option<IncludeData>,
 }
 
 /// The `arkiv_getEntityCount` request: an optional query to filter by (default
@@ -373,7 +397,7 @@ pub struct CountRequest {
 }
 
 /// The `arkiv_query` response: one page of matched entities, the block the
-/// query evaluated against (hex), and a continuation cursor (hex, absent on
+/// query evaluated against (hex), and an opaque continuation cursor (absent on
 /// the last page).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -457,14 +481,6 @@ impl AttributeView {
 
 fn hex_prefixed(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
-}
-
-fn internal_error(message: String) -> ErrorObjectOwned {
-    ErrorObject::owned(INTERNAL_ERROR_CODE, message, None::<()>)
-}
-
-fn invalid_params(message: String) -> ErrorObjectOwned {
-    ErrorObject::owned(INVALID_PARAMS_CODE, message, None::<()>)
 }
 
 #[cfg(test)]

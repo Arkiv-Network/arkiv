@@ -1458,6 +1458,7 @@ dependencies = [
  "arkiv-reth-auxstore",
  "arkiv-reth-entitystore",
  "arkiv-reth-executor",
+ "base64 0.22.1",
  "clap",
  "eyre",
  "jsonrpsee",

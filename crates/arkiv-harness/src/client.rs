@@ -281,15 +281,15 @@ impl<P: Provider> ArkivClient<P> {
             .expect("arkiv_getEntity (historical)")
     }
 
-    /// `arkiv_query` at the tip. `cursor` is the hex string echoed by a prior
-    /// response's `cursor` field.
+    /// `arkiv_query` at the tip, selecting keys only. `cursor` is the opaque
+    /// string echoed by a prior response's `cursor` field.
     pub async fn query(
         &self,
         query: &str,
         page_size: u64,
         cursor: Option<&str>,
     ) -> serde_json::Value {
-        let mut options = serde_json::json!({ "resultsPerPage": page_size });
+        let mut options = serde_json::json!({ "limit": page_size });
         if let Some(cursor) = cursor {
             options["cursor"] = serde_json::json!(cursor);
         }

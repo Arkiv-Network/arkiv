@@ -1,15 +1,13 @@
 # SDK e2e test plan for the typed attribute system
 
-The tests an SDK's CI should run against a live `arkiv-node` (the GHCR image,
+The tests an SDK's CI should run against a live `arkiv-reth` (the GHCR image,
 `--dev` mode, or the kurtosis devnet) to verify the type system across the ABI
-and RPC boundary. This is the *target* surface from the Typed Query Language
-spec; each group is marked with what works on today's `main` so SDK work can
-start on the green parts immediately.
+and RPC boundary.
 
-Legend: **[green]** — passes against `main` today. **[partial]** — works with
-divergences noted. **[blocked]** — needs harness work first (see
-"Query-side gaps" in the audit; mostly the typed-literal parser and the RPC
-option/error surface).
+Status is against the `raz-glm/feat/typed-queries` branch, which implements the
+typed query language and the `arkiv_query` wire surface. Legend: **[green]** —
+passes today. **[partial]** — works with the divergence noted. **[cut]** — not
+in V1 by decision, see `v1-typed-query-scope.md`.
 
 ## A. Write path: one attribute of every type round-trips [green]
 
@@ -72,53 +70,66 @@ not exist afterwards:
 The core of the typed system. For each cell of the spec's matrix, seed
 entities and assert exact match sets:
 
-- **[blocked — typed literals]** `=` / `!=` for all 8 types; `< <= > >=` for
-  `i32` (must span negatives), `u256` (above 2^64), `dec` (negatives +
-  fractional ordering); `STARTSWITH` on `str` (byte prefix, multibyte UTF-8
-  edge: prefix that splits a codepoint matches bytewise)
-- **[blocked]** typed no-cross-match: `level` stored as `i32(10)` on one
-  entity and `u256(10)` on another — `level >= i32(10)` returns only the
-  first; `typeof(level) = i32` distinguishes them
-- **[blocked]** `exists(attr)` — set with any type; `!=` matches only
-  entities that *have* the attribute with that type (not the absent ones —
-  this is a semantic change from today's `$all`-complement)
-- **[blocked]** range op on an equality-only type (`addr`, `key`, `bytes32`,
-  `bool`) and `STARTSWITH` on non-`str` → parse/type error, never empty result
-- **[green with old syntax]** boolean structure: `AND`/`OR`/`NOT` precedence,
-  parens, `NOT` complement over the live set
-- **[partial]** system attributes: `$owner`/`$creator` eq by address,
-  `$expiresAt`/`$createdAt` untagged range (today named
-  `$expiration`/`$createdAtBlock`), `$contentType` eq + prefix, `$key` eq;
-  `$updatedAt` **[blocked — not indexed at all today]**
+- **[green]** `=` for all 8 types; `< <= > >=` for `i32` (must span
+  negatives), `u256` (above 2^64), `dec` (negatives + fractional ordering);
+  `STARTSWITH` on `str` (byte prefix; multibyte UTF-8 edge: a prefix that
+  splits a codepoint matches bytewise)
+- **[green]** typed no-cross-match: `level` stored as `i32(10)` on one entity
+  and `u256(10)` on another — `level >= i32(10)` returns only the first. This
+  falls out of the index addressing, so it needs no runtime check
+- **[green]** range op on an equality-only type (`addr`, `key`, `bytes32`,
+  `bool`) and `STARTSWITH` on non-`str` → type error (−32002), never an empty
+  result
+- **[green]** boolean structure: `AND`/`OR`/`NOT` precedence, parens, `NOT`
+  as the full complement over the live set
+- **[green]** system attributes: `$owner`/`$creator` eq by address (tagged
+  `addr(…)` or a quoted hex string), `$expiresAt`/`$createdAt` untagged range,
+  `$contentType` eq + `STARTSWITH`, `$key` eq
+- **[cut]** `exists(attr)`, `typeof(attr) = T`, and typed `!=`. Write
+  `NOT (attr = value)` for the complement; the rest have stop-gaps in the
+  scope doc. All three are parse errors, so a query never silently means
+  something else
+- **[cut]** `$updatedAt` as a *filter* — it is projectable but not indexed
 
-## E. Projections (`select`) [blocked — today only `includeData` with different names]
+## E. Projections (`select`) [green]
 
-- default is `{key: true}` only
-- each field individually: `owner`, `creator`, `createdAt`, `updatedAt`,
-  `expiresAt`, `contentType` (without payload), `payload`, `creationFlags`
-  **[blocked — flags don't exist in the data model yet]**
-- `attributeSchema` (names + types, no values) **[blocked]**
-- `attributes: true` vs `attributes: {name: true}` subset **[blocked]**
-- response value encodings per type: u256 → hex string, i32 → JSON number,
-  dec → decimal string, bool → JSON bool, addr/key/bytes32 → fixed-width 0x,
-  chain quantities → hex **[blocked — today all values are strings]**
+- **[green]** default is `{key: true}` only — assert nothing else comes back
+- **[green]** each field individually: `owner`, `creator`, `createdAt`,
+  `updatedAt`, `expiresAt`, `contentType` (selectable *without* the payload),
+  `payload`
+- **[green]** `attributeSchema` (names + types, no values)
+- **[green]** `attributes: true` vs `attributes: {name: true}` subset
+- **[green]** response value encodings per type: u256 → hex quantity, i32 →
+  JSON number, dec → decimal string, bool → JSON bool, addr/key/bytes32 →
+  fixed-width 0x, str → string; chain quantities → hex
+- **[green]** an unknown `select` field is rejected rather than ignored, so a
+  typo'd projection fails loudly instead of returning nothing
+- **[cut]** `creationFlags` — entities carry no flags yet; selecting it errors
 
-## F. Pagination [partial]
+## F. Pagination [green]
 
-- full cursor walk at small page size: pages partition the match set, no
-  duplicates/omissions, cursor omitted on the last page **[green]**
-- `limit` above node max → error (today: silent clamp) **[blocked]**
-- malformed cursor, and cursor reused with a different query / block /
-  select → `-32005` **[blocked — cursor is an unbound transparent id today]**
+- **[green]** full cursor walk at a small page size: pages partition the match
+  set, no duplicates or omissions, cursor omitted on the last page
+- **[green]** `limit` above the node max (200), and `limit: 0` → error, not a
+  silent clamp
+- **[green]** malformed cursor, and a cursor reused with a different query /
+  block / select → −32005. Cursors are opaque (`b64:…`) and bound to the
+  request that issued them
 - pagination stability while new entities are being written
 
-## G. Error taxonomy [blocked — today only -32602/-32603, no data]
+## G. Error taxonomy [green]
 
-One test per code asserting code + machine-readable `data`:
-`-32001` parse (with position), `-32002` type error (range op on
-equality-only type), `-32003` literal validation (i32 range, EIP-55, >18 dp),
-`-32004` limits (query length / predicate count / nesting), `-32005` cursor,
-`-32006` block unavailable.
+One test per code, asserting the code **and** the machine-readable `data`
+(parse-side errors carry `position`):
+
+| code | trigger to test |
+|---|---|
+| −32001 | `rank = = u256(1)`, or a removed operator (`&&`, `~`, `!`) |
+| −32002 | `rank != u256(1)`, `team >= str('x')`, `exists(x)`, `$nope = true` |
+| −32003 | `i32(2147483648)`, `dec(0.1234567890123456789)`, a bad EIP-55 checksum |
+| −32004 | query over 8 KiB, over 64 predicates, or nested over 32 deep |
+| −32005 | malformed cursor, or one from a different query/block/select |
+| −32006 | `atBlock` ahead of the tip, or a pruned block |
 
 ## H. Historical reads [green]
 
@@ -136,8 +147,17 @@ equality-only type), `-32003` literal validation (i32 range, EIP-55, >18 dp),
 
 ## Suggested wiring
 
-Run groups A–C and H–I against the released node image now — they pin the ABI
-boundary the SDK builds against. Land groups D–G in the same PRs that close
-the corresponding harness gaps, so the spec surface and its conformance tests
-arrive together. The harness repo's own `bin/arkiv-node/tests/e2e.rs` is the
-reference for spawning and driving a dev node.
+Every group except the **[cut]** items is implementable against the node
+today, so the whole plan can go into SDK CI in one pass rather than being
+staged behind harness work.
+
+Two things worth knowing while writing them:
+
+- `arkiv_getEntity` still answers in an **older shape** than `arkiv_query` —
+  plain-number block fields, and attributes as `{key, valueType, value}` with
+  the value hex-encoded. Only `arkiv_query` follows the spec encodings. If the
+  SDK reads entities through both, expect to normalize; aligning the two is a
+  follow-up.
+- The harness repo's own `bin/arkiv-reth/tests/e2e.rs` is the reference for
+  spawning and driving a dev node, and already covers most of groups D–G — it
+  is the closest thing to a conformance suite to crib from.

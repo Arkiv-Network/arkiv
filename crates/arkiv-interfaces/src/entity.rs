@@ -295,18 +295,21 @@ impl AttributeType {
         !matches!(self, Self::Bytes)
     }
 
-    /// The spec's name for this type.
+    /// The spec's name for this type — the same spelling the query language's
+    /// type tags use (`i32(10)`, `str('Bob')`) and the wire reports in an
+    /// attribute's `type` field, so one vocabulary covers queries, responses and
+    /// error messages.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Bool => "bool",
-            Self::Int => "int",
+            Self::Int => "i32",
             Self::U256 => "u256",
-            Self::Decimal => "decimal",
+            Self::Decimal => "dec",
             Self::Bytes32 => "bytes32",
             Self::Bytes => "bytes",
-            Self::Str => "string",
-            Self::EthereumAddress => "ethereum_address",
-            Self::EntityKey => "entity_key",
+            Self::Str => "str",
+            Self::EthereumAddress => "addr",
+            Self::EntityKey => "key",
         }
     }
 }
