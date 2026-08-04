@@ -285,6 +285,22 @@ pub enum AttributeType {
     EntityKey = 10,
 }
 
+/// Creation-flag bits ([`Entity::creation_flags`], set from a create op).
+///
+/// Bit 0 makes the entity's contents immutable: `patch` reverts. Lifecycle ops
+/// (extend, transfer, delete) still work — only the contents are frozen.
+pub const FLAG_READONLY: u8 = 1 << 0;
+
+/// Bit 1 lets *anyone* extend the entity's expiry, not just the owner. Safe to
+/// open up precisely because extending cannot hurt the owner: the payer gets
+/// nothing and the owner loses nothing.
+pub const FLAG_PERMISSIONLESS_EXTENSION: u8 = 1 << 1;
+
+/// The bits a client may set. Anything outside this mask is a revert, which is
+/// what keeps the six reserved bits genuinely free: a later upgrade can define
+/// one knowing no chain ever accepted it meaning something else.
+pub const CREATION_FLAGS_MASK: u8 = FLAG_READONLY | FLAG_PERMISSIONLESS_EXTENSION;
+
 /// The `typeId` that marks a **tombstone** — "unset this attribute".
 ///
 /// Not an [`AttributeType`]: it tags the *absence* of a value, so
