@@ -89,6 +89,8 @@ alloy_sol_types::sol! {
     interface IEntityRegistry {
         function execute(Operation[] ops) external returns (bytes32[] keys);
         function entityNonce(address owner) external view returns (uint64);
+        function customAttributeNames(bytes32 entityKey) external view returns (Ident32[] names);
+        function attributeTypeId(bytes32 entityKey, Ident32 name) external view returns (uint8 typeId);
         event EntityCreated(bytes32 indexed entityKey, address indexed owner, uint64 expiresAt, uint8 creationFlags);
         event EntityPatched(bytes32 indexed entityKey, address indexed owner);
         event ExpiryExtended(bytes32 indexed entityKey, address indexed owner, uint64 expiresAt);
@@ -130,17 +132,11 @@ pub const OP_EXTEND_EXPIRY: u8 = 3;
 pub const OP_TRANSFER_OWNERSHIP: u8 = 4;
 pub const OP_DELETE: u8 = 5;
 
-/// Creation-flag bits (`Create.creationFlags`).
-///
-/// Bit 0 makes the entity immutable: `patch` reverts. Bit 1 lets *anyone*
-/// extend its expiry, not just the owner. Bits 2–7 are reserved for protocol
-/// upgrades and must be zero.
-pub const FLAG_READONLY: u8 = 1 << 0;
-pub const FLAG_PERMISSIONLESS_EXTENSION: u8 = 1 << 1;
-
-/// The bits a client may actually set — anything outside this mask reverts, so
-/// today's zero-valued reserved bits stay free for a later upgrade to define.
-pub const CREATION_FLAGS_MASK: u8 = FLAG_READONLY | FLAG_PERMISSIONLESS_EXTENSION;
+/// Creation-flag bits. Like the `typeId`s, they belong to the protocol rather
+/// than the ABI, so they live in the spec crate and are re-exported here.
+pub use arkiv_interfaces::entity::{
+    CREATION_FLAGS_MASK, FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY,
+};
 
 /// The attribute type set. The `typeId`s belong to the protocol, not the ABI, so
 /// they live in the spec crate and are re-exported here rather than mirrored.
@@ -178,9 +174,15 @@ mod tests {
     /// from the code:
     ///
     /// ```text
-    /// cast sig 'execute((uint8,bytes)[])'   # 0x49650044
-    /// cast sig 'entityNonce(address)'       # 0x36917bfd
+    /// cast sig 'execute((uint8,bytes)[])'          # 0x49650044
+    /// cast sig 'entityNonce(address)'              # 0x36917bfd
+    /// cast sig 'customAttributeNames(bytes32)'     # 0x58d5418a
+    /// cast sig 'attributeTypeId(bytes32,bytes32)'  # 0x434fb6f3
     /// ```
+    ///
+    /// The `Ident32` parameter contributes its **underlying** `bytes32` to the
+    /// signature, not its UDVT name — which is why the last one reads
+    /// `(bytes32,bytes32)`.
     #[test]
     fn selectors_are_pinned() {
         assert_eq!(
@@ -190,6 +192,14 @@ mod tests {
         assert_eq!(
             IEntityRegistry::entityNonceCall::SELECTOR,
             [0x36, 0x91, 0x7b, 0xfd]
+        );
+        assert_eq!(
+            IEntityRegistry::customAttributeNamesCall::SELECTOR,
+            [0x58, 0xd5, 0x41, 0x8a]
+        );
+        assert_eq!(
+            IEntityRegistry::attributeTypeIdCall::SELECTOR,
+            [0x43, 0x4f, 0xb6, 0xf3]
         );
     }
 

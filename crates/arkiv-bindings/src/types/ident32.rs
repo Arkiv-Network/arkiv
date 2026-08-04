@@ -100,6 +100,22 @@ pub fn validate_system_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32Byte
 }
 
 impl Ident32 {
+    /// The underlying 32-byte word.
+    ///
+    /// `sol!` represents a UDVT as its underlying type wherever it appears in a
+    /// struct or call, so this is what callers outside this crate need to hand
+    /// an `Ident32` to a generated type. The wrapper's own field is private to
+    /// this crate.
+    pub fn into_word(self) -> FixedBytes<32> {
+        self.0
+    }
+
+    /// Wrap a raw word, without validating it — for reading names *back* out of
+    /// ABI data that the node already accepted.
+    pub fn from_word(word: FixedBytes<32>) -> Self {
+        Self(word)
+    }
+
     /// Encode a **system** attribute name (leading `$`), for callers building
     /// `$payload` / `$contentType` triples. [`Ident32::encode`] rejects these
     /// by design — its leading-byte charset is `a-z`.

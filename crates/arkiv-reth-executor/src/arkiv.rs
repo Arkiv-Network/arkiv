@@ -44,8 +44,9 @@ use core::fmt;
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
-use arkiv_bindings::{FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY};
-use arkiv_interfaces::entity::{Attribute, Entity, annotations};
+use arkiv_interfaces::entity::{
+    Attribute, Entity, FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY, annotations,
+};
 use arkiv_interfaces::execution::{
     AttributeMutation, BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
     TransactionExecutor,
