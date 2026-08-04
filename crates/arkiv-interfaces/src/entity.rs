@@ -79,13 +79,17 @@ impl Attribute {
 /// |--------|------------------------|-----------|---------------------|
 /// | 1      | [`Bool`](Self::Bool)   | `bool`    | equality            |
 /// | 2      | [`Int`](Self::Int)     | `int32`   | equality + range    |
-/// | 3      | [`U256`](Self::U256)   | `uint256` | equality + range    |
-/// | 4      | [`Decimal`](Self::Decimal) | `int256` | equality + range |
-/// | 5      | [`Bytes32`](Self::Bytes32) | `bytes32` | equality        |
-/// | 6      | [`Bytes`](Self::Bytes) | `bytes`   | none — system-only  |
-/// | 7      | [`Str`](Self::Str)     | `string`  | equality + prefix   |
-/// | 8      | [`EthereumAddress`](Self::EthereumAddress) | `address` | equality |
-/// | 9      | [`EntityKey`](Self::EntityKey) | `bytes32` | equality    |
+/// | 3      | [`U64`](Self::U64)     | `uint64`  | equality + range    |
+/// | 4      | [`U256`](Self::U256)   | `uint256` | equality + range    |
+/// | 5      | [`Decimal`](Self::Decimal) | `int256` | equality + range |
+/// | 6      | [`Bytes32`](Self::Bytes32) | `bytes32` | equality        |
+/// | 7      | [`Bytes`](Self::Bytes) | `bytes`   | none — system-only  |
+/// | 8      | [`Str`](Self::Str)     | `string`  | equality + prefix   |
+/// | 9      | [`EthereumAddress`](Self::EthereumAddress) | `address` | equality |
+/// | 10     | [`EntityKey`](Self::EntityKey) | `bytes32` | equality    |
+///
+/// `typeId` **0** is not a type: it is the [tombstone](TOMBSTONE_TYPE_ID) tag,
+/// which only ever appears on the wire in a `patch` mutation list.
 ///
 /// Two byte encodings hang off this type, and they are **not** the same thing:
 /// [`encode`](Self::encode) is the canonical *storage* form (natural width, no
@@ -97,6 +101,8 @@ pub enum AttributeValue {
     Bool(bool),
     /// A 32-bit signed integer — the default signed int.
     Int(i32),
+    /// A 64-bit unsigned integer. Block heights, timestamps, counters.
+    U64(u64),
     /// A 256-bit unsigned integer, big-endian.
     U256([u8; 32]),
     /// A fixed-point decimal: a 256-bit **signed** integer (two's complement,
@@ -127,6 +133,7 @@ impl AttributeValue {
         match self {
             Self::Bool(_) => AttributeType::Bool,
             Self::Int(_) => AttributeType::Int,
+            Self::U64(_) => AttributeType::U64,
             Self::U256(_) => AttributeType::U256,
             Self::Decimal(_) => AttributeType::Decimal,
             Self::Bytes32(_) => AttributeType::Bytes32,
@@ -157,6 +164,7 @@ impl AttributeValue {
         match self {
             Self::Bool(b) => Vec::from([u8::from(*b)]),
             Self::Int(n) => Vec::from(n.to_be_bytes()),
+            Self::U64(n) => Vec::from(n.to_be_bytes()),
             Self::U256(w) | Self::Decimal(w) | Self::Bytes32(w) | Self::EntityKey(w) => {
                 Vec::from(*w)
             }
@@ -199,6 +207,12 @@ impl AttributeValue {
                 let mut n = [0u8; 4];
                 n.copy_from_slice(bytes);
                 Ok(Self::Int(i32::from_be_bytes(n)))
+            }
+            AttributeType::U64 => {
+                fixed(8)?;
+                let mut n = [0u8; 8];
+                n.copy_from_slice(bytes);
+                Ok(Self::U64(u64::from_be_bytes(n)))
             }
             AttributeType::U256 => Ok(Self::U256(word()?)),
             AttributeType::Decimal => Ok(Self::Decimal(word()?)),
@@ -256,14 +270,24 @@ const SIGN_BIT_32: u32 = 1 << 31;
 pub enum AttributeType {
     Bool = 1,
     Int = 2,
-    U256 = 3,
-    Decimal = 4,
-    Bytes32 = 5,
-    Bytes = 6,
-    Str = 7,
-    EthereumAddress = 8,
-    EntityKey = 9,
+    U64 = 3,
+    U256 = 4,
+    Decimal = 5,
+    Bytes32 = 6,
+    Bytes = 7,
+    Str = 8,
+    EthereumAddress = 9,
+    EntityKey = 10,
 }
+
+/// The `typeId` that marks a **tombstone** — "unset this attribute".
+///
+/// Not an [`AttributeType`]: it tags the *absence* of a value, so
+/// [`AttributeType::from_id`] rejects it. It is only valid in a `patch`
+/// mutation list, and only carrying a zero-length value (canonical encoding —
+/// anything else is a typed revert). A tombstone in a `create` attribute list
+/// is a revert too: on a fresh entity, "absent" is said by omission.
+pub const TOMBSTONE_TYPE_ID: u8 = 0;
 
 impl AttributeType {
     /// The `typeId` byte.
@@ -276,13 +300,14 @@ impl AttributeType {
         match id {
             1 => Some(Self::Bool),
             2 => Some(Self::Int),
-            3 => Some(Self::U256),
-            4 => Some(Self::Decimal),
-            5 => Some(Self::Bytes32),
-            6 => Some(Self::Bytes),
-            7 => Some(Self::Str),
-            8 => Some(Self::EthereumAddress),
-            9 => Some(Self::EntityKey),
+            3 => Some(Self::U64),
+            4 => Some(Self::U256),
+            5 => Some(Self::Decimal),
+            6 => Some(Self::Bytes32),
+            7 => Some(Self::Bytes),
+            8 => Some(Self::Str),
+            9 => Some(Self::EthereumAddress),
+            10 => Some(Self::EntityKey),
             _ => None,
         }
     }
@@ -300,6 +325,7 @@ impl AttributeType {
         match self {
             Self::Bool => "bool",
             Self::Int => "int",
+            Self::U64 => "u64",
             Self::U256 => "u256",
             Self::Decimal => "decimal",
             Self::Bytes32 => "bytes32",
@@ -370,20 +396,31 @@ mod tests {
         let table = [
             (AttributeType::Bool, 1u8),
             (AttributeType::Int, 2),
-            (AttributeType::U256, 3),
-            (AttributeType::Decimal, 4),
-            (AttributeType::Bytes32, 5),
-            (AttributeType::Bytes, 6),
-            (AttributeType::Str, 7),
-            (AttributeType::EthereumAddress, 8),
-            (AttributeType::EntityKey, 9),
+            (AttributeType::U64, 3),
+            (AttributeType::U256, 4),
+            (AttributeType::Decimal, 5),
+            (AttributeType::Bytes32, 6),
+            (AttributeType::Bytes, 7),
+            (AttributeType::Str, 8),
+            (AttributeType::EthereumAddress, 9),
+            (AttributeType::EntityKey, 10),
         ];
         for (ty, id) in table {
             assert_eq!(ty.id(), id);
             assert_eq!(AttributeType::from_id(id), Some(ty));
         }
-        assert_eq!(AttributeType::from_id(0), None);
-        assert_eq!(AttributeType::from_id(10), None);
+        assert_eq!(AttributeType::from_id(11), None);
+    }
+
+    /// `typeId` 0 is the tombstone tag, never a type — so `from_id` rejects it
+    /// and no value can ever report it.
+    #[test]
+    fn tombstone_tag_is_not_a_type() {
+        assert_eq!(TOMBSTONE_TYPE_ID, 0);
+        assert_eq!(AttributeType::from_id(TOMBSTONE_TYPE_ID), None);
+        for value in samples() {
+            assert_ne!(value.type_id(), TOMBSTONE_TYPE_ID);
+        }
     }
 
     fn samples() -> Vec<AttributeValue> {
@@ -392,6 +429,8 @@ mod tests {
             AttributeValue::Bool(false),
             AttributeValue::Int(-7),
             AttributeValue::Int(i32::MAX),
+            AttributeValue::U64(0),
+            AttributeValue::U64(u64::MAX),
             AttributeValue::U256([0xAB; 32]),
             AttributeValue::Decimal([0xCD; 32]),
             AttributeValue::Bytes32([0x01; 32]),
@@ -463,6 +502,28 @@ mod tests {
         assert!(minus_one.index_bytes() < plus_one.index_bytes());
     }
 
+    /// `u64` is range-indexable, which only works if its index bytes sort
+    /// numerically. Unsigned, so plain big-endian already does — no sign-bit
+    /// bias, unlike [`Int`](AttributeValue::Int).
+    #[test]
+    fn u64_index_bytes_sort_numerically() {
+        let mut ns = [0u64, 1, 255, 256, u64::MAX / 2, u64::MAX];
+        let mut encoded: Vec<Vec<u8>> = ns
+            .iter()
+            .map(|n| AttributeValue::U64(*n).index_bytes())
+            .collect();
+        encoded.sort();
+        ns.sort();
+        let expected: Vec<Vec<u8>> = ns
+            .iter()
+            .map(|n| AttributeValue::U64(*n).index_bytes())
+            .collect();
+        assert_eq!(encoded, expected);
+        // Fixed width, so a bigger number never sorts below a smaller one on length.
+        assert!(AttributeValue::U64(255).index_bytes() < AttributeValue::U64(256).index_bytes());
+        assert_eq!(AttributeValue::U64(1).index_bytes().len(), 8);
+    }
+
     /// Unsigned and unordered types index as their plain storage bytes.
     #[test]
     fn index_bytes_are_storage_bytes_for_unsigned_types() {
@@ -485,7 +546,7 @@ mod tests {
 
     #[test]
     fn only_bytes_is_system_only() {
-        for id in 1..=9u8 {
+        for id in 1..=10u8 {
             let ty = AttributeType::from_id(id).unwrap();
             assert_eq!(ty.is_user_settable(), ty != AttributeType::Bytes);
         }

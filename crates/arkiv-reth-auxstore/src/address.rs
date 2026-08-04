@@ -179,7 +179,11 @@ mod tests {
     // rather than copying what the code now returns — otherwise the vector just
     // restates the bug:
     //
-    //     cast keccak 0x$(printf 'arkiv.pair$all\x00\x07' | xxd -p -c 256)
+    //     cast keccak 0x$(printf 'arkiv.pair$all\x00\x08' | xxd -p -c 256)
+    //
+    // Last re-pinned when the frozen type set (`arkiv-node-api.md` §2) inserted
+    // `u64` at typeId 3 and shifted every tag above it — `Str` 7→8, `U256` 3→4.
+    // The typeId is part of every preimage here, so all five vectors moved.
 
     /// Where the `$all` marker's bucket lives — the bitmap every query with a
     /// negation reads.
@@ -187,7 +191,7 @@ mod tests {
     fn all_marker_bucket_address_is_pinned() {
         assert_eq!(
             pair_address(b"$all", Str, b""),
-            address!("c3ce578d786b69868e8f8a848e6063737f9414a0"),
+            address!("9ba236460280c9c91f261f4b74830f797e48ebe9"),
         );
     }
 
@@ -197,7 +201,7 @@ mod tests {
     fn user_attribute_bucket_address_is_pinned() {
         assert_eq!(
             pair_address(b"color", Str, b"blue"),
-            address!("98edbc9a78ec4b98933a20e9a5d1db0e703338bd"),
+            address!("e338f779d1c294ce7e8ab45d9e4d163d596ee022"),
         );
     }
 
@@ -252,7 +256,7 @@ mod tests {
     fn btree_header_golden() {
         assert_eq!(
             btree_header_address(b"$expiration", U256),
-            address!("64898bb577c7810fef10769b6c168d1bdc590c64"),
+            address!("f9a6d8939a54cdec14e7942c50d2c0dfe62904eb"),
         );
     }
 
@@ -261,7 +265,7 @@ mod tests {
         let header = btree_header_address(b"$expiration", U256);
         assert_eq!(
             btree_node_address(header, 1),
-            address!("28a48678ed4587a96e0e2b69aeead93b9cd38e89"),
+            address!("a44efef67695d6ebf47368563619f09ec6f4b2b4"),
         );
     }
 
@@ -277,7 +281,7 @@ mod tests {
     fn str_level_golden() {
         assert_eq!(
             str_level_address(b"name", Str, b""),
-            address!("dd55be8e46bccf46a682d40d46eaa6b96db429a3"),
+            address!("436d37162beba53707a620bcf6a5435f950bfd6a"),
         );
     }
 

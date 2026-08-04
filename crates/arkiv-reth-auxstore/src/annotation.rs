@@ -36,7 +36,8 @@ pub enum QueryCapabilities {
     /// `$creator`), entity keys (`$key`) — and the `$all` marker.
     Equality,
     /// Equality + range: numerically ordered, so `<`/`>` scan the tier-2 B+ tree.
-    /// The numeric types (`int`, `u256`, `decimal`) and the built-in block numbers.
+    /// The numeric types (`int`, `u64`, `u256`, `decimal`) and the built-in block
+    /// numbers.
     EqualityAndRange,
     /// Equality + prefix: lexically ordered, so `<`/`>` and glob scan the tier-2
     /// cascade. Strings, and the `$contentType` built-in.
@@ -54,9 +55,10 @@ pub fn capabilities_for(attr: &[u8], ty: AttributeType) -> QueryCapabilities {
         EXPIRATION | CREATED_AT_BLOCK => QueryCapabilities::EqualityAndRange,
         CONTENT_TYPE => QueryCapabilities::EqualityAndPrefix,
         _ => match ty {
-            AttributeType::Int | AttributeType::U256 | AttributeType::Decimal => {
-                QueryCapabilities::EqualityAndRange
-            }
+            AttributeType::Int
+            | AttributeType::U64
+            | AttributeType::U256
+            | AttributeType::Decimal => QueryCapabilities::EqualityAndRange,
             AttributeType::Str => QueryCapabilities::EqualityAndPrefix,
             AttributeType::Bytes => QueryCapabilities::None,
             AttributeType::Bool
@@ -137,7 +139,7 @@ mod tests {
     #[test]
     fn builtins_have_fixed_capabilities_regardless_of_value_type() {
         // Every built-in is fixed by name; the type argument is ignored.
-        for id in 1..=9u8 {
+        for id in 1..=10u8 {
             let ty = AttributeType::from_id(id).unwrap();
             assert_eq!(
                 capabilities_for(annotations::OWNER, ty),
@@ -176,6 +178,7 @@ mod tests {
         let expected = [
             (AttributeType::Bool, QueryCapabilities::Equality),
             (AttributeType::Int, QueryCapabilities::EqualityAndRange),
+            (AttributeType::U64, QueryCapabilities::EqualityAndRange),
             (AttributeType::U256, QueryCapabilities::EqualityAndRange),
             (AttributeType::Decimal, QueryCapabilities::EqualityAndRange),
             (AttributeType::Bytes32, QueryCapabilities::Equality),
