@@ -13,7 +13,6 @@
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, hex};
-use arkiv_interfaces::entity::{Attribute, Entity};
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
@@ -160,11 +159,15 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
 
 /// Read one entity by key, at the tip or as of `block`. A past-BTL entity reads
 /// as absent — see [`is_live`].
+///
+/// Answers in the same [`EntityData`] shape as `arkiv_query`, with every field
+/// present ([`Projection::all`]): one entity model, one set of encodings, so an
+/// SDK that reads through both methods decodes them the same way.
 fn read_entity<Provider>(
     provider: &Provider,
     key: B256,
     block: Option<u64>,
-) -> Result<Option<EntityView>, ErrorObjectOwned>
+) -> Result<Option<EntityData>, ErrorObjectOwned>
 where
     Provider: StateProviderFactory + BlockNumReader,
 {
@@ -175,7 +178,7 @@ where
         .map_err(|e| internal_error(format!("get entity: {e:?}")))?;
     Ok(entity
         .filter(|e| is_live(e.expires_at, block_number))
-        .map(EntityView::from_entity))
+        .map(|e| entity_data_from(e, &Projection::all())))
 }
 
 /// A state snapshot for `atBlock` plus the block number it answers for:
@@ -423,96 +426,6 @@ pub struct BlockTimingView {
     pub duration: u64,
 }
 
-/// The JSON shape of an entity: byte fields as `0x`-hex, text fields as strings.
-/// Used by `arkiv_getEntity` only — `arkiv_query` answers with the SDK's
-/// [`EntityData`] shape.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EntityView {
-    pub key: String,
-    pub owner: String,
-    pub creator: String,
-    pub created_at_block: u64,
-    pub last_modified_at_block: u64,
-    pub expires_at: u64,
-    pub content_type: String,
-    pub payload: String,
-    pub attributes: Vec<AttributeView>,
-}
-
-/// The JSON shape of one attribute.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AttributeView {
-    pub key: String,
-    pub value_type: u8,
-    pub value: String,
-}
-
-impl EntityView {
-    fn from_entity(entity: Entity) -> Self {
-        Self {
-            key: hex_prefixed(&entity.key),
-            owner: hex_prefixed(&entity.owner),
-            creator: hex_prefixed(&entity.creator),
-            created_at_block: entity.created_at_block,
-            last_modified_at_block: entity.last_modified_at_block,
-            expires_at: entity.expires_at,
-            content_type: String::from_utf8_lossy(&entity.content_type).into_owned(),
-            payload: hex_prefixed(&entity.payload),
-            attributes: entity
-                .attributes
-                .into_iter()
-                .map(AttributeView::from_attribute)
-                .collect(),
-        }
-    }
-}
-
-impl AttributeView {
-    fn from_attribute(attribute: Attribute) -> Self {
-        Self {
-            key: String::from_utf8_lossy(&attribute.key).into_owned(),
-            value_type: attribute.value.type_id(),
-            value: hex_prefixed(&attribute.value.encode()),
-        }
-    }
-}
-
 fn hex_prefixed(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arkiv_interfaces::entity::AttributeValue;
-    use arkiv_interfaces::entity::CreationFlags;
-
-    #[test]
-    fn entity_view_projects_bytes_as_hex_and_text_as_strings() {
-        let entity = Entity {
-            key: [0x11; 32],
-            owner: [0x22; 20],
-            creator: [0x33; 20],
-            created_at_block: 5,
-            last_modified_at_block: 6,
-            expires_at: 100,
-            creation_flags: CreationFlags::NONE,
-            content_type: b"text/plain".to_vec(),
-            payload: vec![0xDE, 0xAD],
-            attributes: vec![Attribute::new(
-                b"color".to_vec(),
-                AttributeValue::Str("blue".into()),
-            )],
-        };
-        let view = EntityView::from_entity(entity);
-        assert_eq!(view.key, format!("0x{}", "11".repeat(32)));
-        assert_eq!(view.owner, format!("0x{}", "22".repeat(20)));
-        assert_eq!(view.content_type, "text/plain");
-        assert_eq!(view.payload, "0xdead");
-        assert_eq!(view.expires_at, 100);
-        assert_eq!(view.attributes[0].key, "color");
-        assert_eq!(view.attributes[0].value, "0x626c7565"); // "blue"
-    }
 }
