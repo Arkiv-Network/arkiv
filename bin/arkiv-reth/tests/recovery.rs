@@ -11,15 +11,31 @@ use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes};
 use alloy_signer_local::PrivateKeySigner;
-use arkiv_bindings::{Attribute, AttributeValue, Ident32, Mime128, Operation};
+use arkiv_bindings::{Attribute, AttributeValue, Ident32, Operation};
 use arkiv_harness::{
     DEV_CHAIN_ID, DEV_KEY_0, NodeBuilder, connect, derive_entity_key, result_keys,
 };
 
 const READY: Duration = Duration::from_secs(90);
 
-fn text_plain_mime() -> Mime128 {
-    Mime128::encode("text/plain").expect("valid mime")
+/// A create carrying `payload` under `text/plain`, with a purely relative
+/// lifetime — `$contentType` / `$payload` ride in the attribute list now.
+fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
+    attrs.push(
+        Attribute::from_value(
+            Ident32::system("$contentType").unwrap(),
+            &AttributeValue::Str("text/plain".into()),
+        )
+        .unwrap(),
+    );
+    attrs.push(
+        Attribute::from_value(
+            Ident32::system("$payload").unwrap(),
+            &AttributeValue::Bytes(payload.to_vec()),
+        )
+        .unwrap(),
+    );
+    Operation::create(0, 0, min_lifetime, 0, attrs)
 }
 
 fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
@@ -43,22 +59,12 @@ async fn state_and_index_survive_kill_and_restart() {
     // Create two entities with attributes, so there is committed state and index.
     client
         .execute(vec![
-            Operation::create(
-                1000,
-                Bytes::from_static(b"alpha"),
-                text_plain_mime(),
-                attrs(10, "red"),
-            ),
-            Operation::create(
-                1000,
-                Bytes::from_static(b"beta"),
-                text_plain_mime(),
-                attrs(20, "blue"),
-            ),
+            create_op(1000, Bytes::from_static(b"alpha"), attrs(10, "red")),
+            create_op(1000, Bytes::from_static(b"beta"), attrs(20, "blue")),
         ])
         .await;
-    let key0 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
-    let key1 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 1));
+    let key0 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let key1 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 1, 0));
     let created = client.get_entity(key0).await["createdAtBlock"]
         .as_u64()
         .unwrap();
@@ -106,12 +112,7 @@ async fn state_and_index_survive_kill_and_restart() {
         .wait_for_block(tip + 2, Duration::from_secs(30))
         .await;
     client
-        .execute(vec![Operation::create(
-            1000,
-            Bytes::from_static(b"gamma"),
-            text_plain_mime(),
-            vec![],
-        )])
+        .execute(vec![create_op(1000, Bytes::from_static(b"gamma"), vec![])])
         .await;
     assert_eq!(
         client.entity_count(None, None).await,

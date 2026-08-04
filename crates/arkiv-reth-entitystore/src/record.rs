@@ -30,7 +30,14 @@ pub const ENTITY_CODE_MARKER: u8 = 0xFE;
 
 /// Current record format version, written right after the marker. Bump it when the
 /// on-code layout changes; [`decode`] keeps reading older versions.
-pub const RECORD_VERSION: u8 = 0x00;
+///
+/// - `0x00` — the original layout.
+/// - `0x01` — adds `creation_flags`.
+pub const RECORD_VERSION: u8 = 0x01;
+
+/// The original layout, still readable. Records written before creation flags
+/// existed decode with all flags clear, which is exactly what they meant.
+const RECORD_VERSION_V0: u8 = 0x00;
 
 /// Length of the framing prefix: the marker byte followed by the version byte. The
 /// RLP body starts after it.
@@ -64,20 +71,24 @@ pub fn decode(code: &[u8]) -> Result<Entity, RecordError> {
         return Err(RecordError::MissingPrefix);
     };
     match version {
-        RECORD_VERSION => decode_v0(&code[PREFIX_LEN..]),
+        RECORD_VERSION => decode_body::<EntityRlp>(&code[PREFIX_LEN..]),
+        RECORD_VERSION_V0 => decode_body::<EntityRlpV0>(&code[PREFIX_LEN..]),
         v => Err(RecordError::UnsupportedVersion(v)),
     }
 }
 
-/// Decode a version-`0` body. v0 is the canonical layout today, so this is a
-/// straight RLP decode; a future version would parse its own layout here and
-/// migrate the fields up to the canonical [`Entity`].
-fn decode_v0(mut body: &[u8]) -> Result<Entity, RecordError> {
-    let rlp = EntityRlp::decode(&mut body).map_err(RecordError::Rlp)?;
+/// Decode one version's body and migrate it up to the canonical [`Entity`].
+fn decode_body<T: Decodable + IntoEntity>(mut body: &[u8]) -> Result<Entity, RecordError> {
+    let rlp = T::decode(&mut body).map_err(RecordError::Rlp)?;
     if !body.is_empty() {
         return Err(RecordError::TrailingBytes);
     }
     rlp.into_entity()
+}
+
+/// A versioned on-code layout that can be migrated up to an [`Entity`].
+trait IntoEntity {
+    fn into_entity(self) -> Result<Entity, RecordError>;
 }
 
 /// Why decoding an entity record failed.
@@ -142,8 +153,9 @@ impl EntityCodec for RecordCodec {
 
 // ── On-code representation (RLP field order is consensus-critical) ──────
 
-/// The entity as it is RLP-encoded into account code. Field order and types match
-/// db-engine's `EntityRlp` exactly — do not reorder.
+/// The entity as it is RLP-encoded into account code (version `0x01`). Field
+/// order and types are consensus-critical — do not reorder. `creation_flags` is
+/// appended last, so v0 is this layout minus its final field.
 #[derive(RlpEncodable, RlpDecodable)]
 struct EntityRlp {
     payload: Vec<u8>,
@@ -155,6 +167,41 @@ struct EntityRlp {
     key: B256,
     attributes: Vec<AttributeRlp>,
     last_modified_at_block: u64,
+    creation_flags: u8,
+}
+
+/// The version-`0x00` layout: [`EntityRlp`] before creation flags existed.
+/// Read-only — nothing writes it any more.
+#[derive(RlpEncodable, RlpDecodable)]
+struct EntityRlpV0 {
+    payload: Vec<u8>,
+    creator: Address,
+    created_at_block: u64,
+    owner: Address,
+    expires_at: u64,
+    content_type: Vec<u8>,
+    key: B256,
+    attributes: Vec<AttributeRlp>,
+    last_modified_at_block: u64,
+}
+
+impl IntoEntity for EntityRlpV0 {
+    /// Migrate up: a record written before flags existed has none set.
+    fn into_entity(self) -> Result<Entity, RecordError> {
+        EntityRlp {
+            payload: self.payload,
+            creator: self.creator,
+            created_at_block: self.created_at_block,
+            owner: self.owner,
+            expires_at: self.expires_at,
+            content_type: self.content_type,
+            key: self.key,
+            attributes: self.attributes,
+            last_modified_at_block: self.last_modified_at_block,
+            creation_flags: 0,
+        }
+        .into_entity()
+    }
 }
 
 /// An attribute on-code: its `typeId` byte, then the value's canonical storage
@@ -178,9 +225,12 @@ impl EntityRlp {
             key: e.key.into(),
             attributes: e.attributes.iter().map(AttributeRlp::from_attr).collect(),
             last_modified_at_block: e.last_modified_at_block,
+            creation_flags: e.creation_flags,
         }
     }
+}
 
+impl IntoEntity for EntityRlp {
     fn into_entity(self) -> Result<Entity, RecordError> {
         Ok(Entity {
             key: self.key.into(),
@@ -189,6 +239,7 @@ impl EntityRlp {
             created_at_block: self.created_at_block,
             last_modified_at_block: self.last_modified_at_block,
             expires_at: self.expires_at,
+            creation_flags: self.creation_flags,
             content_type: self.content_type,
             payload: self.payload,
             attributes: self
@@ -230,6 +281,7 @@ mod tests {
             created_at_block: 10,
             last_modified_at_block: 20,
             expires_at: 100,
+            creation_flags: 0,
             content_type: b"text/plain".to_vec(),
             payload: b"hello world".to_vec(),
             attributes: vec![
@@ -283,10 +335,10 @@ mod tests {
     #[test]
     fn rejects_unsupported_version() {
         let mut bytes = encode(&sample());
-        bytes[1] = 0x01; // a version this codec doesn't know
+        bytes[1] = 0xFF; // a version this codec doesn't know
         assert!(matches!(
             decode(&bytes),
-            Err(RecordError::UnsupportedVersion(0x01))
+            Err(RecordError::UnsupportedVersion(0xFF))
         ));
     }
 
@@ -329,13 +381,40 @@ mod tests {
                 value: Vec::new(),
             }],
             last_modified_at_block: 0,
+            creation_flags: 0,
         };
         let mut body = Vec::new();
         rlp.encode(&mut body);
         assert!(matches!(
-            decode_v0(&body),
+            decode_body::<EntityRlp>(&body),
             Err(RecordError::UnknownAttributeType(99))
         ));
+    }
+
+    /// A v0 record still decodes, with no flags set — the migration path the
+    /// version byte exists for. Written by hand, since nothing emits v0 now.
+    #[test]
+    fn v0_records_still_decode_with_no_flags() {
+        let e = sample();
+        let v0 = EntityRlpV0 {
+            payload: e.payload.clone(),
+            creator: e.creator.into(),
+            created_at_block: e.created_at_block,
+            owner: e.owner.into(),
+            expires_at: e.expires_at,
+            content_type: e.content_type.clone(),
+            key: e.key.into(),
+            attributes: e.attributes.iter().map(AttributeRlp::from_attr).collect(),
+            last_modified_at_block: e.last_modified_at_block,
+        };
+        let mut code = vec![ENTITY_CODE_MARKER, RECORD_VERSION_V0];
+        v0.encode(&mut code);
+
+        let decoded = decode(&code).expect("v0 record decodes");
+        assert_eq!(decoded.creation_flags, 0);
+        assert_eq!(decoded.key, e.key);
+        assert_eq!(decoded.payload, e.payload);
+        assert_eq!(decoded.attributes, e.attributes);
     }
 
     #[test]

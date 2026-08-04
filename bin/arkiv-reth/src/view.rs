@@ -351,6 +351,7 @@ mod tests {
             created_at_block: 0,
             last_modified_at_block: 0,
             expires_at: 0,
+            creation_flags: 0,
             content_type: Vec::new(),
             payload: Vec::new(),
             attributes: Vec::new(),

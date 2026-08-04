@@ -1,90 +1,146 @@
-//! Vendored Rust bindings for the Arkiv `IEntityRegistry` ABI — trimmed to
-//! the surface the no-EVM node actually implements.
+//! Rust bindings for the Arkiv `IEntityRegistry` ABI — the node's write
+//! surface, and this crate is its source of truth.
 //!
-//! Originally vendored from `IEntityRegistry.sol` in
-//! <https://github.com/Arkiv-Network/arkiv-contracts> (rev `d6ebe18`), which
-//! this crate replaces as the ABI's source of truth: the contract itself is
-//! retired, and the node answers calls to `ARKIV_ADDRESS` directly. Only the
-//! functions the node dispatches are kept — `execute(Operation[])` and
-//! `nonces(address)` — plus the `EntityOperation` event the executor emits
-//! and the business-rule errors. The contract's other view functions
-//! (`commitment`, `entityKey`, `changeSetHash*`, block-node walking, …) were
-//! dropped along with their return structs; the node never implemented them.
+//! The shape here is the **frozen client surface** specified in
+//! `arkiv-architecture`, `planning/260713-followup/arkiv-node-api.md` §3. The
+//! `arkiv-contracts` `IEntityRegistry.sol` this was originally vendored from
+//! is retired — the node answers calls to `ARKIV_ADDRESS` directly — so the
+//! spec document, not a compiled artifact, is what these types track.
 //!
-//! Alongside the `sol!` block, three upstream modules are vendored verbatim
-//! (minus their `serde-wire` feature gates, which nothing here uses):
-//! [`encode`] (the `Operation` / `Attribute` constructors) and the
-//! `Ident32` / `Mime128` validation impls in `types`.
+//! Two shapes carry the whole write path:
 //!
-//! [`tests::selectors_match_compiled_abi`] pins every function selector to the
-//! values from the compiled artifact's `methodIdentifiers`, so a transcription
-//! error here (or an upstream ABI change on re-sync) fails loudly.
+//! - [`Operation`] is a **tagged union**: `operation` selects which payload
+//!   struct ([`Create`], [`Patch`], [`ExtendExpiry`], [`TransferOwnership`],
+//!   [`Delete`]) the `operationData` bytes ABI-decode to. New op types can be
+//!   added without changing `execute`'s signature.
+//! - [`Attribute`] is one `(name, typeId, value)` triple, shared by `create`'s
+//!   attributes and `patch`'s mutations. Its `value` is variable-length
+//!   `bytes`, so the same list carries a `bool` and a 128 KiB `$payload`.
+//!   `typeId = 0` is a [tombstone](arkiv_interfaces::entity::TOMBSTONE_TYPE_ID)
+//!   — "unset this attribute" — valid only in `patch`.
+//!
+//! Alongside the `sol!` block, [`encode`] holds the constructors and the
+//! `AttributeValue` ↔ wire mapping, and `types` the `Ident32` name validation.
+//!
+//! [`tests::selectors_are_pinned`] pins the function selectors, so a
+//! transcription error here — or an unnoticed field reordering, which changes
+//! the selector — fails loudly rather than silently forking the wire.
 
 pub mod encode;
 pub mod types;
 
 alloy_sol_types::sol! {
     #[derive(Debug, PartialEq, Eq, Hash)]
-    type BlockNumber32 is uint32;
-    #[derive(Debug, PartialEq, Eq, Hash)]
     type Ident32 is bytes32;
 
-    #[derive(Debug, Default, PartialEq, Eq)]
-    struct Mime128 {
-        bytes32[4] data;
-    }
-
+    /// The one wire shape shared by `create`'s attributes and `patch`'s
+    /// mutations. `value` is variable-length `bytes` (not a fixed word array),
+    /// which is what lets `$payload` ride in the same list as a `bool`.
     #[derive(Debug, PartialEq, Eq)]
     struct Attribute {
         Ident32 name;
-        uint8 valueType;
-        bytes32[4] value;
+        uint8 typeId;
+        bytes value;
+    }
+
+    /// Tagged union: `operation` selects the payload struct that
+    /// `operationData` ABI-decodes to. New op types extend the protocol
+    /// without changing `execute`'s signature.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Operation {
+        uint8 operation;
+        bytes operationData;
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
-    struct Operation {
-        uint8 operationType;
-        bytes32 entityKey;
-        bytes payload;
-        Mime128 contentType;
+    struct Create {
+        uint128 salt;
+        uint64 expiresAt;
+        uint64 minLifetime;
+        uint8 creationFlags;
         Attribute[] attributes;
-        BlockNumber32 btl;
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Patch {
+        bytes32 entityKey;
+        Attribute[] mutations;
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct ExtendExpiry {
+        bytes32 entityKey;
+        uint64 expiresAt;
+        uint64 minLifetime;
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct TransferOwnership {
+        bytes32 entityKey;
         address newOwner;
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Delete {
+        bytes32 entityKey;
     }
 
     #[sol(rpc)]
     interface IEntityRegistry {
-        function execute(Operation[] ops) external;
-        function nonces(address owner) external view returns (uint32);
-        event EntityOperation(bytes32 indexed entityKey, uint8 indexed operationType, address indexed owner, BlockNumber32 expiresAt, bytes32 entityHash);
+        function execute(Operation[] ops) external returns (bytes32[] keys);
+        function entityNonce(address owner) external view returns (uint64);
+        event EntityCreated(bytes32 indexed entityKey, address indexed owner, uint64 expiresAt, uint8 creationFlags);
+        event EntityPatched(bytes32 indexed entityKey, address indexed owner);
+        event ExpiryExtended(bytes32 indexed entityKey, address indexed owner, uint64 expiresAt);
+        event OwnershipTransferred(bytes32 indexed entityKey, address indexed previousOwner, address indexed newOwner);
+        event EntityDeleted(bytes32 indexed entityKey, address indexed owner);
         error AttributesNotSorted();
         error EmptyBatch();
-        error EntityExpired(bytes32 entityKey, BlockNumber32 expiresAt);
-        error EntityNotExpired(bytes32 entityKey, BlockNumber32 expiresAt);
+        error EmptyMutations(bytes32 entityKey);
+        error EntityExpired(bytes32 entityKey, uint64 expiresAt);
         error EntityNotFound(bytes32 entityKey);
-        error ExpiryNotExtended(bytes32 entityKey, BlockNumber32 newExpiresAt, BlockNumber32 currentExpiresAt);
-        error InvalidOpType(uint8 operationType);
-        error InvalidValueType(Ident32 name, uint8 valueType);
+        error ExpiryNotExtended(bytes32 entityKey, uint64 newExpiresAt, uint64 currentExpiresAt);
+        error ExpiryDeadOnArrival(uint64 target, uint64 currentBlock);
+        error InvalidOpType(uint8 operation);
+        error InvalidValueType(Ident32 name, uint8 typeId);
+        error NonCanonicalOperationData(uint8 operation);
         error NotOwner(bytes32 entityKey, address caller, address owner);
+        error ReadOnlyEntity(bytes32 entityKey);
+        error ReservedCreationFlags(uint8 creationFlags);
+        error SystemAttributeNotWritable(Ident32 name);
+        error TombstoneInCreate(Ident32 name);
+        error TombstoneValueNotEmpty(Ident32 name);
         error TooManyAttributes(uint256 count, uint256 maxCount);
         error TransferToSelf(bytes32 entityKey);
         error TransferToZeroAddress(bytes32 entityKey);
-        error ZeroBtl();
-        // Attribute-name validation errors. Not in the d6ebe18 compiled
-        // artifact, but part of the node ABI the SDK decodes (declared by the
-        // engine's inline interface on kf/merge-db-engine-into-custom-exec).
+        // Attribute-name validation errors, part of the node ABI the SDK decodes.
         error Ident32Empty();
         error Ident32InvalidByte(uint256 position, bytes1 value);
     }
 }
 
-/// Operation type constants (mirrors Entity.sol).
+/// Operation tags — the `operation` byte selecting `operationData`'s struct.
+///
+/// The `expire` op is deliberately absent: expiry is protocol-driven, purged by
+/// a per-block system call rather than a client-submitted operation
+/// (`arkiv-engine.md` §5).
 pub const OP_CREATE: u8 = 1;
-pub const OP_UPDATE: u8 = 2;
-pub const OP_EXTEND: u8 = 3;
-pub const OP_TRANSFER: u8 = 4;
+pub const OP_PATCH: u8 = 2;
+pub const OP_EXTEND_EXPIRY: u8 = 3;
+pub const OP_TRANSFER_OWNERSHIP: u8 = 4;
 pub const OP_DELETE: u8 = 5;
-pub const OP_EXPIRE: u8 = 6;
+
+/// Creation-flag bits (`Create.creationFlags`).
+///
+/// Bit 0 makes the entity immutable: `patch` reverts. Bit 1 lets *anyone*
+/// extend its expiry, not just the owner. Bits 2–7 are reserved for protocol
+/// upgrades and must be zero.
+pub const FLAG_READONLY: u8 = 1 << 0;
+pub const FLAG_PERMISSIONLESS_EXTENSION: u8 = 1 << 1;
+
+/// The bits a client may actually set — anything outside this mask reverts, so
+/// today's zero-valued reserved bits stay free for a later upgrade to define.
+pub const CREATION_FLAGS_MASK: u8 = FLAG_READONLY | FLAG_PERMISSIONLESS_EXTENSION;
 
 /// The attribute type set. The `typeId`s belong to the protocol, not the ABI, so
 /// they live in the spec crate and are re-exported here rather than mirrored.
@@ -95,16 +151,15 @@ pub use arkiv_interfaces::entity::{AttributeType, AttributeValue, DECIMAL_SCALE}
 /// this count; SDKs can validate locally before sending a transaction.
 pub const MAX_ATTRIBUTES: usize = 32;
 
-/// Human-readable label for an operation type, mirroring the `OP_*`
-/// constants. Returns `"UNKNOWN"` for any unrecognised discriminator.
+/// Human-readable label for an operation tag, mirroring the `OP_*` constants.
+/// Returns `"UNKNOWN"` for any unrecognised discriminator.
 pub fn op_type_name(op_type: u8) -> &'static str {
     match op_type {
         OP_CREATE => "CREATE",
-        OP_UPDATE => "UPDATE",
-        OP_EXTEND => "EXTEND",
-        OP_TRANSFER => "TRANSFER",
+        OP_PATCH => "PATCH",
+        OP_EXTEND_EXPIRY => "EXTEND_EXPIRY",
+        OP_TRANSFER_OWNERSHIP => "TRANSFER_OWNERSHIP",
         OP_DELETE => "DELETE",
-        OP_EXPIRE => "EXPIRE",
         _ => "UNKNOWN",
     }
 }
@@ -114,19 +169,53 @@ mod tests {
     use super::*;
     use alloy_sol_types::SolCall;
 
-    /// Selectors as reported by the compiled artifact's `methodIdentifiers`
-    /// (arkiv-contracts rev d6ebe18,
-    /// `out/IEntityRegistry.sol/IEntityRegistry.json`). These are wire
-    /// constants shared with the SDK — they must never drift.
+    /// Wire constants shared with the SDK — they must never drift silently.
+    ///
+    /// A selector is `keccak256(canonicalSignature)[..4]`, and a struct
+    /// parameter contributes its *flattened tuple*, so **reordering or
+    /// retyping any field of [`Operation`] changes these**. That is the drift
+    /// this test exists to catch. Recomputed independently rather than copied
+    /// from the code:
+    ///
+    /// ```text
+    /// cast sig 'execute((uint8,bytes)[])'   # 0x49650044
+    /// cast sig 'entityNonce(address)'       # 0x36917bfd
+    /// ```
     #[test]
-    fn selectors_match_compiled_abi() {
+    fn selectors_are_pinned() {
         assert_eq!(
             IEntityRegistry::executeCall::SELECTOR,
-            [0xba, 0x8c, 0xcf, 0x92]
+            [0x49, 0x65, 0x00, 0x44]
         );
         assert_eq!(
-            IEntityRegistry::noncesCall::SELECTOR,
-            [0x7e, 0xce, 0xbe, 0x00]
+            IEntityRegistry::entityNonceCall::SELECTOR,
+            [0x36, 0x91, 0x7b, 0xfd]
         );
+    }
+
+    /// The op tags are consensus constants: contiguous from 1, and with no
+    /// `expire` — expiry is the protocol's job, not a client op.
+    #[test]
+    fn op_tags_are_pinned() {
+        assert_eq!(
+            [
+                OP_CREATE,
+                OP_PATCH,
+                OP_EXTEND_EXPIRY,
+                OP_TRANSFER_OWNERSHIP,
+                OP_DELETE
+            ],
+            [1, 2, 3, 4, 5]
+        );
+        assert_eq!(op_type_name(6), "UNKNOWN");
+    }
+
+    /// Reserved bits stay reserved: the mask is exactly the two V1 flags, so a
+    /// client setting bits 2–7 is rejected rather than silently accepted.
+    #[test]
+    fn creation_flag_mask_covers_only_the_v1_flags() {
+        assert_eq!(FLAG_READONLY, 0b0000_0001);
+        assert_eq!(FLAG_PERMISSIONLESS_EXTENSION, 0b0000_0010);
+        assert_eq!(CREATION_FLAGS_MASK, 0b0000_0011);
     }
 }

@@ -481,6 +481,7 @@ mod tests {
             created_at_block: 5,
             last_modified_at_block: 6,
             expires_at: 100,
+            creation_flags: 0,
             content_type: b"text/plain".to_vec(),
             payload: vec![0xDE, 0xAD],
             attributes: vec![Attribute::new(

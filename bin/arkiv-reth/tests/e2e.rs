@@ -13,8 +13,7 @@ use alloy_provider::Provider;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use arkiv_bindings::{
-    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Mime128, OP_CREATE,
-    Operation,
+    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Operation,
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, NodeBuilder, connect,
@@ -40,8 +39,38 @@ async fn spawn_dev(
     (node, client, caller)
 }
 
-fn text_plain_mime() -> Mime128 {
-    Mime128::encode("text/plain").expect("valid mime")
+/// A create carrying `payload` under `text/plain`, with a purely relative
+/// lifetime — `$contentType` / `$payload` ride in the attribute list now.
+fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
+    attrs.push(
+        Attribute::from_value(
+            Ident32::system("$contentType").unwrap(),
+            &AttributeValue::Str("text/plain".into()),
+        )
+        .unwrap(),
+    );
+    attrs.push(
+        Attribute::from_value(
+            Ident32::system("$payload").unwrap(),
+            &AttributeValue::Bytes(payload.to_vec()),
+        )
+        .unwrap(),
+    );
+    Operation::create(0, 0, min_lifetime, 0, attrs)
+}
+
+/// A patch that replaces just the payload.
+fn patch_payload(key: B256, payload: Bytes) -> Operation {
+    Operation::patch(
+        key,
+        vec![
+            Attribute::from_value(
+                Ident32::system("$payload").unwrap(),
+                &AttributeValue::Bytes(payload.to_vec()),
+            )
+            .unwrap(),
+        ],
+    )
 }
 
 /// A `rank` (uint) + `team` (string) attribute pair — the two axes the query
@@ -62,12 +91,12 @@ async fn create_then_get_entity_over_a_live_node() {
     assert_eq!(client.chain_id().await, DEV_CHAIN_ID);
 
     // 1) Send a `create` transaction — exactly what an SDK client does.
-    let op = Operation::create(100, Bytes::from_static(b"hello"), text_plain_mime(), vec![]);
+    let op = create_op(100, Bytes::from_static(b"hello"), vec![]);
     let receipt = client.execute(vec![op]).await;
 
     // 2) The key the node minted for this caller's first create (minting nonce 0),
     //    derived independently — the test never learns it from the node.
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
 
     // 2a) The create emits exactly one EntityOperation log at ARKIV_ADDRESS,
     //     carrying the minted key/owner/type — the event surface off-chain
@@ -78,14 +107,14 @@ async fn create_then_get_entity_over_a_live_node() {
         .iter()
         .filter(|log| log.inner.address == ARKIV_ADDRESS)
         .map(|log| {
-            IEntityRegistry::EntityOperation::decode_log(&log.inner)
-                .expect("decode EntityOperation log")
+            IEntityRegistry::EntityCreated::decode_log(&log.inner)
+                .expect("decode EntityCreated log")
         })
         .collect();
-    assert_eq!(events.len(), 1, "one EntityOperation log for one create");
+    assert_eq!(events.len(), 1, "one EntityCreated log for one create");
     assert_eq!(events[0].entityKey, key);
-    assert_eq!(events[0].operationType, OP_CREATE);
     assert_eq!(events[0].owner, caller);
+    assert_eq!(events[0].creationFlags, 0);
 
     // 3) Read it back over arkiv_getEntity and check the projection.
     let entity = client.get_entity(key).await;
@@ -117,15 +146,15 @@ async fn nonces_view_tracks_creates_over_a_live_node() {
     let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
 
     // Fresh accounts have minting nonce 0, whoever asks.
-    assert_eq!(registry.nonces(caller).call().await.unwrap(), 0);
+    assert_eq!(registry.entityNonce(caller).call().await.unwrap(), 0);
     let stranger = Address::repeat_byte(0xCD);
-    assert_eq!(registry.nonces(stranger).call().await.unwrap(), 0);
+    assert_eq!(registry.entityNonce(stranger).call().await.unwrap(), 0);
 
     // Two creates in one batch advance the caller's minting nonce by two.
-    let op = || Operation::create(100, Bytes::from_static(b"n"), text_plain_mime(), vec![]);
+    let op = || create_op(100, Bytes::from_static(b"n"), vec![]);
     client.execute(vec![op(), op()]).await;
-    assert_eq!(registry.nonces(caller).call().await.unwrap(), 2);
-    assert_eq!(registry.nonces(stranger).call().await.unwrap(), 0);
+    assert_eq!(registry.entityNonce(caller).call().await.unwrap(), 2);
+    assert_eq!(registry.entityNonce(stranger).call().await.unwrap(), 0);
 }
 
 /// Business-rule failures surface as ABI-encoded `IEntityRegistry` errors in
@@ -163,7 +192,7 @@ async fn typed_revert_errors_over_a_live_node() {
 
     // Update on a key that was never created → EntityNotFound(key).
     let ghost = B256::repeat_byte(0x42);
-    let update = Operation::update(ghost, Bytes::from_static(b"x"), text_plain_mime(), vec![]);
+    let update = patch_payload(ghost, Bytes::from_static(b"x"));
     let err = revert_of(vec![update], caller).await;
     assert!(
         err.contains(&alloy_primitives::hex::encode(
@@ -173,11 +202,11 @@ async fn typed_revert_errors_over_a_live_node() {
     );
 
     // A stranger updating a real entity → NotOwner(key, caller, owner).
-    let op = Operation::create(100, Bytes::from_static(b"v1"), text_plain_mime(), vec![]);
+    let op = create_op(100, Bytes::from_static(b"v1"), vec![]);
     client.execute(vec![op]).await;
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
     let stranger = Address::repeat_byte(0xCD);
-    let update = Operation::update(key, Bytes::from_static(b"v2"), text_plain_mime(), vec![]);
+    let update = patch_payload(key, Bytes::from_static(b"v2"));
     let err = revert_of(vec![update], stranger).await;
     assert!(
         err.contains(&alloy_primitives::hex::encode(
@@ -200,16 +229,11 @@ async fn typed_revert_errors_over_a_live_node() {
     let mut name = [0u8; 32];
     name[..14].copy_from_slice(b"testInvalidKey");
     let bad_attr = Attribute {
-        name: alloy_primitives::FixedBytes::from(name).into(),
-        valueType: AttributeType::Str.id(),
-        value: [alloy_primitives::FixedBytes::ZERO; 4],
+        name: alloy_primitives::FixedBytes::from(name),
+        typeId: AttributeType::Str.id(),
+        value: Bytes::new(),
     };
-    let create = Operation::create(
-        100,
-        Bytes::from_static(b"x"),
-        text_plain_mime(),
-        vec![bad_attr],
-    );
+    let create = create_op(100, Bytes::from_static(b"x"), vec![bad_attr]);
     let err = revert_of(vec![create], caller).await;
     assert!(
         err.contains(&alloy_primitives::hex::encode(
@@ -234,7 +258,7 @@ async fn estimated_gas_is_accepted_by_the_pool() {
 
     // Create, estimate-then-send — no explicit gas: alloy fills it from
     // eth_estimateGas, exactly like the SDK.
-    let create = Operation::create(1000, payload.clone(), text_plain_mime(), vec![]);
+    let create = create_op(1000, payload.clone(), vec![]);
     let receipt = registry
         .execute(vec![create])
         .send()
@@ -246,8 +270,8 @@ async fn estimated_gas_is_accepted_by_the_pool() {
     assert!(receipt.status(), "create must succeed");
 
     // Update the same entity — the op that used to estimate below the floor.
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
-    let update = Operation::update(key, payload, text_plain_mime(), vec![]);
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let update = patch_payload(key, payload);
     let receipt = registry
         .execute(vec![update])
         .send()
@@ -269,11 +293,11 @@ async fn query_operator_classes_over_a_live_node() {
     let payload = Bytes::from_static(b"x");
     client
         .execute(vec![
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(10, "red")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(20, "red")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(30, "blue")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(40, "blue")),
-            Operation::create(1000, payload.clone(), text_plain_mime(), attrs(50, "green")),
+            create_op(1000, payload.clone(), attrs(10, "red")),
+            create_op(1000, payload.clone(), attrs(20, "red")),
+            create_op(1000, payload.clone(), attrs(30, "blue")),
+            create_op(1000, payload.clone(), attrs(40, "blue")),
+            create_op(1000, payload.clone(), attrs(50, "green")),
         ])
         .await;
 
@@ -281,7 +305,7 @@ async fn query_operator_classes_over_a_live_node() {
         .map(|i| {
             format!(
                 "{:#x}",
-                B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), i))
+                B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), i, 0))
             )
         })
         .collect();
@@ -471,54 +495,39 @@ async fn query_operator_classes_over_a_live_node() {
 async fn write_path_ops_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
-    let key = |i: u32| B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), i));
-    let ks = |i: u32| format!("{:#x}", key(i));
+    let key = |i: u64| B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), i, 0));
+    let ks = |i: u64| format!("{:#x}", key(i));
 
     // Four entities: e0 (update), e1 (extend), e2 (transfer), e3 (delete).
     client
         .execute(vec![
-            Operation::create(
-                1000,
-                Bytes::from_static(b"v1"),
-                text_plain_mime(),
-                attrs(10, "red"),
-            ),
-            Operation::create(
-                1000,
-                Bytes::from_static(b"e1"),
-                text_plain_mime(),
-                attrs(20, "red"),
-            ),
-            Operation::create(
-                1000,
-                Bytes::from_static(b"e2"),
-                text_plain_mime(),
-                attrs(30, "blue"),
-            ),
-            Operation::create(
-                1000,
-                Bytes::from_static(b"e3"),
-                text_plain_mime(),
-                attrs(40, "blue"),
-            ),
+            create_op(1000, Bytes::from_static(b"v1"), attrs(10, "red")),
+            create_op(1000, Bytes::from_static(b"e1"), attrs(20, "red")),
+            create_op(1000, Bytes::from_static(b"e2"), attrs(30, "blue")),
+            create_op(1000, Bytes::from_static(b"e3"), attrs(40, "blue")),
         ])
         .await;
     assert_eq!(client.entity_count(None, None).await, 4);
 
-    // UPDATE e0: new payload + reindexed attributes (rank 10 -> 100).
+    // PATCH e0: new payload + reindexed attributes (rank 10 -> 100).
     client
-        .execute(vec![Operation::update(
-            key(0),
-            Bytes::from_static(b"v2"),
-            text_plain_mime(),
-            attrs(100, "gold"),
-        )])
+        .execute(vec![{
+            let mut muts = attrs(100, "gold");
+            muts.push(
+                Attribute::from_value(
+                    Ident32::system("$payload").unwrap(),
+                    &AttributeValue::Bytes(b"v2".to_vec()),
+                )
+                .unwrap(),
+            );
+            Operation::patch(key(0), muts)
+        }])
         .await;
     let e0 = client.get_entity(key(0)).await;
     assert_eq!(e0["payload"], "0x7632"); // "v2"
     assert!(
         e0["lastModifiedAtBlock"].as_u64().unwrap() > e0["createdAtBlock"].as_u64().unwrap(),
-        "update should advance lastModifiedAtBlock",
+        "patch should advance lastModifiedAtBlock",
     );
     assert_eq!(
         result_keys(&client.query("rank = 100", 100, None).await),
@@ -534,7 +543,9 @@ async fn write_path_ops_over_a_live_node() {
     let before = client.get_entity(key(1)).await["expiresAt"]
         .as_u64()
         .unwrap();
-    client.execute(vec![Operation::extend(key(1), 5000)]).await;
+    client
+        .execute(vec![Operation::extend_expiry(key(1), 0, 5000)])
+        .await;
     let after = client.get_entity(key(1)).await["expiresAt"]
         .as_u64()
         .unwrap();
@@ -545,7 +556,9 @@ async fn write_path_ops_over_a_live_node() {
 
     // TRANSFER e2 to a new owner: it changes owner buckets.
     let bob = Address::from([0xBB; 20]);
-    client.execute(vec![Operation::transfer(key(2), bob)]).await;
+    client
+        .execute(vec![Operation::transfer_ownership(key(2), bob)])
+        .await;
     assert_eq!(
         client.get_entity(key(2)).await["owner"].as_str(),
         Some(format!("{bob:#x}").as_str()),
@@ -589,14 +602,13 @@ async fn write_path_ops_over_a_live_node() {
 async fn historical_reads_and_block_timing_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
     let ks = format!("{key:#x}");
 
     client
-        .execute(vec![Operation::create(
+        .execute(vec![create_op(
             1000,
             Bytes::from_static(b"v1"),
-            text_plain_mime(),
             attrs(10, "red"),
         )])
         .await;
@@ -605,12 +617,17 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
         .unwrap();
 
     client
-        .execute(vec![Operation::update(
-            key,
-            Bytes::from_static(b"v2"),
-            text_plain_mime(),
-            attrs(100, "red"),
-        )])
+        .execute(vec![{
+            let mut muts = attrs(100, "red");
+            muts.push(
+                Attribute::from_value(
+                    Ident32::system("$payload").unwrap(),
+                    &AttributeValue::Bytes(b"v2".to_vec()),
+                )
+                .unwrap(),
+            );
+            Operation::patch(key, muts)
+        }])
         .await;
 
     // The tip reflects the update.
@@ -657,25 +674,20 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
     let stranger = connect(&node.http_url(), stranger_signer);
 
     owner
-        .execute(vec![Operation::create(
-            1000,
-            Bytes::from_static(b"v1"),
-            text_plain_mime(),
-            vec![],
-        )])
+        .execute(vec![create_op(1000, Bytes::from_static(b"v1"), vec![])])
         .await;
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &owner_addr.into_array(), 0));
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &owner_addr.into_array(),
+        0,
+        0,
+    ));
     assert_eq!(owner.get_entity(key).await["payload"], "0x7631"); // "v1"
 
     // The stranger cannot update or delete the owner's entity — both revert.
     assert!(
         !stranger
-            .try_execute(vec![Operation::update(
-                key,
-                Bytes::from_static(b"hacked"),
-                text_plain_mime(),
-                vec![],
-            )])
+            .try_execute(vec![patch_payload(key, Bytes::from_static(b"hacked"))])
             .await,
         "non-owner update must revert",
     );
@@ -695,18 +707,18 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
     assert!(
         !owner
             .try_execute(vec![
-                Operation::create(
-                    1000,
-                    Bytes::from_static(b"batch"),
-                    text_plain_mime(),
-                    vec![]
-                ),
+                create_op(1000, Bytes::from_static(b"batch"), vec![]),
                 Operation::delete(phantom),
             ])
             .await,
         "a batch with a failing op must revert wholesale",
     );
-    let would_be = B256::from(derive_entity_key(DEV_CHAIN_ID, &owner_addr.into_array(), 1));
+    let would_be = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &owner_addr.into_array(),
+        1,
+        0,
+    ));
     assert!(
         owner.get_entity(would_be).await.is_null(),
         "the reverted batch minted no entity",
@@ -716,53 +728,6 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
         1,
         "count unchanged by the reverted batch"
     );
-}
-
-/// The explicit `expire` op: rejected while the entity is live, accepted once the
-/// chain passes its expiry block, after which the entity is gone from reads,
-/// queries, and the count.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn explicit_expire_over_a_live_node() {
-    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
-
-    // A TTL long enough to outlive the checks made while the entity is live, yet
-    // short enough that the expiry block arrives in ~15s at 250ms blocks.
-    client
-        .execute(vec![Operation::create(
-            60,
-            Bytes::from_static(b"ttl"),
-            text_plain_mime(),
-            vec![],
-        )])
-        .await;
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
-    let expires_at = client.get_entity(key).await["expiresAt"].as_u64().unwrap();
-
-    // While live, `expire` reverts.
-    assert!(
-        !client.try_execute(vec![Operation::expire(key)]).await,
-        "a live entity cannot be expired",
-    );
-    assert!(!client.get_entity(key).await.is_null(), "still live");
-
-    // Once the chain passes the expiry block, `expire` succeeds and the entity is
-    // gone everywhere.
-    client
-        .wait_for_block(expires_at + 1, Duration::from_secs(30))
-        .await;
-    assert!(
-        client.try_execute(vec![Operation::expire(key)]).await,
-        "expire past the TTL succeeds",
-    );
-    assert!(
-        client.get_entity(key).await.is_null(),
-        "expired entity reads null"
-    );
-    assert!(
-        !result_keys(&client.query("*", 100, None).await).contains(&format!("{key:#x}")),
-        "expired entity leaves queries",
-    );
-    assert_eq!(client.entity_count(None, None).await, 0);
 }
 
 /// A lapsed BTL hides an entity from every read *without* an explicit `expire`
@@ -775,14 +740,9 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
     // A TTL long enough to outlive the liveness check below, yet short enough
     // that the expiry block arrives in ~15s at 250ms blocks.
     client
-        .execute(vec![Operation::create(
-            60,
-            Bytes::from_static(b"ttl"),
-            text_plain_mime(),
-            vec![],
-        )])
+        .execute(vec![create_op(60, Bytes::from_static(b"ttl"), vec![])])
         .await;
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
+    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
     let expires_at = client.get_entity(key).await["expiresAt"].as_u64().unwrap();
     assert_eq!(
         client.entity_count(None, None).await,

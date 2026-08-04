@@ -19,8 +19,8 @@
 //!   calldata is decoded to entity [`Op`]s and applied by [`ArkivExecutor`] over a
 //!   reth-backed entity store, returning the account diff reth commits (plus the
 //!   sender's gas charge) — see [`arkiv_transact`]. The one view function,
-//!   `nonces(address)`, is answered directly from the minting-nonce slot — see
-//!   [`arkiv_nonces_call`].
+//!   `entityNonce(address)`, is answered directly from the minting-nonce slot —
+//!   see [`arkiv_entity_nonce_call`].
 //! - **Contract creation** — rejected (neutered): user programs never execute.
 //!
 //! ## Honest scope
@@ -222,12 +222,15 @@ fn arkiv_transact<DB: Database>(
         }
     };
 
-    // A call to ARKIV_ADDRESS is either the `nonces(address)` view or the
+    // A call to ARKIV_ADDRESS is either the `entityNonce(address)` view or the
     // entity state transition (`execute(Operation[])` — the only other
     // selector `decode_ops` accepts).
     if to == ARKIV_ADDRESS {
-        if tx.data.starts_with(&IEntityRegistry::noncesCall::SELECTOR) {
-            return arkiv_nonces_call(db, &tx);
+        if tx
+            .data
+            .starts_with(&IEntityRegistry::entityNonceCall::SELECTOR)
+        {
+            return arkiv_entity_nonce_call(db, &tx);
         }
         return arkiv_entity_transact(db, block_number, &tx);
     }
@@ -365,30 +368,31 @@ fn arkiv_entity_transact<DB: Database>(
     Ok(ResultAndState::new(result, evm_state))
 }
 
-/// Answer the `nonces(address)` view: the queried owner's entity-key minting
-/// nonce, ABI-encoded as a `uint32`.
+/// Answer the `entityNonce(address)` view: the queried owner's entity-key
+/// minting nonce, ABI-encoded as a `uint64`.
 ///
 /// SDKs `eth_call` this before sending creates to predict the keys the batch
-/// will mint (`derive_entity_key(chain_id, owner, nonce + i)`), so it reads
+/// will mint (`derive_entity_key(chain_id, owner, nonce + i, salt)`), so it reads
 /// the same system-account slot the execute path mints from. The only state
 /// staged is the sender's flat gas charge + EOA nonce bump — meaningless for
 /// an `eth_call` (the diff is discarded) but keeps reth's sender invariants
 /// intact if the call ever arrives as a mined transaction.
-fn arkiv_nonces_call<DB: Database>(
+fn arkiv_entity_nonce_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    let output = match IEntityRegistry::noncesCall::abi_decode_raw(&tx.data[4..]) {
+    let output = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
         Ok(call) => {
             let nonce = ExecutorState::new(db)
                 .read_nonce(call.owner)
                 .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
-            Ok(IEntityRegistry::noncesCall::abi_encode_returns(&nonce))
+            Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(&nonce))
         }
         // Malformed args revert with the standard `Error(string)` payload.
-        Err(e) => {
-            Err(alloy_sol_types::Revert::from(format!("invalid nonces calldata: {e}")).abi_encode())
-        }
+        Err(e) => Err(
+            alloy_sol_types::Revert::from(format!("invalid entityNonce calldata: {e}"))
+                .abi_encode(),
+        ),
     };
 
     // Sender phase — mirrors the plain-transfer accounting.
@@ -443,7 +447,7 @@ fn run_ops<DB: Database>(
     let create_count = ops
         .iter()
         .filter(|o| matches!(o, Op::Create { .. }))
-        .count() as u32;
+        .count() as u64;
     let caller = Address::from(env.caller);
 
     let mut store = RethEntityStore::new(CodeBackend::new(state));
@@ -486,31 +490,50 @@ fn run_ops<DB: Database>(
     }
 }
 
-/// Encode an [`OpEffect`] as the ABI `EntityOperation` log a client indexes. The
-/// entity-hash field is unused for now (`0x0`).
+/// Encode an [`OpEffect`] as the ABI event log a client indexes.
+///
+/// One event per op kind, rather than one generic event with a discriminator:
+/// each carries only the fields that op actually changes, and an indexer can
+/// filter on the topic instead of decoding every entity write to find out
+/// whether it cared.
 fn entity_operation_log(effect: &OpEffect) -> Log {
-    let event = arkiv_bindings::IEntityRegistry::EntityOperation {
-        entityKey: B256::from(effect.key),
-        operationType: op_type_byte(effect.kind),
-        owner: Address::from(effect.owner),
-        expiresAt: effect.expires_at.min(u32::MAX as u64) as u32,
-        entityHash: B256::ZERO,
+    use arkiv_bindings::IEntityRegistry as E;
+    let key = B256::from(effect.key);
+    let owner = Address::from(effect.owner);
+    let data = match effect.kind {
+        OpKind::Create => E::EntityCreated {
+            entityKey: key,
+            owner,
+            expiresAt: effect.expires_at,
+            creationFlags: effect.creation_flags,
+        }
+        .encode_log_data(),
+        OpKind::Patch => E::EntityPatched {
+            entityKey: key,
+            owner,
+        }
+        .encode_log_data(),
+        OpKind::ExtendExpiry => E::ExpiryExtended {
+            entityKey: key,
+            owner,
+            expiresAt: effect.expires_at,
+        }
+        .encode_log_data(),
+        OpKind::Transfer => E::OwnershipTransferred {
+            entityKey: key,
+            previousOwner: Address::from(effect.previous_owner.unwrap_or(effect.owner)),
+            newOwner: owner,
+        }
+        .encode_log_data(),
+        OpKind::Delete => E::EntityDeleted {
+            entityKey: key,
+            owner,
+        }
+        .encode_log_data(),
     };
     Log {
         address: ARKIV_ADDRESS,
-        data: event.encode_log_data(),
-    }
-}
-
-fn op_type_byte(kind: OpKind) -> u8 {
-    use arkiv_bindings::{OP_CREATE, OP_DELETE, OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE};
-    match kind {
-        OpKind::Create => OP_CREATE,
-        OpKind::Update => OP_UPDATE,
-        OpKind::ExtendExpiry => OP_EXTEND,
-        OpKind::Transfer => OP_TRANSFER,
-        OpKind::Delete => OP_DELETE,
-        OpKind::Expire => OP_EXPIRE,
+        data,
     }
 }
 
@@ -596,22 +619,21 @@ mod tests {
     use super::*;
     use alloy_primitives::Bytes;
     use alloy_sol_types::SolCall;
-    use arkiv_bindings::{IEntityRegistry, Mime128, Operation};
+    use arkiv_bindings::{IEntityRegistry, Operation};
     use arkiv_reth_entitystore::decode;
     use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot};
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
-    fn create_calldata(btl: u32, payload: &'static [u8]) -> Bytes {
-        let mime = Mime128 {
-            data: [alloy_primitives::FixedBytes::ZERO; 4],
-        };
+    /// A create with a purely relative lifetime of `min_lifetime` blocks,
+    /// carrying `payload` as the `$payload` triple.
+    fn create_calldata(min_lifetime: u64, payload: &'static [u8]) -> Bytes {
+        let payload_attr = arkiv_bindings::Attribute::from_value(
+            arkiv_bindings::Ident32::system("$payload").unwrap(),
+            &arkiv_interfaces::entity::AttributeValue::Bytes(payload.to_vec()),
+        )
+        .unwrap();
         IEntityRegistry::executeCall {
-            ops: vec![Operation::create(
-                btl,
-                Bytes::from_static(payload),
-                mime,
-                vec![],
-            )],
+            ops: vec![Operation::create(0, 0, min_lifetime, 0, vec![payload_attr])],
         }
         .abi_encode()
         .into()
@@ -642,14 +664,14 @@ mod tests {
         assert!(rs.result.is_success());
 
         // The entity landed at the derived key, decodable, with env-resolved fields.
-        let key = derive_entity_key(1, &[0xAA; 20], 0);
+        let key = derive_entity_key(1, &[0xAA; 20], 0, 0);
         let acc = rs
             .state
             .get(&entity_address(key))
             .expect("entity account in the diff");
         let entity = decode(&acc.info.code.as_ref().unwrap().original_bytes()).unwrap();
         assert_eq!(entity.owner, [0xAA; 20]);
-        assert_eq!(entity.expires_at, 60); // block 10 + btl 50
+        assert_eq!(entity.expires_at, 60); // block 10 + minLifetime 50
         assert_eq!(entity.payload, b"hello");
 
         // The minting nonce advanced to 1 in the system account.
@@ -664,17 +686,16 @@ mod tests {
         let sender = rs.state.get(&alice).expect("sender account");
         assert_eq!(sender.info.nonce, 1);
 
-        // One EntityOperation log was emitted for the create, at ARKIV_ADDRESS.
+        // One EntityCreated log was emitted for the create, at ARKIV_ADDRESS.
         let logs = rs.result.logs();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].address, ARKIV_ADDRESS);
         let event =
-            arkiv_bindings::IEntityRegistry::EntityOperation::decode_log_data(&logs[0].data)
-                .unwrap();
+            arkiv_bindings::IEntityRegistry::EntityCreated::decode_log_data(&logs[0].data).unwrap();
         assert_eq!(event.entityKey, B256::from(key));
-        assert_eq!(event.operationType, arkiv_bindings::OP_CREATE);
         assert_eq!(event.owner, alice);
         assert_eq!(event.expiresAt, 60);
+        assert_eq!(event.creationFlags, 0);
     }
 
     /// A create commits the **index** alongside the entity: the new entity's id (0,
@@ -720,14 +741,16 @@ mod tests {
     }
 
     fn nonces_calldata(owner: Address) -> Bytes {
-        IEntityRegistry::noncesCall { owner }.abi_encode().into()
+        IEntityRegistry::entityNonceCall { owner }
+            .abi_encode()
+            .into()
     }
 
-    /// Decode the `uint32` a successful `nonces(address)` call returned.
-    fn nonce_from(rs: &ResultAndState<HaltReason>) -> u32 {
+    /// Decode the `uint64` a successful `entityNonce(address)` call returned.
+    fn nonce_from(rs: &ResultAndState<HaltReason>) -> u64 {
         assert!(rs.result.is_success());
-        IEntityRegistry::noncesCall::abi_decode_returns(rs.result.output().unwrap())
-            .expect("uint32 return")
+        IEntityRegistry::entityNonceCall::abi_decode_returns(rs.result.output().unwrap())
+            .expect("uint64 return")
     }
 
     /// `nonces(owner)` on a fresh chain answers 0 — and stages nothing beyond
@@ -771,7 +794,7 @@ mod tests {
     fn nonces_call_with_malformed_args_reverts() {
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
-        let mut data = IEntityRegistry::noncesCall::SELECTOR.to_vec();
+        let mut data = IEntityRegistry::entityNonceCall::SELECTOR.to_vec();
         data.extend_from_slice(&[0x01, 0x02]);
         let rs = arkiv_transact(&mut db, 10, arkiv_tx(alice, data.into())).unwrap();
         assert!(!rs.result.is_success());
@@ -791,18 +814,17 @@ mod tests {
             arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
         db.commit(rs.state);
 
-        // An update batch: cheap in the cost model (40k base) but with calldata
+        // A patch batch: cheap in the cost model (40k base) but with calldata
         // whose intrinsic floor exceeds it.
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0));
+        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0, 0));
+        let big_payload = arkiv_bindings::Attribute::from_value(
+            arkiv_bindings::Ident32::system("$payload").unwrap(),
+            // 4k nonzero bytes → floor ≈ 181k
+            &arkiv_interfaces::entity::AttributeValue::Bytes(vec![0xAB; 4_000]),
+        )
+        .unwrap();
         let update = IEntityRegistry::executeCall {
-            ops: vec![Operation::update(
-                key,
-                Bytes::from(vec![0xAB; 4_000]), // 4k nonzero bytes → floor ≈ 181k
-                Mime128 {
-                    data: [alloy_primitives::FixedBytes::ZERO; 4],
-                },
-                vec![],
-            )],
+            ops: vec![Operation::patch(key, vec![big_payload])],
         }
         .abi_encode();
         let floor = intrinsic_gas(&update);

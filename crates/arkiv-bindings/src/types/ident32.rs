@@ -61,7 +61,60 @@ pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> 
     Ok(())
 }
 
+/// The `$` prefix marking a system attribute name.
+const SYSTEM_PREFIX: u8 = b'$';
+
+/// Validate a **system** attribute name (`$payload`, `$contentType`).
+///
+/// System names are protocol-defined, not client-chosen, so no charset applies:
+/// the real names are camelCase (`$contentType`, `$createdAtBlock`), which the
+/// user charset — lowercase, digits, `.-_` — would reject outright. Validating
+/// them against a charset would be theatre anyway, because the set of writable
+/// system names is a **closed allow-list** of exact strings
+/// (`annotations::USER_MANAGED`); anything else is rejected as engine-owned.
+/// That check is strictly stronger than any charset.
+///
+/// So this enforces only what the encoding itself needs: a leading `$`, a
+/// non-empty remainder, and contiguous null padding (no bytes after the
+/// padding starts, which would make two spellings of one name).
+pub fn validate_system_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> {
+    if bytes[0] != SYSTEM_PREFIX {
+        return Err(Ident32ByteError::InvalidByte {
+            position: 0,
+            value: bytes[0],
+        });
+    }
+    if bytes[1] == 0 {
+        // `$` alone is not a name.
+        return Err(Ident32ByteError::Empty);
+    }
+    let mut seen_zero = false;
+    for (position, &b) in bytes.iter().enumerate().skip(1) {
+        if b == 0 {
+            seen_zero = true;
+        } else if seen_zero {
+            return Err(Ident32ByteError::InvalidByte { position, value: b });
+        }
+    }
+    Ok(())
+}
+
 impl Ident32 {
+    /// Encode a **system** attribute name (leading `$`), for callers building
+    /// `$payload` / `$contentType` triples. [`Ident32::encode`] rejects these
+    /// by design — its leading-byte charset is `a-z`.
+    pub fn system(s: &str) -> Result<Self> {
+        let bytes = s.as_bytes();
+        if bytes.len() > 32 {
+            eyre::bail!("system ident too long: {} bytes (max 32)", bytes.len());
+        }
+        let mut word = [0u8; 32];
+        word[..bytes.len()].copy_from_slice(bytes);
+        validate_system_ident32_bytes(&word)
+            .map_err(|e| eyre::eyre!("invalid system ident '{s}': {e:?}"))?;
+        Ok(Self(alloy_primitives::FixedBytes::from(word)))
+    }
+
     /// Encode a string into an `Ident32`, validating the charset.
     ///
     /// Rules (mirrors `validateIdent32` in Ident32.sol):

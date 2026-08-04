@@ -1357,6 +1357,7 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-genesis",
+ "arkiv-interfaces",
  "clap",
  "eyre",
  "hex",

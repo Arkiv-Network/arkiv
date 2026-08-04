@@ -28,9 +28,9 @@ use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use alloy_sol_types::{SolCall, SolEvent};
-use arkiv_bindings::{
-    IEntityRegistry, IEntityRegistry::EntityOperation, Mime128, OP_CREATE, Operation,
-};
+use arkiv_bindings::{IEntityRegistry, IEntityRegistry::EntityCreated, Operation};
+
+use crate::{content_type_attr, payload_attr};
 use arkiv_genesis::dev_signers;
 use clap::Args;
 use eyre::{Result, bail};
@@ -107,30 +107,28 @@ fn parse_duration_or_zero(s: &str) -> std::result::Result<Duration, String> {
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 enum OpKind {
     Create,
-    Update,
-    Extend,
+    Patch,
+    ExtendExpiry,
     Transfer,
     Delete,
-    Expire,
 }
 
 impl OpKind {
     fn name(self) -> &'static str {
         match self {
             OpKind::Create => "create",
-            OpKind::Update => "update",
-            OpKind::Extend => "extend",
+            OpKind::Patch => "patch",
+            OpKind::ExtendExpiry => "extendExpiry",
             OpKind::Transfer => "transfer",
             OpKind::Delete => "delete",
-            OpKind::Expire => "expire",
         }
     }
 
     fn from_name(s: &str) -> Result<Self> {
         Ok(match s {
             "create" => OpKind::Create,
-            "update" => OpKind::Update,
-            "extend" => OpKind::Extend,
+            "patch" => OpKind::Patch,
+            "extendExpiry" => OpKind::ExtendExpiry,
             "transfer" => OpKind::Transfer,
             "delete" => OpKind::Delete,
             other => bail!("unknown op kind: {}", other),
@@ -173,10 +171,10 @@ struct AliveEntity {
 #[derive(Default)]
 struct State {
     alive: HashMap<B256, AliveEntity>,
+    /// Entities the simulator believes are past their expiry. Nothing is
+    /// submitted for them — the protocol purges expired entities itself — so
+    /// this only feeds the progress display.
     expired: Vec<B256>,
-    /// EXPIRE candidates that have been reserved by an in-flight batch;
-    /// returned to `expired` on failure.
-    expired_pending: Vec<B256>,
     counts: HashMap<OpKind, Counters>,
 }
 
@@ -319,11 +317,8 @@ fn pick_op_kind(
     signer_count: usize,
     creates_in_batch: usize,
 ) -> Option<OpKind> {
-    // Prefer EXPIRE if any past-expiry entity is queued (and not already
-    // claimed by another in-flight batch).
-    if !state.expired.is_empty() {
-        return Some(OpKind::Expire);
-    }
+    // There is no EXPIRE op to prefer any more: expired entities are removed by
+    // the protocol's per-block purge, so the simulator just lets them age out.
 
     let feasible: Vec<(OpKind, u32)> = weights
         .iter()
@@ -371,9 +366,8 @@ fn is_feasible(
     };
     match kind {
         OpKind::Create => state.alive_count() + creates_in_batch < max_alive,
-        OpKind::Update | OpKind::Extend | OpKind::Delete => owned_available(),
+        OpKind::Patch | OpKind::ExtendExpiry | OpKind::Delete => owned_available(),
         OpKind::Transfer => owned_available() && signer_count >= 2,
-        OpKind::Expire => !state.expired.is_empty(),
     }
 }
 
@@ -395,33 +389,49 @@ fn build_op(
             let payload = random_payload(rng, size);
             Some(PlannedOp {
                 kind,
-                op: Operation::create(lifespan as u32, payload, random_content_type(rng), vec![]),
+                op: Operation::create(
+                    0,
+                    0,
+                    lifespan,
+                    0,
+                    vec![
+                        content_type_attr(&random_content_type(rng)).ok()?,
+                        payload_attr(&payload).ok()?,
+                    ],
+                ),
                 target: None,
                 new_expires_at: Some(expires_at),
                 new_owner_idx: None,
             })
         }
-        OpKind::Update => {
+        OpKind::Patch => {
             let key = pick_owned_alive(state, signer_idx, rng)?;
             let size = rng.random_range(64..512);
             let payload = random_payload(rng, size);
             Some(PlannedOp {
                 kind,
-                op: Operation::update(key, payload, random_content_type(rng), vec![]),
+                op: Operation::patch(
+                    key,
+                    vec![
+                        content_type_attr(&random_content_type(rng)).ok()?,
+                        payload_attr(&payload).ok()?,
+                    ],
+                ),
                 target: Some(key),
                 new_expires_at: None,
                 new_owner_idx: None,
             })
         }
-        OpKind::Extend => {
+        OpKind::ExtendExpiry => {
             let key = pick_owned_alive(state, signer_idx, rng)?;
             let entity = state.alive.get(&key)?.clone();
             let bump = rng.random_range(50u64..400);
             let new_expires_at = (current_block + bump).max(entity.expires_at as u64 + 1) as u32;
-            let btl = (new_expires_at as u64 - current_block) as u32;
             Some(PlannedOp {
                 kind,
-                op: Operation::extend(key, btl),
+                // Absolute target: the simulator tracks exact expiries, so a
+                // relative floor would desync its model from the chain.
+                op: Operation::extend_expiry(key, new_expires_at as u64, 0),
                 target: Some(key),
                 new_expires_at: Some(new_expires_at),
                 new_owner_idx: None,
@@ -438,8 +448,9 @@ fn build_op(
             // Stash the index here so we know what to update on receipt.
             Some(PlannedOp {
                 kind,
-                // newOwner is Address::ZERO here; submit_plan overwrites it from the signer pool.
-                op: Operation::transfer(key, Address::ZERO),
+                // newOwner is Address::ZERO here; submit_plan rebuilds the op
+                // from the signer pool.
+                op: Operation::transfer_ownership(key, Address::ZERO),
                 target: Some(key),
                 new_expires_at: None,
                 new_owner_idx: Some(new_idx),
@@ -451,17 +462,6 @@ fn build_op(
                 kind,
                 op: Operation::delete(key),
                 target: Some(key),
-                new_expires_at: None,
-                new_owner_idx: None,
-            })
-        }
-        OpKind::Expire => {
-            let key = state.expired.pop()?;
-            state.expired_pending.push(key);
-            Some(PlannedOp {
-                kind,
-                op: Operation::expire(key),
-                target: None, // no `alive` entry to flip pending on
                 new_expires_at: None,
                 new_owner_idx: None,
             })
@@ -485,7 +485,7 @@ fn random_payload(rng: &mut ChaCha8Rng, size: usize) -> Bytes {
     Bytes::from(buf)
 }
 
-fn random_content_type(rng: &mut ChaCha8Rng) -> Mime128 {
+fn random_content_type(rng: &mut ChaCha8Rng) -> String {
     const TYPES: &[&str] = &[
         "application/json",
         "application/octet-stream",
@@ -494,7 +494,7 @@ fn random_content_type(rng: &mut ChaCha8Rng) -> Mime128 {
         "image/jpeg",
     ];
     let s = TYPES.choose(rng).copied().unwrap_or(TYPES[0]);
-    Mime128::encode(s).expect("hardcoded MIME types are always valid")
+    s.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +521,10 @@ async fn submit_plan<P: Provider + Clone + Send + Sync + 'static>(
     for planned in &mut ops_with_addresses {
         if planned.kind == OpKind::Transfer {
             let idx = planned.new_owner_idx.expect("transfer plan");
-            planned.op.newOwner = signer_addrs[idx];
+            // The op is a tagged union now, so the target address is inside the
+            // encoded payload — rebuild rather than poke a field.
+            let key = planned.target.expect("transfer plan has a target");
+            planned.op = Operation::transfer_ownership(key, signer_addrs[idx]);
         }
     }
 
@@ -580,11 +583,10 @@ fn apply_success(
     logs: &[alloy_rpc_types::eth::Log],
     sender_idx: usize,
 ) {
-    // Walk EntityOperation logs in order; CREATE ops consume one each.
+    // Walk EntityCreated logs in order; CREATE ops consume one each.
     let mut create_keys: Vec<B256> = logs
         .iter()
-        .filter_map(|log| EntityOperation::decode_log(&log.inner).ok())
-        .filter(|ev| ev.data.operationType == OP_CREATE)
+        .filter_map(|log| EntityCreated::decode_log(&log.inner).ok())
         .map(|ev| ev.data.entityKey)
         .collect();
     create_keys.reverse(); // pop from end → consume in original order
@@ -603,14 +605,14 @@ fn apply_success(
                     );
                 }
             }
-            OpKind::Update => {
+            OpKind::Patch => {
                 if let Some(key) = op.target
                     && let Some(e) = state.alive.get_mut(&key)
                 {
                     e.pending = false;
                 }
             }
-            OpKind::Extend => {
+            OpKind::ExtendExpiry => {
                 if let Some(key) = op.target
                     && let Some(e) = state.alive.get_mut(&key)
                 {
@@ -627,16 +629,9 @@ fn apply_success(
                     e.pending = false;
                 }
             }
-            OpKind::Delete | OpKind::Expire => {
+            OpKind::Delete => {
                 if let Some(key) = op.target {
                     state.alive.remove(&key);
-                } else {
-                    // EXPIRE: the key is in the op itself.
-                    let key = op.op.entityKey;
-                    let pos = state.expired_pending.iter().position(|k| *k == key);
-                    if let Some(pos) = pos {
-                        state.expired_pending.remove(pos);
-                    }
                 }
             }
         }
@@ -651,14 +646,6 @@ fn apply_failure(state: &mut State, planned: &[PlannedOp]) {
             && let Some(e) = state.alive.get_mut(&key)
         {
             e.pending = false;
-        }
-        if op.kind == OpKind::Expire {
-            let key = op.op.entityKey;
-            let pos = state.expired_pending.iter().position(|k| *k == key);
-            if let Some(pos) = pos {
-                state.expired_pending.remove(pos);
-                state.expired.push(key);
-            }
         }
         state.record_failed(op.kind);
     }
@@ -684,11 +671,10 @@ fn print_status(
     );
     let order = [
         OpKind::Create,
-        OpKind::Update,
-        OpKind::Extend,
+        OpKind::Patch,
+        OpKind::ExtendExpiry,
         OpKind::Transfer,
         OpKind::Delete,
-        OpKind::Expire,
     ];
     for kind in order {
         let c = state.counts.get(&kind).copied().unwrap_or_default();

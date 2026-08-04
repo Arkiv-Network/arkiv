@@ -5,15 +5,30 @@
 //! bytes into the spec's host-agnostic [`Op`]s that [`ArkivExecutor::apply`] runs.
 //! All ABI knowledge lives here; the executor never sees Solidity types.
 //!
-//! Two things are *resolved* during decode, per the [`Op`] contract:
-//! - **`btl` → `expires_at`.** The ABI carries a relative "blocks to live"; the
-//!   [`Op`] carries an absolute expiry (`env.block_number + btl`).
-//! - **The create key.** The contract sends `entityKey = 0` for a `Create` and
-//!   expects the node to mint the key from `(chain_id, caller, nonce)` — see
-//!   [`derive_entity_key`]. A batch shares one caller, so successive creates use
-//!   `start_nonce`, `start_nonce + 1`, …; reading and advancing the caller's
-//!   persistent nonce is the wiring step's job, which is why `start_nonce` is a
-//!   parameter and decode stays a pure function.
+//! Each [`Operation`] is a tagged union — an `operation` byte plus an
+//! `operationData` blob that ABI-decodes to the struct that tag names. The blob
+//! must be *canonically* encoded (`arkiv-node-api.md` §3), so one op has exactly
+//! one spelling on the wire.
+//!
+//! Three things are *resolved* here, per the [`Op`] contract:
+//!
+//! - **Expiry.** The ABI carries `(expiresAt, minLifetime)`; the [`Op`] carries
+//!   one absolute block, `max(expiresAt, current + minLifetime)`, which must be
+//!   in the future. See [`resolve_expiry`].
+//! - **The create key.** A `Create` carries no key — the node mints it from
+//!   `(domain, owner, nonce, salt)`; see [`derive_entity_key`]. A batch shares
+//!   one caller, so successive creates use `start_nonce`, `start_nonce + 1`, …;
+//!   reading and advancing the caller's persistent nonce is the wiring step's
+//!   job, which is why `start_nonce` is a parameter and decode stays a pure
+//!   function.
+//! - **`$payload` / `$contentType`.** They travel as ordinary triples in the
+//!   attribute list; a `Create` lifts them out into the entity's own fields,
+//!   since a create always yields a whole entity. A `Patch` leaves them in its
+//!   mutation list — a patch is a delta, and the executor routes them there.
+//!
+//! What decode does *not* do is check state: ownership, liveness, and whether an
+//! entity exists are the executor's business. Everything rejected here is a
+//! structural fault, decidable from the calldata alone.
 //!
 //! [`ArkivExecutor::apply`]: crate::ArkivExecutor
 
@@ -22,14 +37,15 @@ use core::fmt;
 use alloy_primitives::{Address, U256, keccak256};
 use alloy_sol_types::SolCall;
 use arkiv_bindings::{
-    Attribute as AbiAttribute, IEntityRegistry, MAX_ATTRIBUTES, Mime128, OP_CREATE, OP_DELETE,
-    OP_EXPIRE, OP_EXTEND, OP_TRANSFER, OP_UPDATE,
-    encode::{AttrAbiError, pack_words},
-    types::{Ident32ByteError, validate_ident32_bytes},
+    Attribute as AbiAttribute, CREATION_FLAGS_MASK, Create, Delete, ExtendExpiry, IEntityRegistry,
+    MAX_ATTRIBUTES, OP_CREATE, OP_DELETE, OP_EXTEND_EXPIRY, OP_PATCH, OP_TRANSFER_OWNERSHIP,
+    Operation, Patch, TransferOwnership,
+    encode::{AttrAbiError, OpAbiError},
+    types::{Ident32ByteError, validate_ident32_bytes, validate_system_ident32_bytes},
 };
-use arkiv_interfaces::entity::Attribute;
-use arkiv_interfaces::execution::{ExecEnv, Op};
-use arkiv_interfaces::primitives::EntityKey;
+use arkiv_interfaces::entity::{Attribute, AttributeValue, annotations};
+use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
+use arkiv_interfaces::primitives::{BlockNumber, EntityKey};
 
 use crate::ARKIV_ADDRESS;
 
@@ -40,7 +56,7 @@ use crate::ARKIV_ADDRESS;
 pub fn decode_ops(
     env: &ExecEnv,
     calldata: &[u8],
-    start_nonce: u32,
+    start_nonce: u64,
 ) -> Result<Vec<Op>, DecodeError> {
     if calldata.len() < 4 {
         return Err(DecodeError::CalldataTooShort);
@@ -56,50 +72,61 @@ pub fn decode_ops(
     }
 
     let mut out = Vec::with_capacity(batch.ops.len());
-    let mut create_index: u32 = 0;
+    let mut create_index: u64 = 0;
     for op in &batch.ops {
-        let key: EntityKey = op.entityKey.0; // supplied by the client for non-creates
-        let decoded = match op.operationType {
+        let decoded = match op.operation {
             OP_CREATE => {
-                if op.btl == 0 {
-                    return Err(DecodeError::ZeroBtl);
+                let c: Create = payload(op)?;
+                if c.creationFlags & !CREATION_FLAGS_MASK != 0 {
+                    return Err(DecodeError::ReservedCreationFlags(c.creationFlags));
                 }
                 let nonce = start_nonce.saturating_add(create_index);
                 create_index += 1;
+                let SystemSplit {
+                    content_type,
+                    payload,
+                    attributes,
+                } = split_create_attributes(&c.attributes)?;
                 Op::Create {
-                    key: derive_entity_key(env.chain_id, &env.caller, nonce),
-                    expires_at: env.block_number.saturating_add(op.btl as u64),
-                    content_type: mime128_to_bytes(&op.contentType),
-                    payload: op.payload.to_vec(),
-                    attributes: convert_attributes(&op.attributes)?,
+                    key: derive_entity_key(env.chain_id, &env.caller, nonce, c.salt),
+                    expires_at: resolve_expiry(env.block_number, c.expiresAt, c.minLifetime)?,
+                    creation_flags: c.creationFlags,
+                    content_type,
+                    payload,
+                    attributes,
                 }
             }
-            OP_UPDATE => Op::Update {
-                key,
-                content_type: mime128_to_bytes(&op.contentType),
-                payload: op.payload.to_vec(),
-                attributes: convert_attributes(&op.attributes)?,
-            },
-            OP_EXTEND => {
-                if op.btl == 0 {
-                    return Err(DecodeError::ZeroBtl);
+            OP_PATCH => {
+                let p: Patch = payload(op)?;
+                if p.mutations.is_empty() {
+                    return Err(DecodeError::EmptyMutations { key: p.entityKey.0 });
                 }
+                Op::Patch {
+                    key: p.entityKey.0,
+                    mutations: convert_mutations(&p.mutations)?,
+                }
+            }
+            OP_EXTEND_EXPIRY => {
+                let e: ExtendExpiry = payload(op)?;
                 Op::ExtendExpiry {
-                    key,
-                    new_expires_at: env.block_number.saturating_add(op.btl as u64),
+                    key: e.entityKey.0,
+                    new_expires_at: resolve_expiry(env.block_number, e.expiresAt, e.minLifetime)?,
                 }
             }
-            OP_TRANSFER => {
-                if op.newOwner == Address::ZERO {
-                    return Err(DecodeError::TransferToZeroAddress { key });
+            OP_TRANSFER_OWNERSHIP => {
+                let t: TransferOwnership = payload(op)?;
+                if t.newOwner == Address::ZERO {
+                    return Err(DecodeError::TransferToZeroAddress { key: t.entityKey.0 });
                 }
                 Op::Transfer {
-                    key,
-                    new_owner: op.newOwner.into_array(),
+                    key: t.entityKey.0,
+                    new_owner: t.newOwner.into_array(),
                 }
             }
-            OP_DELETE => Op::Delete { key },
-            OP_EXPIRE => Op::Expire { key },
+            OP_DELETE => {
+                let d: Delete = payload(op)?;
+                Op::Delete { key: d.entityKey.0 }
+            }
             other => return Err(DecodeError::InvalidOpType(other)),
         };
         out.push(decoded);
@@ -107,24 +134,124 @@ pub fn decode_ops(
     Ok(out)
 }
 
-/// Mint a `Create`'s entity key: `keccak256(chain_id_be32 || ARKIV_ADDRESS ||
-/// owner || nonce_be4)`. Matches the SDK's local derivation, so a client can
-/// predict the key it's about to create.
-pub fn derive_entity_key(chain_id: u64, owner: &[u8; 20], nonce: u32) -> EntityKey {
-    let mut buf = Vec::with_capacity(32 + 20 + 20 + 4);
+/// Decode one op's `operationData` as the struct its tag names.
+fn payload<T>(op: &Operation) -> Result<T, DecodeError>
+where
+    T: alloy_sol_types::SolValue
+        + From<<<T as alloy_sol_types::SolValue>::SolType as alloy_sol_types::SolType>::RustType>,
+{
+    op.payload_of::<T>()
+        .map_err(|e| DecodeError::OperationData {
+            operation: op.operation,
+            reason: e,
+        })
+}
+
+/// Resolve the two wire expiry args into one absolute block.
+///
+/// `target = max(expiresAt, current + minLifetime)`, which covers absolute
+/// (`minLifetime = 0`), relative (`expiresAt = 0`), and "absolute with a floor"
+/// in a single rule — the floor raises a stale or too-close `expiresAt` instead
+/// of silently under-delivering the lifetime asked for.
+///
+/// The result must be strictly in the future: an op that would mint or extend to
+/// an already-dead block is a client error, not a no-op.
+pub fn resolve_expiry(
+    current: BlockNumber,
+    expires_at: u64,
+    min_lifetime: u64,
+) -> Result<BlockNumber, DecodeError> {
+    // Checked, so an absurd floor reverts rather than wrapping. Permanence is
+    // expressed as `expiresAt = u64::MAX`, never as a huge `minLifetime`.
+    let floor = current
+        .checked_add(min_lifetime)
+        .ok_or(DecodeError::ExpiryOverflow {
+            current,
+            min_lifetime,
+        })?;
+    let target = expires_at.max(floor);
+    if target <= current {
+        return Err(DecodeError::ExpiryDeadOnArrival { target, current });
+    }
+    Ok(target)
+}
+
+/// Mint a `Create`'s entity key: `keccak256(domain || owner || nonce || salt)`.
+///
+/// The **domain** is this chain's `(chain_id, ARKIV_ADDRESS)` pair, which keeps
+/// keys from colliding across chains. `nonce` is the caller's per-owner entity
+/// counter and is what makes the key *unique*; `salt` is caller-chosen and only
+/// makes it *unpredictable*. Without a salt the next key is a pure function of
+/// public state, so anyone could compute a creator's future key and pre-entangle
+/// it — front-loaded reference spam aimed at an entity that does not exist yet.
+/// `salt = 0` is valid and yields a unique but publicly predictable key; SDKs
+/// default it to 128 random bits.
+///
+/// This must match the SDK's local derivation exactly — a client predicts the
+/// key it is about to create, and a later op in the same batch targets it.
+pub fn derive_entity_key(chain_id: u64, owner: &[u8; 20], nonce: u64, salt: u128) -> EntityKey {
+    let mut buf = Vec::with_capacity(32 + 20 + 20 + 8 + 16);
     buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
     buf.extend_from_slice(ARKIV_ADDRESS.as_slice());
     buf.extend_from_slice(owner.as_slice());
     buf.extend_from_slice(&nonce.to_be_bytes());
+    buf.extend_from_slice(&salt.to_be_bytes());
     keccak256(&buf).0
 }
 
-/// Convert ABI attributes to entity attributes, decoding each value by its type.
+/// A create's attribute list, split into the entity's system fields and its
+/// user attributes.
+struct SystemSplit {
+    content_type: Vec<u8>,
+    payload: Vec<u8>,
+    attributes: Vec<Attribute>,
+}
+
+/// Validate a `create`'s attribute list and lift `$payload` / `$contentType`
+/// out of it.
 ///
-/// Structural rules from the contract: at most [`MAX_ATTRIBUTES`], names are
-/// valid `Ident32`s, and strictly ascending by name (which also enforces name
-/// uniqueness).
-fn convert_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeError> {
+/// Tombstones are rejected: on a fresh entity there is nothing to unset, so
+/// "absent" is said by omission — one canonical way to encode it.
+fn split_create_attributes(attrs: &[AbiAttribute]) -> Result<SystemSplit, DecodeError> {
+    check_triple_list(attrs)?;
+    let mut out = SystemSplit {
+        content_type: Vec::new(),
+        payload: Vec::new(),
+        attributes: Vec::with_capacity(attrs.len()),
+    };
+    for a in attrs {
+        let name = attr_name(a);
+        let Some(value) = decode_attr_value(a)? else {
+            return Err(DecodeError::TombstoneInCreate { name });
+        };
+        match name.as_slice() {
+            annotations::PAYLOAD => out.payload = value.encode(),
+            annotations::CONTENT_TYPE => out.content_type = value.encode(),
+            _ => out.attributes.push(Attribute { key: name, value }),
+        }
+    }
+    Ok(out)
+}
+
+/// Validate a `patch`'s mutation list. Tombstones are what make it a patch, so
+/// they are kept — `None` is "unset this".
+fn convert_mutations(attrs: &[AbiAttribute]) -> Result<Vec<AttributeMutation>, DecodeError> {
+    check_triple_list(attrs)?;
+    attrs
+        .iter()
+        .map(|a| {
+            Ok(AttributeMutation {
+                key: attr_name(a),
+                value: decode_attr_value(a)?,
+            })
+        })
+        .collect()
+}
+
+/// The structural rules every triple list obeys, whichever op carries it: at
+/// most [`MAX_ATTRIBUTES`], valid `Ident32` names, strictly ascending by name
+/// (which also enforces uniqueness), and no engine-controlled `$` name.
+fn check_triple_list(attrs: &[AbiAttribute]) -> Result<(), DecodeError> {
     if attrs.len() > MAX_ATTRIBUTES {
         return Err(DecodeError::TooManyAttributes {
             count: attrs.len(),
@@ -132,7 +259,21 @@ fn convert_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeEr
         });
     }
     for a in attrs {
-        if let Err(e) = validate_ident32_bytes(&a.name.0) {
+        let name = attr_name(a);
+        // System names (`$…`) are protocol-defined and exempt from the `a-z`
+        // leading-byte rule for user attributes — `$` is the byte that
+        // separates the two namespaces. Which of them a client may write is
+        // the allow-list's call, checked first so the error names the real
+        // problem ("the engine owns this") rather than a charset violation.
+        let validate = if name.first() == Some(&annotations::SYSTEM_PREFIX) {
+            if annotations::is_engine_controlled(&name) {
+                return Err(DecodeError::SystemAttributeNotWritable { name });
+            }
+            validate_system_ident32_bytes
+        } else {
+            validate_ident32_bytes
+        };
+        if let Err(e) = validate(&a.name.0) {
             return Err(match e {
                 Ident32ByteError::Empty => DecodeError::AttributeNameEmpty,
                 Ident32ByteError::InvalidByte { position, value } => {
@@ -144,27 +285,21 @@ fn convert_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeEr
     if attrs.windows(2).any(|w| w[0].name.0 >= w[1].name.0) {
         return Err(DecodeError::AttributesNotSorted);
     }
-    attrs
-        .iter()
-        .map(|a| {
-            let value = a
-                .to_value()
-                .map_err(|reason| DecodeError::InvalidAttributeValue {
-                    name: a.name.0,
-                    value_type: a.valueType,
-                    reason,
-                })?;
-            Ok(Attribute {
-                key: strip_trailing_zeros(a.name.0.to_vec()),
-                value,
-            })
-        })
-        .collect()
+    Ok(())
 }
 
-/// The four 32-byte words concatenated, with trailing zero padding removed.
-fn mime128_to_bytes(m: &Mime128) -> Vec<u8> {
-    pack_words(&m.data)
+/// One triple's value: `None` for a tombstone.
+fn decode_attr_value(a: &AbiAttribute) -> Result<Option<AttributeValue>, DecodeError> {
+    a.to_value()
+        .map_err(|reason| DecodeError::InvalidAttributeValue {
+            name: a.name.0,
+            value_type: a.typeId,
+            reason,
+        })
+}
+
+fn attr_name(a: &AbiAttribute) -> Vec<u8> {
+    strip_trailing_zeros(a.name.0.to_vec())
 }
 
 fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
@@ -186,10 +321,29 @@ pub enum DecodeError {
     Abi(String),
     /// `execute` was called with no operations.
     EmptyBatch,
-    /// An operation's type byte isn't one of the six known kinds.
+    /// An operation's tag byte isn't one of the five known kinds.
     InvalidOpType(u8),
-    /// A `Create` or `Extend` gave a zero blocks-to-live.
-    ZeroBtl,
+    /// An op's `operationData` didn't decode as its tag's struct, or wasn't
+    /// canonically encoded.
+    OperationData { operation: u8, reason: OpAbiError },
+    /// A `patch` carried no mutations — it would be a no-op costing gas.
+    EmptyMutations { key: EntityKey },
+    /// Resolved expiry is at or before the current block.
+    ExpiryDeadOnArrival {
+        target: BlockNumber,
+        current: BlockNumber,
+    },
+    /// `current + minLifetime` overflowed.
+    ExpiryOverflow {
+        current: BlockNumber,
+        min_lifetime: u64,
+    },
+    /// A `create` set bits outside [`CREATION_FLAGS_MASK`].
+    ReservedCreationFlags(u8),
+    /// A `create` carried a tombstone; nothing exists yet to unset.
+    TombstoneInCreate { name: Vec<u8> },
+    /// A triple named a `$` attribute the engine owns.
+    SystemAttributeNotWritable { name: Vec<u8> },
     /// A `Transfer` named the zero address as the new owner.
     TransferToZeroAddress { key: EntityKey },
     /// An attribute's value isn't a well-formed encoding of its declared type.
@@ -210,13 +364,34 @@ pub enum DecodeError {
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = |n: &[u8]| String::from_utf8_lossy(n).into_owned();
         match self {
             DecodeError::CalldataTooShort => write!(f, "calldata too short for a selector"),
             DecodeError::UnknownSelector(s) => write!(f, "unknown selector {s:02x?}"),
             DecodeError::Abi(e) => write!(f, "invalid execute calldata: {e}"),
             DecodeError::EmptyBatch => write!(f, "execute called with an empty batch"),
             DecodeError::InvalidOpType(t) => write!(f, "invalid operation type {t}"),
-            DecodeError::ZeroBtl => write!(f, "operation gave a zero blocks-to-live"),
+            DecodeError::OperationData { operation, reason } => {
+                write!(f, "operation {operation}: {reason}")
+            }
+            DecodeError::EmptyMutations { .. } => write!(f, "patch carried no mutations"),
+            DecodeError::ExpiryDeadOnArrival { target, current } => write!(
+                f,
+                "resolved expiry {target} is not past the current block {current}"
+            ),
+            DecodeError::ExpiryOverflow {
+                current,
+                min_lifetime,
+            } => write!(f, "expiry overflow ({current} + {min_lifetime})"),
+            DecodeError::ReservedCreationFlags(b) => {
+                write!(f, "creation flags set reserved bits (0b{b:08b})")
+            }
+            DecodeError::TombstoneInCreate { name } => {
+                write!(f, "create carried a tombstone for '{}'", shown(name))
+            }
+            DecodeError::SystemAttributeNotWritable { name } => {
+                write!(f, "'{}' is maintained by the engine", shown(name))
+            }
             DecodeError::TransferToZeroAddress { .. } => write!(f, "transfer to the zero address"),
             DecodeError::InvalidAttributeValue {
                 value_type, reason, ..
@@ -242,13 +417,7 @@ impl std::error::Error for DecodeError {}
 mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes, FixedBytes};
-    use arkiv_bindings::{AttributeType, AttributeValue, Ident32, Operation};
-
-    fn empty_mime() -> Mime128 {
-        Mime128 {
-            data: [FixedBytes::ZERO; 4],
-        }
-    }
+    use arkiv_bindings::{AttributeType, Ident32};
 
     fn calldata(ops: Vec<Operation>) -> Vec<u8> {
         IEntityRegistry::executeCall { ops }.abi_encode()
@@ -263,26 +432,38 @@ mod tests {
         }
     }
 
+    fn ident(name: &str) -> Ident32 {
+        if name.starts_with('$') {
+            Ident32::system(name).unwrap()
+        } else {
+            Ident32::encode(name).unwrap()
+        }
+    }
+
+    fn attr(name: &str, value: &AttributeValue) -> AbiAttribute {
+        AbiAttribute::from_value(ident(name), value).unwrap()
+    }
+
+    /// A relative-lifetime create: `expiresAt = 0`, so the floor decides.
+    fn create_in(min_lifetime: u64, attrs: Vec<AbiAttribute>) -> Operation {
+        Operation::create(0, 0, min_lifetime, 0, attrs)
+    }
+
+    // -------------------------------------------------------------------------
+    // Create
+    // -------------------------------------------------------------------------
+
     #[test]
     fn decodes_create_with_derived_key_and_resolved_expiry() {
-        let cd = calldata(vec![Operation::create(
-            50,
-            Bytes::from_static(b"hi"),
-            empty_mime(),
-            vec![],
-        )]);
+        let cd = calldata(vec![create_in(50, vec![])]);
         let ops = decode_ops(&env([0xAA; 20], 10, 1), &cd, 7).unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::Create {
-                key,
-                expires_at,
-                payload,
-                ..
+                key, expires_at, ..
             } => {
-                assert_eq!(*key, derive_entity_key(1, &[0xAA; 20], 7)); // nonce = start_nonce
-                assert_eq!(*expires_at, 60); // block 10 + btl 50
-                assert_eq!(payload, b"hi");
+                assert_eq!(*key, derive_entity_key(1, &[0xAA; 20], 7, 0)); // nonce = start_nonce
+                assert_eq!(*expires_at, 60); // block 10 + minLifetime 50
             }
             other => panic!("expected create, got {other:?}"),
         }
@@ -290,113 +471,259 @@ mod tests {
 
     #[test]
     fn successive_creates_mint_sequential_keys() {
-        let cd = calldata(vec![
-            Operation::create(1, Bytes::new(), empty_mime(), vec![]),
-            Operation::create(1, Bytes::new(), empty_mime(), vec![]),
-        ]);
+        let cd = calldata(vec![create_in(1, vec![]), create_in(1, vec![])]);
         let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 100).unwrap();
-        assert_eq!(*ops[0].key(), derive_entity_key(1, &[0xAA; 20], 100));
-        assert_eq!(*ops[1].key(), derive_entity_key(1, &[0xAA; 20], 101));
+        assert_eq!(*ops[0].key(), derive_entity_key(1, &[0xAA; 20], 100, 0));
+        assert_eq!(*ops[1].key(), derive_entity_key(1, &[0xAA; 20], 101, 0));
+    }
+
+    /// The salt is what makes a key unpredictable, so it must change the key —
+    /// otherwise it is decoration and the pre-image window stays open.
+    #[test]
+    fn salt_changes_the_minted_key() {
+        let key_of = |salt: u128| {
+            let cd = calldata(vec![Operation::create(salt, 0, 1, 0, vec![])]);
+            *decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap()[0].key()
+        };
+        assert_ne!(key_of(0), key_of(1));
+        assert_ne!(key_of(1), key_of(u128::MAX));
+        // Same salt, same everything: still deterministic.
+        assert_eq!(key_of(42), key_of(42));
+    }
+
+    /// Key derivation is consensus-critical and mirrored in the SDK, so every
+    /// input must actually reach the preimage.
+    #[test]
+    fn every_derivation_input_changes_the_key() {
+        let base = derive_entity_key(1, &[0xAA; 20], 5, 9);
+        assert_ne!(base, derive_entity_key(2, &[0xAA; 20], 5, 9), "chain_id");
+        assert_ne!(base, derive_entity_key(1, &[0xBB; 20], 5, 9), "owner");
+        assert_ne!(base, derive_entity_key(1, &[0xAA; 20], 6, 9), "nonce");
+        assert_ne!(base, derive_entity_key(1, &[0xAA; 20], 5, 8), "salt");
     }
 
     #[test]
-    fn decodes_a_uint_attribute() {
-        let value = AttributeValue::u256_from_u64(42);
-        let attr = AbiAttribute::from_value(Ident32::encode("age").unwrap(), &value).unwrap();
-        let cd = calldata(vec![Operation::create(
+    fn create_lifts_payload_and_content_type_out_of_the_attributes() {
+        let cd = calldata(vec![create_in(
             1,
-            Bytes::new(),
-            empty_mime(),
-            vec![attr],
+            vec![
+                attr("$contentType", &AttributeValue::Str("text/plain".into())),
+                attr("$payload", &AttributeValue::Bytes(b"hi".to_vec())),
+                attr("rank", &AttributeValue::u256_from_u64(3)),
+            ],
         )]);
         let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
-        let Op::Create { attributes, .. } = &ops[0] else {
+        let Op::Create {
+            content_type,
+            payload,
+            attributes,
+            ..
+        } = &ops[0]
+        else {
             panic!("expected create");
         };
+        assert_eq!(content_type, b"text/plain");
+        assert_eq!(payload, b"hi");
+        // Only the user attribute is left.
         assert_eq!(attributes.len(), 1);
-        assert_eq!(attributes[0].key, b"age");
-        assert_eq!(attributes[0].value, value);
+        assert_eq!(attributes[0].key, b"rank");
     }
 
-    /// Every user-settable type reaches the [`Op`] as the value the client sent.
     #[test]
-    fn decodes_every_attribute_type() {
-        let values = [
-            AttributeValue::Bool(true),
-            AttributeValue::Int(-9),
-            AttributeValue::u256_from_u64(7),
-            AttributeValue::Decimal([0xFF; 32]),
-            AttributeValue::Bytes32([0x5A; 32]),
-            AttributeValue::Str("blue".into()),
-            AttributeValue::EthereumAddress([0x11; 20]),
-            AttributeValue::EntityKey([0x22; 32]),
-        ];
-        // Names must be strictly ascending, so index them.
-        let attrs: Vec<_> = values
-            .iter()
-            .enumerate()
-            .map(|(i, v)| AbiAttribute::from_value(Ident32::encode(&format!("a{i}")).unwrap(), v))
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let cd = calldata(vec![Operation::create(
-            1,
-            Bytes::new(),
-            empty_mime(),
-            attrs,
-        )]);
+    fn create_records_creation_flags() {
+        let cd = calldata(vec![Operation::create(0, 0, 1, 0b11, vec![])]);
         let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
-        let Op::Create { attributes, .. } = &ops[0] else {
+        let Op::Create { creation_flags, .. } = &ops[0] else {
             panic!("expected create");
         };
-        let decoded: Vec<_> = attributes.iter().map(|a| a.value.clone()).collect();
-        assert_eq!(decoded, values);
+        assert_eq!(*creation_flags, 0b11);
     }
 
-    /// `bytes` is system-only, and unknown tags are unknown — both revert as an
-    /// invalid value type rather than decoding to something.
+    /// Reserved bits must stay reserved — accepting them now would make them
+    /// unusable later, since old nodes would have ignored whatever they meant.
     #[test]
-    fn rejects_system_only_and_unknown_attribute_types() {
-        for value_type in [AttributeType::Bytes.id(), 99] {
-            let attr = AbiAttribute {
-                name: FixedBytes::right_padding_from(b"a"),
-                valueType: value_type,
-                value: [FixedBytes::ZERO; 4],
-            };
-            let cd = calldata(vec![Operation::create(
-                1,
-                Bytes::new(),
-                empty_mime(),
-                vec![attr],
-            )]);
+    fn create_rejects_reserved_creation_flags() {
+        for flags in [0b100, 0b1000_0000, 0xFF] {
+            let cd = calldata(vec![Operation::create(0, 0, 1, flags, vec![])]);
             assert!(matches!(
                 decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
-                Err(DecodeError::InvalidAttributeValue { .. })
+                Err(DecodeError::ReservedCreationFlags(_)),
             ));
         }
     }
+
+    #[test]
+    fn create_rejects_a_tombstone() {
+        let cd = calldata(vec![create_in(
+            1,
+            vec![AbiAttribute::tombstone(Ident32::encode("gone").unwrap())],
+        )]);
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            Err(DecodeError::TombstoneInCreate { .. })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Expiry resolution
+    // -------------------------------------------------------------------------
+
+    /// The single `max` rule, mode by mode.
+    #[test]
+    fn expiry_resolves_absolute_relative_and_floor() {
+        // Relative: expiresAt = 0, so the floor wins.
+        assert_eq!(resolve_expiry(100, 0, 50).unwrap(), 150);
+        // Absolute: a future expiresAt with no floor.
+        assert_eq!(resolve_expiry(100, 500, 0).unwrap(), 500);
+        // Absolute + floor: the floor raises a too-close target.
+        assert_eq!(resolve_expiry(100, 110, 50).unwrap(), 150);
+        // ...but does not lower a further one.
+        assert_eq!(resolve_expiry(100, 500, 50).unwrap(), 500);
+        // Permanent.
+        assert_eq!(resolve_expiry(100, u64::MAX, 0).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn expiry_rejects_dead_on_arrival_and_overflow() {
+        // Both args zero, and a past or current target.
+        for (expires_at, min_lifetime) in [(0, 0), (100, 0), (50, 0)] {
+            assert!(matches!(
+                resolve_expiry(100, expires_at, min_lifetime),
+                Err(DecodeError::ExpiryDeadOnArrival { .. })
+            ));
+        }
+        // An absurd floor reverts rather than wrapping around to a live block.
+        assert!(matches!(
+            resolve_expiry(100, 0, u64::MAX),
+            Err(DecodeError::ExpiryOverflow { .. })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Patch
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn decodes_patch_sets_and_unsets() {
+        let key = B256::repeat_byte(9);
+        let cd = calldata(vec![Operation::patch(
+            key,
+            vec![
+                attr("color", &AttributeValue::Str("blue".into())),
+                AbiAttribute::tombstone(Ident32::encode("size").unwrap()),
+            ],
+        )]);
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let Op::Patch { key: k, mutations } = &ops[0] else {
+            panic!("expected patch");
+        };
+        assert_eq!(*k, key.0);
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(
+            mutations[0],
+            AttributeMutation::set(b"color".to_vec(), AttributeValue::Str("blue".into()))
+        );
+        assert_eq!(mutations[1], AttributeMutation::unset(b"size".to_vec()));
+    }
+
+    /// `$payload` / `$contentType` stay in the mutation list — a patch is a
+    /// delta, so "not mentioned" and "set to empty" must stay distinguishable.
+    #[test]
+    fn patch_keeps_user_managed_system_attributes_as_mutations() {
+        let cd = calldata(vec![Operation::patch(
+            B256::repeat_byte(1),
+            vec![attr("$payload", &AttributeValue::Bytes(b"new".to_vec()))],
+        )]);
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let Op::Patch { mutations, .. } = &ops[0] else {
+            panic!("expected patch");
+        };
+        assert_eq!(mutations[0].key, b"$payload");
+    }
+
+    #[test]
+    fn patch_rejects_an_empty_mutation_list() {
+        let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![])]);
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            Err(DecodeError::EmptyMutations { .. })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // System-attribute authority
+    // -------------------------------------------------------------------------
+
+    /// The engine owns these cells. Naming one — set *or* tombstone, create *or*
+    /// patch — is a revert, so a client can never forge provenance or lifecycle.
+    #[test]
+    fn engine_controlled_system_attributes_are_rejected() {
+        for name in [
+            "$owner",
+            "$creator",
+            "$createdAtBlock",
+            "$expiration",
+            "$key",
+        ] {
+            let set =
+                AbiAttribute::from_value(ident(name), &AttributeValue::u256_from_u64(1)).unwrap();
+            for op in [
+                Operation::create(0, 0, 1, 0, vec![set.clone()]),
+                Operation::patch(B256::repeat_byte(1), vec![set.clone()]),
+                Operation::patch(
+                    B256::repeat_byte(1),
+                    vec![AbiAttribute::tombstone(ident(name))],
+                ),
+            ] {
+                assert!(
+                    matches!(
+                        decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![op]), 0),
+                        Err(DecodeError::SystemAttributeNotWritable { .. })
+                    ),
+                    "{name} should be rejected"
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // The keyed ops
+    // -------------------------------------------------------------------------
 
     #[test]
     fn maps_the_keyed_ops() {
         let key = B256::repeat_byte(9);
         let owner = Address::repeat_byte(0xBB);
         let cd = calldata(vec![
-            Operation::update(key, Bytes::from_static(b"p"), empty_mime(), vec![]),
-            Operation::extend(key, 5),
-            Operation::transfer(key, owner),
+            Operation::extend_expiry(key, 0, 5),
+            Operation::transfer_ownership(key, owner),
             Operation::delete(key),
-            Operation::expire(key),
         ]);
         let ops = decode_ops(&env([0xAA; 20], 100, 1), &cd, 0).unwrap();
-        assert!(matches!(&ops[0], Op::Update { key: k, .. } if *k == key.0));
         assert!(
-            matches!(&ops[1], Op::ExtendExpiry { new_expires_at, .. } if *new_expires_at == 105)
+            matches!(&ops[0], Op::ExtendExpiry { new_expires_at, .. } if *new_expires_at == 105)
         );
         assert!(
-            matches!(&ops[2], Op::Transfer { new_owner, .. } if *new_owner == owner.into_array())
+            matches!(&ops[1], Op::Transfer { new_owner, .. } if *new_owner == owner.into_array())
         );
-        assert!(matches!(&ops[3], Op::Delete { .. }));
-        assert!(matches!(&ops[4], Op::Expire { .. }));
+        assert!(matches!(&ops[2], Op::Delete { .. }));
     }
+
+    #[test]
+    fn rejects_transfer_to_zero() {
+        let cd = calldata(vec![Operation::transfer_ownership(
+            B256::repeat_byte(1),
+            Address::ZERO,
+        )]);
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            Err(DecodeError::TransferToZeroAddress { .. })
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Structural faults
+    // -------------------------------------------------------------------------
 
     #[test]
     fn rejects_empty_batch() {
@@ -407,16 +734,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_btl_create() {
-        let cd = calldata(vec![Operation::create(
-            0,
-            Bytes::new(),
-            empty_mime(),
-            vec![],
-        )]);
+    fn rejects_unknown_op_tag() {
+        let cd = calldata(vec![Operation {
+            operation: 99,
+            operationData: Bytes::new(),
+        }]);
         assert!(matches!(
             decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
-            Err(DecodeError::ZeroBtl)
+            Err(DecodeError::InvalidOpType(99))
+        ));
+    }
+
+    /// One op, one encoding: a blob with trailing junk decodes under a
+    /// permissive reader but is not what the encoder emits.
+    #[test]
+    fn rejects_non_canonical_operation_data() {
+        let mut op = Operation::delete(B256::repeat_byte(1));
+        op.operationData = {
+            let mut b = op.operationData.to_vec();
+            b.extend_from_slice(&[0u8; 32]);
+            Bytes::from(b)
+        };
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![op]), 0),
+            Err(DecodeError::OperationData {
+                reason: OpAbiError::NonCanonical,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unsorted_and_duplicate_attributes() {
+        let a = attr("b", &AttributeValue::u256_from_u64(1));
+        let b = attr("a", &AttributeValue::u256_from_u64(2));
+        // Hand-built (the constructors sort), so the order is what reaches decode.
+        let unsorted = Operation {
+            operation: OP_PATCH,
+            operationData: Bytes::from(alloy_sol_types::SolValue::abi_encode(&Patch {
+                entityKey: B256::repeat_byte(1),
+                mutations: vec![a.clone(), b],
+            })),
+        };
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![unsorted]), 0),
+            Err(DecodeError::AttributesNotSorted)
+        ));
+
+        let duplicate = Operation {
+            operation: OP_PATCH,
+            operationData: Bytes::from(alloy_sol_types::SolValue::abi_encode(&Patch {
+                entityKey: B256::repeat_byte(1),
+                mutations: vec![a.clone(), a],
+            })),
+        };
+        assert!(matches!(
+            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![duplicate]), 0),
+            Err(DecodeError::AttributesNotSorted)
         ));
     }
 
@@ -426,17 +800,12 @@ mod tests {
     fn rejects_invalid_attribute_name() {
         let mut name = [0u8; 32];
         name[..14].copy_from_slice(b"testInvalidKey");
-        let attr = AbiAttribute {
-            name: FixedBytes::from(name).into(),
-            valueType: AttributeType::Str.id(),
-            value: [FixedBytes::ZERO; 4],
+        let bad = AbiAttribute {
+            name: FixedBytes::from(name),
+            typeId: AttributeType::Str.id(),
+            value: Bytes::new(),
         };
-        let cd = calldata(vec![Operation::create(
-            10,
-            Bytes::new(),
-            empty_mime(),
-            vec![attr],
-        )]);
+        let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![bad])]);
         assert!(matches!(
             decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
             // "testInvalidKey": the first bad byte is 'I' (0x49) at position 4.
@@ -449,32 +818,15 @@ mod tests {
 
     #[test]
     fn rejects_empty_attribute_name() {
-        let attr = AbiAttribute {
-            name: FixedBytes::from([0u8; 32]).into(),
-            valueType: AttributeType::Str.id(),
-            value: [FixedBytes::ZERO; 4],
+        let bad = AbiAttribute {
+            name: FixedBytes::from([0u8; 32]),
+            typeId: AttributeType::Str.id(),
+            value: Bytes::new(),
         };
-        let cd = calldata(vec![Operation::create(
-            10,
-            Bytes::new(),
-            empty_mime(),
-            vec![attr],
-        )]);
+        let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![bad])]);
         assert!(matches!(
             decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
             Err(DecodeError::AttributeNameEmpty)
-        ));
-    }
-
-    #[test]
-    fn rejects_transfer_to_zero() {
-        let cd = calldata(vec![Operation::transfer(
-            B256::repeat_byte(1),
-            Address::ZERO,
-        )]);
-        assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
-            Err(DecodeError::TransferToZeroAddress { .. })
         ));
     }
 

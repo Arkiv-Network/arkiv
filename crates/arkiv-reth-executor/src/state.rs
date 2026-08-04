@@ -167,16 +167,16 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
     }
 
     /// Read `caller`'s entity-key minting nonce from the system account.
-    pub fn read_nonce(&mut self, caller: Address) -> Result<u32, eyre::Report> {
+    pub fn read_nonce(&mut self, caller: Address) -> Result<u64, eyre::Report> {
         let slot = U256::from_be_bytes(nonce_slot(caller).0);
         Ok(self
             .read_slot(SYSTEM_ACCOUNT_ADDRESS, slot)?
-            .saturating_to::<u32>())
+            .saturating_to::<u64>())
     }
 
     /// Advance `caller`'s minting nonce by `by` (one per entity created), returning
     /// the value it had *before* the bump — the `start_nonce` the batch decoded with.
-    pub fn bump_nonce(&mut self, caller: Address, by: u32) -> Result<u32, eyre::Report> {
+    pub fn bump_nonce(&mut self, caller: Address, by: u64) -> Result<u64, eyre::Report> {
         self.persist_account(SYSTEM_ACCOUNT_ADDRESS)?;
         let current = self.read_nonce(caller)?;
         let slot = U256::from_be_bytes(nonce_slot(caller).0);
@@ -303,6 +303,7 @@ mod tests {
             created_at_block: 10,
             last_modified_at_block: 20,
             expires_at: 100,
+            creation_flags: 0,
             content_type: b"text/plain".to_vec(),
             payload: b"hello world".to_vec(),
             attributes: vec![

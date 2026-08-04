@@ -11,9 +11,8 @@
 //!     → apply_delta → EvmState → the entity is committed at its minted key
 //! ```
 
-use alloy_primitives::{Bytes, FixedBytes};
 use alloy_sol_types::SolCall;
-use arkiv_bindings::{IEntityRegistry, Mime128, Operation};
+use arkiv_bindings::{Attribute as AbiAttribute, IEntityRegistry, Ident32, Operation};
 use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus};
 use arkiv_interfaces::state::EntityStore;
 use arkiv_reth_entitystore::layout::entity_address;
@@ -23,10 +22,18 @@ use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
 const CHAIN_ID: u64 = 1;
 
-fn empty_mime() -> Mime128 {
-    Mime128 {
-        data: [FixedBytes::ZERO; 4],
-    }
+/// The `$payload` triple — payload rides in the attribute list now.
+fn payload_attr(bytes: &[u8]) -> AbiAttribute {
+    AbiAttribute::from_value(
+        Ident32::system("$payload").unwrap(),
+        &arkiv_interfaces::entity::AttributeValue::Bytes(bytes.to_vec()),
+    )
+    .unwrap()
+}
+
+/// A create with a purely relative lifetime.
+fn create(min_lifetime: u64, payload: &[u8]) -> Operation {
+    Operation::create(0, 0, min_lifetime, 0, vec![payload_attr(payload)])
 }
 
 fn calldata(ops: Vec<Operation>) -> Vec<u8> {
@@ -47,12 +54,7 @@ fn create_from_calldata_lands_in_reth_state() {
     let alice = [0xAA; 20];
     // What arkiv-cli would send: a create with a 50-block TTL. entityKey is 0 in the
     // calldata — the node mints it.
-    let cd = calldata(vec![Operation::create(
-        50,
-        Bytes::from_static(b"hello"),
-        empty_mime(),
-        vec![],
-    )]);
+    let cd = calldata(vec![create(50, b"hello")]);
 
     let env = env(alice, 10);
     let ops = decode_ops(&env, &cd, 0).unwrap(); // start_nonce 0
@@ -66,7 +68,7 @@ fn create_from_calldata_lands_in_reth_state() {
     assert_eq!(out.status, ExecStatus::Ok);
 
     // The entity was minted at the derived key, with env-resolved lifecycle fields.
-    let expected_key = derive_entity_key(CHAIN_ID, &alice, 0);
+    let expected_key = derive_entity_key(CHAIN_ID, &alice, 0, 0);
     let staged = draft.entities.puts[0].clone();
     assert_eq!(staged.key, expected_key);
     assert_eq!(staged.owner, alice);
@@ -88,10 +90,7 @@ fn create_from_calldata_lands_in_reth_state() {
 #[test]
 fn a_batch_of_creates_lands_each_at_its_minted_key() {
     let alice = [0xAA; 20];
-    let cd = calldata(vec![
-        Operation::create(10, Bytes::from_static(b"a"), empty_mime(), vec![]),
-        Operation::create(10, Bytes::from_static(b"b"), empty_mime(), vec![]),
-    ]);
+    let cd = calldata(vec![create(10, b"a"), create(10, b"b")]);
 
     let env = env(alice, 5);
     let ops = decode_ops(&env, &cd, 0).unwrap();
@@ -104,8 +103,8 @@ fn a_batch_of_creates_lands_each_at_its_minted_key() {
     store.apply_delta(&draft.entities).unwrap();
 
     // Two distinct keys from consecutive nonces, each holding its own entity.
-    let k0 = derive_entity_key(CHAIN_ID, &alice, 0);
-    let k1 = derive_entity_key(CHAIN_ID, &alice, 1);
+    let k0 = derive_entity_key(CHAIN_ID, &alice, 0, 0);
+    let k1 = derive_entity_key(CHAIN_ID, &alice, 1, 0);
     assert_ne!(k0, k1);
     assert_eq!(store.get(k0).unwrap().unwrap().payload, b"a");
     assert_eq!(store.get(k1).unwrap().unwrap().payload, b"b");

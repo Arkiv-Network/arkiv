@@ -117,6 +117,7 @@ mod tests {
             key: [7u8; 32],
             owner: [2u8; 20],
             expires_at: 100,
+            creation_flags: 0,
             content_type: b"text/plain".to_vec(),
             payload: b"hi".to_vec(),
             attributes: vec![Attribute::new(

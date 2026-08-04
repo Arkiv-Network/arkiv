@@ -25,6 +25,11 @@ pub struct Entity {
     pub last_modified_at_block: BlockNumber,
     /// The block it expires in.
     pub expires_at: BlockNumber,
+    /// Entity properties fixed at creation: `readonly`, `permissionless
+    /// extension`, and six bits reserved for later protocol upgrades. Set from
+    /// the create op's `creationFlags` and immutable thereafter — no op changes
+    /// them, which is what lets a reader trust them without checking history.
+    pub creation_flags: u8,
     /// Opaque content type (e.g. a MIME string).
     pub content_type: Vec<u8>,
     /// Opaque application payload.
@@ -382,8 +387,36 @@ pub mod annotations {
     pub const KEY: &[u8] = b"$key";
     /// The expiry block, as a big-endian `u64` (changes on extend).
     pub const EXPIRATION: &[u8] = b"$expiration";
-    /// The content type (changes on update).
+    /// The content type (changes on patch). User-managed.
     pub const CONTENT_TYPE: &[u8] = b"$contentType";
+    /// The opaque payload bytes. User-managed, and not indexed — `bytes` has no
+    /// ordering, so it is never queryable.
+    pub const PAYLOAD: &[u8] = b"$payload";
+
+    /// The `$` prefix marking a system attribute. Reserved: a user attribute
+    /// name may never start with it.
+    pub const SYSTEM_PREFIX: u8 = b'$';
+
+    /// The only system attributes a `create` or `patch` may name.
+    ///
+    /// Every other `$` attribute is **engine-controlled** — filled from the
+    /// transaction context at creation (`$creator`, `$createdAtBlock`) or
+    /// maintained by the protocol (`$owner`, `$expiration`) — and naming one in
+    /// a triple list is a revert, set or tombstone alike. That is what keeps
+    /// "the engine owns these cells" true by construction rather than by
+    /// convention.
+    pub const USER_MANAGED: [&[u8]; 2] = [PAYLOAD, CONTENT_TYPE];
+
+    /// Whether `name` is a system attribute a client may write.
+    pub fn is_user_managed(name: &[u8]) -> bool {
+        USER_MANAGED.contains(&name)
+    }
+
+    /// Whether `name` is reserved for the engine — a system name that is not
+    /// user-managed.
+    pub fn is_engine_controlled(name: &[u8]) -> bool {
+        name.first() == Some(&SYSTEM_PREFIX) && !is_user_managed(name)
+    }
 }
 
 #[cfg(test)]

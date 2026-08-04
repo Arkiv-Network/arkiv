@@ -202,6 +202,7 @@ mod tests {
             created_at_block: 3,
             last_modified_at_block: 4,
             expires_at: 60,
+            creation_flags: 0,
             content_type: b"text/plain".to_vec(),
             payload: b"ignored".to_vec(),
             attributes: vec![Attribute::new(

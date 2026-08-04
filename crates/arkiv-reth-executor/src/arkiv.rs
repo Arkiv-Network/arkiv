@@ -44,9 +44,11 @@ use core::fmt;
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
-use arkiv_interfaces::entity::Entity;
+use arkiv_bindings::{FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY};
+use arkiv_interfaces::entity::{Attribute, Entity, annotations};
 use arkiv_interfaces::execution::{
-    BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason, TransactionExecutor,
+    AttributeMutation, BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
+    TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
 use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey};
@@ -63,10 +65,16 @@ pub struct OpEffect {
     /// Which operation it was.
     pub kind: OpKind,
     /// The entity's owner after the op (the new owner for a transfer; the prior
-    /// owner for a delete/expire).
+    /// owner for a delete).
     pub owner: Address,
     /// The entity's expiry after the op.
     pub expires_at: BlockNumber,
+    /// The entity's creation flags. Only meaningful for a create — the event it
+    /// feeds is the one place they are published.
+    pub creation_flags: u8,
+    /// The owner *before* a transfer. `None` for every other op, which have no
+    /// ownership change to report.
+    pub previous_owner: Option<Address>,
 }
 
 /// The fixed-function entity executor.
@@ -243,6 +251,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             Op::Create {
                 key,
                 expires_at,
+                creation_flags,
                 content_type,
                 payload,
                 attributes,
@@ -257,6 +266,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     created_at_block: env.block_number,
                     last_modified_at_block: env.block_number,
                     expires_at: *expires_at,
+                    creation_flags: *creation_flags,
                     content_type: content_type.clone(),
                     payload: payload.clone(),
                     attributes: attributes.clone(),
@@ -267,31 +277,31 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     kind: OpKind::Create,
                     owner: env.caller,
                     expires_at: *expires_at,
+                    creation_flags: *creation_flags,
+                    previous_owner: None,
                 }))
             }
-            Op::Update {
-                key,
-                content_type,
-                payload,
-                attributes,
-            } => self
+            Op::Patch { key, mutations } => self
                 .mutate(
                     env,
                     entities,
                     draft,
                     overlay,
                     *key,
-                    |_| Ok(()),
+                    Auth::OwnerOnly,
+                    // `readonly` is fixed at creation and makes contents
+                    // immutable — lifecycle ops (extend, transfer, delete)
+                    // still work, only the contents are frozen.
                     |e| {
-                        e.content_type = content_type.clone();
-                        e.payload = payload.clone();
-                        e.attributes = attributes.clone();
+                        if e.creation_flags & FLAG_READONLY != 0 {
+                            return Err(RevertReason::ReadOnly { key: *key });
+                        }
+                        Ok(())
                     },
+                    |e| apply_mutations(e, mutations),
                 )
                 .map(|r| {
-                    r.map(|(owner, expires_at)| {
-                        self.effect(*key, OpKind::Update, owner, expires_at)
-                    })
+                    r.map(|(owner, expires_at)| self.effect(*key, OpKind::Patch, owner, expires_at))
                 }),
             Op::ExtendExpiry {
                 key,
@@ -303,9 +313,15 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     draft,
                     overlay,
                     *key,
-                    // Lifetime must move forward; matching the contract's rule.
+                    // `permissionless_extension` lets anyone pay to keep an
+                    // entity alive — the one op a non-owner may perform, and
+                    // only because extending can't harm the owner.
+                    Auth::OwnerOrFlag(FLAG_PERMISSIONLESS_EXTENSION),
+                    // Lifetimes never shorten. Equal is a no-op rather than a
+                    // revert: the resolved target is what the client asked for,
+                    // and asking for a lifetime it already has is satisfied.
                     |e| {
-                        if *new_expires_at <= e.expires_at {
+                        if *new_expires_at < e.expires_at {
                             return Err(RevertReason::ExpiryNotExtended {
                                 key: *key,
                                 new_expires_at: *new_expires_at,
@@ -323,13 +339,21 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                         self.effect(*key, OpKind::ExtendExpiry, owner, expires_at)
                     })
                 }),
-            Op::Transfer { key, new_owner } => self
-                .mutate(
+            Op::Transfer { key, new_owner } => {
+                // Read the outgoing owner before `mutate` overwrites it — the
+                // event reports both sides of the handover, and afterwards the
+                // old one is gone. `None` here means the entity is missing,
+                // which `mutate` reports as `NotFound`.
+                let previous_owner = self
+                    .current(entities, draft, overlay, *key)?
+                    .map(|e| e.owner);
+                self.mutate(
                     env,
                     entities,
                     draft,
                     overlay,
                     *key,
+                    Auth::OwnerOnly,
                     // A no-op transfer is a client mistake; matching the contract.
                     |e| {
                         if *new_owner == e.owner {
@@ -342,10 +366,12 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     },
                 )
                 .map(|r| {
-                    r.map(|(owner, expires_at)| {
-                        self.effect(*key, OpKind::Transfer, owner, expires_at)
+                    r.map(|(owner, expires_at)| OpEffect {
+                        previous_owner,
+                        ..self.effect(*key, OpKind::Transfer, owner, expires_at)
                     })
-                }),
+                })
+            }
             Op::Delete { key } => {
                 let Some(entity) = self.current(entities, draft, overlay, *key)? else {
                     return Ok(Err(RevertReason::NotFound { key: *key }));
@@ -361,24 +387,6 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 Ok(Ok(self.effect(
                     *key,
                     OpKind::Delete,
-                    entity.owner,
-                    entity.expires_at,
-                )))
-            }
-            Op::Expire { key } => {
-                let Some(entity) = self.current(entities, draft, overlay, *key)? else {
-                    return Ok(Err(RevertReason::NotFound { key: *key }));
-                };
-                if entity.expires_at > env.block_number {
-                    return Ok(Err(RevertReason::NotExpired {
-                        key: *key,
-                        expires_at: entity.expires_at,
-                    }));
-                }
-                overlay.insert(*key, None);
-                Ok(Ok(self.effect(
-                    *key,
-                    OpKind::Expire,
                     entity.owner,
                     entity.expires_at,
                 )))
@@ -399,11 +407,13 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             kind,
             owner,
             expires_at,
+            creation_flags: 0,
+            previous_owner: None,
         }
     }
 
-    /// Shared read-modify-write for [`Op::Update`] / [`Op::ExtendExpiry`] /
-    /// [`Op::Transfer`]: load the entity, check ownership and liveness, run the
+    /// Shared read-modify-write for [`Op::Patch`] / [`Op::ExtendExpiry`] /
+    /// [`Op::Transfer`]: load the entity, authorize, check liveness, run the
     /// op's own `check` against the loaded entity, mutate, re-stage.
     ///
     /// An expired entity (current block at or past its `expires_at`) is not
@@ -417,13 +427,14 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         draft: &BlockDraft,
         overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
         key: EntityKey,
+        auth: Auth,
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
         edit: impl FnOnce(&mut Entity),
     ) -> Result<Result<(Address, BlockNumber), RevertReason>, ExecError> {
         let Some(mut entity) = self.current(entities, draft, overlay, key)? else {
             return Ok(Err(RevertReason::NotFound { key }));
         };
-        if entity.owner != env.caller {
+        if !auth.permits(&entity, &env.caller) {
             return Ok(Err(RevertReason::NotOwner {
                 key,
                 caller: env.caller,
@@ -485,6 +496,72 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
 /// delete in the same transaction, which nets to no entity and no index entries).
 ///
 /// The diff is symmetric set difference over the entities' full annotation sets, so
+/// Who may perform a mutating op on an entity.
+///
+/// Ownership is the rule for anything that changes what an entity *is*. The one
+/// exception is opened by a creation flag, and only because the op it guards
+/// cannot hurt the owner: paying to extend someone else's expiry gives the payer
+/// nothing and takes nothing away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    /// Only the current owner.
+    OwnerOnly,
+    /// The owner, or anyone at all if the entity carries this creation flag.
+    OwnerOrFlag(u8),
+}
+
+impl Auth {
+    fn permits(self, entity: &Entity, caller: &Address) -> bool {
+        if entity.owner == *caller {
+            return true;
+        }
+        match self {
+            Auth::OwnerOnly => false,
+            Auth::OwnerOrFlag(flag) => entity.creation_flags & flag != 0,
+        }
+    }
+}
+
+/// Apply a patch's mutations to an entity: set some attributes, unset others,
+/// leave everything else untouched.
+///
+/// This is what makes `patch` a patch. An attribute absent from `mutations`
+/// keeps its value, so two patches touching disjoint attributes compose instead
+/// of the second clobbering the first — the lost-update race a whole-entity
+/// replace has by construction.
+///
+/// `$payload` and `$contentType` are user-managed system attributes that live in
+/// the entity's own fields rather than its attribute list, so they are routed
+/// here; unsetting one clears it. Every other `$` name was rejected at decode.
+fn apply_mutations(entity: &mut Entity, mutations: &[AttributeMutation]) {
+    for m in mutations {
+        match m.key.as_slice() {
+            annotations::PAYLOAD => {
+                entity.payload = m.value.as_ref().map(|v| v.encode()).unwrap_or_default()
+            }
+            annotations::CONTENT_TYPE => {
+                entity.content_type = m.value.as_ref().map(|v| v.encode()).unwrap_or_default()
+            }
+            name => match &m.value {
+                Some(value) => match entity.attributes.iter_mut().find(|a| a.key == name) {
+                    // A set replaces the value *and* its type — one name holds
+                    // one typed value, so re-typing is a set, not a conflict.
+                    Some(existing) => existing.value = value.clone(),
+                    None => entity.attributes.push(Attribute {
+                        key: name.to_vec(),
+                        value: value.clone(),
+                    }),
+                },
+                // Unsetting an attribute that isn't set is a no-op, not an
+                // error: the requested end state ("absent") is what results.
+                None => entity.attributes.retain(|a| a.key != name),
+            },
+        }
+    }
+    // The stored order is canonical, and a push above may have broken it.
+    entity.attributes.sort_by(|a, b| a.key.cmp(&b.key));
+}
+
 /// it is correct for every op kind without special-casing: whatever the two states
 /// disagree on is exactly what the index must change.
 fn auxiliary_delta(
@@ -602,6 +679,7 @@ mod tests {
             created_at_block: 3,
             last_modified_at_block: 4,
             expires_at: 100,
+            creation_flags: 0,
             content_type: b"text/plain".to_vec(),
             payload: b"hello".to_vec(),
             attributes: vec![
@@ -637,6 +715,7 @@ mod tests {
                 &[Op::Create {
                     key: [1u8; 32],
                     expires_at: 50,
+                    creation_flags: 0,
                     content_type: b"x".to_vec(),
                     payload: b"y".to_vec(),
                     attributes: Vec::new(),
@@ -675,6 +754,7 @@ mod tests {
                 &[Op::Create {
                     key: [1u8; 32],
                     expires_at: 50,
+                    creation_flags: 0,
                     content_type: Vec::new(),
                     payload: Vec::new(),
                     attributes: Vec::new(),
@@ -773,7 +853,7 @@ mod tests {
     /// An extend that doesn't move the expiry forward reverts
     /// `ExpiryNotExtended` — lifetime must strictly increase.
     #[test]
-    fn extend_must_increase_expiry() {
+    fn extend_never_shortens_and_equal_is_a_no_op() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
         let owner = [2u8; 20];
@@ -785,7 +865,9 @@ mod tests {
             .unwrap();
         let mut draft = BlockDraft::default();
 
-        // Equal expiry is not an extension.
+        // Equal expiry succeeds as a no-op: the client asked for a lifetime the
+        // entity already has, and that request is satisfied. (This is the rule
+        // from arkiv-node-api.md §3 — "> extends, == no-op, < reverts".)
         let out = exec
             .apply(
                 &env(owner, 20),
@@ -797,12 +879,28 @@ mod tests {
                 }],
             )
             .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(draft.entities.puts[0].expires_at, 100);
+
+        // An earlier expiry reverts — lifetimes never shorten.
+        let mut shrink_draft = BlockDraft::default();
+        let out = exec
+            .apply(
+                &env(owner, 20),
+                &mut store,
+                &mut shrink_draft,
+                &[Op::ExtendExpiry {
+                    key: [7u8; 32],
+                    new_expires_at: 50,
+                }],
+            )
+            .unwrap();
         assert_eq!(out.status, ExecStatus::Reverted);
         assert_eq!(
             out.revert,
             Some(RevertReason::ExpiryNotExtended {
                 key: [7u8; 32],
-                new_expires_at: 100,
+                new_expires_at: 50,
                 current_expires_at: 100,
             })
         );
@@ -843,6 +941,7 @@ mod tests {
                     Op::Create {
                         key: [3u8; 32],
                         expires_at: 50,
+                        creation_flags: 0,
                         content_type: Vec::new(),
                         payload: Vec::new(),
                         attributes: Vec::new(),
@@ -876,6 +975,7 @@ mod tests {
             &[Op::Create {
                 key: [1u8; 32],
                 expires_at: 50,
+                creation_flags: 0,
                 content_type: b"text/plain".to_vec(),
                 payload: b"y".to_vec(),
                 attributes: vec![Attribute::new(
@@ -942,10 +1042,12 @@ mod tests {
         );
     }
 
-    /// An `Update` diffs only what changed: the new `$contentType` in, the old one
-    /// plus every dropped user attribute out. Unchanged built-ins never appear.
+    /// A `Patch` diffs only what changed: the new `$contentType` in, the old one
+    /// and the explicitly-unset attribute out. `size`, which the patch never
+    /// mentions, does not appear on either side — that is the difference from a
+    /// whole-entity replace, which would have dropped it too.
     #[test]
-    fn update_stages_only_changed_annotations() {
+    fn patch_stages_only_changed_annotations() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
         store
@@ -960,18 +1062,22 @@ mod tests {
             &env([2u8; 20], 20),
             &mut store,
             &mut draft,
-            &[Op::Update {
+            &[Op::Patch {
                 key: [7u8; 32],
-                content_type: b"application/json".to_vec(),
-                payload: b"world".to_vec(),
-                attributes: Vec::new(), // drops color + size
+                mutations: vec![
+                    AttributeMutation::set(
+                        annotations::CONTENT_TYPE,
+                        AttributeValue::Str("application/json".into()),
+                    ),
+                    AttributeMutation::unset(b"color".to_vec()),
+                ],
             }],
         )
         .unwrap();
 
         let delta = &draft.auxiliary.entities[0];
-        // Out: old $contentType, color, size. In: new $contentType.
-        assert_eq!(delta.removes.len(), 3);
+        // Out: old $contentType, color. In: new $contentType.
+        assert_eq!(delta.removes.len(), 2);
         assert_eq!(delta.inserts.len(), 1);
         assert_eq!(delta.inserts[0].attr, b"$contentType");
         assert_eq!(
@@ -979,49 +1085,13 @@ mod tests {
             AttributeValue::Str("application/json".into())
         );
         assert!(delta.removes.iter().any(|a| a.attr == b"color"));
-        assert!(delta.removes.iter().any(|a| a.attr == b"size"));
         assert!(
             delta.removes.iter().any(|a| a.attr == b"$contentType"
                 && a.value == AttributeValue::Str("text/plain".into()))
         );
-    }
-
-    /// `Expire` is gated on the clock, not on ownership: it reverts while the
-    /// entity is still live (current block before `expires_at`) and succeeds once
-    /// the block has reached `expires_at`, staging a delete.
-    #[test]
-    fn expire_only_after_expiry_block() {
-        let exec = ArkivExecutor::<MemStore>::new();
-        let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
-                puts: vec![sample_entity()], // key [7; 32], expires_at = 100
-                deletes: Vec::new(),
-            })
-            .unwrap();
-
-        let mut draft = BlockDraft::default();
-        let out = exec
-            .apply(
-                &env([0u8; 20], 50),
-                &mut store,
-                &mut draft,
-                &[Op::Expire { key: [7u8; 32] }],
-            )
-            .unwrap();
-        assert_eq!(out.status, ExecStatus::Reverted);
-
-        let mut draft = BlockDraft::default();
-        let out = exec
-            .apply(
-                &env([0u8; 20], 100),
-                &mut store,
-                &mut draft,
-                &[Op::Expire { key: [7u8; 32] }],
-            )
-            .unwrap();
-        assert_eq!(out.status, ExecStatus::Ok);
-        assert_eq!(draft.entities.deletes, vec![[7u8; 32]]);
+        // The untouched attribute is absent from the delta entirely.
+        assert!(delta.removes.iter().all(|a| a.attr != b"size"));
+        assert!(delta.inserts.iter().all(|a| a.attr != b"size"));
     }
 
     /// `Update` (owner, live entity) replaces `content_type` / `payload` /
@@ -1029,7 +1099,7 @@ mod tests {
     /// lifecycle fields (creator, owner, created_at_block, expires_at) are left
     /// exactly as they were.
     #[test]
-    fn update_replaces_content_and_stamps_modified() {
+    fn patch_merges_content_and_stamps_modified() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
         store
@@ -1045,11 +1115,18 @@ mod tests {
                 &env([2u8; 20], 20),
                 &mut store,
                 &mut draft,
-                &[Op::Update {
+                &[Op::Patch {
                     key: [7u8; 32],
-                    content_type: b"application/json".to_vec(),
-                    payload: b"world".to_vec(),
-                    attributes: Vec::new(),
+                    mutations: vec![
+                        AttributeMutation::set(
+                            annotations::CONTENT_TYPE,
+                            AttributeValue::Str("application/json".into()),
+                        ),
+                        AttributeMutation::set(
+                            annotations::PAYLOAD,
+                            AttributeValue::Bytes(b"world".to_vec()),
+                        ),
+                    ],
                 }],
             )
             .unwrap();
@@ -1058,7 +1135,8 @@ mod tests {
         let e = &draft.entities.puts[0];
         assert_eq!(e.content_type, b"application/json");
         assert_eq!(e.payload, b"world");
-        assert!(e.attributes.is_empty());
+        // Attributes the patch never mentioned survive — the whole point.
+        assert_eq!(e.attributes.len(), 2);
         assert_eq!(e.last_modified_at_block, 20);
         // Identity and lifecycle untouched.
         assert_eq!(e.creator, [1u8; 20]);
@@ -1117,11 +1195,12 @@ mod tests {
         let owner = [2u8; 20];
 
         let expired_ops = [
-            Op::Update {
+            Op::Patch {
                 key: [7u8; 32],
-                content_type: Vec::new(),
-                payload: b"x".to_vec(),
-                attributes: Vec::new(),
+                mutations: vec![AttributeMutation::set(
+                    b"color".to_vec(),
+                    AttributeValue::Str("x".into()),
+                )],
             },
             Op::ExtendExpiry {
                 key: [7u8; 32],
@@ -1166,6 +1245,7 @@ mod tests {
         let create = Op::Create {
             key: [1u8; 32],
             expires_at: 50,
+            creation_flags: 0,
             content_type: Vec::new(),
             payload: Vec::new(),
             attributes: Vec::new(),
@@ -1198,6 +1278,7 @@ mod tests {
         let create = Op::Create {
             key: [1u8; 32],
             expires_at: 50,
+            creation_flags: 0,
             content_type: Vec::new(),
             payload: Vec::new(),
             attributes: Vec::new(),
