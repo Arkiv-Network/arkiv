@@ -181,6 +181,7 @@ pub fn format_attribute_value(value: &AttributeValue) -> String {
     match value {
         AttributeValue::Bool(b) => b.to_string(),
         AttributeValue::Int(n) => n.to_string(),
+        AttributeValue::U64(n) => n.to_string(),
         AttributeValue::U256(w) => U256::from_be_bytes(*w).to_string(),
         AttributeValue::Decimal(w) => format_decimal(*w),
         AttributeValue::Str(s) => s.clone(),
@@ -380,7 +381,10 @@ mod tests {
         };
         let json = serde_json::to_value(&attr).expect("serialize");
         assert_eq!(json["key"], "score");
-        assert_eq!(json["valueType"], 3);
+        // Derived, not restated: the typeId numbering is pinned once, in
+        // `arkiv_interfaces::entity`. This test is about the camelCase field
+        // names.
+        assert_eq!(json["valueType"], attr.value_type);
         assert_eq!(json["value"], "42");
         assert!(json.get("value_type").is_none());
     }

@@ -132,6 +132,7 @@ impl Attribute {
                 w[WORD - 4..].copy_from_slice(&n.to_be_bytes());
                 words[0] = FixedBytes::from(w);
             }
+            AttributeValue::U64(n) => words[0].0[WORD - 8..].copy_from_slice(&n.to_be_bytes()),
             AttributeValue::U256(w)
             | AttributeValue::Decimal(w)
             | AttributeValue::Bytes32(w)
@@ -208,6 +209,12 @@ fn decode_word(ty: AttributeType, w: [u8; WORD]) -> Result<AttributeValue, AttrA
             Ok(AttributeValue::EthereumAddress(
                 w[WORD - 20..].try_into().unwrap(),
             ))
+        }
+        AttributeType::U64 => {
+            zero_prefix(&w, WORD - 8)?;
+            Ok(AttributeValue::U64(u64::from_be_bytes(
+                w[WORD - 8..].try_into().unwrap(),
+            )))
         }
         AttributeType::U256 => Ok(AttributeValue::U256(w)),
         AttributeType::Decimal => Ok(AttributeValue::Decimal(w)),
