@@ -58,7 +58,6 @@
 extern crate alloc;
 
 pub mod codec;
-pub mod collections;
 pub mod entity;
 pub mod execution;
 pub mod gas;
@@ -68,7 +67,6 @@ pub mod rpc;
 pub mod state;
 
 pub use codec::*;
-pub use collections::*;
 pub use entity::*;
 pub use execution::*;
 pub use gas::*;

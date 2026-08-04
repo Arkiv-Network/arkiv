@@ -3,20 +3,22 @@
 //!
 //! A straight tree walk, ported from `arkiv-db-engine`'s interpreter:
 //!
-//! - **Equality** (`Eq`/`In`) reads pair bitmaps and unions them.
-//! - **Negation** (`Neq`/`NotIn`/`Not`/`NotGlob`) is `$all` minus the positive
-//!   match — see [`complement`].
+//! - **Equality** (`Eq`) reads one pair bitmap — the query value's own type and
+//!   index bytes name the same bucket the writer derived.
+//! - **Negation** (`Not`) is `$all` minus the positive match — see
+//!   [`complement`]. It is the only negation the language has: value-negation
+//!   (`!=`) would need a per-`(attribute, type)` presence set the index does not
+//!   maintain, so the parser rejects it rather than answering this wider set.
 //! - **Range** (`Gt`/`Gte`/`Lt`/`Lte`) scans the tier-2 index for the matching
 //!   *values*, then unions each value's tier-1 pair bitmap ([`union_pair_bitmaps`]).
 //!   This tier-2 → tier-1 resolution is the whole reason values are recorded twice.
-//! - **Glob** is a str-mode prefix scan, resolved the same way.
+//! - **StartsWith** is a str-mode prefix scan, resolved the same way.
 //! - **Boolean** `And`/`Or` intersect/union the sub-results, with `And`
 //!   short-circuiting on an empty left side.
 //!
 //! Everything is keyed on the compact `u64` entity id; the caller
 //! ([`store`](crate::store)) maps the surviving ids back to keys.
 
-use arkiv_interfaces::collections::NonEmptyVec;
 use arkiv_interfaces::entity::AttributeType;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, Query};
 use arkiv_reth_entitystore::AccountCode;
@@ -39,18 +41,13 @@ where
         Query::All => all_entities(backend),
 
         Query::Eq { key, value } => read_eq(backend, key, value),
-        Query::Neq { key, value } => complement(backend, |b| read_eq(b, key, value)),
-
-        Query::In { key, values } => read_in(backend, key, values),
-        Query::NotIn { key, values } => complement(backend, |b| read_in(b, key, values)),
 
         Query::Gt { key, value } => range_bitmaps(backend, key, value, Bound::Gt),
         Query::Gte { key, value } => range_bitmaps(backend, key, value, Bound::Gte),
         Query::Lt { key, value } => range_bitmaps(backend, key, value, Bound::Lt),
         Query::Lte { key, value } => range_bitmaps(backend, key, value, Bound::Lte),
 
-        Query::Glob { key, value } => glob_bitmaps(backend, key, value),
-        Query::NotGlob { key, value } => complement(backend, |b| glob_bitmaps(b, key, value)),
+        Query::StartsWith { key, value } => prefix_bitmaps(backend, key, value),
 
         Query::And(left, right) => {
             let mut hits = eval(left, backend)?;
@@ -106,24 +103,6 @@ fn value_pair_address(attr: &[u8], value: &AnnotVal) -> alloy_primitives::Addres
     pair_address(attr, value.attr_type(), &value.index_bytes())
 }
 
-/// The union of pair bitmaps for `key` equal to any of `values`.
-fn read_in<B, E>(
-    backend: &mut B,
-    key: &AnnotKey,
-    values: &NonEmptyVec<AnnotVal>,
-) -> Result<Bitmap, AuxError<E>>
-where
-    B: AccountCode<Error = E>,
-{
-    let attr = annotation::attr_bytes(key);
-    let mut hits = Bitmap::new();
-    for value in values.iter() {
-        let bucket = read_pair_bitmap(backend, value_pair_address(&attr, value))?;
-        hits.union_with(&bucket);
-    }
-    Ok(hits)
-}
-
 /// Resolve a range predicate: scan the tier-2 index for the matching values, then
 /// union their tier-1 pair bitmaps.
 fn range_bitmaps<B, E>(
@@ -153,8 +132,9 @@ where
     union_pair_bitmaps(backend, &attr, ty, values)
 }
 
-/// Resolve a glob predicate: a str-mode prefix scan, then union the pair bitmaps.
-fn glob_bitmaps<B, E>(
+/// Resolve a `STARTSWITH` predicate: a str-mode prefix scan, then union the pair
+/// bitmaps.
+fn prefix_bitmaps<B, E>(
     backend: &mut B,
     key: &AnnotKey,
     value: &AnnotVal,

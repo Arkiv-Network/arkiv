@@ -111,7 +111,7 @@ async fn state_and_index_survive_kill_and_restart() {
         "create block survives",
     );
     assert_eq!(
-        result_keys(&client.query("rank = 20", 100, None).await),
+        result_keys(&client.query("rank = u256(20)", 100, None).await),
         BTreeSet::from([format!("{key1:#x}")]),
         "the query index survives restart",
     );

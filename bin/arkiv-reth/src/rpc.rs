@@ -152,7 +152,7 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
     Query::And(
         Box::new(query),
         Box::new(Query::Gt {
-            key: AnnotKey::BuiltIn(BuiltIn::Expiration),
+            key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
             value: AnnotVal::u256_from_u64(block),
         }),
     )
