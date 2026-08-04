@@ -12,6 +12,8 @@
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
+mod cursor;
+mod errors;
 mod rpc;
 mod snapshot;
 mod view;

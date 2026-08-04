@@ -28,6 +28,12 @@ alloy-consensus.workspace = true
 # `BlockNumberOrTag` for the `atBlock` query option.
 alloy-eips.workspace = true
 serde.workspace = true
+# Attribute values are rendered per type (number, bool, string, hex), so the wire
+# value is a JSON value rather than a formatted string.
+serde_json.workspace = true
+# Query cursors are opaque and bound to their query — base64 of an id plus a
+# binding hash, per the `b64:` form in the spec.
+base64 = "0.22"
 tokio.workspace = true
 eyre.workspace = true
 clap.workspace = true
