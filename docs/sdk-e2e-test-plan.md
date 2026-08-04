@@ -153,11 +153,12 @@ staged behind harness work.
 
 Two things worth knowing while writing them:
 
-- `arkiv_getEntity` still answers in an **older shape** than `arkiv_query` —
-  plain-number block fields, and attributes as `{key, valueType, value}` with
-  the value hex-encoded. Only `arkiv_query` follows the spec encodings. If the
-  SDK reads entities through both, expect to normalize; aligning the two is a
-  follow-up.
+- `arkiv_getEntity` and `arkiv_query` answer with **one entity model** — the
+  same field names and the same per-type encodings — so an SDK decodes a
+  result from either the same way. `getEntity` returns every field (there is
+  nothing to save by trimming a single entity); `arkiv_query` projects. A
+  single-entity read that *does* want a subset can ask `$key = key(…)` through
+  `arkiv_query`. Worth one test asserting the two agree.
 - The harness repo's own `bin/arkiv-reth/tests/e2e.rs` is the reference for
   spawning and driving a dev node, and already covers most of groups D–G — it
   is the closest thing to a conformance suite to crib from.

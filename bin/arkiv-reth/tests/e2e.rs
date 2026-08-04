@@ -18,7 +18,7 @@ use arkiv_bindings::{
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, NodeBuilder, connect,
-    derive_entity_key, result_keys,
+    derive_entity_key, hex_quantity, result_keys,
 };
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
@@ -62,7 +62,12 @@ async fn create_then_get_entity_over_a_live_node() {
     assert_eq!(client.chain_id().await, DEV_CHAIN_ID);
 
     // 1) Send a `create` transaction — exactly what an SDK client does.
-    let op = Operation::create(100, Bytes::from_static(b"hello"), text_plain_mime(), vec![]);
+    let op = Operation::create(
+        100,
+        Bytes::from_static(b"hello"),
+        text_plain_mime(),
+        attrs(7, "red"),
+    );
     let receipt = client.execute(vec![op]).await;
 
     // 2) The key the node minted for this caller's first create (minting nonce 0),
@@ -101,8 +106,31 @@ async fn create_then_get_entity_over_a_live_node() {
     );
     assert_eq!(entity["contentType"], "text/plain");
     assert_eq!(entity["payload"], "0x68656c6c6f"); // "hello"
-    let created = entity["createdAtBlock"].as_u64().unwrap();
-    assert_eq!(entity["expiresAt"].as_u64().unwrap(), created + 100); // btl resolved
+    let created = hex_quantity(&entity["createdAt"]);
+    assert_eq!(hex_quantity(&entity["expiresAt"]), created + 100); // btl resolved
+    // Attributes are typed, in the same shape `arkiv_query` answers with.
+    assert_eq!(
+        entity["attributes"],
+        serde_json::json!([
+            { "name": "rank", "type": "u256", "value": "0x7" },
+            { "name": "team", "type": "str", "value": "red" },
+        ])
+    );
+
+    // 3a) The two read methods answer with one entity model — an SDK decodes
+    //     a result from either the same way.
+    let queried = client
+        .query_raw(
+            &format!("$key = key({key:#x})"),
+            serde_json::json!({ "select": {
+                "key": true, "owner": true, "creator": true,
+                "createdAt": true, "updatedAt": true, "expiresAt": true,
+                "contentType": true, "payload": true, "attributes": true,
+            }}),
+        )
+        .await
+        .expect("query by key");
+    assert_eq!(queried["data"][0], entity, "getEntity and query must agree");
 
     // 4) A key that was never created reads back as null.
     let missing = client.get_entity(B256::repeat_byte(0xAB)).await;
@@ -638,8 +666,8 @@ async fn write_path_ops_over_a_live_node() {
     let e0 = client.get_entity(key(0)).await;
     assert_eq!(e0["payload"], "0x7632"); // "v2"
     assert!(
-        e0["lastModifiedAtBlock"].as_u64().unwrap() > e0["createdAtBlock"].as_u64().unwrap(),
-        "update should advance lastModifiedAtBlock",
+        hex_quantity(&e0["updatedAt"]) > hex_quantity(&e0["createdAt"]),
+        "update should advance updatedAt",
     );
     assert_eq!(
         result_keys(&client.query("rank = u256(100)", 100, None).await),
@@ -652,13 +680,9 @@ async fn write_path_ops_over_a_live_node() {
     );
 
     // EXTEND e1: expiry rises.
-    let before = client.get_entity(key(1)).await["expiresAt"]
-        .as_u64()
-        .unwrap();
+    let before = hex_quantity(&client.get_entity(key(1)).await["expiresAt"]);
     client.execute(vec![Operation::extend(key(1), 5000)]).await;
-    let after = client.get_entity(key(1)).await["expiresAt"]
-        .as_u64()
-        .unwrap();
+    let after = hex_quantity(&client.get_entity(key(1)).await["expiresAt"]);
     assert!(
         after > before,
         "extend should raise expiresAt: {before} -> {after}"
@@ -725,9 +749,7 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
             attrs(10, "red"),
         )])
         .await;
-    let created = client.get_entity(key).await["createdAtBlock"]
-        .as_u64()
-        .unwrap();
+    let created = hex_quantity(&client.get_entity(key).await["createdAt"]);
 
     client
         .execute(vec![Operation::update(
@@ -861,7 +883,7 @@ async fn explicit_expire_over_a_live_node() {
         )])
         .await;
     let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
-    let expires_at = client.get_entity(key).await["expiresAt"].as_u64().unwrap();
+    let expires_at = hex_quantity(&client.get_entity(key).await["expiresAt"]);
 
     // While live, `expire` reverts.
     assert!(
@@ -908,7 +930,7 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
         )])
         .await;
     let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
-    let expires_at = client.get_entity(key).await["expiresAt"].as_u64().unwrap();
+    let expires_at = hex_quantity(&client.get_entity(key).await["expiresAt"]);
     assert_eq!(
         client.entity_count(None, None).await,
         1,

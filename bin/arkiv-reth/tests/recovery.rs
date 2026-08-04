@@ -13,7 +13,7 @@ use alloy_primitives::{B256, Bytes};
 use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{Attribute, AttributeValue, Ident32, Mime128, Operation};
 use arkiv_harness::{
-    DEV_CHAIN_ID, DEV_KEY_0, NodeBuilder, connect, derive_entity_key, result_keys,
+    DEV_CHAIN_ID, DEV_KEY_0, NodeBuilder, connect, derive_entity_key, hex_quantity, result_keys,
 };
 
 const READY: Duration = Duration::from_secs(90);
@@ -59,9 +59,7 @@ async fn state_and_index_survive_kill_and_restart() {
         .await;
     let key0 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0));
     let key1 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 1));
-    let created = client.get_entity(key0).await["createdAtBlock"]
-        .as_u64()
-        .unwrap();
+    let created = hex_quantity(&client.get_entity(key0).await["createdAt"]);
 
     // Let the chain advance well past the create block so it is persisted below the
     // in-memory tip (the safe head that survives an abrupt kill).
@@ -91,7 +89,7 @@ async fn state_and_index_survive_kill_and_restart() {
         "payload survives"
     );
     assert_eq!(
-        entity_after["createdAtBlock"], entity_before["createdAtBlock"],
+        entity_after["createdAt"], entity_before["createdAt"],
         "create block survives",
     );
     assert_eq!(

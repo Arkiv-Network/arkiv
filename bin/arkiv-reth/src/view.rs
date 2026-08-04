@@ -99,6 +99,27 @@ impl Default for Projection {
 }
 
 impl Projection {
+    /// Every field — what a read of one entity by key answers with.
+    ///
+    /// `arkiv_query` projects because a page can be large; `arkiv_getEntity`
+    /// names a single entity, so there is nothing to save by trimming it. A
+    /// caller who does want a subset can ask `$key = key(…)` through
+    /// `arkiv_query` instead.
+    pub fn all() -> Self {
+        Self {
+            key: true,
+            owner: true,
+            creator: true,
+            created_at: true,
+            updated_at: true,
+            expires_at: true,
+            content_type: true,
+            payload: true,
+            attribute_schema: false,
+            attributes: AttributeProjection::All,
+        }
+    }
+
     /// Resolve a caller's `select`, or the default when it is absent.
     ///
     /// Errors describe the one field this version cannot serve.
