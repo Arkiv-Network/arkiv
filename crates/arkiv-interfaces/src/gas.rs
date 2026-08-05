@@ -7,7 +7,7 @@
 //! not the frozen schedule. Expect them to change.
 
 use crate::entity::Attribute;
-use crate::execution::Op;
+use crate::execution::{AttributeMutation, Op};
 use crate::primitives::Gas;
 use crate::query::QueryStats;
 
@@ -25,16 +25,14 @@ pub trait CostModel {
 
 /// Base cost to create an entity.
 const G_CREATE: Gas = 80_000;
-/// Base cost to update an entity's contents.
-const G_UPDATE: Gas = 40_000;
+/// Base cost to patch an entity's contents.
+const G_PATCH: Gas = 40_000;
 /// Base cost to extend an entity's expiry.
 const G_EXTEND_EXPIRY: Gas = 10_000;
 /// Base cost to transfer ownership.
 const G_TRANSFER: Gas = 20_000;
 /// Base cost to delete an entity.
 const G_DELETE: Gas = 10_000;
-/// Base cost to expire an entity.
-const G_EXPIRE: Gas = 5_000;
 /// Per byte of `content_type` + `payload` a write carries.
 const G_BYTE: Gas = 16;
 /// Per attribute a write carries (index maintenance).
@@ -54,6 +52,22 @@ fn data_cost(content_type: &[u8], payload: &[u8], attributes: &[Attribute]) -> G
         .saturating_add((attributes.len() as Gas).saturating_mul(G_ATTRIBUTE))
 }
 
+/// A patch costs its *mutations*, not the entity it touches.
+///
+/// This is the point of the op: `k` mutations cost `k` touches, with no
+/// O(entity) floor. A one-attribute patch of a large entity is cheap, so
+/// callers have no incentive to batch unrelated writes to amortise a floor —
+/// which is also what lets disjoint patches compose instead of racing.
+///
+/// An unset (tombstone) still costs a touch: removing an index entry is work.
+fn mutation_cost(mutations: &[AttributeMutation]) -> Gas {
+    mutations.iter().fold(0, |acc, m| {
+        let bytes = m.value.as_ref().map_or(0, |v| v.encode().len() as Gas);
+        acc.saturating_add(G_ATTRIBUTE)
+            .saturating_add(bytes.saturating_mul(G_BYTE))
+    })
+}
+
 /// A **provisional** cost model with non-zero, non-final numbers. Enough to
 /// exercise gas accounting (metering, out-of-gas) until the real schedule lands.
 #[derive(Debug, Clone, Copy, Default)]
@@ -68,16 +82,10 @@ impl CostModel for PlaceholderCost {
                 attributes,
                 ..
             } => G_CREATE.saturating_add(data_cost(content_type, payload, attributes)),
-            Op::Update {
-                content_type,
-                payload,
-                attributes,
-                ..
-            } => G_UPDATE.saturating_add(data_cost(content_type, payload, attributes)),
+            Op::Patch { mutations, .. } => G_PATCH.saturating_add(mutation_cost(mutations)),
             Op::ExtendExpiry { .. } => G_EXTEND_EXPIRY,
             Op::Transfer { .. } => G_TRANSFER,
             Op::Delete { .. } => G_DELETE,
-            Op::Expire { .. } => G_EXPIRE,
         }
     }
 
@@ -93,6 +101,7 @@ impl CostModel for PlaceholderCost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::CreationFlags;
     use alloc::vec;
 
     #[test]
@@ -110,6 +119,7 @@ mod tests {
             PlaceholderCost.op_cost(&Op::Create {
                 key,
                 expires_at: 1,
+                creation_flags: CreationFlags::NONE,
                 content_type: ct,
                 payload: pl,
                 attributes: at,
@@ -136,12 +146,43 @@ mod tests {
         let cost = PlaceholderCost.op_cost(&Op::Create {
             key,
             expires_at: 1,
+            creation_flags: CreationFlags::NONE,
             content_type: b"ab".to_vec(), // 2 bytes
             payload: b"cde".to_vec(),     // 3 bytes
             attributes: one_attr,
         });
         // base + 5 bytes * G_BYTE + 1 attr * G_ATTRIBUTE
         assert_eq!(cost, G_CREATE + 5 * G_BYTE + G_ATTRIBUTE);
+    }
+
+    /// A patch is priced on what it changes, not on the entity it changes —
+    /// so cost scales with the mutation count and nothing else.
+    #[test]
+    fn patch_cost_scales_with_mutations_not_entity_size() {
+        use crate::entity::AttributeValue;
+        let key = [0u8; 32];
+        let patch = |mutations| PlaceholderCost.op_cost(&Op::Patch { key, mutations });
+
+        // One set: base + one touch + its value bytes ("v" encodes to 1 byte).
+        let one = patch(vec![AttributeMutation::set(
+            b"k".to_vec(),
+            AttributeValue::Str("v".into()),
+        )]);
+        assert_eq!(one, G_PATCH + G_ATTRIBUTE + G_BYTE);
+
+        // Two sets cost exactly one more touch than one — linear, no floor.
+        let two = patch(vec![
+            AttributeMutation::set(b"k".to_vec(), AttributeValue::Str("v".into())),
+            AttributeMutation::set(b"j".to_vec(), AttributeValue::Str("w".into())),
+        ]);
+        assert_eq!(two - one, G_ATTRIBUTE + G_BYTE);
+
+        // An unset carries no bytes but still costs a touch: removing an index
+        // entry is work.
+        assert_eq!(
+            patch(vec![AttributeMutation::unset(b"k".to_vec())]),
+            G_PATCH + G_ATTRIBUTE
+        );
     }
 
     #[test]

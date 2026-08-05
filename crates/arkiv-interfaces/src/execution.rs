@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::entity::Attribute;
+use crate::entity::{Attribute, AttributeValue, CreationFlags};
 use crate::primitives::{Address, BlockNumber, EntityKey, Gas, Hash};
 use crate::state::{BlockAuxiliaryStoreDelta, BlockEntityStoreDelta, EntityStore};
 
@@ -63,12 +63,9 @@ pub enum RevertReason {
         key: EntityKey,
         expires_at: BlockNumber,
     },
-    /// An `Expire` targeted an entity still within its lifetime.
-    NotExpired {
-        key: EntityKey,
-        expires_at: BlockNumber,
-    },
-    /// An `ExtendExpiry` did not move the expiry forward.
+    /// A `Patch` targeted an entity created with the `readonly` flag.
+    ReadOnly { key: EntityKey },
+    /// An `ExtendExpiry` would have moved the expiry backwards.
     ExpiryNotExtended {
         key: EntityKey,
         new_expires_at: BlockNumber,
@@ -109,10 +106,10 @@ impl fmt::Display for RevertReason {
                 hex(f, key)?;
                 write!(f, " has expired")
             }
-            Self::NotExpired { key, .. } => {
+            Self::ReadOnly { key } => {
                 write!(f, "entity ")?;
                 hex(f, key)?;
-                write!(f, " has not expired")
+                write!(f, " is read-only")
             }
             Self::ExpiryNotExtended {
                 key,
@@ -148,15 +145,21 @@ pub enum Op {
     Create {
         key: EntityKey,
         expires_at: BlockNumber,
+        /// Entity properties fixed at creation. Immutable thereafter.
+        creation_flags: CreationFlags,
         content_type: Vec<u8>,
         payload: Vec<u8>,
         attributes: Vec<Attribute>,
     },
-    Update {
+    /// Partially mutate an entity: set some attributes, unset others, leave the
+    /// rest alone.
+    ///
+    /// This is **not** a whole-entity replace. Two patches touching disjoint
+    /// attributes compose instead of clobbering one another, and the cost is
+    /// proportional to the mutation count rather than the entity size.
+    Patch {
         key: EntityKey,
-        content_type: Vec<u8>,
-        payload: Vec<u8>,
-        attributes: Vec<Attribute>,
+        mutations: Vec<AttributeMutation>,
     },
     ExtendExpiry {
         key: EntityKey,
@@ -169,9 +172,39 @@ pub enum Op {
     Delete {
         key: EntityKey,
     },
-    Expire {
-        key: EntityKey,
-    },
+}
+
+/// One entry in a [`Patch`](Op::Patch)'s mutation list: set an attribute, or
+/// unset it.
+///
+/// `key` may name a user attribute or one of the two **user-managed** system
+/// attributes (`$payload`, `$contentType`); any engine-controlled `$` name is
+/// rejected while decoding, so the engine's authority over `$owner`,
+/// `$expiresAt` and friends is never in question here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeMutation {
+    pub key: Vec<u8>,
+    /// The value to set, or `None` to unset the attribute — a *tombstone* on
+    /// the wire (`typeId` 0).
+    pub value: Option<AttributeValue>,
+}
+
+impl AttributeMutation {
+    /// Set `key` to `value`.
+    pub fn set(key: impl Into<Vec<u8>>, value: AttributeValue) -> Self {
+        Self {
+            key: key.into(),
+            value: Some(value),
+        }
+    }
+
+    /// Unset `key`.
+    pub fn unset(key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            value: None,
+        }
+    }
 }
 
 impl Op {
@@ -179,11 +212,10 @@ impl Op {
     pub fn key(&self) -> &EntityKey {
         match self {
             Op::Create { key, .. }
-            | Op::Update { key, .. }
+            | Op::Patch { key, .. }
             | Op::ExtendExpiry { key, .. }
             | Op::Transfer { key, .. }
-            | Op::Delete { key }
-            | Op::Expire { key } => key,
+            | Op::Delete { key } => key,
         }
     }
 
@@ -191,24 +223,25 @@ impl Op {
     pub fn kind(&self) -> OpKind {
         match self {
             Op::Create { .. } => OpKind::Create,
-            Op::Update { .. } => OpKind::Update,
+            Op::Patch { .. } => OpKind::Patch,
             Op::ExtendExpiry { .. } => OpKind::ExtendExpiry,
             Op::Transfer { .. } => OpKind::Transfer,
             Op::Delete { .. } => OpKind::Delete,
-            Op::Expire { .. } => OpKind::Expire,
         }
     }
 }
 
 /// The kind of an [`Op`], without its data.
+///
+/// There is no `Expire`: an expired entity is removed by the protocol's
+/// per-block purge, not by a client-submitted operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     Create,
-    Update,
+    Patch,
     ExtendExpiry,
     Transfer,
     Delete,
-    Expire,
 }
 
 /// A block's changes-in-progress: what execution has staged so far, to be applied

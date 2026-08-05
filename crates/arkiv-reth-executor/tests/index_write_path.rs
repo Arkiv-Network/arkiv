@@ -12,8 +12,8 @@ use std::convert::Infallible;
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_interfaces::entity::{Attribute, AttributeValue};
-use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op};
+use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags};
+use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, BlockEntityStoreDelta, EntityStore};
@@ -159,6 +159,7 @@ fn create_is_queryable_by_its_attributes() {
         &[Op::Create {
             key,
             expires_at: 50,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"y".to_vec(),
             attributes: vec![Attribute::new(b"rank".to_vec(), uint(42))],
@@ -232,6 +233,7 @@ fn transfer_moves_the_entity_between_owner_queries() {
         &[Op::Create {
             key,
             expires_at: 50,
+            creation_flags: CreationFlags::NONE,
             content_type: b"x".to_vec(),
             payload: b"y".to_vec(),
             attributes: Vec::new(),
@@ -278,6 +280,7 @@ fn delete_removes_the_entity_from_queries() {
         &[Op::Create {
             key,
             expires_at: 50,
+            creation_flags: CreationFlags::NONE,
             content_type: b"x".to_vec(),
             payload: b"y".to_vec(),
             attributes: Vec::new(),
@@ -325,6 +328,7 @@ fn update_reindexes_attributes() {
         &[Op::Create {
             key,
             expires_at: 500,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"y".to_vec(),
             attributes: vec![Attribute::new(b"rank".to_vec(), uint(10))],
@@ -336,11 +340,9 @@ fn update_reindexes_attributes() {
         &mut index,
         alice,
         11,
-        &[Op::Update {
+        &[Op::Patch {
             key,
-            content_type: b"text/plain".to_vec(),
-            payload: b"y".to_vec(),
-            attributes: vec![Attribute::new(b"rank".to_vec(), uint(20))],
+            mutations: vec![AttributeMutation::set(b"rank".to_vec(), uint(20))],
         }],
     );
 
@@ -378,6 +380,7 @@ fn expiration_is_range_queryable() {
             &[Op::Create {
                 key: [key_byte; 32],
                 expires_at,
+                creation_flags: CreationFlags::NONE,
                 content_type: b"x".to_vec(),
                 payload: b"y".to_vec(),
                 attributes: Vec::new(),

@@ -10,14 +10,17 @@
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::{Revert, SolError};
-use arkiv_bindings::IEntityRegistry;
+use arkiv_bindings::{IEntityRegistry, encode::OpAbiError};
 use arkiv_interfaces::execution::RevertReason;
 
 use crate::decode::DecodeError;
 
-/// Clip a `u64` block number into the ABI's `BlockNumber32` (`uint32`).
-fn clip_u32(n: u64) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
+/// Right-pad an attribute name back into the ABI's fixed-width `Ident32`.
+fn ident32(name: &[u8]) -> alloy_primitives::FixedBytes<32> {
+    let mut w = [0u8; 32];
+    let n = name.len().min(32);
+    w[..n].copy_from_slice(&name[..n]);
+    alloy_primitives::FixedBytes::from(w)
 }
 
 /// ABI-encode a business-rule [`RevertReason`] as Solidity revert data.
@@ -36,12 +39,11 @@ pub fn revert_data(reason: &RevertReason) -> Bytes {
         .abi_encode(),
         RevertReason::Expired { key, expires_at } => E::EntityExpired {
             entityKey: B256::from(*key),
-            expiresAt: clip_u32(*expires_at),
+            expiresAt: *expires_at,
         }
         .abi_encode(),
-        RevertReason::NotExpired { key, expires_at } => E::EntityNotExpired {
+        RevertReason::ReadOnly { key } => E::ReadOnlyEntity {
             entityKey: B256::from(*key),
-            expiresAt: clip_u32(*expires_at),
         }
         .abi_encode(),
         RevertReason::ExpiryNotExtended {
@@ -50,8 +52,8 @@ pub fn revert_data(reason: &RevertReason) -> Bytes {
             current_expires_at,
         } => E::ExpiryNotExtended {
             entityKey: B256::from(*key),
-            newExpiresAt: clip_u32(*new_expires_at),
-            currentExpiresAt: clip_u32(*current_expires_at),
+            newExpiresAt: *new_expires_at,
+            currentExpiresAt: *current_expires_at,
         }
         .abi_encode(),
         RevertReason::TransferToSelf { key } => E::TransferToSelf {
@@ -71,8 +73,34 @@ pub fn decode_revert_data(e: &DecodeError) -> Bytes {
     use IEntityRegistry as E;
     match e {
         DecodeError::EmptyBatch => E::EmptyBatch {}.abi_encode(),
-        DecodeError::ZeroBtl => E::ZeroBtl {}.abi_encode(),
-        DecodeError::InvalidOpType(t) => E::InvalidOpType { operationType: *t }.abi_encode(),
+        DecodeError::InvalidOpType(t) => E::InvalidOpType { operation: *t }.abi_encode(),
+        DecodeError::EmptyMutations { key } => E::EmptyMutations {
+            entityKey: B256::from(*key),
+        }
+        .abi_encode(),
+        DecodeError::ExpiryDeadOnArrival { target, current } => E::ExpiryDeadOnArrival {
+            target: *target,
+            currentBlock: *current,
+        }
+        .abi_encode(),
+        DecodeError::ReservedCreationFlags(b) => {
+            E::ReservedCreationFlags { creationFlags: *b }.abi_encode()
+        }
+        DecodeError::TombstoneInCreate { name } => E::TombstoneInCreate {
+            name: ident32(name),
+        }
+        .abi_encode(),
+        DecodeError::SystemAttributeNotWritable { name } => E::SystemAttributeNotWritable {
+            name: ident32(name),
+        }
+        .abi_encode(),
+        DecodeError::OperationData { operation, reason } => match reason {
+            OpAbiError::NonCanonical => E::NonCanonicalOperationData {
+                operation: *operation,
+            }
+            .abi_encode(),
+            OpAbiError::Abi(_) => Revert::from(e.to_string()).abi_encode(),
+        },
         DecodeError::TransferToZeroAddress { key } => E::TransferToZeroAddress {
             entityKey: B256::from(*key),
         }
@@ -81,7 +109,7 @@ pub fn decode_revert_data(e: &DecodeError) -> Bytes {
             name, value_type, ..
         } => E::InvalidValueType {
             name: (*name).into(),
-            valueType: *value_type,
+            typeId: *value_type,
         }
         .abi_encode(),
         DecodeError::TooManyAttributes { count, max } => E::TooManyAttributes {
@@ -97,9 +125,10 @@ pub fn decode_revert_data(e: &DecodeError) -> Bytes {
         }
         .abi_encode(),
         // Structural faults with no ABI counterpart.
-        DecodeError::CalldataTooShort | DecodeError::UnknownSelector(_) | DecodeError::Abi(_) => {
-            Revert::from(e.to_string()).abi_encode()
-        }
+        DecodeError::CalldataTooShort
+        | DecodeError::UnknownSelector(_)
+        | DecodeError::Abi(_)
+        | DecodeError::ExpiryOverflow { .. } => Revert::from(e.to_string()).abi_encode(),
     }
     .into()
 }
@@ -149,8 +178,8 @@ mod tests {
         let data = revert_data(&RevertReason::TransferToSelf { key });
         assert_eq!(selector(&data), E::TransferToSelf::SELECTOR);
 
-        let data = revert_data(&RevertReason::NotExpired { key, expires_at: 7 });
-        assert_eq!(selector(&data), E::EntityNotExpired::SELECTOR);
+        let data = revert_data(&RevertReason::ReadOnly { key });
+        assert_eq!(selector(&data), E::ReadOnlyEntity::SELECTOR);
     }
 
     #[test]
@@ -169,8 +198,24 @@ mod tests {
             E::EmptyBatch::SELECTOR
         );
         assert_eq!(
-            selector(&decode_revert_data(&DecodeError::ZeroBtl)),
-            E::ZeroBtl::SELECTOR
+            selector(&decode_revert_data(&DecodeError::ReservedCreationFlags(
+                0b100
+            ))),
+            E::ReservedCreationFlags::SELECTOR
+        );
+        assert_eq!(
+            selector(&decode_revert_data(
+                &DecodeError::SystemAttributeNotWritable {
+                    name: b"$owner".to_vec()
+                }
+            )),
+            E::SystemAttributeNotWritable::SELECTOR
+        );
+        assert_eq!(
+            selector(&decode_revert_data(&DecodeError::TombstoneInCreate {
+                name: b"gone".to_vec()
+            })),
+            E::TombstoneInCreate::SELECTOR
         );
         assert_eq!(
             selector(&decode_revert_data(&DecodeError::AttributesNotSorted)),
@@ -205,9 +250,18 @@ mod tests {
         );
     }
 
+    /// Expiries are `uint64` end to end now, so a far-future block survives the
+    /// ABI boundary intact instead of saturating.
     #[test]
-    fn u64_expiries_clip_to_u32() {
-        assert_eq!(clip_u32(u64::MAX), u32::MAX);
-        assert_eq!(clip_u32(7), 7);
+    fn far_future_expiries_survive_the_abi_boundary() {
+        use IEntityRegistry as E;
+        let data = revert_data(&RevertReason::Expired {
+            key: [0x11; 32],
+            expires_at: u64::MAX,
+        });
+        assert_eq!(
+            E::EntityExpired::abi_decode(&data).unwrap().expiresAt,
+            u64::MAX
+        );
     }
 }

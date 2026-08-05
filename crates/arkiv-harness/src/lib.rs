@@ -19,6 +19,7 @@ pub use client::{ArkivClient, connect, connect_reader, result_keys};
 pub use node::{Node, NodeBuilder};
 
 // Protocol re-exports: build calldata and predict minted keys from one import.
+pub use arkiv_interfaces::primitives::EntityNonce;
 pub use arkiv_reth_executor::{ARKIV_ADDRESS, derive_entity_key};
 
 /// Version of this support library.

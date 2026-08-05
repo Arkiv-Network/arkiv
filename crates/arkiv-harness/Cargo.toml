@@ -21,6 +21,7 @@ arkiv-bindings.workspace = true
 # ARKIV_ADDRESS + derive_entity_key: protocol constants a client needs to build
 # calldata and predict minted keys.
 arkiv-reth-executor.workspace = true
+arkiv-interfaces.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 eyre.workspace = true

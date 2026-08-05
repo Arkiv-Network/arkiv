@@ -25,6 +25,10 @@ pub struct Entity {
     pub last_modified_at_block: BlockNumber,
     /// The block it expires in.
     pub expires_at: BlockNumber,
+    /// Entity properties fixed at creation. Set from the create op's
+    /// `creationFlags` and immutable thereafter — no op changes them, which is
+    /// what lets a reader trust them without checking history.
+    pub creation_flags: CreationFlags,
     /// Opaque content type (e.g. a MIME string).
     pub content_type: Vec<u8>,
     /// Opaque application payload.
@@ -280,6 +284,76 @@ pub enum AttributeType {
     EntityKey = 10,
 }
 
+/// An entity's creation flags: eight bits fixed at creation, two defined.
+///
+/// A newtype rather than a bare `u8`, so the bit arithmetic lives here once
+/// instead of at every call site, and so an unvalidated byte off the wire
+/// cannot be mistaken for checked flags. [`from_bits`](Self::from_bits) is the
+/// only way in from untrusted input and it rejects the reserved bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
+pub struct CreationFlags(u8);
+
+impl CreationFlags {
+    /// No flags set.
+    pub const NONE: Self = Self(0);
+
+    /// The entity's contents are immutable: `patch` reverts. Lifecycle ops
+    /// (extend, transfer, delete) still work — only the contents are frozen.
+    pub const READONLY: Self = Self(1 << 0);
+
+    /// *Anyone* may extend this entity's expiry, not just the owner. Safe to
+    /// open up precisely because extending cannot hurt the owner: the payer
+    /// gets nothing and the owner loses nothing.
+    pub const PERMISSIONLESS_EXTENSION: Self = Self(1 << 1);
+
+    /// The bits a client may set. Anything outside this mask is rejected, which
+    /// is what keeps the six reserved bits genuinely free — a later upgrade can
+    /// define one knowing no chain ever accepted it meaning something else.
+    pub const MASK: u8 = Self::READONLY.0 | Self::PERMISSIONLESS_EXTENSION.0;
+
+    /// Validated construction from a wire byte: `None` if a reserved bit is set.
+    pub const fn from_bits(raw: u8) -> Option<Self> {
+        if raw & !Self::MASK != 0 {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    /// Construction from a byte already known good — one this node itself
+    /// wrote and is reading back out of storage.
+    pub const fn from_stored_bits(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    /// The raw byte, for the wire and for storage.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether every flag in `other` is set here.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Contents frozen — a `patch` must revert.
+    pub const fn is_readonly(self) -> bool {
+        self.contains(Self::READONLY)
+    }
+
+    /// Anyone may extend the expiry, not just the owner.
+    pub const fn allows_permissionless_extension(self) -> bool {
+        self.contains(Self::PERMISSIONLESS_EXTENSION)
+    }
+}
+
+impl core::ops::BitOr for CreationFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 /// The `typeId` that marks a **tombstone** — "unset this attribute".
 ///
 /// Not an [`AttributeType`]: it tags the *absence* of a value, so
@@ -382,8 +456,36 @@ pub mod annotations {
     pub const KEY: &[u8] = b"$key";
     /// The expiry block, as a big-endian `u64` (changes on extend).
     pub const EXPIRATION: &[u8] = b"$expiration";
-    /// The content type (changes on update).
+    /// The content type (changes on patch). User-managed.
     pub const CONTENT_TYPE: &[u8] = b"$contentType";
+    /// The opaque payload bytes. User-managed, and not indexed — `bytes` has no
+    /// ordering, so it is never queryable.
+    pub const PAYLOAD: &[u8] = b"$payload";
+
+    /// The `$` prefix marking a system attribute. Reserved: a user attribute
+    /// name may never start with it.
+    pub const SYSTEM_PREFIX: u8 = b'$';
+
+    /// The only system attributes a `create` or `patch` may name.
+    ///
+    /// Every other `$` attribute is **engine-controlled** — filled from the
+    /// transaction context at creation (`$creator`, `$createdAtBlock`) or
+    /// maintained by the protocol (`$owner`, `$expiration`) — and naming one in
+    /// a triple list is a revert, set or tombstone alike. That is what keeps
+    /// "the engine owns these cells" true by construction rather than by
+    /// convention.
+    pub const USER_MANAGED: [&[u8]; 2] = [PAYLOAD, CONTENT_TYPE];
+
+    /// Whether `name` is a system attribute a client may write.
+    pub fn is_user_managed(name: &[u8]) -> bool {
+        USER_MANAGED.contains(&name)
+    }
+
+    /// Whether `name` is reserved for the engine — a system name that is not
+    /// user-managed.
+    pub fn is_engine_controlled(name: &[u8]) -> bool {
+        name.first() == Some(&SYSTEM_PREFIX) && !is_user_managed(name)
+    }
 }
 
 #[cfg(test)]

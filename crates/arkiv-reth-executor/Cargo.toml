@@ -15,6 +15,7 @@ license.workspace = true
 [dependencies]
 # The host-agnostic executor interface this crate implements (see arkiv.rs).
 arkiv-interfaces.workspace = true
+arkiv-constants.workspace = true
 # The entity store's `AccountCode` seam, which the reth write-path bridge
 # (state.rs) implements over the Database + EvmState diff.
 arkiv-reth-entitystore.workspace = true
@@ -36,6 +37,7 @@ tracing.workspace = true
 # Integration tests wire calldata → decode_ops → apply → RethEntityStore →
 # CodeBackend → ExecutorState → EvmState, and build calldata via the SDK bindings.
 arkiv-interfaces.workspace = true
+arkiv-constants.workspace = true
 arkiv-reth-entitystore.workspace = true
 # The index-write-path test drives apply's draft.auxiliary into a real RethAuxStore
 # and queries it back.

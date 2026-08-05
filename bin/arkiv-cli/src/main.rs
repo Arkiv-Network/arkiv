@@ -6,7 +6,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::eth::Log as RpcLog;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
-use arkiv_bindings::{IEntityRegistry::EntityOperation, op_type_name, *};
+use arkiv_bindings::*;
+use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
 use rand::Rng;
@@ -55,9 +56,26 @@ enum Command {
         #[arg(long, default_value = "application/octet-stream")]
         content_type: String,
 
-        /// Blocks-to-live: how many blocks until the entity expires.
-        #[arg(long)]
-        btl: u32,
+        /// Absolute expiry block. 0 means "purely relative" — use --min-lifetime.
+        #[arg(long, default_value_t = 0)]
+        expires_at: u64,
+
+        /// Minimum lifetime in blocks from now. Resolves as
+        /// max(--expires-at, current + --min-lifetime).
+        #[arg(long, default_value_t = 0)]
+        min_lifetime: u64,
+
+        /// Make the entity read-only: it can never be patched.
+        #[arg(long, default_value_t = false)]
+        readonly: bool,
+
+        /// Let anyone (not just the owner) extend the entity's expiry.
+        #[arg(long, default_value_t = false)]
+        permissionless_extension: bool,
+
+        /// Key salt. Only affects predictability, never uniqueness.
+        #[arg(long, default_value_t = 0)]
+        salt: u128,
 
         /// Payload bytes. Raw string by default; 0x-prefixed values are decoded as hex bytes.
         /// Mutually exclusive with `--random-payload`.
@@ -77,18 +95,21 @@ enum Command {
         attributes: String,
     },
 
-    /// Update an existing entity. Either `--payload` or `--random-payload` must be set.
-    Update {
-        /// Entity key to update.
+    /// Patch an entity: set some attributes, unset others, leave the rest alone.
+    ///
+    /// Unlike the old whole-entity update, anything you do not mention keeps
+    /// its current value.
+    Patch {
+        /// Entity key to patch.
         #[arg(long)]
         key: B256,
 
-        /// Content type MIME string.
-        #[arg(long, default_value = "application/octet-stream")]
-        content_type: String,
+        /// Content type MIME string. Omit to leave it unchanged.
+        #[arg(long)]
+        content_type: Option<String>,
 
         /// Payload bytes. Raw string by default; 0x-prefixed values are decoded as hex bytes.
-        /// Mutually exclusive with `--random-payload`.
+        /// Omit to leave the payload unchanged.
         #[arg(long)]
         payload: Option<String>,
 
@@ -100,20 +121,34 @@ enum Command {
         #[arg(long, default_value = "256")]
         size: usize,
 
-        /// Comma-separated attributes: name=value, name:string=value, name:uint=value, name:entityKey=0x...
+        /// Comma-separated attributes to set: name=value, name:string=value, ...
         #[arg(long, default_value = "")]
         attributes: String,
+
+        /// Comma-separated *attribute* names to remove from the entity, e.g.
+        /// `--unset color,size`. This deletes those attributes; it does not
+        /// touch the entity's lifetime — use `delete` to remove the entity, or
+        /// `extend-expiry` to change when it expires.
+        ///
+        /// On the wire each name becomes a tombstone: a `(name, typeId 0, "")`
+        /// triple, the encoding for "unset this".
+        #[arg(long, default_value = "")]
+        unset: String,
     },
 
-    /// Extend an entity's expiration.
-    Extend {
+    /// Extend an entity's expiry. Never shortens: equal is a no-op, earlier reverts.
+    ExtendExpiry {
         /// Entity key to extend.
         #[arg(long)]
         key: B256,
 
-        /// Blocks-to-live: how many blocks until the entity expires.
-        #[arg(long)]
-        btl: u32,
+        /// Absolute expiry block. 0 means "purely relative" — use --min-lifetime.
+        #[arg(long, default_value_t = 0)]
+        expires_at: u64,
+
+        /// Minimum lifetime in blocks from now.
+        #[arg(long, default_value_t = 0)]
+        min_lifetime: u64,
     },
 
     /// Transfer entity ownership.
@@ -130,13 +165,6 @@ enum Command {
     /// Delete an entity.
     Delete {
         /// Entity key to delete.
-        #[arg(long)]
-        key: B256,
-    },
-
-    /// Expire an entity (must be past its expiration block).
-    Expire {
-        /// Entity key to expire.
         #[arg(long)]
         key: B256,
     },
@@ -172,6 +200,12 @@ enum Command {
     },
 
     /// Fire off multiple entity creates.
+    /// Load-generate: fire `--count` single-create transactions back to back,
+    /// one per tx rather than one batch.
+    ///
+    /// A throughput/backpressure probe, not a correctness tool — it is how the
+    /// pool's behaviour under a burst gets exercised (nonce sequencing, the
+    /// pool-full retry path). For a realistic mixed workload use `simulate`.
     Spam {
         /// Number of entities to create.
         #[arg(long, default_value = "10")]
@@ -181,14 +215,56 @@ enum Command {
         #[arg(long, default_value = "256")]
         size: usize,
 
-        /// Blocks-to-live: how many blocks until each entity expires.
+        /// Minimum lifetime in blocks for each created entity.
         #[arg(long)]
-        btl: u32,
+        min_lifetime: u64,
     },
 
     /// Continuously generate a weighted mix of entity operations against
     /// a running node, simulating live system traffic.
     Simulate(simulate::SimulateArgs),
+}
+
+/// The `$contentType` triple — a `str` attribute, since content type is a
+/// user-managed system attribute rather than its own operation field now.
+fn content_type_attr(s: &str) -> Result<Attribute> {
+    Attribute::from_value(
+        Ident32::system("$contentType")?,
+        &arkiv_interfaces::entity::AttributeValue::Str(s.to_string()),
+    )
+    .map_err(|e| eyre::eyre!("content type: {e}"))
+}
+
+/// The `$payload` triple.
+fn payload_attr(b: &Bytes) -> Result<Attribute> {
+    Attribute::from_value(
+        Ident32::system("$payload")?,
+        &arkiv_interfaces::entity::AttributeValue::Bytes(b.to_vec()),
+    )
+    .map_err(|e| eyre::eyre!("payload: {e}"))
+}
+
+/// Pack the `--readonly` / `--permissionless-extension` switches into the
+/// creation-flags byte.
+fn creation_flags(readonly: bool, permissionless_extension: bool) -> u8 {
+    let mut flags = CreationFlags::NONE;
+    if readonly {
+        flags = flags | CreationFlags::READONLY;
+    }
+    if permissionless_extension {
+        flags = flags | CreationFlags::PERMISSIONLESS_EXTENSION;
+    }
+    flags.bits()
+}
+
+/// Parse `--unset a,b,c` into tombstone triples — one per attribute to remove.
+fn parse_unset(input: &str) -> Result<Vec<Attribute>> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| Ok(Attribute::tombstone(Ident32::encode(name)?)))
+        .collect()
 }
 
 fn random_payload(size: usize) -> Bytes {
@@ -200,25 +276,57 @@ fn random_payload(size: usize) -> Bytes {
 
 /// Predict the entity key the `n`-th CREATE will mint, mirroring the node's
 /// `derive_entity_key`: keccak over (chain id, registry address, owner, nonce).
-fn predict_entity_key(chain_id: u64, registry: Address, owner: Address, nonce: u32) -> B256 {
-    let mut buf = Vec::with_capacity(32 + 20 + 20 + 4);
+fn predict_entity_key(
+    chain_id: u64,
+    registry: Address,
+    owner: Address,
+    nonce: u64,
+    salt: u128,
+) -> B256 {
+    // Must match `arkiv_reth_executor::decode::derive_entity_key` byte for byte:
+    // chain_id ‖ registry ‖ owner ‖ nonce ‖ salt.
+    let mut buf = Vec::with_capacity(
+        WORD_LEN + ADDRESS_LEN + ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
+    );
     buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
     buf.extend_from_slice(registry.as_slice());
     buf.extend_from_slice(owner.as_slice());
     buf.extend_from_slice(&nonce.to_be_bytes());
+    buf.extend_from_slice(&salt.to_be_bytes());
     keccak256(&buf)
 }
 
+/// Print the per-op events a receipt carries. One event type per op kind now,
+/// so this tries each in turn rather than switching on a discriminator.
 fn print_events(logs: &[RpcLog]) {
+    use IEntityRegistry as E;
     for log in logs {
-        if let Ok(event) = EntityOperation::decode_log(&log.inner) {
-            let e = event.data;
-            println!("---");
-            println!("  op:          {}", op_type_name(e.operationType));
-            println!("  entity_key:  {}", e.entityKey);
-            println!("  owner:       {}", e.owner);
-            println!("  expires_at:  {}", e.expiresAt);
-            println!("  entity_hash: {}", e.entityHash);
+        println!("---");
+        if let Ok(ev) = E::EntityCreated::decode_log(&log.inner) {
+            println!("  op:          CREATE");
+            println!("  entity_key:  {}", ev.data.entityKey);
+            println!("  owner:       {}", ev.data.owner);
+            println!("  expires_at:  {}", ev.data.expiresAt);
+            println!("  flags:       0b{:08b}", ev.data.creationFlags);
+        } else if let Ok(ev) = E::EntityPatched::decode_log(&log.inner) {
+            println!("  op:          PATCH");
+            println!("  entity_key:  {}", ev.data.entityKey);
+            println!("  owner:       {}", ev.data.owner);
+        } else if let Ok(ev) = E::ExpiryExtended::decode_log(&log.inner) {
+            println!("  op:          EXTEND_EXPIRY");
+            println!("  entity_key:  {}", ev.data.entityKey);
+            println!("  expires_at:  {}", ev.data.expiresAt);
+        } else if let Ok(ev) = E::OwnershipTransferred::decode_log(&log.inner) {
+            println!("  op:          TRANSFER_OWNERSHIP");
+            println!("  entity_key:  {}", ev.data.entityKey);
+            println!("  from:        {}", ev.data.previousOwner);
+            println!("  to:          {}", ev.data.newOwner);
+        } else if let Ok(ev) = E::EntityDeleted::decode_log(&log.inner) {
+            println!("  op:          DELETE");
+            println!("  entity_key:  {}", ev.data.entityKey);
+            println!("  owner:       {}", ev.data.owner);
+        } else {
+            println!("  (unrecognised event)");
         }
     }
 }
@@ -305,24 +413,37 @@ enum BatchOp {
         payload: Option<String>,
         /// Random payload size in bytes. Mutually exclusive with `payload`.
         size: Option<usize>,
-        btl: u32,
+        #[serde(default, rename = "expiresAt")]
+        expires_at: u64,
+        #[serde(default, rename = "minLifetime")]
+        min_lifetime: u64,
+        #[serde(default)]
+        salt: u128,
+        #[serde(default, rename = "creationFlags")]
+        creation_flags: u8,
         #[serde(default)]
         attributes: Vec<BatchAttribute>,
     },
-    Update {
+    Patch {
         #[serde(rename = "entityKey")]
         entity_key: EntityKeyRef,
-        #[serde(default = "default_content_type", rename = "contentType")]
-        content_type: String,
+        #[serde(default, rename = "contentType")]
+        content_type: Option<String>,
         payload: Option<String>,
         size: Option<usize>,
         #[serde(default)]
         attributes: Vec<BatchAttribute>,
+        /// Attribute names to unset.
+        #[serde(default)]
+        unset: Vec<String>,
     },
-    Extend {
+    ExtendExpiry {
         #[serde(rename = "entityKey")]
         entity_key: EntityKeyRef,
-        btl: u32,
+        #[serde(default, rename = "expiresAt")]
+        expires_at: u64,
+        #[serde(default, rename = "minLifetime")]
+        min_lifetime: u64,
     },
     Transfer {
         #[serde(rename = "entityKey")]
@@ -331,10 +452,6 @@ enum BatchOp {
         new_owner: Address,
     },
     Delete {
-        #[serde(rename = "entityKey")]
-        entity_key: EntityKeyRef,
-    },
-    Expire {
         #[serde(rename = "entityKey")]
         entity_key: EntityKeyRef,
     },
@@ -789,42 +906,26 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Create {
             content_type,
-            btl,
+            expires_at,
+            min_lifetime,
+            readonly,
+            permissionless_extension,
+            salt,
             payload,
             random_payload,
             size,
             attributes,
         } => {
             let resolved_payload = resolve_cli_payload(payload.as_deref(), random_payload, size)?;
-            let content_type = Mime128::encode(&content_type)?;
-            let attributes = build_cli_attributes(&attributes, "create")?;
-            let op = Operation::create(btl, resolved_payload, content_type, attributes);
-
-            let receipt = registry
-                .execute(vec![op])
-                .gas_price(cli.gas_price)
-                .send()
-                .await?
-                .get_receipt()
-                .await?;
-            println!("tx: {}", receipt.transaction_hash);
-            print_events(receipt.inner.logs());
-        }
-
-        Command::Update {
-            key,
-            content_type,
-            payload,
-            random_payload,
-            size,
-            attributes,
-        } => {
-            let resolved_payload = resolve_cli_payload(payload.as_deref(), random_payload, size)?;
-            let op = Operation::update(
-                key,
-                resolved_payload,
-                Mime128::encode(&content_type)?,
-                build_cli_attributes(&attributes, "update")?,
+            let mut attributes = build_cli_attributes(&attributes, "create")?;
+            attributes.push(content_type_attr(&content_type)?);
+            attributes.push(payload_attr(&resolved_payload)?);
+            let op = Operation::create(
+                salt,
+                expires_at,
+                min_lifetime,
+                creation_flags(readonly, permissionless_extension),
+                attributes,
             );
 
             let receipt = registry
@@ -838,8 +939,50 @@ async fn main() -> Result<()> {
             print_events(receipt.inner.logs());
         }
 
-        Command::Extend { key, btl } => {
-            let op = Operation::extend(key, btl);
+        Command::Patch {
+            key,
+            content_type,
+            payload,
+            random_payload,
+            size,
+            attributes,
+            unset,
+        } => {
+            let mut mutations = build_cli_attributes(&attributes, "patch")?;
+            mutations.extend(parse_unset(&unset)?);
+            if let Some(ct) = content_type.as_deref() {
+                mutations.push(content_type_attr(ct)?);
+            }
+            // Only touch the payload if the caller asked to — omitting it must
+            // leave the stored payload alone, not blank it.
+            if payload.is_some() || random_payload {
+                let resolved = resolve_cli_payload(payload.as_deref(), random_payload, size)?;
+                mutations.push(payload_attr(&resolved)?);
+            }
+            if mutations.is_empty() {
+                bail!(
+                    "a patch needs at least one of --attributes, --unset, --content-type, --payload"
+                );
+            }
+            let op = Operation::patch(key, mutations);
+
+            let receipt = registry
+                .execute(vec![op])
+                .gas_price(cli.gas_price)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+            println!("tx: {}", receipt.transaction_hash);
+            print_events(receipt.inner.logs());
+        }
+
+        Command::ExtendExpiry {
+            key,
+            expires_at,
+            min_lifetime,
+        } => {
+            let op = Operation::extend_expiry(key, expires_at, min_lifetime);
 
             let receipt = registry
                 .execute(vec![op])
@@ -853,7 +996,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Transfer { key, new_owner } => {
-            let op = Operation::transfer(key, new_owner);
+            let op = Operation::transfer_ownership(key, new_owner);
 
             let receipt = registry
                 .execute(vec![op])
@@ -868,20 +1011,6 @@ async fn main() -> Result<()> {
 
         Command::Delete { key } => {
             let op = Operation::delete(key);
-
-            let receipt = registry
-                .execute(vec![op])
-                .gas_price(cli.gas_price)
-                .send()
-                .await?
-                .get_receipt()
-                .await?;
-            println!("tx: {}", receipt.transaction_hash);
-            print_events(receipt.inner.logs());
-        }
-
-        Command::Expire { key } => {
-            let op = Operation::expire(key);
 
             let receipt = registry
                 .execute(vec![op])
@@ -922,17 +1051,22 @@ async fn main() -> Result<()> {
 
             // Precompute $N -> entityKey for every CREATE in the batch, before
             // we send execute() (which would mutate the sender's nonce).
-            let signer_nonce: u32 = registry.nonces(signer_address).call().await?;
+            let signer_nonce: u64 = registry.entityNonce(signer_address).call().await?;
             let chain_id = provider.get_chain_id().await?;
             let mut refs: HashMap<usize, B256> = HashMap::new();
             let mut create_count: u32 = 0;
             for (i, op) in ops.iter().enumerate() {
                 if matches!(op, BatchOp::Create { .. }) {
+                    let salt = match op {
+                        BatchOp::Create { salt, .. } => *salt,
+                        _ => 0,
+                    };
                     let k = predict_entity_key(
                         chain_id,
                         cli.registry,
                         signer_address,
-                        signer_nonce + create_count,
+                        signer_nonce.saturating_add(create_count as u64),
+                        salt,
                     );
                     refs.insert(i, k);
                     create_count += 1;
@@ -955,35 +1089,48 @@ async fn main() -> Result<()> {
                         content_type,
                         payload,
                         size,
-                        btl,
+                        expires_at,
+                        min_lifetime,
+                        salt,
+                        creation_flags,
                         attributes,
-                    } => Operation::create(
-                        *btl,
-                        resolve_payload(payload.as_deref(), *size)?,
-                        Mime128::encode(content_type)?,
-                        build_attributes(attributes, &resolve)?,
-                    ),
-                    BatchOp::Update {
+                    } => {
+                        let mut attrs = build_attributes(attributes, &resolve)?;
+                        attrs.push(content_type_attr(content_type)?);
+                        attrs.push(payload_attr(&resolve_payload(payload.as_deref(), *size)?)?);
+                        Operation::create(*salt, *expires_at, *min_lifetime, *creation_flags, attrs)
+                    }
+                    BatchOp::Patch {
                         entity_key,
                         content_type,
                         payload,
                         size,
                         attributes,
-                    } => Operation::update(
-                        resolve(entity_key)?,
-                        resolve_payload(payload.as_deref(), *size)?,
-                        Mime128::encode(content_type)?,
-                        build_attributes(attributes, &resolve)?,
-                    ),
-                    BatchOp::Extend { entity_key, btl } => {
-                        Operation::extend(resolve(entity_key)?, *btl)
+                        unset,
+                    } => {
+                        let mut mutations = build_attributes(attributes, &resolve)?;
+                        for name in unset {
+                            mutations.push(Attribute::tombstone(Ident32::encode(name)?));
+                        }
+                        if let Some(ct) = content_type.as_deref() {
+                            mutations.push(content_type_attr(ct)?);
+                        }
+                        if payload.is_some() || size.is_some() {
+                            mutations
+                                .push(payload_attr(&resolve_payload(payload.as_deref(), *size)?)?);
+                        }
+                        Operation::patch(resolve(entity_key)?, mutations)
                     }
+                    BatchOp::ExtendExpiry {
+                        entity_key,
+                        expires_at,
+                        min_lifetime,
+                    } => Operation::extend_expiry(resolve(entity_key)?, *expires_at, *min_lifetime),
                     BatchOp::Transfer {
                         entity_key,
                         new_owner,
-                    } => Operation::transfer(resolve(entity_key)?, *new_owner),
+                    } => Operation::transfer_ownership(resolve(entity_key)?, *new_owner),
                     BatchOp::Delete { entity_key } => Operation::delete(resolve(entity_key)?),
-                    BatchOp::Expire { entity_key } => Operation::expire(resolve(entity_key)?),
                 };
                 sol_ops.push(sol_op);
             }
@@ -999,7 +1146,11 @@ async fn main() -> Result<()> {
             print_events(receipt.inner.logs());
         }
 
-        Command::Spam { count, size, btl } => {
+        Command::Spam {
+            count,
+            size,
+            min_lifetime,
+        } => {
             let nonce_start = provider.get_transaction_count(signer_address).await?;
 
             // Fire all transactions, retrying on pool-full errors
@@ -1008,10 +1159,14 @@ async fn main() -> Result<()> {
                 let nonce = nonce_start + i as u64;
                 loop {
                     let op = Operation::create(
-                        btl,
-                        random_payload(size),
-                        Mime128::encode("application/octet-stream")?,
-                        vec![],
+                        0,
+                        0,
+                        min_lifetime,
+                        0,
+                        vec![
+                            content_type_attr("application/octet-stream")?,
+                            payload_attr(&random_payload(size))?,
+                        ],
                     );
 
                     match registry

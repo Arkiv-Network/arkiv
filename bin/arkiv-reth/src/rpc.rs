@@ -471,6 +471,7 @@ fn invalid_params(message: String) -> ErrorObjectOwned {
 mod tests {
     use super::*;
     use arkiv_interfaces::entity::AttributeValue;
+    use arkiv_interfaces::entity::CreationFlags;
 
     #[test]
     fn entity_view_projects_bytes_as_hex_and_text_as_strings() {
@@ -481,6 +482,7 @@ mod tests {
             created_at_block: 5,
             last_modified_at_block: 6,
             expires_at: 100,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: vec![0xDE, 0xAD],
             attributes: vec![Attribute::new(

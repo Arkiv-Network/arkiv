@@ -21,6 +21,7 @@
 //! [`RethAuxStore`]: arkiv_reth_auxstore::RethAuxStore
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use arkiv_interfaces::primitives::EntityNonce;
 use arkiv_reth_auxstore::IndexStorage;
 use arkiv_reth_entitystore::AccountCode;
 use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, nonce_slot};
@@ -167,23 +168,24 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
     }
 
     /// Read `caller`'s entity-key minting nonce from the system account.
-    pub fn read_nonce(&mut self, caller: Address) -> Result<u32, eyre::Report> {
+    pub fn read_nonce(&mut self, caller: Address) -> Result<EntityNonce, eyre::Report> {
         let slot = U256::from_be_bytes(nonce_slot(caller).0);
-        Ok(self
-            .read_slot(SYSTEM_ACCOUNT_ADDRESS, slot)?
-            .saturating_to::<u32>())
+        Ok(EntityNonce::new(
+            self.read_slot(SYSTEM_ACCOUNT_ADDRESS, slot)?
+                .saturating_to::<u64>(),
+        ))
     }
 
     /// Advance `caller`'s minting nonce by `by` (one per entity created), returning
     /// the value it had *before* the bump — the `start_nonce` the batch decoded with.
-    pub fn bump_nonce(&mut self, caller: Address, by: u32) -> Result<u32, eyre::Report> {
+    pub fn bump_nonce(&mut self, caller: Address, by: u64) -> Result<EntityNonce, eyre::Report> {
         self.persist_account(SYSTEM_ACCOUNT_ADDRESS)?;
         let current = self.read_nonce(caller)?;
         let slot = U256::from_be_bytes(nonce_slot(caller).0);
         self.write_slot(
             SYSTEM_ACCOUNT_ADDRESS,
             slot,
-            U256::from(current.saturating_add(by)),
+            U256::from(current.advanced_by(by).get()),
         )?;
         Ok(current)
     }
@@ -267,7 +269,9 @@ impl<DB: Database> IndexStorage for ExecutorState<'_, DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkiv_interfaces::entity::CreationFlags;
     use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
+    use arkiv_interfaces::primitives::EntityNonce;
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
     fn addr() -> Address {
@@ -303,6 +307,7 @@ mod tests {
             created_at_block: 10,
             last_modified_at_block: 20,
             expires_at: 100,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"hello world".to_vec(),
             attributes: vec![
@@ -381,13 +386,13 @@ mod tests {
         let mut db = EmptyDB::default();
         let mut state = ExecutorState::new(&mut db);
         let caller = Address::from([0xAA; 20]);
-        assert_eq!(state.read_nonce(caller).unwrap(), 0);
+        assert_eq!(state.read_nonce(caller).unwrap(), EntityNonce::ZERO);
         // A batch of two creates: bump returns the pre-bump start (0), leaves 2.
-        assert_eq!(state.bump_nonce(caller, 2).unwrap(), 0);
-        assert_eq!(state.read_nonce(caller).unwrap(), 2);
+        assert_eq!(state.bump_nonce(caller, 2).unwrap(), EntityNonce::ZERO);
+        assert_eq!(state.read_nonce(caller).unwrap(), EntityNonce::new(2));
         // Next batch of one: start 2, leaves 3.
-        assert_eq!(state.bump_nonce(caller, 1).unwrap(), 2);
-        assert_eq!(state.read_nonce(caller).unwrap(), 3);
+        assert_eq!(state.bump_nonce(caller, 1).unwrap(), EntityNonce::new(2));
+        assert_eq!(state.read_nonce(caller).unwrap(), EntityNonce::new(3));
     }
 
     #[test]
@@ -397,8 +402,8 @@ mod tests {
         let a = Address::from([0xAA; 20]);
         let b = Address::from([0xBB; 20]);
         state.bump_nonce(a, 5).unwrap();
-        assert_eq!(state.read_nonce(a).unwrap(), 5);
-        assert_eq!(state.read_nonce(b).unwrap(), 0);
+        assert_eq!(state.read_nonce(a).unwrap(), EntityNonce::new(5));
+        assert_eq!(state.read_nonce(b).unwrap(), EntityNonce::ZERO);
     }
 
     /// The nonce bump materialises the system account in the diff, kept alive.
