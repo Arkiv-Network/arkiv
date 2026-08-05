@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 arkiv-bindings.workspace = true
 arkiv-interfaces.workspace = true
+arkiv-constants.workspace = true
 arkiv-genesis.workspace = true
 
 alloy-primitives.workspace = true

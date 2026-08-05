@@ -135,6 +135,7 @@ pub fn entity_annotations(entity: &Entity) -> Vec<AttrEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkiv_interfaces::entity::CreationFlags;
 
     #[test]
     fn builtins_have_fixed_capabilities_regardless_of_value_type() {
@@ -202,7 +203,7 @@ mod tests {
             created_at_block: 3,
             last_modified_at_block: 4,
             expires_at: 60,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"ignored".to_vec(),
             attributes: vec![Attribute::new(

@@ -14,6 +14,7 @@
 use alloy_sol_types::SolCall;
 use arkiv_bindings::{Attribute as AbiAttribute, IEntityRegistry, Ident32, Operation};
 use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus};
+use arkiv_interfaces::primitives::EntityNonce;
 use arkiv_interfaces::state::EntityStore;
 use arkiv_reth_entitystore::layout::entity_address;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore, decode};
@@ -57,7 +58,7 @@ fn create_from_calldata_lands_in_reth_state() {
     let cd = calldata(vec![create(50, b"hello")]);
 
     let env = env(alice, 10);
-    let ops = decode_ops(&env, &cd, 0).unwrap(); // start_nonce 0
+    let ops = decode_ops(&env, &cd, EntityNonce::new(0)).unwrap(); // start_nonce 0
 
     let mut db = EmptyDB::default();
     let mut store = RethEntityStore::new(CodeBackend::new(ExecutorState::new(&mut db)));
@@ -68,7 +69,7 @@ fn create_from_calldata_lands_in_reth_state() {
     assert_eq!(out.status, ExecStatus::Ok);
 
     // The entity was minted at the derived key, with env-resolved lifecycle fields.
-    let expected_key = derive_entity_key(CHAIN_ID, &alice, 0, 0);
+    let expected_key = derive_entity_key(CHAIN_ID, &alice, EntityNonce::new(0), 0);
     let staged = draft.entities.puts[0].clone();
     assert_eq!(staged.key, expected_key);
     assert_eq!(staged.owner, alice);
@@ -93,7 +94,7 @@ fn a_batch_of_creates_lands_each_at_its_minted_key() {
     let cd = calldata(vec![create(10, b"a"), create(10, b"b")]);
 
     let env = env(alice, 5);
-    let ops = decode_ops(&env, &cd, 0).unwrap();
+    let ops = decode_ops(&env, &cd, EntityNonce::new(0)).unwrap();
 
     let mut db = EmptyDB::default();
     let mut store = RethEntityStore::new(CodeBackend::new(ExecutorState::new(&mut db)));
@@ -103,8 +104,8 @@ fn a_batch_of_creates_lands_each_at_its_minted_key() {
     store.apply_delta(&draft.entities).unwrap();
 
     // Two distinct keys from consecutive nonces, each holding its own entity.
-    let k0 = derive_entity_key(CHAIN_ID, &alice, 0, 0);
-    let k1 = derive_entity_key(CHAIN_ID, &alice, 1, 0);
+    let k0 = derive_entity_key(CHAIN_ID, &alice, EntityNonce::new(0), 0);
+    let k1 = derive_entity_key(CHAIN_ID, &alice, EntityNonce::new(1), 0);
     assert_ne!(k0, k1);
     assert_eq!(store.get(k0).unwrap().unwrap().payload, b"a");
     assert_eq!(store.get(k1).unwrap().unwrap().payload, b"b");

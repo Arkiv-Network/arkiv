@@ -1,14 +1,26 @@
 //! Entity view layer: maps [`Entity`] to wire-ready structs with field projection.
 //!
+//! ## What "projection" means here
+//!
+//! A stored [`Entity`] has more on it than most callers want: the payload can be
+//! 128 KiB, and a query answers a whole page of them. So a read names which
+//! fields it wants — its **projection** — and everything else is left off the
+//! response entirely rather than sent as null. A field that was asked for is a
+//! *projected field*; the rest are absent, and `serde` skips them.
+//!
+//! [`IncludeData`] is the caller's request (each field `Option<bool>`, so
+//! "unset" is distinguishable from "explicitly off"); [`ResolvedIncludeData`] is
+//! that request resolved once per call into plain booleans. Omitting the whole
+//! object means *everything* ([`ResolvedIncludeData::all`]) — convenient for
+//! reading one entity by key, where there is nothing to save by trimming.
+//!
 //! Ported from the `arkiv-db-engine` view layer — the wire shapes the Arkiv SDK
 //! consumes. Everything here is pure Rust — no reth types, no JSON-RPC
 //! plumbing. The RPC layer calls [`entity_data_from`] after fetching pages
 //! from the query index.
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use arkiv_interfaces::entity::{
-    AttributeValue, DECIMAL_SCALE, Entity, FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY,
-};
+use arkiv_interfaces::entity::{self, AttributeValue, DECIMAL_SCALE, Entity};
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 
@@ -162,11 +174,12 @@ pub struct CreationFlags {
 }
 
 impl CreationFlags {
-    pub fn from_byte(raw: u8) -> Self {
+    /// Project the protocol type onto the wire shape.
+    pub fn from_flags(flags: entity::CreationFlags) -> Self {
         Self {
-            readonly: raw & FLAG_READONLY != 0,
-            permissionless_extension: raw & FLAG_PERMISSIONLESS_EXTENSION != 0,
-            raw,
+            readonly: flags.is_readonly(),
+            permissionless_extension: flags.allows_permissionless_extension(),
+            raw: flags.bits(),
         }
     }
 }
@@ -206,7 +219,7 @@ pub fn entity_data_from(e: Entity, inc: &ResolvedIncludeData) -> EntityData {
         operation_index_in_transaction: inc.operation_index_in_transaction.then_some(0),
         creation_flags: inc
             .creation_flags
-            .then(|| CreationFlags::from_byte(e.creation_flags)),
+            .then(|| CreationFlags::from_flags(e.creation_flags)),
         attributes,
     }
 }
@@ -386,7 +399,7 @@ mod tests {
             created_at_block: 0,
             last_modified_at_block: 0,
             expires_at: 0,
-            creation_flags: 0,
+            creation_flags: entity::CreationFlags::NONE,
             content_type: Vec::new(),
             payload: Vec::new(),
             attributes: Vec::new(),
@@ -413,18 +426,21 @@ mod tests {
     /// and booleans alone would silently drop whatever a later upgrade defines.
     #[test]
     fn creation_flags_project_named_bits_and_the_raw_byte() {
-        let both = CreationFlags::from_byte(FLAG_READONLY | FLAG_PERMISSIONLESS_EXTENSION);
+        let both = CreationFlags::from_flags(
+            entity::CreationFlags::READONLY | entity::CreationFlags::PERMISSIONLESS_EXTENSION,
+        );
         assert!(both.readonly && both.permissionless_extension);
         assert_eq!(both.raw, 0b11);
 
-        let ro = CreationFlags::from_byte(FLAG_READONLY);
+        let ro = CreationFlags::from_flags(entity::CreationFlags::READONLY);
         assert!(ro.readonly && !ro.permissionless_extension);
 
-        let none = CreationFlags::from_byte(0);
+        let none = CreationFlags::from_flags(entity::CreationFlags::NONE);
         assert!(!none.readonly && !none.permissionless_extension);
 
         // A reserved bit this version does not name still reaches the caller.
-        let future = CreationFlags::from_byte(0b1000_0000);
+        let future =
+            CreationFlags::from_flags(entity::CreationFlags::from_stored_bits(0b1000_0000));
         assert!(!future.readonly && !future.permissionless_extension);
         assert_eq!(future.raw, 0b1000_0000);
 
@@ -434,13 +450,17 @@ mod tests {
         assert_eq!(json["raw"], 3);
     }
 
-    /// Opting out omits the flags entirely, like every other projected field.
+    /// Not asking for a field means it is absent from the response, not null —
+    /// so a caller can tell "I did not request this" from "this has no value".
     #[test]
     fn creation_flags_respect_the_projection() {
         let mut e = test_entity();
-        e.creation_flags = FLAG_READONLY;
+        e.creation_flags = entity::CreationFlags::READONLY;
         let all = entity_data_from(e.clone(), &ResolvedIncludeData::all());
-        assert_eq!(all.creation_flags.unwrap().raw, FLAG_READONLY);
+        assert_eq!(
+            all.creation_flags.unwrap().raw,
+            entity::CreationFlags::READONLY.bits()
+        );
 
         let none = ResolvedIncludeData::from_options(Some(&IncludeData::default()));
         assert!(entity_data_from(e, &none).creation_flags.is_none());

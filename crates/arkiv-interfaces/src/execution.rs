@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::entity::{Attribute, AttributeValue};
+use crate::entity::{Attribute, AttributeValue, CreationFlags};
 use crate::primitives::{Address, BlockNumber, EntityKey, Gas, Hash};
 use crate::state::{BlockAuxiliaryStoreDelta, BlockEntityStoreDelta, EntityStore};
 
@@ -145,9 +145,8 @@ pub enum Op {
     Create {
         key: EntityKey,
         expires_at: BlockNumber,
-        /// Entity properties fixed at creation — see the `FLAG_*` constants in
-        /// `arkiv-bindings`. Immutable thereafter.
-        creation_flags: u8,
+        /// Entity properties fixed at creation. Immutable thereafter.
+        creation_flags: CreationFlags,
         content_type: Vec<u8>,
         payload: Vec<u8>,
         attributes: Vec<Attribute>,

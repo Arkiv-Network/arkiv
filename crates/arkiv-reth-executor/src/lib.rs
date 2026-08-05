@@ -452,7 +452,7 @@ fn arkiv_entity_nonce_call<DB: Database>(
             .read_nonce(call.owner)
             .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
-            &nonce,
+            &nonce.get(),
         )))
     })
 }
@@ -619,7 +619,7 @@ fn entity_operation_log(effect: &OpEffect) -> Log {
             entityKey: key,
             owner,
             expiresAt: effect.expires_at,
-            creationFlags: effect.creation_flags,
+            creationFlags: effect.creation_flags.bits(),
         }
         .encode_log_data(),
         OpKind::Patch => E::EntityPatched {
@@ -734,6 +734,7 @@ mod tests {
     use alloy_primitives::Bytes;
     use alloy_sol_types::SolCall;
     use arkiv_bindings::{IEntityRegistry, Operation};
+    use arkiv_interfaces::primitives::EntityNonce;
     use arkiv_reth_entitystore::decode;
     use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot};
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
@@ -778,7 +779,7 @@ mod tests {
         assert!(rs.result.is_success());
 
         // The entity landed at the derived key, decodable, with env-resolved fields.
-        let key = derive_entity_key(1, &[0xAA; 20], 0, 0);
+        let key = derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0);
         let acc = rs
             .state
             .get(&entity_address(key))
@@ -951,7 +952,7 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0, 0));
+        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
         let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, names_calldata(key))).unwrap();
         assert_eq!(names_from(&rs), vec!["color", "rank"]);
     }
@@ -971,7 +972,7 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0, 0));
+        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
 
         let rs =
             arkiv_transact(&mut db, 11, arkiv_tx(alice, type_id_calldata(key, "rank"))).unwrap();
@@ -1024,7 +1025,7 @@ mod tests {
             arkiv_transact(&mut db, 10, arkiv_tx(alice, create_with_attrs_calldata(50))).unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0, 0));
+        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
 
         // Last live block is 59.
         let rs = arkiv_transact(&mut db, 59, arkiv_tx(alice, names_calldata(key))).unwrap();
@@ -1085,7 +1086,7 @@ mod tests {
 
         // A patch batch: cheap in the cost model (40k base) but with calldata
         // whose intrinsic floor exceeds it.
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], 0, 0));
+        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
         let big_payload = arkiv_bindings::Attribute::from_value(
             arkiv_bindings::Ident32::system("$payload").unwrap(),
             // 4k nonzero bytes → floor ≈ 181k

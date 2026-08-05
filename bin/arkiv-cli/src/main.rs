@@ -7,6 +7,7 @@ use alloy_rpc_types::eth::Log as RpcLog;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use arkiv_bindings::*;
+use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
 use rand::Rng;
@@ -124,7 +125,13 @@ enum Command {
         #[arg(long, default_value = "")]
         attributes: String,
 
-        /// Comma-separated attribute names to unset (tombstone).
+        /// Comma-separated *attribute* names to remove from the entity, e.g.
+        /// `--unset color,size`. This deletes those attributes; it does not
+        /// touch the entity's lifetime — use `delete` to remove the entity, or
+        /// `extend-expiry` to change when it expires.
+        ///
+        /// On the wire each name becomes a tombstone: a `(name, typeId 0, "")`
+        /// triple, the encoding for "unset this".
         #[arg(long, default_value = "")]
         unset: String,
     },
@@ -193,6 +200,12 @@ enum Command {
     },
 
     /// Fire off multiple entity creates.
+    /// Load-generate: fire `--count` single-create transactions back to back,
+    /// one per tx rather than one batch.
+    ///
+    /// A throughput/backpressure probe, not a correctness tool — it is how the
+    /// pool's behaviour under a burst gets exercised (nonce sequencing, the
+    /// pool-full retry path). For a realistic mixed workload use `simulate`.
     Spam {
         /// Number of entities to create.
         #[arg(long, default_value = "10")]
@@ -234,15 +247,17 @@ fn payload_attr(b: &Bytes) -> Result<Attribute> {
 /// Pack the `--readonly` / `--permissionless-extension` switches into the
 /// creation-flags byte.
 fn creation_flags(readonly: bool, permissionless_extension: bool) -> u8 {
-    (if readonly { FLAG_READONLY } else { 0 })
-        | (if permissionless_extension {
-            FLAG_PERMISSIONLESS_EXTENSION
-        } else {
-            0
-        })
+    let mut flags = CreationFlags::NONE;
+    if readonly {
+        flags = flags | CreationFlags::READONLY;
+    }
+    if permissionless_extension {
+        flags = flags | CreationFlags::PERMISSIONLESS_EXTENSION;
+    }
+    flags.bits()
 }
 
-/// Parse `--unset a,b,c` into tombstone triples.
+/// Parse `--unset a,b,c` into tombstone triples — one per attribute to remove.
 fn parse_unset(input: &str) -> Result<Vec<Attribute>> {
     input
         .split(',')
@@ -268,7 +283,11 @@ fn predict_entity_key(
     nonce: u64,
     salt: u128,
 ) -> B256 {
-    let mut buf = Vec::with_capacity(32 + 20 + 20 + 8 + 16);
+    // Must match `arkiv_reth_executor::decode::derive_entity_key` byte for byte:
+    // chain_id ‖ registry ‖ owner ‖ nonce ‖ salt.
+    let mut buf = Vec::with_capacity(
+        WORD_LEN + ADDRESS_LEN + ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
+    );
     buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
     buf.extend_from_slice(registry.as_slice());
     buf.extend_from_slice(owner.as_slice());
@@ -1046,7 +1065,7 @@ async fn main() -> Result<()> {
                         chain_id,
                         cli.registry,
                         signer_address,
-                        signer_nonce + create_count as u64,
+                        signer_nonce.saturating_add(create_count as u64),
                         salt,
                     );
                     refs.insert(i, k);
@@ -1089,17 +1108,18 @@ async fn main() -> Result<()> {
                         attributes,
                         unset,
                     } => {
-                        let mut muts = build_attributes(attributes, &resolve)?;
+                        let mut mutations = build_attributes(attributes, &resolve)?;
                         for name in unset {
-                            muts.push(Attribute::tombstone(Ident32::encode(name)?));
+                            mutations.push(Attribute::tombstone(Ident32::encode(name)?));
                         }
                         if let Some(ct) = content_type.as_deref() {
-                            muts.push(content_type_attr(ct)?);
+                            mutations.push(content_type_attr(ct)?);
                         }
                         if payload.is_some() || size.is_some() {
-                            muts.push(payload_attr(&resolve_payload(payload.as_deref(), *size)?)?);
+                            mutations
+                                .push(payload_attr(&resolve_payload(payload.as_deref(), *size)?)?);
                         }
-                        Operation::patch(resolve(entity_key)?, muts)
+                        Operation::patch(resolve(entity_key)?, mutations)
                     }
                     BatchOp::ExtendExpiry {
                         entity_key,

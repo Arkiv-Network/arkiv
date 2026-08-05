@@ -13,7 +13,7 @@ use alloy_primitives::{B256, Bytes};
 use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{Attribute, AttributeValue, Ident32, Operation};
 use arkiv_harness::{
-    DEV_CHAIN_ID, DEV_KEY_0, NodeBuilder, connect, derive_entity_key, result_keys,
+    DEV_CHAIN_ID, DEV_KEY_0, EntityNonce, NodeBuilder, connect, derive_entity_key, result_keys,
 };
 
 const READY: Duration = Duration::from_secs(90);
@@ -63,8 +63,18 @@ async fn state_and_index_survive_kill_and_restart() {
             create_op(1000, Bytes::from_static(b"beta"), attrs(20, "blue")),
         ])
         .await;
-    let key0 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
-    let key1 = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 1, 0));
+    let key0 = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
+    let key1 = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(1),
+        0,
+    ));
     let created = client.get_entity(key0).await["createdAtBlock"]
         .as_u64()
         .unwrap();

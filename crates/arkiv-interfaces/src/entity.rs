@@ -25,11 +25,10 @@ pub struct Entity {
     pub last_modified_at_block: BlockNumber,
     /// The block it expires in.
     pub expires_at: BlockNumber,
-    /// Entity properties fixed at creation: `readonly`, `permissionless
-    /// extension`, and six bits reserved for later protocol upgrades. Set from
-    /// the create op's `creationFlags` and immutable thereafter — no op changes
-    /// them, which is what lets a reader trust them without checking history.
-    pub creation_flags: u8,
+    /// Entity properties fixed at creation. Set from the create op's
+    /// `creationFlags` and immutable thereafter — no op changes them, which is
+    /// what lets a reader trust them without checking history.
+    pub creation_flags: CreationFlags,
     /// Opaque content type (e.g. a MIME string).
     pub content_type: Vec<u8>,
     /// Opaque application payload.
@@ -285,21 +284,75 @@ pub enum AttributeType {
     EntityKey = 10,
 }
 
-/// Creation-flag bits ([`Entity::creation_flags`], set from a create op).
+/// An entity's creation flags: eight bits fixed at creation, two defined.
 ///
-/// Bit 0 makes the entity's contents immutable: `patch` reverts. Lifecycle ops
-/// (extend, transfer, delete) still work — only the contents are frozen.
-pub const FLAG_READONLY: u8 = 1 << 0;
+/// A newtype rather than a bare `u8`, so the bit arithmetic lives here once
+/// instead of at every call site, and so an unvalidated byte off the wire
+/// cannot be mistaken for checked flags. [`from_bits`](Self::from_bits) is the
+/// only way in from untrusted input and it rejects the reserved bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
+pub struct CreationFlags(u8);
 
-/// Bit 1 lets *anyone* extend the entity's expiry, not just the owner. Safe to
-/// open up precisely because extending cannot hurt the owner: the payer gets
-/// nothing and the owner loses nothing.
-pub const FLAG_PERMISSIONLESS_EXTENSION: u8 = 1 << 1;
+impl CreationFlags {
+    /// No flags set.
+    pub const NONE: Self = Self(0);
 
-/// The bits a client may set. Anything outside this mask is a revert, which is
-/// what keeps the six reserved bits genuinely free: a later upgrade can define
-/// one knowing no chain ever accepted it meaning something else.
-pub const CREATION_FLAGS_MASK: u8 = FLAG_READONLY | FLAG_PERMISSIONLESS_EXTENSION;
+    /// The entity's contents are immutable: `patch` reverts. Lifecycle ops
+    /// (extend, transfer, delete) still work — only the contents are frozen.
+    pub const READONLY: Self = Self(1 << 0);
+
+    /// *Anyone* may extend this entity's expiry, not just the owner. Safe to
+    /// open up precisely because extending cannot hurt the owner: the payer
+    /// gets nothing and the owner loses nothing.
+    pub const PERMISSIONLESS_EXTENSION: Self = Self(1 << 1);
+
+    /// The bits a client may set. Anything outside this mask is rejected, which
+    /// is what keeps the six reserved bits genuinely free — a later upgrade can
+    /// define one knowing no chain ever accepted it meaning something else.
+    pub const MASK: u8 = Self::READONLY.0 | Self::PERMISSIONLESS_EXTENSION.0;
+
+    /// Validated construction from a wire byte: `None` if a reserved bit is set.
+    pub const fn from_bits(raw: u8) -> Option<Self> {
+        if raw & !Self::MASK != 0 {
+            None
+        } else {
+            Some(Self(raw))
+        }
+    }
+
+    /// Construction from a byte already known good — one this node itself
+    /// wrote and is reading back out of storage.
+    pub const fn from_stored_bits(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    /// The raw byte, for the wire and for storage.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Whether every flag in `other` is set here.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Contents frozen — a `patch` must revert.
+    pub const fn is_readonly(self) -> bool {
+        self.contains(Self::READONLY)
+    }
+
+    /// Anyone may extend the expiry, not just the owner.
+    pub const fn allows_permissionless_extension(self) -> bool {
+        self.contains(Self::PERMISSIONLESS_EXTENSION)
+    }
+}
+
+impl core::ops::BitOr for CreationFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
 
 /// The `typeId` that marks a **tombstone** — "unset this attribute".
 ///

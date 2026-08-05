@@ -13,7 +13,7 @@
 //! It proves the business-logic delta actually becomes correct reth account state:
 //! the entity lands as `code` at its address, byte-for-byte and still decodable.
 
-use arkiv_interfaces::entity::{AttributeValue, annotations};
+use arkiv_interfaces::entity::{AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::state::EntityStore;
 use arkiv_reth_entitystore::layout::entity_address;
@@ -55,7 +55,7 @@ fn create_commits_the_entity_as_account_code() {
             &[Op::Create {
                 key,
                 expires_at: 50,
-                creation_flags: 0,
+                creation_flags: CreationFlags::NONE,
                 content_type: b"text/plain".to_vec(),
                 payload: b"hello".to_vec(),
                 attributes: Vec::new(),
@@ -116,7 +116,7 @@ fn update_recommits_the_entity_as_new_code() {
         &[Op::Create {
             key,
             expires_at: 100,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"v1".to_vec(),
             attributes: Vec::new(),
@@ -178,7 +178,7 @@ fn transfer_recommits_with_the_new_owner() {
         &[Op::Create {
             key,
             expires_at: 100,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"x".to_vec(),
             payload: b"y".to_vec(),
             attributes: Vec::new(),
@@ -222,7 +222,7 @@ fn extend_recommits_with_a_higher_expiry() {
         &[Op::Create {
             key,
             expires_at: 100,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"x".to_vec(),
             payload: b"y".to_vec(),
             attributes: Vec::new(),
@@ -270,7 +270,7 @@ fn create_then_delete_commits_a_tombstone() {
                 Op::Create {
                     key,
                     expires_at: 50,
-                    creation_flags: 0,
+                    creation_flags: CreationFlags::NONE,
                     content_type: b"x".to_vec(),
                     payload: b"y".to_vec(),
                     attributes: Vec::new(),

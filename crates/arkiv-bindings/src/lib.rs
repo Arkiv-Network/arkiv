@@ -132,11 +132,9 @@ pub const OP_EXTEND_EXPIRY: u8 = 3;
 pub const OP_TRANSFER_OWNERSHIP: u8 = 4;
 pub const OP_DELETE: u8 = 5;
 
-/// Creation-flag bits. Like the `typeId`s, they belong to the protocol rather
-/// than the ABI, so they live in the spec crate and are re-exported here.
-pub use arkiv_interfaces::entity::{
-    CREATION_FLAGS_MASK, FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY,
-};
+/// Creation flags. Like the `typeId`s they belong to the protocol rather than
+/// the ABI, so the type lives in the spec crate and is re-exported here.
+pub use arkiv_interfaces::entity::CreationFlags;
 
 /// The attribute type set. The `typeId`s belong to the protocol, not the ABI, so
 /// they live in the spec crate and are re-exported here rather than mirrored.
@@ -165,13 +163,7 @@ mod tests {
     use super::*;
     use alloy_sol_types::SolCall;
 
-    /// Wire constants shared with the SDK — they must never drift silently.
-    ///
-    /// A selector is `keccak256(canonicalSignature)[..4]`, and a struct
-    /// parameter contributes its *flattened tuple*, so **reordering or
-    /// retyping any field of [`Operation`] changes these**. That is the drift
-    /// this test exists to catch. Recomputed independently rather than copied
-    /// from the code:
+    /// The pinned selectors, recomputed independently of this crate:
     ///
     /// ```text
     /// cast sig 'execute((uint8,bytes)[])'          # 0x49650044
@@ -183,23 +175,62 @@ mod tests {
     /// The `Ident32` parameter contributes its **underlying** `bytes32` to the
     /// signature, not its UDVT name — which is why the last one reads
     /// `(bytes32,bytes32)`.
+    const EXECUTE_SELECTOR: [u8; 4] = [0x49, 0x65, 0x00, 0x44];
+    const ENTITY_NONCE_SELECTOR: [u8; 4] = [0x36, 0x91, 0x7b, 0xfd];
+    const CUSTOM_ATTRIBUTE_NAMES_SELECTOR: [u8; 4] = [0x58, 0xd5, 0x41, 0x8a];
+    const ATTRIBUTE_TYPE_ID_SELECTOR: [u8; 4] = [0x43, 0x4f, 0xb6, 0xf3];
+
+    /// Wire constants shared with the SDK — they must never drift silently.
+    ///
+    /// A selector is `keccak256(canonicalSignature)[..4]`, and a struct
+    /// parameter contributes its *flattened tuple*, so **reordering or
+    /// retyping any field of [`Operation`] changes these**. That is the drift
+    /// this test exists to catch. Recomputed independently rather than copied
+    /// from the code:
+    ///
+    /// The check is genuinely independent: the right-hand sides above were
+    /// computed by `cast` from the Solidity signature, while the left-hand
+    /// sides are what `alloy` derives from the `sol!` block. Nothing in this
+    /// file feeds both, so a field reordering — which changes the flattened
+    /// tuple and therefore the selector — fails here rather than silently
+    /// forking the wire.
     #[test]
     fn selectors_are_pinned() {
-        assert_eq!(
-            IEntityRegistry::executeCall::SELECTOR,
-            [0x49, 0x65, 0x00, 0x44]
-        );
+        assert_eq!(IEntityRegistry::executeCall::SELECTOR, EXECUTE_SELECTOR);
         assert_eq!(
             IEntityRegistry::entityNonceCall::SELECTOR,
-            [0x36, 0x91, 0x7b, 0xfd]
+            ENTITY_NONCE_SELECTOR
         );
         assert_eq!(
             IEntityRegistry::customAttributeNamesCall::SELECTOR,
-            [0x58, 0xd5, 0x41, 0x8a]
+            CUSTOM_ATTRIBUTE_NAMES_SELECTOR
         );
         assert_eq!(
             IEntityRegistry::attributeTypeIdCall::SELECTOR,
-            [0x43, 0x4f, 0xb6, 0xf3]
+            ATTRIBUTE_TYPE_ID_SELECTOR
+        );
+    }
+
+    /// A selector is `keccak256(canonicalSignature)[..4]` — so the pins can be
+    /// re-derived here too, from the signature strings, with no external tool.
+    /// This is what makes the `cast` lines above reproducible rather than
+    /// folklore.
+    #[test]
+    fn pinned_selectors_match_their_signatures() {
+        let selector_of = |signature: &str| -> [u8; 4] {
+            alloy_primitives::keccak256(signature.as_bytes())[..4]
+                .try_into()
+                .unwrap()
+        };
+        assert_eq!(selector_of("execute((uint8,bytes)[])"), EXECUTE_SELECTOR);
+        assert_eq!(selector_of("entityNonce(address)"), ENTITY_NONCE_SELECTOR);
+        assert_eq!(
+            selector_of("customAttributeNames(bytes32)"),
+            CUSTOM_ATTRIBUTE_NAMES_SELECTOR
+        );
+        assert_eq!(
+            selector_of("attributeTypeId(bytes32,bytes32)"),
+            ATTRIBUTE_TYPE_ID_SELECTOR
         );
     }
 
@@ -224,8 +255,16 @@ mod tests {
     /// client setting bits 2–7 is rejected rather than silently accepted.
     #[test]
     fn creation_flag_mask_covers_only_the_v1_flags() {
-        assert_eq!(FLAG_READONLY, 0b0000_0001);
-        assert_eq!(FLAG_PERMISSIONLESS_EXTENSION, 0b0000_0010);
-        assert_eq!(CREATION_FLAGS_MASK, 0b0000_0011);
+        assert_eq!(CreationFlags::READONLY.bits(), 0b0000_0001);
+        assert_eq!(CreationFlags::PERMISSIONLESS_EXTENSION.bits(), 0b0000_0010);
+        assert_eq!(CreationFlags::MASK, 0b0000_0011);
+        // Every reserved bit is refused at the door.
+        for bit in 2..8 {
+            assert_eq!(CreationFlags::from_bits(1 << bit), None, "bit {bit}");
+        }
+        assert_eq!(
+            CreationFlags::from_bits(0b11),
+            Some(CreationFlags::READONLY | CreationFlags::PERMISSIONLESS_EXTENSION)
+        );
     }
 }

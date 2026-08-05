@@ -37,15 +37,17 @@ use core::fmt;
 use alloy_primitives::{Address, U256, keccak256};
 use alloy_sol_types::SolCall;
 use arkiv_bindings::{
-    Attribute as AbiAttribute, CREATION_FLAGS_MASK, Create, Delete, ExtendExpiry, IEntityRegistry,
-    MAX_ATTRIBUTES, OP_CREATE, OP_DELETE, OP_EXTEND_EXPIRY, OP_PATCH, OP_TRANSFER_OWNERSHIP,
-    Operation, Patch, TransferOwnership,
+    Attribute as AbiAttribute, Create, Delete, ExtendExpiry, IEntityRegistry, MAX_ATTRIBUTES,
+    OP_CREATE, OP_DELETE, OP_EXTEND_EXPIRY, OP_PATCH, OP_TRANSFER_OWNERSHIP, Operation, Patch,
+    TransferOwnership,
     encode::{AttrAbiError, OpAbiError},
     types::{Ident32ByteError, validate_ident32_bytes, validate_system_ident32_bytes},
 };
-use arkiv_interfaces::entity::{Attribute, AttributeValue, annotations};
+use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
-use arkiv_interfaces::primitives::{BlockNumber, EntityKey};
+use arkiv_interfaces::primitives::{BlockNumber, EntityKey, EntityNonce};
+
+use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
 
 use crate::ARKIV_ADDRESS;
 
@@ -56,7 +58,7 @@ use crate::ARKIV_ADDRESS;
 pub fn decode_ops(
     env: &ExecEnv,
     calldata: &[u8],
-    start_nonce: u64,
+    start_nonce: EntityNonce,
 ) -> Result<Vec<Op>, DecodeError> {
     if calldata.len() < 4 {
         return Err(DecodeError::CalldataTooShort);
@@ -77,10 +79,10 @@ pub fn decode_ops(
         let decoded = match op.operation {
             OP_CREATE => {
                 let c: Create = payload(op)?;
-                if c.creationFlags & !CREATION_FLAGS_MASK != 0 {
+                let Some(creation_flags) = CreationFlags::from_bits(c.creationFlags) else {
                     return Err(DecodeError::ReservedCreationFlags(c.creationFlags));
-                }
-                let nonce = start_nonce.saturating_add(create_index);
+                };
+                let nonce = start_nonce.advanced_by(create_index);
                 create_index += 1;
                 let SystemSplit {
                     content_type,
@@ -90,7 +92,7 @@ pub fn decode_ops(
                 Op::Create {
                     key: derive_entity_key(env.chain_id, &env.caller, nonce, c.salt),
                     expires_at: resolve_expiry(env.block_number, c.expiresAt, c.minLifetime)?,
-                    creation_flags: c.creationFlags,
+                    creation_flags,
                     content_type,
                     payload,
                     attributes,
@@ -189,12 +191,20 @@ pub fn resolve_expiry(
 ///
 /// This must match the SDK's local derivation exactly — a client predicts the
 /// key it is about to create, and a later op in the same batch targets it.
-pub fn derive_entity_key(chain_id: u64, owner: &[u8; 20], nonce: u64, salt: u128) -> EntityKey {
-    let mut buf = Vec::with_capacity(32 + 20 + 20 + 8 + 16);
+pub fn derive_entity_key(
+    chain_id: u64,
+    owner: &[u8; 20],
+    nonce: EntityNonce,
+    salt: u128,
+) -> EntityKey {
+    // chain_id ‖ ARKIV_ADDRESS ‖ owner ‖ nonce ‖ salt
+    let mut buf = Vec::with_capacity(
+        WORD_LEN + ADDRESS_LEN + ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
+    );
     buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
     buf.extend_from_slice(ARKIV_ADDRESS.as_slice());
     buf.extend_from_slice(owner.as_slice());
-    buf.extend_from_slice(&nonce.to_be_bytes());
+    buf.extend_from_slice(&nonce.get().to_be_bytes());
     buf.extend_from_slice(&salt.to_be_bytes());
     keccak256(&buf).0
 }
@@ -456,13 +466,16 @@ mod tests {
     #[test]
     fn decodes_create_with_derived_key_and_resolved_expiry() {
         let cd = calldata(vec![create_in(50, vec![])]);
-        let ops = decode_ops(&env([0xAA; 20], 10, 1), &cd, 7).unwrap();
+        let ops = decode_ops(&env([0xAA; 20], 10, 1), &cd, EntityNonce::new(7)).unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::Create {
                 key, expires_at, ..
             } => {
-                assert_eq!(*key, derive_entity_key(1, &[0xAA; 20], 7, 0)); // nonce = start_nonce
+                assert_eq!(
+                    *key,
+                    derive_entity_key(1, &[0xAA; 20], EntityNonce::new(7), 0)
+                ); // nonce = start_nonce
                 assert_eq!(*expires_at, 60); // block 10 + minLifetime 50
             }
             other => panic!("expected create, got {other:?}"),
@@ -472,9 +485,15 @@ mod tests {
     #[test]
     fn successive_creates_mint_sequential_keys() {
         let cd = calldata(vec![create_in(1, vec![]), create_in(1, vec![])]);
-        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 100).unwrap();
-        assert_eq!(*ops[0].key(), derive_entity_key(1, &[0xAA; 20], 100, 0));
-        assert_eq!(*ops[1].key(), derive_entity_key(1, &[0xAA; 20], 101, 0));
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(100)).unwrap();
+        assert_eq!(
+            *ops[0].key(),
+            derive_entity_key(1, &[0xAA; 20], EntityNonce::new(100), 0)
+        );
+        assert_eq!(
+            *ops[1].key(),
+            derive_entity_key(1, &[0xAA; 20], EntityNonce::new(101), 0)
+        );
     }
 
     /// The salt is what makes a key unpredictable, so it must change the key —
@@ -483,7 +502,7 @@ mod tests {
     fn salt_changes_the_minted_key() {
         let key_of = |salt: u128| {
             let cd = calldata(vec![Operation::create(salt, 0, 1, 0, vec![])]);
-            *decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap()[0].key()
+            *decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)).unwrap()[0].key()
         };
         assert_ne!(key_of(0), key_of(1));
         assert_ne!(key_of(1), key_of(u128::MAX));
@@ -495,11 +514,27 @@ mod tests {
     /// input must actually reach the preimage.
     #[test]
     fn every_derivation_input_changes_the_key() {
-        let base = derive_entity_key(1, &[0xAA; 20], 5, 9);
-        assert_ne!(base, derive_entity_key(2, &[0xAA; 20], 5, 9), "chain_id");
-        assert_ne!(base, derive_entity_key(1, &[0xBB; 20], 5, 9), "owner");
-        assert_ne!(base, derive_entity_key(1, &[0xAA; 20], 6, 9), "nonce");
-        assert_ne!(base, derive_entity_key(1, &[0xAA; 20], 5, 8), "salt");
+        let base = derive_entity_key(1, &[0xAA; 20], EntityNonce::new(5), 9);
+        assert_ne!(
+            base,
+            derive_entity_key(2, &[0xAA; 20], EntityNonce::new(5), 9),
+            "chain_id"
+        );
+        assert_ne!(
+            base,
+            derive_entity_key(1, &[0xBB; 20], EntityNonce::new(5), 9),
+            "owner"
+        );
+        assert_ne!(
+            base,
+            derive_entity_key(1, &[0xAA; 20], EntityNonce::new(6), 9),
+            "nonce"
+        );
+        assert_ne!(
+            base,
+            derive_entity_key(1, &[0xAA; 20], EntityNonce::new(5), 8),
+            "salt"
+        );
     }
 
     #[test]
@@ -512,7 +547,7 @@ mod tests {
                 attr("rank", &AttributeValue::u256_from_u64(3)),
             ],
         )]);
-        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)).unwrap();
         let Op::Create {
             content_type,
             payload,
@@ -532,11 +567,11 @@ mod tests {
     #[test]
     fn create_records_creation_flags() {
         let cd = calldata(vec![Operation::create(0, 0, 1, 0b11, vec![])]);
-        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)).unwrap();
         let Op::Create { creation_flags, .. } = &ops[0] else {
             panic!("expected create");
         };
-        assert_eq!(*creation_flags, 0b11);
+        assert_eq!(creation_flags.bits(), 0b11);
     }
 
     /// Reserved bits must stay reserved — accepting them now would make them
@@ -546,7 +581,7 @@ mod tests {
         for flags in [0b100, 0b1000_0000, 0xFF] {
             let cd = calldata(vec![Operation::create(0, 0, 1, flags, vec![])]);
             assert!(matches!(
-                decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+                decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
                 Err(DecodeError::ReservedCreationFlags(_)),
             ));
         }
@@ -559,7 +594,7 @@ mod tests {
             vec![AbiAttribute::tombstone(Ident32::encode("gone").unwrap())],
         )]);
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
             Err(DecodeError::TombstoneInCreate { .. })
         ));
     }
@@ -613,7 +648,7 @@ mod tests {
                 AbiAttribute::tombstone(Ident32::encode("size").unwrap()),
             ],
         )]);
-        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)).unwrap();
         let Op::Patch { key: k, mutations } = &ops[0] else {
             panic!("expected patch");
         };
@@ -634,7 +669,7 @@ mod tests {
             B256::repeat_byte(1),
             vec![attr("$payload", &AttributeValue::Bytes(b"new".to_vec()))],
         )]);
-        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, 0).unwrap();
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)).unwrap();
         let Op::Patch { mutations, .. } = &ops[0] else {
             panic!("expected patch");
         };
@@ -645,7 +680,7 @@ mod tests {
     fn patch_rejects_an_empty_mutation_list() {
         let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![])]);
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
             Err(DecodeError::EmptyMutations { .. })
         ));
     }
@@ -677,7 +712,11 @@ mod tests {
             ] {
                 assert!(
                     matches!(
-                        decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![op]), 0),
+                        decode_ops(
+                            &env([0xAA; 20], 1, 1),
+                            &calldata(vec![op]),
+                            EntityNonce::ZERO
+                        ),
                         Err(DecodeError::SystemAttributeNotWritable { .. })
                     ),
                     "{name} should be rejected"
@@ -699,7 +738,7 @@ mod tests {
             Operation::transfer_ownership(key, owner),
             Operation::delete(key),
         ]);
-        let ops = decode_ops(&env([0xAA; 20], 100, 1), &cd, 0).unwrap();
+        let ops = decode_ops(&env([0xAA; 20], 100, 1), &cd, EntityNonce::new(0)).unwrap();
         assert!(
             matches!(&ops[0], Op::ExtendExpiry { new_expires_at, .. } if *new_expires_at == 105)
         );
@@ -716,7 +755,7 @@ mod tests {
             Address::ZERO,
         )]);
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
             Err(DecodeError::TransferToZeroAddress { .. })
         ));
     }
@@ -728,7 +767,7 @@ mod tests {
     #[test]
     fn rejects_empty_batch() {
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![]), 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![]), EntityNonce::ZERO),
             Err(DecodeError::EmptyBatch)
         ));
     }
@@ -740,7 +779,7 @@ mod tests {
             operationData: Bytes::new(),
         }]);
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
             Err(DecodeError::InvalidOpType(99))
         ));
     }
@@ -756,7 +795,11 @@ mod tests {
             Bytes::from(b)
         };
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![op]), 0),
+            decode_ops(
+                &env([0xAA; 20], 1, 1),
+                &calldata(vec![op]),
+                EntityNonce::ZERO
+            ),
             Err(DecodeError::OperationData {
                 reason: OpAbiError::NonCanonical,
                 ..
@@ -777,7 +820,11 @@ mod tests {
             })),
         };
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![unsorted]), 0),
+            decode_ops(
+                &env([0xAA; 20], 1, 1),
+                &calldata(vec![unsorted]),
+                EntityNonce::ZERO
+            ),
             Err(DecodeError::AttributesNotSorted)
         ));
 
@@ -789,7 +836,11 @@ mod tests {
             })),
         };
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &calldata(vec![duplicate]), 0),
+            decode_ops(
+                &env([0xAA; 20], 1, 1),
+                &calldata(vec![duplicate]),
+                EntityNonce::ZERO
+            ),
             Err(DecodeError::AttributesNotSorted)
         ));
     }
@@ -807,7 +858,7 @@ mod tests {
         };
         let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![bad])]);
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
             // "testInvalidKey": the first bad byte is 'I' (0x49) at position 4.
             Err(DecodeError::AttributeNameInvalidByte {
                 position: 4,
@@ -825,7 +876,7 @@ mod tests {
         };
         let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![bad])]);
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &cd, 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityNonce::new(0)),
             Err(DecodeError::AttributeNameEmpty)
         ));
     }
@@ -833,11 +884,15 @@ mod tests {
     #[test]
     fn rejects_unknown_selector() {
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &[0xDE, 0xAD, 0xBE, 0xEF, 0x00], 0),
+            decode_ops(
+                &env([0xAA; 20], 1, 1),
+                &[0xDE, 0xAD, 0xBE, 0xEF, 0x00],
+                EntityNonce::ZERO
+            ),
             Err(DecodeError::UnknownSelector(_))
         ));
         assert!(matches!(
-            decode_ops(&env([0xAA; 20], 1, 1), &[0x01, 0x02], 0),
+            decode_ops(&env([0xAA; 20], 1, 1), &[0x01, 0x02], EntityNonce::ZERO),
             Err(DecodeError::CalldataTooShort)
         ));
     }

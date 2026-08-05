@@ -44,15 +44,13 @@ use core::fmt;
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
-use arkiv_interfaces::entity::{
-    Attribute, Entity, FLAG_PERMISSIONLESS_EXTENSION, FLAG_READONLY, annotations,
-};
+use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity, annotations};
 use arkiv_interfaces::execution::{
     AttributeMutation, BlockDraft, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
     TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
-use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey};
+use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey, EntityNonce};
 use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta, EntityStore};
 use arkiv_reth_auxstore::annotation::entity_annotations;
 
@@ -72,7 +70,7 @@ pub struct OpEffect {
     pub expires_at: BlockNumber,
     /// The entity's creation flags. Only meaningful for a create — the event it
     /// feeds is the one place they are published.
-    pub creation_flags: u8,
+    pub creation_flags: CreationFlags,
     /// The owner *before* a transfer. `None` for every other op, which have no
     /// ownership change to report.
     pub previous_owner: Option<Address>,
@@ -139,10 +137,10 @@ impl<E: EntityStore, C: CostModel> TransactionExecutor for ArkivExecutor<E, C> {
         draft: &mut BlockDraft,
         op_bytes: &[u8],
     ) -> Result<ExecOutput, Self::Error> {
-        // `start_nonce` is 0 here: threading the caller's persistent nonce from the
+        // `start_nonce` is zero here: threading the caller's persistent nonce from the
         // system account is the wiring step's job (this trait path isn't the live
         // reth executor yet). Decode failures are host faults surfaced as errors.
-        let ops = crate::decode::decode_ops(env, op_bytes, 0)
+        let ops = crate::decode::decode_ops(env, op_bytes, EntityNonce::ZERO)
             .map_err(|e| ExecError::Decode(e.to_string()))?;
         self.apply(env, entities, draft, &ops)
     }
@@ -294,7 +292,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     // immutable — lifecycle ops (extend, transfer, delete)
                     // still work, only the contents are frozen.
                     |e| {
-                        if e.creation_flags & FLAG_READONLY != 0 {
+                        if e.creation_flags.is_readonly() {
                             return Err(RevertReason::ReadOnly { key: *key });
                         }
                         Ok(())
@@ -317,7 +315,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     // `permissionless_extension` lets anyone pay to keep an
                     // entity alive — the one op a non-owner may perform, and
                     // only because extending can't harm the owner.
-                    Auth::OwnerOrFlag(FLAG_PERMISSIONLESS_EXTENSION),
+                    Auth::OwnerOrFlag(CreationFlags::PERMISSIONLESS_EXTENSION),
                     // Lifetimes never shorten. Equal is a no-op rather than a
                     // revert: the resolved target is what the client asked for,
                     // and asking for a lifetime it already has is satisfied.
@@ -408,7 +406,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             kind,
             owner,
             expires_at,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             previous_owner: None,
         }
     }
@@ -508,7 +506,7 @@ enum Auth {
     /// Only the current owner.
     OwnerOnly,
     /// The owner, or anyone at all if the entity carries this creation flag.
-    OwnerOrFlag(u8),
+    OwnerOrFlag(CreationFlags),
 }
 
 impl Auth {
@@ -518,7 +516,7 @@ impl Auth {
         }
         match self {
             Auth::OwnerOnly => false,
-            Auth::OwnerOrFlag(flag) => entity.creation_flags & flag != 0,
+            Auth::OwnerOrFlag(flag) => entity.creation_flags.contains(flag),
         }
     }
 }
@@ -680,7 +678,7 @@ mod tests {
             created_at_block: 3,
             last_modified_at_block: 4,
             expires_at: 100,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"hello".to_vec(),
             attributes: vec![
@@ -716,7 +714,7 @@ mod tests {
                 &[Op::Create {
                     key: [1u8; 32],
                     expires_at: 50,
-                    creation_flags: 0,
+                    creation_flags: CreationFlags::NONE,
                     content_type: b"x".to_vec(),
                     payload: b"y".to_vec(),
                     attributes: Vec::new(),
@@ -755,7 +753,7 @@ mod tests {
                 &[Op::Create {
                     key: [1u8; 32],
                     expires_at: 50,
-                    creation_flags: 0,
+                    creation_flags: CreationFlags::NONE,
                     content_type: Vec::new(),
                     payload: Vec::new(),
                     attributes: Vec::new(),
@@ -942,7 +940,7 @@ mod tests {
                     Op::Create {
                         key: [3u8; 32],
                         expires_at: 50,
-                        creation_flags: 0,
+                        creation_flags: CreationFlags::NONE,
                         content_type: Vec::new(),
                         payload: Vec::new(),
                         attributes: Vec::new(),
@@ -976,7 +974,7 @@ mod tests {
             &[Op::Create {
                 key: [1u8; 32],
                 expires_at: 50,
-                creation_flags: 0,
+                creation_flags: CreationFlags::NONE,
                 content_type: b"text/plain".to_vec(),
                 payload: b"y".to_vec(),
                 attributes: vec![Attribute::new(
@@ -1246,7 +1244,7 @@ mod tests {
         let create = Op::Create {
             key: [1u8; 32],
             expires_at: 50,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: Vec::new(),
             payload: Vec::new(),
             attributes: Vec::new(),
@@ -1279,7 +1277,7 @@ mod tests {
         let create = Op::Create {
             key: [1u8; 32],
             expires_at: 50,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: Vec::new(),
             payload: Vec::new(),
             attributes: Vec::new(),

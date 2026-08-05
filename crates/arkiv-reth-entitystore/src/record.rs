@@ -21,7 +21,7 @@ use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 
 use arkiv_interfaces::codec::EntityCodec;
 use arkiv_interfaces::entity::{
-    Attribute, AttributeType, AttributeValue, AttributeValueError, Entity,
+    Attribute, AttributeType, AttributeValue, AttributeValueError, CreationFlags, Entity,
 };
 
 /// Marker byte before an entity record — the EVM `INVALID` opcode, so a `CALL` to
@@ -225,7 +225,7 @@ impl EntityRlp {
             key: e.key.into(),
             attributes: e.attributes.iter().map(AttributeRlp::from_attr).collect(),
             last_modified_at_block: e.last_modified_at_block,
-            creation_flags: e.creation_flags,
+            creation_flags: e.creation_flags.bits(),
         }
     }
 }
@@ -239,7 +239,7 @@ impl IntoEntity for EntityRlp {
             created_at_block: self.created_at_block,
             last_modified_at_block: self.last_modified_at_block,
             expires_at: self.expires_at,
-            creation_flags: self.creation_flags,
+            creation_flags: CreationFlags::from_stored_bits(self.creation_flags),
             content_type: self.content_type,
             payload: self.payload,
             attributes: self
@@ -281,7 +281,7 @@ mod tests {
             created_at_block: 10,
             last_modified_at_block: 20,
             expires_at: 100,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"text/plain".to_vec(),
             payload: b"hello world".to_vec(),
             attributes: vec![
@@ -411,7 +411,7 @@ mod tests {
         v0.encode(&mut code);
 
         let decoded = decode(&code).expect("v0 record decodes");
-        assert_eq!(decoded.creation_flags, 0);
+        assert_eq!(decoded.creation_flags, CreationFlags::NONE);
         assert_eq!(decoded.key, e.key);
         assert_eq!(decoded.payload, e.payload);
         assert_eq!(decoded.attributes, e.attributes);

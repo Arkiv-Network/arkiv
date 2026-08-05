@@ -101,6 +101,7 @@ impl CostModel for PlaceholderCost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::CreationFlags;
     use alloc::vec;
 
     #[test]
@@ -118,7 +119,7 @@ mod tests {
             PlaceholderCost.op_cost(&Op::Create {
                 key,
                 expires_at: 1,
-                creation_flags: 0,
+                creation_flags: CreationFlags::NONE,
                 content_type: ct,
                 payload: pl,
                 attributes: at,
@@ -145,7 +146,7 @@ mod tests {
         let cost = PlaceholderCost.op_cost(&Op::Create {
             key,
             expires_at: 1,
-            creation_flags: 0,
+            creation_flags: CreationFlags::NONE,
             content_type: b"ab".to_vec(), // 2 bytes
             payload: b"cde".to_vec(),     // 3 bytes
             attributes: one_attr,

@@ -16,8 +16,8 @@ use arkiv_bindings::{
     Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Operation,
 };
 use arkiv_harness::{
-    ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, NodeBuilder, connect,
-    derive_entity_key, result_keys,
+    ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityNonce, NodeBuilder,
+    connect, derive_entity_key, result_keys,
 };
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
@@ -96,7 +96,12 @@ async fn create_then_get_entity_over_a_live_node() {
 
     // 2) The key the node minted for this caller's first create (minting nonce 0),
     //    derived independently — the test never learns it from the node.
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
 
     // 2a) The create emits exactly one EntityOperation log at ARKIV_ADDRESS,
     //     carrying the minted key/owner/type — the event surface off-chain
@@ -204,7 +209,12 @@ async fn typed_revert_errors_over_a_live_node() {
     // A stranger updating a real entity → NotOwner(key, caller, owner).
     let op = create_op(100, Bytes::from_static(b"v1"), vec![]);
     client.execute(vec![op]).await;
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
     let stranger = Address::repeat_byte(0xCD);
     let update = patch_payload(key, Bytes::from_static(b"v2"));
     let err = revert_of(vec![update], stranger).await;
@@ -270,7 +280,12 @@ async fn estimated_gas_is_accepted_by_the_pool() {
     assert!(receipt.status(), "create must succeed");
 
     // Update the same entity — the op that used to estimate below the floor.
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
     let update = patch_payload(key, payload);
     let receipt = registry
         .execute(vec![update])
@@ -305,7 +320,12 @@ async fn query_operator_classes_over_a_live_node() {
         .map(|i| {
             format!(
                 "{:#x}",
-                B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), i, 0))
+                B256::from(derive_entity_key(
+                    DEV_CHAIN_ID,
+                    &caller.into_array(),
+                    EntityNonce::new(i),
+                    0
+                ))
             )
         })
         .collect();
@@ -495,7 +515,14 @@ async fn query_operator_classes_over_a_live_node() {
 async fn write_path_ops_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
-    let key = |i: u64| B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), i, 0));
+    let key = |i: u64| {
+        B256::from(derive_entity_key(
+            DEV_CHAIN_ID,
+            &caller.into_array(),
+            EntityNonce::new(i),
+            0,
+        ))
+    };
     let ks = |i: u64| format!("{:#x}", key(i));
 
     // Four entities: e0 (update), e1 (extend), e2 (transfer), e3 (delete).
@@ -602,7 +629,12 @@ async fn write_path_ops_over_a_live_node() {
 async fn historical_reads_and_block_timing_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
     let ks = format!("{key:#x}");
 
     client
@@ -679,7 +711,7 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
     let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &owner_addr.into_array(),
-        0,
+        EntityNonce::new(0),
         0,
     ));
     assert_eq!(owner.get_entity(key).await["payload"], "0x7631"); // "v1"
@@ -716,7 +748,7 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
     let would_be = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &owner_addr.into_array(),
-        1,
+        EntityNonce::new(1),
         0,
     ));
     assert!(
@@ -742,7 +774,12 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
     client
         .execute(vec![create_op(60, Bytes::from_static(b"ttl"), vec![])])
         .await;
-    let key = B256::from(derive_entity_key(DEV_CHAIN_ID, &caller.into_array(), 0, 0));
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
     let expires_at = client.get_entity(key).await["expiresAt"].as_u64().unwrap();
     assert_eq!(
         client.entity_count(None, None).await,

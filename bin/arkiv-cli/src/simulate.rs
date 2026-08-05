@@ -317,9 +317,6 @@ fn pick_op_kind(
     signer_count: usize,
     creates_in_batch: usize,
 ) -> Option<OpKind> {
-    // There is no EXPIRE op to prefer any more: expired entities are removed by
-    // the protocol's per-block purge, so the simulator just lets them age out.
-
     let feasible: Vec<(OpKind, u32)> = weights
         .iter()
         .copied()
