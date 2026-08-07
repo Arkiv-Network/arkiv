@@ -462,30 +462,40 @@ async fn query_operator_classes_over_a_live_node() {
         expect(&[2]),
     );
 
-    // Error contract: the parser's rejections reach the caller as errors.
-    for rejected in [
-        "rank = = u256(30)",                      // malformed
-        "$createdAt >= 1",                        // system u64 needs its tag
-        "rank != u256(30)",                       // != is not in the language
-        "team >= str('blue')",                    // range on an unordered type
-        "rank >= u256(20) && team = str('blue')", // removed symbol operator
-        "exists(rank)",                           // reserved, unimplemented
-        "rank = i32(2147483648)",                 // literal out of range
+    // Error contract: each class of failure reaches the caller under its own
+    // stable code, because the code is what an SDK branches on.
+    for (rejected, code) in [
+        ("rank = = u256(30)", "-32001"),                      // malformed
+        ("rank >= u256(20) && team = str('blue')", "-32001"), // removed operator
+        ("$createdAt >= 1", "-32002"),                        // system u64 needs its tag
+        ("rank != u256(30)", "-32002"),                       // != is not in the language
+        ("team >= str('blue')", "-32002"),                    // range on an unordered type
+        ("exists(rank)", "-32002"),                           // reserved, unimplemented
+        ("rank = i32(2147483648)", "-32003"),                 // literal out of range
+        (
+            "who = addr(0x5aAeb6053f3E94C9b9A09f33669435E7Ef1BeAed)",
+            "-32003",
+        ), // bad EIP-55 checksum
+        (&"(".repeat(200), "-32004"),                         // nested too deeply
     ] {
+        let err = client
+            .query_raw(rejected, serde_json::json!({}))
+            .await
+            .expect_err(rejected)
+            .to_string();
         assert!(
-            client
-                .query_raw(rejected, serde_json::json!({}))
-                .await
-                .is_err(),
-            "query must be rejected: {rejected}",
+            err.contains(code),
+            "{rejected} should be {code}, got: {err}"
         );
     }
+    let future_block = client
+        .query_raw("*", serde_json::json!({ "atBlock": "0x5f5e0ff" }))
+        .await
+        .expect_err("a future block must error")
+        .to_string();
     assert!(
-        client
-            .query_raw("*", serde_json::json!({ "atBlock": "0x5f5e0ff" }))
-            .await
-            .is_err(),
-        "a future block must error",
+        future_block.contains("-32006"),
+        "an unavailable block should be -32006, got: {future_block}"
     );
     assert!(
         client
@@ -495,16 +505,27 @@ async fn query_operator_classes_over_a_live_node() {
         "non-latest tags must error",
     );
 
-    // resultsPerPage 0 clamps to 1 rather than erroring (branch/SDK semantics).
-    let clamped = client
-        .query_raw("*", serde_json::json!({ "resultsPerPage": 0 }))
-        .await
-        .expect("resultsPerPage 0 clamps");
-    assert_eq!(result_keys(&clamped).len(), 1);
+    // `limit` is bounded rather than silently trimmed, in both directions.
+    for bad_limit in [serde_json::json!(0), serde_json::json!(201)] {
+        assert!(
+            client
+                .query_raw("*", serde_json::json!({ "limit": bad_limit }))
+                .await
+                .is_err(),
+            "limit {bad_limit} must error rather than clamp",
+        );
+    }
+    // A typo'd option is refused instead of being quietly ignored.
+    assert!(
+        client
+            .query_raw("*", serde_json::json!({ "resultsPerPage": 2 }))
+            .await
+            .is_err(),
+        "unknown options must error",
+    );
 
     // SDK wire shapes: a bare query string with no options object (the exact
-    // form viem sends for key lookups), hex resultsPerPage, and includeData
-    // projection.
+    // form viem sends for key lookups), and a hex `limit`.
     let bare: serde_json::Value = client
         .provider()
         .raw_request("arkiv_query".into(), (format!("$key = key({})", k[0]),))
@@ -519,27 +540,105 @@ async fn query_operator_classes_over_a_live_node() {
     );
 
     let hex_page = client
-        .query_raw("*", serde_json::json!({ "resultsPerPage": "0x2" }))
+        .query_raw("*", serde_json::json!({ "limit": "0x2" }))
         .await
-        .expect("hex resultsPerPage");
+        .expect("hex limit");
     assert_eq!(result_keys(&hex_page).len(), 2);
 
+    // Projections are opt-in: the default is the key alone.
+    let defaulted = client
+        .query_raw(&format!("$key = key({})", k[0]), serde_json::json!({}))
+        .await
+        .expect("default projection");
+    let entity = &defaulted["data"][0];
+    assert!(entity["key"].as_str().is_some(), "key is the default field");
+    assert_eq!(
+        entity.as_object().unwrap().len(),
+        1,
+        "nothing but the key without a select: {entity}"
+    );
+
+    // …and each selected field comes back in its spec encoding.
     let projected = client
         .query_raw(
             &format!("$key = key({})", k[0]),
-            serde_json::json!({ "includeData": { "key": true } }),
+            serde_json::json!({ "select": {
+                "key": true, "owner": true, "expiresAt": true,
+                "attributes": true, "attributeSchema": true,
+            }}),
         )
         .await
-        .expect("includeData projection");
+        .expect("select projection");
     let entity = &projected["data"][0];
-    assert!(entity["key"].as_str().is_some(), "key requested → present");
+    assert!(entity["owner"].as_str().is_some(), "owner requested");
     assert!(
-        entity.get("value").is_none(),
-        "value not requested → absent"
+        entity["expiresAt"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("0x")),
+        "chain quantities are hex: {entity}"
+    );
+    assert!(entity.get("payload").is_none(), "payload not requested");
+    assert!(
+        entity.get("creator").is_none(),
+        "creator not requested → absent"
+    );
+    // rank is a u256 (hex quantity) and team a str, both tagged by type name.
+    let attributes = entity["attributes"].as_array().expect("attributes array");
+    let rank = attributes
+        .iter()
+        .find(|a| a["name"] == "rank")
+        .expect("rank attribute");
+    assert_eq!(rank["type"], "u256");
+    assert_eq!(rank["value"], "0xa");
+    let team = attributes
+        .iter()
+        .find(|a| a["name"] == "team")
+        .expect("team attribute");
+    assert_eq!(team["type"], "str");
+    assert_eq!(team["value"], "red");
+    // The schema is the same names and types, without the values.
+    let schema = entity["attributeSchema"]
+        .as_array()
+        .expect("attributeSchema array");
+    assert_eq!(schema.len(), attributes.len());
+    assert!(schema.iter().all(|entry| entry.get("value").is_none()));
+
+    // A named subset returns only what was asked for.
+    let subset = client
+        .query_raw(
+            &format!("$key = key({})", k[0]),
+            serde_json::json!({ "select": { "attributes": { "team": true } } }),
+        )
+        .await
+        .expect("named attribute subset");
+    let names: Vec<_> = subset["data"][0]["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["team"]);
+
+    // Cursors are opaque and bound to the request that issued them.
+    let first = client.query("*", 2, None).await;
+    let cursor = first["cursor"].as_str().expect("a cursor for page 2");
+    assert!(cursor.starts_with("b64:"), "opaque cursor: {cursor}");
+    assert!(
+        client
+            .query_raw(
+                "rank >= u256(10)",
+                serde_json::json!({ "limit": 2, "cursor": cursor }),
+            )
+            .await
+            .is_err(),
+        "a cursor from another query must be refused",
     );
     assert!(
-        entity.get("owner").is_none(),
-        "owner not requested → absent"
+        client
+            .query_raw("*", serde_json::json!({ "limit": 2, "cursor": "b64:zzzz" }))
+            .await
+            .is_err(),
+        "a malformed cursor must be refused",
     );
 }
 
