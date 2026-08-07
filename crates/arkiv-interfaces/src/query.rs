@@ -4,7 +4,6 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::collections::NonEmptyVec;
 use crate::entity::{AttributeValue, Entity};
 use crate::primitives::{BlockNumber, EntityKey, Gas};
 use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, HistoricalEntityStore};
@@ -13,24 +12,23 @@ use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, Histor
 ///
 /// The leaves compare one attribute (`key`) against a typed [`AnnotVal`]. The
 /// branches (`And`/`Or`/`Not`) combine them.
+///
+/// Every leaf carries a *typed* value, and a predicate matches only an attribute
+/// of that same type: `level >= i32(10)` never matches a `u256`-typed `level`.
+/// The host gets this for free — the type is mixed into the index key — but it is
+/// the language's rule, not an implementation detail.
+///
+/// There is deliberately **no `!=` variant**. Value-negation restricted to
+/// "attribute is set with this type, and differs" needs a per-`(attribute, type)`
+/// presence index the host does not maintain, so the language omits the operator
+/// rather than silently answering the wider [`Not`](Self::Not) complement. See
+/// `docs/v1-typed-query-scope.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
-    /// Matches every live entity (`*` / `$all`).
+    /// Matches every live entity (`*`).
     All,
     /// Matches entities whose `key` equals `value`.
     Eq { key: AnnotKey, value: AnnotVal },
-    /// Matches entities whose `key` does not equal `value`.
-    Neq { key: AnnotKey, value: AnnotVal },
-    /// Matches entities whose `key` equals one of `values`.
-    In {
-        key: AnnotKey,
-        values: NonEmptyVec<AnnotVal>,
-    },
-    /// Matches entities whose `key` equals none of `values`.
-    NotIn {
-        key: AnnotKey,
-        values: NonEmptyVec<AnnotVal>,
-    },
     /// Matches entities whose `key` is greater than `value`.
     Gt { key: AnnotKey, value: AnnotVal },
     /// Matches entities whose `key` is greater than or equal to `value`.
@@ -39,15 +37,15 @@ pub enum Query {
     Lt { key: AnnotKey, value: AnnotVal },
     /// Matches entities whose `key` is less than or equal to `value`.
     Lte { key: AnnotKey, value: AnnotVal },
-    /// Matches entities whose `key` starts with `value` (prefix match, `~`).
-    Glob { key: AnnotKey, value: AnnotVal },
-    /// Matches entities whose `key` does not start with `value`.
-    NotGlob { key: AnnotKey, value: AnnotVal },
+    /// Matches entities whose `key` starts with `value` — the `STARTSWITH`
+    /// operator, a raw UTF-8 byte prefix with no normalization.
+    StartsWith { key: AnnotKey, value: AnnotVal },
     /// Matches entities satisfying both subqueries.
     And(Box<Query>, Box<Query>),
     /// Matches entities satisfying either subquery.
     Or(Box<Query>, Box<Query>),
-    /// Matches entities not satisfying the subquery.
+    /// Matches entities not satisfying the subquery — the full complement,
+    /// evaluated against the live-entity set.
     Not(Box<Query>),
 }
 
@@ -58,15 +56,26 @@ pub enum AnnotKey {
     User(String),
 }
 
-/// The built-in fields you can query by name.
+/// The built-in (`$`-prefixed) fields you can query by name.
+///
+/// These are the *language's* names. The byte strings they are indexed under are
+/// the [`annotations`](crate::entity::annotations) constants, which a host maps
+/// them to — the two are deliberately decoupled, because the annotation bytes are
+/// mixed into index-bucket addresses and renaming one relocates on-chain state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltIn {
+    /// `$owner` — the current owner's address.
     Owner,
+    /// `$creator` — the creating address, immutable.
     Creator,
+    /// `$key` — the entity key.
     Key,
-    Expiration,
+    /// `$expiresAt` — the expiry block.
+    ExpiresAt,
+    /// `$createdAt` — the creation block.
+    CreatedAt,
+    /// `$contentType` — the payload's MIME string.
     ContentType,
-    CreatedAtBlock,
 }
 
 /// A value a predicate compares against.
