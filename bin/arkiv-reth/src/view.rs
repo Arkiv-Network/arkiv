@@ -110,9 +110,29 @@ impl Default for Projection {
 }
 
 impl Projection {
-    /// Resolve a caller's `select`, or the default when it is absent.
+    /// Every field — what a read of one entity by key answers with.
     ///
-    /// Errors describe the one field this version cannot serve.
+    /// `arkiv_query` projects because a page can be large; `arkiv_getEntity`
+    /// names a single entity, so there is nothing to save by trimming it. A
+    /// caller who does want a subset can ask `$key = key(…)` through
+    /// `arkiv_query` instead.
+    pub fn all() -> Self {
+        Self {
+            key: true,
+            owner: true,
+            creator: true,
+            created_at: true,
+            updated_at: true,
+            expires_at: true,
+            creation_flags: true,
+            content_type: true,
+            payload: true,
+            attribute_schema: false,
+            attributes: AttributeProjection::All,
+        }
+    }
+
+    /// Resolve a caller's `select`, or the default when it is absent.
     pub fn resolve(select: Option<&Select>) -> Result<Self, String> {
         let Some(select) = select else {
             return Ok(Self::default());

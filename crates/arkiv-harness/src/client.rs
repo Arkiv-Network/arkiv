@@ -358,6 +358,20 @@ fn is_nonce_too_low(error: &impl std::fmt::Display) -> bool {
     error.to_string().to_lowercase().contains("nonce too low")
 }
 
+/// A chain quantity from an `arkiv_*` response, which are all hex strings.
+///
+/// Panics with the offending value rather than returning an option: in a test,
+/// a field that is not the hex quantity it should be is the finding.
+pub fn hex_quantity(value: &serde_json::Value) -> u64 {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a hex quantity string, got {value}"));
+    let digits = text
+        .strip_prefix("0x")
+        .unwrap_or_else(|| panic!("expected a 0x-prefixed quantity, got {text:?}"));
+    u64::from_str_radix(digits, 16).unwrap_or_else(|e| panic!("invalid hex quantity {text:?}: {e}"))
+}
+
 /// The set of `key` strings in a query response — order-independent, since the
 /// index returns newest-first but tests assert on membership.
 pub fn result_keys(response: &serde_json::Value) -> BTreeSet<String> {
