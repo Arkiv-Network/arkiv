@@ -90,9 +90,10 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    # The arm64 runner has half the cores and half the memory of the amd64 one,
-    # so a cold build of the three images there takes several times as long.
-    timeout-minutes: 330
+    # A cold run compiles the whole dependency tree and then uploads it as
+    # registry cache, which together take upwards of an hour and a half; a run
+    # that finds its cache warm finishes in a fraction of that.
+    timeout-minutes: 240
     permissions:
       contents: read
       packages: write
