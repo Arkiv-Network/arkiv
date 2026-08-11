@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  REGISTRY: ghcr.io/arkiv-network
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -59,18 +62,37 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
 
-  # Builds all three images, pushing them to GHCR on main commits and `v*`
-  # tags; manual dispatch runs build and refresh the caches without pushing
-  # image tags. The Dockerfiles' cargo-chef stages are identical up to the
-  # final `cargo build --bin`, so dependency compilation is a single shared
-  # layer: the sequential builds hit it through the buildx builder's local
-  # cache within a run, and through the per-image `buildcache` tag on GHCR
-  # across runs.
+  # Builds all three images once per platform on a native runner — emulated
+  # arm64 would run rustc under QEMU, which the size of the reth compile rules
+  # out. Each platform job pushes every image by digest only; `docker-manifest`
+  # then binds the tags to a manifest list spanning both platforms, so a pull
+  # resolves to the host's architecture. Manual dispatch builds and refreshes
+  # the caches without pushing anything.
+  #
+  # The Dockerfiles' cargo-chef stages are identical up to the final
+  # `cargo build --bin`, so dependency compilation is a single shared layer:
+  # the three sequential builds hit it through the buildx builder's local cache
+  # within a run, and through the per-image, per-platform `buildcache` tag on
+  # GHCR across runs.
   docker:
-    runs-on: ubuntu-latest
     needs: [fmt, test]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 120
+    strategy:
+      # One platform failing leaves the other's digests pushed, so a rerun only
+      # repeats the leg that broke.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # The arm64 runner has half the cores and half the memory of the amd64 one,
+    # so a cold build of the three images there takes several times as long.
+    timeout-minutes: 330
     permissions:
       contents: read
       packages: write
@@ -83,63 +105,116 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` moves only with main commits; tag pushes add the version tag.
+      # Tags are bound in `docker-manifest`; the metadata steps here supply the
+      # OCI labels that go into each per-platform image.
       - id: meta-reth
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/arkiv-network/arkiv-reth
-          flavor: |
-            latest=false
-          tags: |
-            type=ref,event=tag
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+          images: ${{ env.REGISTRY }}/arkiv-reth
+      - id: build-reth
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/arkiv-reth.Dockerfile
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta-reth.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta-reth.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/arkiv-network/arkiv-reth:buildcache
-          cache-to: type=registry,ref=ghcr.io/arkiv-network/arkiv-reth:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          outputs: ${{ github.event_name == 'push' && format('type=image,name={0}/arkiv-reth,push-by-digest=true,name-canonical=true,push=true', env.REGISTRY) || 'type=cacheonly' }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
 
       - id: meta-committer
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/arkiv-network/arkiv-committer
-          flavor: |
-            latest=false
-          tags: |
-            type=ref,event=tag
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
+          images: ${{ env.REGISTRY }}/arkiv-committer
+      - id: build-committer
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/arkiv-committer.Dockerfile
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta-committer.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta-committer.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/arkiv-network/arkiv-committer:buildcache
-          cache-to: type=registry,ref=ghcr.io/arkiv-network/arkiv-committer:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+          outputs: ${{ github.event_name == 'push' && format('type=image,name={0}/arkiv-committer,push-by-digest=true,name-canonical=true,push=true', env.REGISTRY) || 'type=cacheonly' }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/arkiv-committer:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/arkiv-committer:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
 
       - id: meta-reth-dev
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/arkiv-network/arkiv-reth-dev
+          images: ${{ env.REGISTRY }}/arkiv-reth-dev
+      - id: build-reth-dev
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/arkiv-reth-dev.Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta-reth-dev.outputs.labels }}
+          outputs: ${{ github.event_name == 'push' && format('type=image,name={0}/arkiv-reth-dev,push-by-digest=true,name-canonical=true,push=true', env.REGISTRY) || 'type=cacheonly' }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth-dev:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth-dev:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
+
+      # One artifact per platform, holding an empty file named after each
+      # image's digest — the merge job turns those names back into references.
+      - if: github.event_name == 'push'
+        env:
+          DIGEST_RETH: ${{ steps.build-reth.outputs.digest }}
+          DIGEST_COMMITTER: ${{ steps.build-committer.outputs.digest }}
+          DIGEST_RETH_DEV: ${{ steps.build-reth-dev.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests/arkiv-reth /tmp/digests/arkiv-committer /tmp/digests/arkiv-reth-dev
+          touch "/tmp/digests/arkiv-reth/${DIGEST_RETH#sha256:}"
+          touch "/tmp/digests/arkiv-committer/${DIGEST_COMMITTER#sha256:}"
+          touch "/tmp/digests/arkiv-reth-dev/${DIGEST_RETH_DEV#sha256:}"
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Binds each image's tags to a manifest list over the per-platform digests
+  # both build jobs pushed.
+  docker-manifest:
+    needs: docker
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [arkiv-reth, arkiv-committer, arkiv-reth-dev]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` moves only with main commits; tag pushes add the version tag.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image }}
           flavor: |
             latest=false
           tags: |
             type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/arkiv-reth-dev.Dockerfile
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta-reth-dev.outputs.tags }}
-          labels: ${{ steps.meta-reth-dev.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/arkiv-network/arkiv-reth-dev:buildcache
-          cache-to: type=registry,ref=ghcr.io/arkiv-network/arkiv-reth-dev:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+      - working-directory: /tmp/digests/${{ matrix.image }}
+        run: |
+          # Both substitutions expand to several arguments — one -t per tag,
+          # one reference per digest file — so the splitting is deliberate.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ matrix.image }}@sha256:%s ' *)
+      - run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
