@@ -59,11 +59,11 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
 
-  # Builds both images, pushing them to GHCR on main commits and `v*`
+  # Builds all three images, pushing them to GHCR on main commits and `v*`
   # tags; manual dispatch runs build and refresh the caches without pushing
   # image tags. The Dockerfiles' cargo-chef stages are identical up to the
   # final `cargo build --bin`, so dependency compilation is a single shared
-  # layer: the two sequential builds hit it through the buildx builder's local
+  # layer: the sequential builds hit it through the buildx builder's local
   # cache within a run, and through the per-image `buildcache` tag on GHCR
   # across runs.
   docker:
@@ -123,3 +123,23 @@ jobs:
           labels: ${{ steps.meta-committer.outputs.labels }}
           cache-from: type=registry,ref=ghcr.io/arkiv-network/arkiv-committer:buildcache
           cache-to: type=registry,ref=ghcr.io/arkiv-network/arkiv-committer:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - id: meta-reth-dev
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/arkiv-network/arkiv-reth-dev
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/arkiv-reth-dev.Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta-reth-dev.outputs.tags }}
+          labels: ${{ steps.meta-reth-dev.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/arkiv-network/arkiv-reth-dev:buildcache
+          cache-to: type=registry,ref=ghcr.io/arkiv-network/arkiv-reth-dev:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
