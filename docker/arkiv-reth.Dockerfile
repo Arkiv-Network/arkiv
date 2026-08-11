@@ -7,9 +7,9 @@
 
 # ---- chef ----
 # This stage, the planner stage and the cook step below are byte-identical
-# across the arkiv-reth and arkiv-committer Dockerfiles, so both builds resolve
-# to the same layer digests and share one dependency compilation. Edit them in
-# lockstep.
+# across the arkiv-reth, arkiv-committer and arkiv-reth-dev Dockerfiles, so all
+# builds resolve to the same layer digests and share one dependency
+# compilation. Edit them in lockstep.
 FROM rust:1.94-slim-bookworm AS chef
 WORKDIR /build
 
