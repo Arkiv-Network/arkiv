@@ -123,21 +123,6 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth:buildcache-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
 
-      - id: meta-committer
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/arkiv-committer
-      - id: build-committer
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/arkiv-committer.Dockerfile
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta-committer.outputs.labels }}
-          outputs: ${{ github.event_name == 'push' && format('type=image,name={0}/arkiv-committer,push-by-digest=true,name-canonical=true,push=true', env.REGISTRY) || 'type=cacheonly' }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/arkiv-committer:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/arkiv-committer:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
-
       - id: meta-reth-dev
         uses: docker/metadata-action@v5
         with:
@@ -158,12 +143,10 @@ jobs:
       - if: github.event_name == 'push'
         env:
           DIGEST_RETH: ${{ steps.build-reth.outputs.digest }}
-          DIGEST_COMMITTER: ${{ steps.build-committer.outputs.digest }}
           DIGEST_RETH_DEV: ${{ steps.build-reth-dev.outputs.digest }}
         run: |
-          mkdir -p /tmp/digests/arkiv-reth /tmp/digests/arkiv-committer /tmp/digests/arkiv-reth-dev
+          mkdir -p /tmp/digests/arkiv-reth /tmp/digests/arkiv-reth-dev
           touch "/tmp/digests/arkiv-reth/${DIGEST_RETH#sha256:}"
-          touch "/tmp/digests/arkiv-committer/${DIGEST_COMMITTER#sha256:}"
           touch "/tmp/digests/arkiv-reth-dev/${DIGEST_RETH_DEV#sha256:}"
       # Artifact names are immutable within a run, so re-running a leg that
       # already uploaded needs `overwrite`. The retention window has to outlast
@@ -195,7 +178,7 @@ jobs:
       # images.
       fail-fast: false
       matrix:
-        image: [arkiv-reth, arkiv-committer, arkiv-reth-dev]
+        image: [arkiv-reth, arkiv-reth-dev]
     steps:
       - uses: actions/download-artifact@v4
         with:

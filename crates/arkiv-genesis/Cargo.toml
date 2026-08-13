@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 # Genesis primitives for the Arkiv chain: the precompile address and the
-# mnemonic-derived dev-funding alloc. Ported from arkiv-op-reth; the sole
-# dependency on arkiv-entitydb (the ARKIV_ADDRESS constant) is inlined here.
+# mnemonic-derived dev-funding alloc. The ARKIV_ADDRESS constant is defined
+# locally so genesis setup does not depend on another node architecture.
 
 [dependencies]
 alloy-genesis.workspace = true

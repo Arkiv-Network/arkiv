@@ -6,15 +6,12 @@
 # supported platform, so we use it.
 
 # ---- chef ----
-# This stage, the planner stage and the cook step below are byte-identical
-# across the arkiv-reth, arkiv-committer and arkiv-reth-dev Dockerfiles, so all
-# builds resolve to the same layer digests and share one dependency
-# compilation. Edit them in lockstep.
+# This stage contains the workspace dependency build used by arkiv-reth.
 FROM rust:1.94-slim-bookworm AS chef
 WORKDIR /build
 
 # Native deps for the reth/alloy stack: libclang for bindgen (reth-mdbx-sys),
-# plus clang/cmake/git/build-essential (also covers zstd-sys' bundled libzstd).
+# plus clang/cmake/git/build-essential.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         pkg-config libclang-dev clang cmake git build-essential \
@@ -55,7 +52,37 @@ RUN apt-get update \
     && useradd -u 714 -m -s /usr/sbin/nologin arkiv \
     && mkdir -p /data && chown arkiv:arkiv /data
 
-COPY --from=builder /build/target/release/arkiv-reth /usr/local/bin/arkiv-reth
+COPY --from=builder /build/target/release/arkiv-reth /usr/local/bin/arkiv-reth-bin
+# ethereum-package currently supplies ENR bootnodes to the EL. Reth v2.2.0
+# accepts enode URLs for --bootnodes, but not ENRs; remove incompatible values
+# while leaving consensus-layer bootnodes untouched.
+RUN <<'EOF'
+cat > /usr/local/bin/arkiv-reth <<'SCRIPT'
+#!/bin/sh
+set -eu
+args=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --bootnodes=enr:*|--bootnodes=)
+            shift
+            continue
+            ;;
+    esac
+    if [ "$1" = "--bootnodes" ] && [ "$#" -ge 2 ]; then
+        case "$2" in
+            enr:*|"") ;;
+            *) args="$args --bootnodes $2" ;;
+        esac
+        shift 2
+        continue
+    fi
+    args="$args $1"
+    shift
+done
+eval "exec /usr/local/bin/arkiv-reth-bin $args"
+SCRIPT
+chmod +x /usr/local/bin/arkiv-reth
+EOF
 # ethpandaops/ethereum-package's reth launcher runs a binary named `reth`;
 # alias it so the image drops into a kurtosis `el_type: reth` participant.
 RUN ln -sf /usr/local/bin/arkiv-reth /usr/local/bin/reth

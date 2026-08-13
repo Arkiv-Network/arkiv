@@ -8,8 +8,8 @@
 //!
 //! ## Versioning
 //!
-//! The encoding is version-tagged (byte 0 is the format version), mirroring
-//! `arkiv-da`'s `DA_VERSION`. There is **one** in-memory [`Entity`] — always the
+//! The encoding is version-tagged (byte 0 is the format version). There is
+//! **one** in-memory [`Entity`] — always the
 //! latest schema. [`EntityCodec::decode`] reads the tag, parses that version's
 //! layout, and migrates the result *up* to the canonical [`Entity`], defaulting
 //! any field newer than the stored version. [`EntityCodec::encode`] always writes
@@ -32,8 +32,7 @@ pub trait EntityCodec {
     fn current_version(&self) -> u8;
 
     /// Serialize `entity` to stored bytes in the current version. Infallible: a
-    /// well-formed in-memory entity always encodes (mirrors `arkiv-da`'s
-    /// `encode_bytes`).
+    /// well-formed in-memory entity always encodes.
     fn encode(&self, entity: &Entity) -> Vec<u8>;
 
     /// Parse stored bytes of any supported version into the canonical [`Entity`],
