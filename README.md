@@ -36,7 +36,7 @@ Scaffold only — the workspace builds and the devnet is wired; real harness log
 
 ## Development
 
-CI runs two workflows: `rust.yml` (`cargo fmt --check`, `cargo build --workspace`, and `cargo nextest run --workspace`, with cargo caching, then a Docker build that pushes `ghcr.io/arkiv-network/arkiv-reth`, `ghcr.io/arkiv-network/arkiv-committer` and `ghcr.io/arkiv-network/arkiv-reth-dev` on `main` pushes and `v*` tags) and `lint.yml` (black over the Python scripts).
+CI runs two workflows: `rust.yml` (`cargo fmt --check`, `cargo build --workspace`, and `cargo nextest run --workspace`, with cargo caching, then a Docker build that pushes `ghcr.io/arkiv-network/arkiv-reth`, `ghcr.io/arkiv-network/arkiv-committer` and `ghcr.io/arkiv-network/arkiv-reth-dev` on `main` pushes and `v*` tags) and `lint.yml` (black over the Python scripts). Each image is built for `linux/amd64` and `linux/arm64` on a native runner per platform, and the two are joined into one manifest list per tag.
 
 The Python helper scripts are formatted with [black](https://black.readthedocs.io); config lives in `pyproject.toml`.
 
@@ -44,7 +44,7 @@ Enable the local pre-commit hook with `pip install pre-commit && pre-commit inst
 
 ## Releasing
 
-Every merged commit on `main` is pushed to GHCR automatically as `ghcr.io/arkiv-network/arkiv-reth`, `ghcr.io/arkiv-network/arkiv-committer` and `ghcr.io/arkiv-network/arkiv-reth-dev` (an auto-sealing dev node carrying `arkiv-cli`), tagged `sha-<short-commit>` and `latest`. To cut a versioned release, tag a commit with `vX.Y.Z` — the same images get pushed with that version tag. The packages are private, so pulling needs `docker login ghcr.io` with a GitHub token carrying `read:packages`.
+Every merged commit on `main` is pushed to GHCR automatically as `ghcr.io/arkiv-network/arkiv-reth`, `ghcr.io/arkiv-network/arkiv-committer` and `ghcr.io/arkiv-network/arkiv-reth-dev` (an auto-sealing dev node carrying `arkiv-cli`), tagged `sha-<short-commit>` and `latest`. Every tag is a manifest list covering `linux/amd64` and `linux/arm64`, so a pull resolves to the architecture of the machine doing the pulling — an Apple Silicon Mac gets the arm64 image from the same name and tag a server uses for amd64. To cut a versioned release, tag a commit with `vX.Y.Z` — the same images get pushed with that version tag. The packages are private, so pulling needs `docker login ghcr.io` with a GitHub token carrying `read:packages`.
 
 **CLI** — tag the tip of main and push the tag:
 

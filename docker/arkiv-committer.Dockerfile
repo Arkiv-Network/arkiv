@@ -33,10 +33,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 # into an ordinary layer; only manifest, lockfile or toolchain changes
 # invalidate it. The workspace crates then build on top of that target/ dir.
 FROM chef AS builder
+# BuildKit fills TARGETARCH in from the platform being built for.
+ARG TARGETARCH
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+# jemalloc, which reth links in, fixes its page size at compile time — and both
+# the cook and the build step compile it. arm64 is built for 64 KiB pages: such
+# a build also runs on hosts with 4 KiB and 16 KiB pages, while one built for
+# 4 KiB pages aborts at startup on a larger-page host.
+RUN if [ "$TARGETARCH" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi; \
+    cargo chef cook --release --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --locked --bin arkiv-committer
+RUN if [ "$TARGETARCH" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi; \
+    cargo build --release --locked --bin arkiv-committer
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
