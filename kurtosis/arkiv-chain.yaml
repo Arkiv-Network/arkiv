@@ -1,25 +1,44 @@
 # Args for ethpandaops/ethereum-package — the Arkiv chain.
 # arkiv-reth EL + lighthouse CL; genesis / JWT / validators generated for us.
 #
-# Run directly (the local wrapper approach fails: kurtosis can't import a remote
-# package from a local one, so we run ethereum-package remotely and add the base
-# chain as a second run into the same enclave — see scripts/kurtosis/up.sh).
+# This is a single Arkiv network with multiple Arkiv participants. There is no
+# L1, L2, settlement chain, or cross-chain coordination.
 #
 # Schema: https://github.com/ethpandaops/ethereum-package#configuration
 
 participants:
-  # EL is our custom arkiv-reth image, driven as a standard reth client.
+  # Participant 1 is the sole sequencer: its validator client proposes blocks.
   - el_type: reth
     el_image: arkiv-reth:dev
     cl_type: lighthouse
-  # To test watcher keep-up, add a second follower participant here.
+    validator_count: 1
+
+  # Participant 2 is an Arkiv follower: it runs the EL and beacon node, but no
+  # validator client, so it only follows the sequencer over P2P/consensus.
+  - el_type: reth
+    el_image: arkiv-reth:dev
+    cl_type: lighthouse
+    validator_count: 0
+    # ethereum-package currently emits an ENR as Reth's --bootnodes value,
+    # but this pinned Reth accepts enode URLs only. The follower's Lighthouse
+    # beacon node still uses the valid ENR for consensus synchronization.
+    el_extra_params:
+      - --bootnodes=
 
 network_params:
   preset: minimal
-  seconds_per_slot: 4
+  seconds_per_slot: 2
+  # The two-node devnet has one validator and cannot satisfy Fulu's PeerDAS
+  # supernode requirements. Keep Fulu disabled until the network is expanded.
+  fulu_fork_epoch: 18446744073709551615
+  bpo_1_epoch: 18446744073709551615
+  bpo_2_epoch: 18446744073709551615
+  bpo_3_epoch: 18446744073709551615
+  bpo_4_epoch: 18446744073709551615
+  bpo_5_epoch: 18446744073709551615
 
-# Publish EL/CL host ports at deterministic numbers so the harness can hardcode
-# endpoints instead of discovering kurtosis' random allocations.
+# Publish EL/CL host ports so local black-box tests can reach each participant.
+# The package assigns subsequent ports to subsequent participants.
 port_publisher:
   el:
     enabled: true

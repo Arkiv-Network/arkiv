@@ -1,0 +1,67 @@
+name: kurtosis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  two-node-smoke:
+    name: sequencer + follower smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
+
+      - name: Install Kurtosis CLI
+        run: |
+          set -euxo pipefail
+          echo 'deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /' \
+            | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y kurtosis-cli
+
+      - name: Verify CI runtime
+        run: |
+          set -euxo pipefail
+          docker --version
+          docker info
+          kurtosis version
+          kurtosis engine status || true
+
+      - name: Start sequencer and follower and run health check
+        run: |
+          set -euxo pipefail
+          python3 scripts/kurtosis/up.py arkiv-harness
+
+      - name: Collect Kurtosis diagnostics
+        if: always()
+        run: |
+          set +e
+          echo '--- Kurtosis enclaves ---'
+          kurtosis enclave ls
+          echo '--- Arkiv enclave ---'
+          kurtosis enclave inspect arkiv-harness
+          echo '--- Arkiv service logs ---'
+          kurtosis service logs --all-services --num 200 arkiv-harness
+
+      - name: Tear down Kurtosis enclave
+        if: always()
+        run: |
+          set +e
+          python3 scripts/kurtosis/down.py arkiv-harness

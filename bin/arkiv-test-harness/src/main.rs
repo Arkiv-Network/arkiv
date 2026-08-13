@@ -15,6 +15,4 @@ fn main() {
     println!("  EL Engine   : {}", cfg.el_engine_url);
     println!("  CL beacon   : {}", cfg.cl_beacon_url);
     println!("  JWT secret  : {}", cfg.jwt_path.display());
-    println!("  Base chain  : {}", cfg.base_chain_rpc_url);
-    println!("  Inbox addr  : {}", cfg.inbox_address);
 }

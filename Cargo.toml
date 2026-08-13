@@ -29,13 +29,11 @@ clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 tracing = "0.1"
 
-# alloy + compression for the DA format (versions match what reth v2.2.0 already
-# pins in Cargo.lock — adding them as direct deps resolves to the locked stack).
+# alloy primitives used by the Arkiv protocol crates.
 alloy-rlp = "0.3"
 alloy-primitives = { version = "1.6", features = ["rlp"] }
 alloy-consensus = "2.0"
 alloy-evm = "0.34"
-zstd = "0.13"
 
 # Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
 # pair account's bitmap bytes are consensus state (its codeHash =
@@ -74,8 +72,6 @@ arkiv-interfaces = { path = "crates/arkiv-interfaces" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
-arkiv-da = { path = "crates/arkiv-da" }
-arkiv-committer = { path = "crates/arkiv-committer" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-entitystore = { path = "crates/arkiv-reth-entitystore" }
 arkiv-reth-auxstore = { path = "crates/arkiv-reth-auxstore" }
