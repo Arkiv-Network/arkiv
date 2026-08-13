@@ -62,12 +62,12 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
 
-  # Builds all three images once per platform on a native runner — emulated
-  # arm64 would run rustc under QEMU, which the size of the reth compile rules
-  # out. Each platform job pushes every image by digest only; `docker-manifest`
-  # then binds the tags to a manifest list spanning both platforms, so a pull
-  # resolves to the host's architecture. Manual dispatch builds and refreshes
-  # the caches without pushing anything.
+  # Builds all three images once per platform, each leg on a runner of that
+  # architecture. Each platform job pushes every image by digest only;
+  # `docker-manifest` then binds the tags to a manifest list spanning both
+  # platforms, so a pull resolves to the host's architecture. Manual dispatch
+  # builds without pushing images, though it still writes the per-platform
+  # `buildcache` tags.
   #
   # The Dockerfiles' cargo-chef stages are identical up to the final
   # `cargo build --bin`, so dependency compilation is a single shared layer:
@@ -165,13 +165,19 @@ jobs:
           touch "/tmp/digests/arkiv-reth/${DIGEST_RETH#sha256:}"
           touch "/tmp/digests/arkiv-committer/${DIGEST_COMMITTER#sha256:}"
           touch "/tmp/digests/arkiv-reth-dev/${DIGEST_RETH_DEV#sha256:}"
+      # Artifact names are immutable within a run, so re-running a leg that
+      # already uploaded needs `overwrite`. The retention window has to outlast
+      # a weekend: re-running one leg reads the other's digests from the
+      # original attempt, and an expired artifact would leave the merge job
+      # with a single platform.
       - if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
-          retention-days: 1
+          overwrite: true
+          retention-days: 7
 
   # Binds each image's tags to a manifest list over the per-platform digests
   # both build jobs pushed.
@@ -184,6 +190,10 @@ jobs:
       contents: read
       packages: write
     strategy:
+      # Each image's tags are bound independently, so one image's registry
+      # failure must not cancel the others and leave the tag set skewed across
+      # images.
+      fail-fast: false
       matrix:
         image: [arkiv-reth, arkiv-committer, arkiv-reth-dev]
     steps:
@@ -210,6 +220,15 @@ jobs:
             type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+      # Both platforms must be in hand before the tags move: a list built from
+      # a subset resolves on one architecture and fails to pull on the other.
+      - working-directory: /tmp/digests/${{ matrix.image }}
+        run: |
+          found=$(ls -1 | wc -l | tr -d ' ')
+          if [ "$found" -ne 2 ]; then
+            echo "::error::${{ matrix.image }}: expected one digest per platform, found $found"
+            exit 1
+          fi
       - working-directory: /tmp/digests/${{ matrix.image }}
         run: |
           # Both substitutions expand to several arguments — one -t per tag,
@@ -218,4 +237,16 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ matrix.image }}@sha256:%s ' *)
-      - run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+
+      - env:
+          REF: ${{ env.REGISTRY }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$REF"
+          # Attestation manifests report a platform of unknown/unknown.
+          platforms=$(docker buildx imagetools inspect --raw "$REF" | jq -r \
+            '[.manifests[].platform | select(.os != null and .os != "unknown")
+              | "\(.os)/\(.architecture)"] | unique | join(",")')
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::$REF covers $platforms"
+            exit 1
+          fi
