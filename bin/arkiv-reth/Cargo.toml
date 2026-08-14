@@ -49,5 +49,9 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
+# The deploy-tx stall regression builds a raw contract-creation
+# TransactionRequest — the typed ArkivClient path only sends entity calls.
+alloy-network.workspace = true
+alloy-rpc-types.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

@@ -8,8 +8,10 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::Provider;
+use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use arkiv_bindings::{
@@ -1106,5 +1108,81 @@ async fn no_transaction_is_included_twice_over_a_live_node() {
         registry.entityNonce(caller).call().await.unwrap(),
         DUPLICATE_PROBE_COUNT,
         "one minting-nonce step per probe tx",
+    );
+}
+
+/// **A pooled deployment transaction must not stall block production.**
+///
+/// The stock pool accepts contract-creation transactions — nothing filters them
+/// at ingress — and never evicts an unmined one, so the executor's rejection is
+/// what the payload builder sees on *every* build. How it rejects is
+/// load-bearing: a typed invalid-tx error is skipped, while anything else
+/// (`EVMError::Custom`) aborts the whole build as fatal. With the same tx
+/// re-offered on every rebuild, one deploy tx submitted to a dev node would
+/// then halt the chain permanently: no block is produced again and every later
+/// transaction times out.
+///
+/// The probe: pool a deploy tx, then prove the chain still works. A normal
+/// entity create from a *different* sender must still mine — the deploy
+/// legitimately queues its own sender's later nonces behind it, so a same-sender
+/// probe would prove nothing — and the deploy itself must never mine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pooled_create_transaction_does_not_stall_block_production() {
+    let (node, client, caller) = spawn_dev(DEV_KEY_0).await;
+
+    // A deployment tx: `to: None`, one STOP byte of initcode. Every gas field is
+    // pinned so no filler round-trips through eth_estimateGas — estimating a
+    // create is itself rejected by the executor.
+    let nonce = client
+        .provider()
+        .get_transaction_count(caller)
+        .await
+        .expect("transaction count");
+    let deploy = TransactionRequest::default()
+        .with_deploy_code(Bytes::from_static(&[0x00]))
+        .with_nonce(nonce)
+        .with_gas_limit(1_000_000)
+        .with_gas_price(1_000_000_000)
+        .with_chain_id(DEV_CHAIN_ID);
+    // Ingress must ACCEPT it — that the pool lets creates through is the premise
+    // of the whole scenario.
+    let deploy_hash = *client
+        .provider()
+        .send_transaction(deploy)
+        .await
+        .expect("the pool accepts a deployment transaction at ingress")
+        .tx_hash();
+
+    // With the deploy sitting in the pool, an independent sender's create must
+    // still be built and mined.
+    let bystander_signer: PrivateKeySigner = DEV_KEY_1.parse().unwrap();
+    let bystander_addr = bystander_signer.address();
+    let bystander = connect(&node.http_url(), bystander_signer);
+    bystander
+        .execute(vec![create_op(1000, Bytes::from_static(b"alive"), vec![])])
+        .await;
+
+    let key = B256::from(derive_entity_key(
+        DEV_CHAIN_ID,
+        &bystander_addr.into_array(),
+        EntityNonce::new(0),
+        0,
+    ));
+    assert_eq!(
+        bystander.get_entity(key).await["payload"],
+        "0x616c697665", // "alive"
+        "the bystander's create must land while the deploy is pooled",
+    );
+
+    // And the deploy was skipped, not mined: no receipt, though the chain has
+    // demonstrably moved past it.
+    assert!(
+        client
+            .provider()
+            .get_transaction_receipt(deploy_hash)
+            .await
+            .expect("eth_getTransactionReceipt")
+            .is_none(),
+        "a contract deployment must never be mined",
     );
 }
