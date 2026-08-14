@@ -13,6 +13,13 @@
 //! transition **directly** — it never builds or runs the revm bytecode
 //! interpreter. So for user/entity transactions, `revm`'s EVM is not invoked.
 //!
+//! Read that literally: it is not only the interpreter that is skipped but revm's
+//! **whole handler pipeline**, and that includes its pre-execution *validation* stage.
+//! Every check revm would have made — nonce, balance, base fee, chain id, EIP-3607 — is
+//! therefore ours to make or to knowingly go without. Anything [`arkiv_transact`] is
+//! handed and does not explicitly reject *succeeds*. The nonce is checked, in
+//! [`validate_nonce`]; the rest are not yet, which is a real gap and not a design choice.
+//!
 //! - **Plain transfer** — debit sender (value + flat 21k gas), bump nonce,
 //!   credit recipient. Computed in Rust, committed as a `BundleState`.
 //! - **Call to [`ARKIV_ADDRESS`]** — the entity engine. The `execute(Operation[])`
@@ -73,8 +80,8 @@ use reth_ethereum::{
             MainBuilder, MainContext,
             context::{BlockEnv, CfgEnv, Context, TxEnv},
             context_interface::result::{
-                EVMError, ExecutionResult, HaltReason, OutOfGasError, Output, ResultAndState,
-                ResultGas, SuccessReason,
+                EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError, Output,
+                ResultAndState, ResultGas, SuccessReason,
             },
             inspector::{Inspector, NoOpInspector},
             interpreter::interpreter::EthInterpreter,
@@ -88,6 +95,8 @@ use reth_ethereum::{
         builder::{BuilderContext, components::ExecutorBuilder},
     },
 };
+
+use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
@@ -165,12 +174,23 @@ where
 
     /// The interception point. Applies the state transition directly — **no
     /// interpreter, no `revm` execution of the transaction.**
+    ///
+    /// Bypassing revm also bypasses its pre-execution validation stage, so the
+    /// nonce check has to be re-done here — see [`validate_nonce`].
     fn transact_raw(
         &mut self,
         tx: TxEnv,
     ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
         let block_number = self.inner.block().number.saturating_to::<u64>();
-        arkiv_transact(self.inner.db_mut(), block_number, tx)
+        // Read the flag before taking the mutable database borrow. reth sets it for
+        // `eth_simulateV1` without `validation` and for engine-tree payload prewarming,
+        // both of which execute against state that need not match the tx's nonce.
+        let nonce_check = !self.cfg_env().disable_nonce_check;
+        let db = self.inner.db_mut();
+        if nonce_check {
+            validate_nonce(db, &tx)?;
+        }
+        arkiv_transact(db, block_number, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -201,7 +221,43 @@ where
     }
 }
 
+/// revm's pre-execution nonce check, which the no-EVM path would otherwise skip.
+///
+/// This is replay protection, and it is the node's only copy of it once revm is out of
+/// the picture — the tx-pool's validator does not see blocks arriving over the engine
+/// API or P2P.
+///
+/// Returning [`EVMError::Transaction`] rather than [`EVMError::Custom`] is load-bearing.
+/// Only the former is converted to `BlockValidationError::InvalidTx` by
+/// `BlockExecutionError::evm`, and only that variant satisfies the
+/// `error.is_nonce_too_low()` test reth's payload builder uses to *skip* a transaction
+/// instead of aborting the block. Without it, a transaction still sitting in the pool
+/// when the dev miner's next interval fires — the pool is cleared asynchronously, on the
+/// canonical-state stream — is built into a second block and applied twice.
+fn validate_nonce<DB: Database>(db: &mut DB, tx: &TxEnv) -> Result<(), EVMError<DB::Error>> {
+    let state = db
+        .basic(tx.caller)
+        .map_err(EVMError::Database)?
+        .map(|acc| acc.nonce)
+        .unwrap_or_default();
+
+    match tx.nonce.cmp(&state) {
+        Ordering::Equal => Ok(()),
+        Ordering::Less => Err(EVMError::Transaction(InvalidTransaction::NonceTooLow {
+            tx: tx.nonce,
+            state,
+        })),
+        Ordering::Greater => Err(EVMError::Transaction(InvalidTransaction::NonceTooHigh {
+            tx: tx.nonce,
+            state,
+        })),
+    }
+}
+
 /// The fixed-function state-transition function — Rust, no EVM.
+///
+/// Callers reach this through [`ArkivEvm::transact_raw`], which validates the nonce
+/// first; the sender's nonce bump below therefore lands on `tx.nonce + 1`.
 ///
 /// Reads accounts through the `Database`, applies the transfer / entity-call
 /// accounting, and returns a `ResultAndState` (execution result + the account
@@ -811,6 +867,90 @@ mod tests {
         assert_eq!(event.owner, alice);
         assert_eq!(event.expiresAt, 60);
         assert_eq!(event.creationFlags, 0);
+    }
+
+    /// **Replay protection.** Re-submitting a transaction that has already been
+    /// mined must be rejected, not applied a second time.
+    ///
+    /// Without this check the whole `Operation[]` batch re-runs against
+    /// post-first-execution state. For a create that is not even idempotent: the
+    /// minting nonce has advanced, so the replay mints a *second* entity under a
+    /// different key from a single user intent.
+    #[test]
+    fn a_replayed_transaction_is_rejected() {
+        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
+
+        // CacheDB, not EmptyDB: the point is what the *second* application sees.
+        let mut db = CacheDB::new(EmptyDB::default());
+        let alice = Address::repeat_byte(0xAA);
+        let tx = arkiv_tx(alice, create_calldata(50, b"hello"));
+
+        // First submission: valid at nonce 0, and it advances the sender to 1.
+        validate_nonce(&mut db, &tx).expect("a fresh account's nonce 0 is valid");
+        let rs = arkiv_transact(&mut db, 10, tx.clone()).unwrap();
+        assert!(rs.result.is_success());
+        assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
+        db.commit(rs.state);
+
+        // The identical transaction, submitted again.
+        let err = validate_nonce(&mut db, &tx).expect_err("a replay must be rejected");
+        assert!(
+            matches!(
+                err,
+                EVMError::Transaction(InvalidTransaction::NonceTooLow { tx: 0, state: 1 })
+            ),
+            "expected NonceTooLow {{ tx: 0, state: 1 }}, got {err:?}",
+        );
+    }
+
+    /// A nonce ahead of the account's is rejected too — the gap has to be filled
+    /// before the transaction is executable.
+    #[test]
+    fn a_future_nonce_is_rejected() {
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let tx = TxEnv {
+            nonce: 7,
+            ..arkiv_tx(alice, create_calldata(50, b"hello"))
+        };
+
+        let err = validate_nonce(&mut db, &tx).expect_err("a nonce gap must be rejected");
+        assert!(
+            matches!(
+                err,
+                EVMError::Transaction(InvalidTransaction::NonceTooHigh { tx: 7, state: 0 })
+            ),
+            "expected NonceTooHigh {{ tx: 7, state: 0 }}, got {err:?}",
+        );
+    }
+
+    /// The rejection must be the *variant reth tests for*, not merely some error.
+    ///
+    /// reth's payload builder skips a transaction only when
+    /// `error.is_nonce_too_low()` holds, which requires the error to survive
+    /// `BlockExecutionError::evm`'s conversion into `BlockValidationError::InvalidTx`
+    /// — something [`EVMError::Custom`] does not do. Weaken this and a stale
+    /// transaction the pool has not evicted yet stops being skipped and starts
+    /// being built into a second block again.
+    #[test]
+    fn a_stale_nonce_is_the_error_reths_payload_builder_skips_on() {
+        use alloy_evm::{EvmError, InvalidTxError};
+        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let alice = Address::repeat_byte(0xAA);
+        let tx = arkiv_tx(alice, create_calldata(50, b"hello"));
+        let rs = arkiv_transact(&mut db, 10, tx.clone()).unwrap();
+        db.commit(rs.state);
+
+        let err = validate_nonce(&mut db, &tx).expect_err("a replay must be rejected");
+        let invalid = err
+            .try_into_invalid_tx_err()
+            .expect("must convert to an invalid-tx error, or reth aborts the block instead");
+        assert!(
+            invalid.is_nonce_too_low(),
+            "must satisfy is_nonce_too_low(), or reth stops skipping the duplicate",
+        );
     }
 
     /// A create commits the **index** alongside the entity: the new entity's id (0,
