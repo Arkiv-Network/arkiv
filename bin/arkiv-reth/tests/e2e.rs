@@ -962,3 +962,149 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
         "a historical read before the expiry block still sees it",
     );
 }
+
+/// How many creates [`no_transaction_is_included_twice_over_a_live_node`] fires.
+///
+/// The bug it guards was reported at roughly 1 tx in 200, so this is a few
+/// expected hits rather than a coin flip — the trigger is a race and a run that
+/// happens to miss it proves nothing.
+const DUPLICATE_PROBE_COUNT: u64 = 1_000;
+
+/// A lifetime that cannot lapse within the probe's own block span, so the count
+/// assertions below measure double-execution and not expiry.
+const DUPLICATE_PROBE_LIFETIME: u64 = 100_000;
+
+/// The gas the probe pins on every transaction, mirroring `ArkivClient`'s own
+/// values so it skips `eth_estimateGas` — a round trip per tx would slow the
+/// submission loop enough to stop keeping the pool full.
+const DUPLICATE_PROBE_GAS: u64 = 8_000_000;
+const DUPLICATE_PROBE_GAS_PRICE: u128 = 1_000_000_000;
+
+/// The node's `--dev` block time, which is how long a full pool takes to drain.
+const DUPLICATE_PROBE_BLOCK_TIME: Duration = Duration::from_millis(250);
+
+/// **No transaction is executed twice.** A tx that has already been mined must
+/// never be built into a second block.
+///
+/// This is a regression test for a reported `--dev` failure: at a 250ms block
+/// time roughly 1 tx in 200 landed in two consecutive blocks — same hash, same
+/// nonce — and its ops applied twice.
+///
+/// The race is reth's and is expected: `MiningMode::Interval` is a bare timer,
+/// and mined transactions leave the pool asynchronously, on the canonical-state
+/// stream. So a tick can snapshot `best_transactions` before the previous block's
+/// eviction lands. reth absorbs this in its payload builder, which skips any
+/// transaction the EVM rejects as `NonceTooLow` — a defence that only works if
+/// the EVM *checks*. Arkiv's no-EVM executor did not, so the duplicate executed
+/// cleanly and the resulting block was valid on every node.
+///
+/// Firing the whole batch without waiting is the point: the pool has to be
+/// non-empty when the timer fires, or there is nothing to re-include.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_transaction_is_included_twice_over_a_live_node() {
+    use std::collections::BTreeMap;
+
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+
+    let first_block = client.block_number().await;
+    let nonce_start = client
+        .provider()
+        .get_transaction_count(caller)
+        .await
+        .expect("transaction count");
+
+    // Submit with explicit sequential nonces and without awaiting receipts, so
+    // the pool stays loaded across many miner ticks.
+    //
+    // The pool caps one sender at `max_account_slots` (16) pending transactions,
+    // so this backs off a block on a full pool and retries the same nonce —
+    // exactly what `arkiv-cli spam` does. That cap is a help here, not a
+    // hindrance: it keeps the sender's queue saturated for the whole run.
+    let mut pending = Vec::with_capacity(DUPLICATE_PROBE_COUNT as usize);
+    for i in 0..DUPLICATE_PROBE_COUNT {
+        let nonce = nonce_start + i;
+        let sent = loop {
+            let op = create_op(
+                DUPLICATE_PROBE_LIFETIME,
+                Bytes::from_static(b"dup-probe"),
+                vec![],
+            );
+            match registry
+                .execute(vec![op])
+                .nonce(nonce)
+                .gas(DUPLICATE_PROBE_GAS)
+                .gas_price(DUPLICATE_PROBE_GAS_PRICE)
+                .send()
+                .await
+            {
+                Ok(sent) => break sent,
+                Err(e) if e.to_string().contains("txpool is full") => {
+                    tokio::time::sleep(DUPLICATE_PROBE_BLOCK_TIME).await;
+                }
+                Err(e) => panic!("submitting probe tx {i} at nonce {nonce}: {e}"),
+            }
+        };
+        pending.push(sent);
+    }
+
+    // Collect every receipt, and with them the block span to scan.
+    let mut submitted = BTreeSet::new();
+    let mut last_block = first_block;
+    for (i, sent) in pending.into_iter().enumerate() {
+        let hash = *sent.tx_hash();
+        let receipt = sent
+            .with_timeout(Some(Duration::from_secs(120)))
+            .get_receipt()
+            .await
+            .unwrap_or_else(|e| panic!("no receipt for probe tx {i} ({hash}): {e}"));
+        assert!(receipt.status(), "probe tx {i} ({hash}) reverted");
+        last_block = last_block.max(receipt.block_number.expect("mined receipt has a block"));
+        submitted.insert(hash);
+    }
+    assert_eq!(
+        submitted.len() as u64,
+        DUPLICATE_PROBE_COUNT,
+        "each probe tx should have its own hash",
+    );
+
+    // Walk the block bodies. Receipts cannot answer this: a second inclusion has
+    // its own receipt that nothing would think to ask for.
+    let mut inclusions: BTreeMap<B256, Vec<u64>> = BTreeMap::new();
+    for number in first_block..=last_block {
+        let Some(hashes) = client.block_tx_hashes(number).await else {
+            panic!("block {number} missing while scanning [{first_block}, {last_block}]");
+        };
+        for hash in hashes {
+            inclusions.entry(hash).or_default().push(number);
+        }
+    }
+
+    let duplicated: Vec<_> = inclusions
+        .iter()
+        .filter(|(_, blocks)| blocks.len() > 1)
+        .map(|(hash, blocks)| format!("{hash} in blocks {blocks:?}"))
+        .collect();
+    assert!(
+        duplicated.is_empty(),
+        "{} of {DUPLICATE_PROBE_COUNT} transactions were included more than once \
+         (scanned blocks {first_block}..={last_block}): {}",
+        duplicated.len(),
+        duplicated.join(", "),
+    );
+
+    // The state-level cross-check: a create that ran twice mints a *second*
+    // entity under a different key, because the minting nonce advanced in
+    // between. Both of these over-count if any batch was applied twice, and they
+    // catch a double execution even if the block scan somehow missed it.
+    assert_eq!(
+        client.entity_count(None, None).await,
+        DUPLICATE_PROBE_COUNT,
+        "one entity per probe tx",
+    );
+    assert_eq!(
+        registry.entityNonce(caller).call().await.unwrap(),
+        DUPLICATE_PROBE_COUNT,
+        "one minting-nonce step per probe tx",
+    );
+}

@@ -124,6 +124,20 @@ impl<P: Provider> ArkivClient<P> {
         }
     }
 
+    /// The transaction hashes in block `number`, in order, or `None` if the node
+    /// has no such block.
+    ///
+    /// Receipts alone cannot tell you *where* a transaction ended up — a second
+    /// inclusion has its own receipt nobody thinks to fetch. Reading block bodies
+    /// is the only way to assert a hash appears exactly once on the chain.
+    pub async fn block_tx_hashes(&self, number: u64) -> Option<Vec<B256>> {
+        self.provider
+            .get_block_by_number(number.into())
+            .await
+            .expect("eth_getBlockByNumber")
+            .map(|block| block.transactions.into_hashes_vec())
+    }
+
     // ── writes ───────────────────────────────────────────────────────────────
 
     /// Submit `ops` in one `execute` transaction and assert it succeeded,
