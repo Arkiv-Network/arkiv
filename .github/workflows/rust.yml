@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94
+      - uses: dtolnay/rust-toolchain@1.97
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -34,7 +34,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94
+      - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -52,7 +52,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94
+      - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # cargo-udeps needs a nightly rustc to run its analysis, independent of
-      # the workspace's pinned 1.94 stable toolchain.
+      # the workspace's pinned 1.97 stable toolchain.
       - uses: dtolnay/rust-toolchain@nightly
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
@@ -80,7 +80,7 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-udeps
-      # rust-toolchain.toml pins 1.94, which overrides `rustup default nightly`;
+      # rust-toolchain.toml pins 1.97, which overrides `rustup default nightly`;
       # `+nightly` is needed to actually invoke the nightly rustc udeps requires.
       - run: cargo +nightly udeps --workspace --locked
 

@@ -5,23 +5,38 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.97"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 # reth, pinned to the tag the local checkout tracks (~/Projects/arkiv/reth).
 # Docker builds the workspace in isolation, so reth must be a git dependency.
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+# Default features are off: v2.5.0 added "jit" to reth's defaults, which pulls
+# revmc -> llvm-sys and needs a system LLVM 22 that neither the dev machines nor
+# the slim Docker builder has. We only use `reth::cli::Cli`, so nothing else in
+# that default set is required — except "asm-keccak" (assembly keccak256 on the
+# state-root/tx-hash hot path) and "jemalloc".
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", default-features = false, features = [
+    "asm-keccak",
+    "jemalloc",
+] }
+reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+# The jemalloc allocator itself. `reth`'s "jemalloc" feature only wires up the
+# jemalloc *stats* reporting in node-core/metrics/provider; the allocator has to
+# be declared as `#[global_allocator]` by the binary, which is what reth's own
+# main.rs does. `reth` doesn't re-export it, so we depend on it directly.
+reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", features = [
+    "jemalloc",
+] }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # Umbrella crate used by the executor seam (matches the custom-evm example's deps).
 # Keep default features (std); the executor crate adds "evm" + "node".
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 
 # JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
-# reth v2.2.0 uses so the RpcModule we register merges into reth's rpc modules.
+# reth v2.5.0 uses so the RpcModule we register merges into reth's rpc modules.
 jsonrpsee = { version = "0.26", features = ["server"] }
 
 # Common
@@ -32,8 +47,8 @@ tracing = "0.1"
 # alloy primitives used by the Arkiv protocol crates.
 alloy-rlp = "0.3"
 alloy-primitives = { version = "1.6", features = ["rlp"] }
-alloy-consensus = "2.0"
-alloy-evm = "0.34"
+alloy-consensus = "2.3"
+alloy-evm = "0.38"
 
 # Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
 # pair account's bitmap bytes are consensus state (its codeHash =
@@ -43,18 +58,16 @@ alloy-evm = "0.34"
 roaring = "=0.11.4"
 
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
-# arkiv-genesis (mnemonic-derived dev signers). Pinned to =2.0.4: alloy-rpc-types
-# 2.0.5+ requires alloy-rpc-types-engine ^2.0.5, whose only match is 2.1.0 — and
-# 2.1.0 adds EthPayloadAttributes::target_gas_limit, a field reth v2.2.0 doesn't
-# set, breaking the workspace build. 2.0.4 keeps the engine crate at 2.0.4.
-alloy-genesis = "=2.0.4"
-alloy-eips = "=2.0.4"
-alloy-sol-types = "1.6.0"
-alloy-provider = "=2.0.4"
-alloy-signer-local = { version = "=2.0.4", features = ["mnemonic"] }
-alloy-network = "=2.0.4"
-alloy-contract = "=2.0.4"
-alloy-rpc-types = "=2.0.4"
+# arkiv-genesis (mnemonic-derived dev signers). Kept on the same 2.3 line reth
+# v2.5.0 pins so cargo unifies these with reth's copies.
+alloy-genesis = "2.3"
+alloy-eips = "2.3"
+alloy-sol-types = "1.6.1"
+alloy-provider = "2.3"
+alloy-signer-local = { version = "2.3", features = ["mnemonic"] }
+alloy-network = "2.3"
+alloy-contract = "2.3"
+alloy-rpc-types = "2.3"
 
 # Solidity bindings for the Arkiv EntityRegistry ABI, vendored from
 # arkiv-contracts rev d6ebe18 (see crates/arkiv-bindings for the sync story).

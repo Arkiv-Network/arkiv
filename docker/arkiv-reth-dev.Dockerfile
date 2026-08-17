@@ -10,7 +10,7 @@
 # across the arkiv-reth, arkiv-committer and arkiv-reth-dev Dockerfiles, so all
 # builds resolve to the same layer digests and share one dependency
 # compilation. Edit them in lockstep.
-FROM rust:1.94-slim-bookworm AS chef
+FROM rust:1.97-slim-bookworm AS chef
 WORKDIR /build
 
 # Native deps for the reth/alloy stack: libclang for bindgen (reth-mdbx-sys),
