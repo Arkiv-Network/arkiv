@@ -80,7 +80,9 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-udeps
-      - run: cargo udeps --workspace --locked
+      # rust-toolchain.toml pins 1.94, which overrides `rustup default nightly`;
+      # `+nightly` is needed to actually invoke the nightly rustc udeps requires.
+      - run: cargo +nightly udeps --workspace --locked
 
   # Builds all three images once per platform, each leg on a runner of that
   # architecture. Each platform job pushes every image by digest only;
