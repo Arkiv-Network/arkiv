@@ -23,7 +23,7 @@
 
 use alloc::string::String;
 
-use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::entity::{AttributeValue, DECIMAL_SCALE};
 use arkiv_interfaces::primitives::Address;
 
@@ -36,7 +36,7 @@ use crate::lexer::{TypeTag, scan_single_quoted};
 pub use arkiv_interfaces::constants::MAX_STR_BYTES;
 
 /// Hex characters in an address and in a 32-byte value — two per byte.
-const ADDRESS_HEX_LEN: usize = 2 * ADDRESS_LEN;
+const ADDRESS_HEX_LEN: usize = 2 * ETH_ADDRESS_LEN;
 const WORD_HEX_LEN: usize = 2 * WORD_LEN;
 
 /// Validate a typed literal's raw body against its tag.

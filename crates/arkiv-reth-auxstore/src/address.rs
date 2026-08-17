@@ -11,9 +11,22 @@
 //! order changes the state root and forks the chain. They are ported verbatim from
 //! `arkiv-db-engine` and locked with golden vectors in the tests below — never
 //! adjust them to "clean up" the encoding.
+//!
+//! ## The `[..ETH_ADDRESS_LEN]` truncation
+//!
+//! Every derivation here computes a full 32-byte keccak and then keeps 20 bytes.
+//! That is **not** because these are Ethereum addresses — no bucket has a key, a
+//! signer, or an owner; they are storage locations that must wear an address
+//! because reth keys accounts by one. The truncation costs 96 bits: the buckets
+//! live in a 160-bit space instead of the 256-bit one the hash already gave us.
+//!
+//! Removing it means a wider account key in the host, which these golden vectors
+//! correctly treat as a fork. Kept deliberately for now, and named
+//! [`ETH_ADDRESS_LEN`] rather than a generic "address length" so the adaptation
+//! stays visible.
 
 use alloy_primitives::{Address, keccak256};
-use arkiv_interfaces::constants::ADDRESS_LEN;
+use arkiv_interfaces::constants::ETH_ADDRESS_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
 /// Every domain tag is this many bytes (`b"arkiv.pair"`, `b"arkiv.ibth"`, …), so
@@ -69,7 +82,7 @@ pub fn pair_address(attr: &[u8], ty: AttributeType, value: &[u8]) -> Address {
     buf.push(0x00);
     buf.push(ty.id());
     buf.extend_from_slice(value);
-    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+    Address::from_slice(&keccak256(buf).0[..ETH_ADDRESS_LEN])
 }
 
 /// Address of the bucket every live entity belongs to: the `($all, "")` pair.
@@ -98,7 +111,7 @@ pub fn btree_header_address(attr: &[u8], ty: AttributeType) -> Address {
     buf.extend_from_slice(attr);
     buf.push(0x00);
     buf.push(ty.id());
-    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+    Address::from_slice(&keccak256(buf).0[..ETH_ADDRESS_LEN])
 }
 
 /// Address of the **node account** with id `node_id` under `header_addr`.
@@ -108,21 +121,21 @@ pub fn btree_header_address(attr: &[u8], ty: AttributeType) -> Address {
 ///
 /// ```text
 ///   byte:  0 ................ 10 ...................... 30 ......... 38
-///          | "arkiv.ibtn" (10) | header_addr (ADDRESS_LEN) | node_id (u64) |
+///          | "arkiv.ibtn" (10) | header_addr (ETH_ADDRESS_LEN) | node_id (u64) |
 /// ```
 ///
-/// i.e. `keccak256("arkiv.ibtn" || header_addr || node_id_be)[..ADDRESS_LEN]`.
+/// i.e. `keccak256("arkiv.ibtn" || header_addr || node_id_be)[..ETH_ADDRESS_LEN]`.
 /// Folding `header_addr` into the preimage **namespaces the node ids to their own
 /// tree**, so node 1 of one attribute's index and node 1 of another's never land
 /// at the same account. `node_id` is big-endian; id 0 is never allocated (it is the
 /// header's "no root / no node" sentinel), so no node account collides with the
 /// header account.
 pub fn btree_node_address(header_addr: Address, node_id: u64) -> Address {
-    let mut buf = [0u8; DOMAIN_TAG_LEN + ADDRESS_LEN + size_of::<u64>()];
+    let mut buf = [0u8; DOMAIN_TAG_LEN + ETH_ADDRESS_LEN + size_of::<u64>()];
     buf[..DOMAIN_TAG_LEN].copy_from_slice(BTREE_NODE_DOMAIN);
-    buf[DOMAIN_TAG_LEN..DOMAIN_TAG_LEN + ADDRESS_LEN].copy_from_slice(header_addr.as_slice());
-    buf[DOMAIN_TAG_LEN + ADDRESS_LEN..].copy_from_slice(&node_id.to_be_bytes());
-    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+    buf[DOMAIN_TAG_LEN..DOMAIN_TAG_LEN + ETH_ADDRESS_LEN].copy_from_slice(header_addr.as_slice());
+    buf[DOMAIN_TAG_LEN + ETH_ADDRESS_LEN..].copy_from_slice(&node_id.to_be_bytes());
+    Address::from_slice(&keccak256(buf).0[..ETH_ADDRESS_LEN])
 }
 
 /// Address of the cascade **level account** for `attr`'s `ty` values at `prefix`.
@@ -139,7 +152,7 @@ pub fn str_level_address(attr: &[u8], ty: AttributeType, prefix: &[u8]) -> Addre
     buf.push(0x00);
     buf.push(ty.id());
     buf.extend_from_slice(prefix);
-    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+    Address::from_slice(&keccak256(buf).0[..ETH_ADDRESS_LEN])
 }
 
 /// Address of the **enumeration list** companion for an index account.
@@ -150,10 +163,10 @@ pub fn str_level_address(attr: &[u8], ty: AttributeType, prefix: &[u8]) -> Addre
 /// the reader enumerate a level's live entries. Slot `0` holds the count; slot `i`
 /// (1-based) holds the `i`-th key.
 pub fn list_address_for(index_addr: Address) -> Address {
-    let mut buf = Vec::with_capacity(LIST_DOMAIN.len() + ADDRESS_LEN);
+    let mut buf = Vec::with_capacity(LIST_DOMAIN.len() + ETH_ADDRESS_LEN);
     buf.extend_from_slice(LIST_DOMAIN);
     buf.extend_from_slice(index_addr.as_slice());
-    Address::from_slice(&keccak256(buf).0[..ADDRESS_LEN])
+    Address::from_slice(&keccak256(buf).0[..ETH_ADDRESS_LEN])
 }
 
 #[cfg(test)]

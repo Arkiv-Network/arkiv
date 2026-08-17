@@ -28,7 +28,7 @@ use core::fmt;
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
-use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::entity::{AttributeType, AttributeValue, TOMBSTONE_TYPE_ID};
 
 use crate::{
@@ -305,9 +305,9 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
             )))
         }
         AttributeType::EthereumAddress => {
-            zero_prefix(&w, WORD_LEN - ADDRESS_LEN)?;
+            zero_prefix(&w, WORD_LEN - ETH_ADDRESS_LEN)?;
             Ok(AttributeValue::EthereumAddress(
-                w[WORD_LEN - ADDRESS_LEN..].try_into().unwrap(),
+                w[WORD_LEN - ETH_ADDRESS_LEN..].try_into().unwrap(),
             ))
         }
         AttributeType::U256 => Ok(AttributeValue::U256(w)),

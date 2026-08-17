@@ -7,7 +7,7 @@ use alloy_rpc_types::eth::Log as RpcLog;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use arkiv_bindings::*;
-use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
 use arkiv_rpc_types::method::BlockTimingView;
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
@@ -287,7 +287,7 @@ fn predict_entity_key(
     // Must match `arkiv_reth_executor::decode::derive_entity_key` byte for byte:
     // chain_id ‖ registry ‖ owner ‖ nonce ‖ salt.
     let mut buf = Vec::with_capacity(
-        WORD_LEN + ADDRESS_LEN + ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
+        WORD_LEN + ETH_ADDRESS_LEN + ETH_ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
     );
     buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
     buf.extend_from_slice(registry.as_slice());

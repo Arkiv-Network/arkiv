@@ -15,13 +15,13 @@
 //! Arkiv specification's.
 
 use alloy_primitives::{Address, B256, keccak256};
-use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::primitives::EntityKey;
 
 // The named widths must match the types this module bridges: an entity key is a
 // spec word, and its prefix is an alloy address. Enforced at compile time.
 const _: () = assert!(size_of::<EntityKey>() == WORD_LEN);
-const _: () = assert!(size_of::<Address>() == ADDRESS_LEN);
+const _: () = assert!(size_of::<Address>() == ETH_ADDRESS_LEN);
 
 /// The storage-host account for entity-store bookkeeping — the global entity
 /// counter, the per-caller nonce map, and the id ↔ address maps live here as
@@ -31,20 +31,31 @@ pub const SYSTEM_ACCOUNT_ADDRESS: Address = Address::new([
     0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x46,
 ]);
 
-/// Entity-account address: the first [`ADDRESS_LEN`] bytes of the entity key.
+/// Entity-account address: the first [`ETH_ADDRESS_LEN`] bytes of the entity key.
 ///
 /// The address is a pure identity anchor; the entity's content is committed via
 /// the account's `codeHash`, not its address.
+///
+/// **This truncation is a host adaptation, not an Arkiv property.** An entity key
+/// is a full [`WORD_LEN`]-byte value; reth keys accounts by 20 bytes, so 12 are
+/// dropped here and the effective account space is 160 bits rather than 256. Two
+/// keys agreeing on their first [`ETH_ADDRESS_LEN`] bytes therefore share one
+/// account — see `address_is_exactly_the_key_prefix` below, which pins that
+/// behaviour — and nothing downstream distinguishes them: [`RethEntityStore`]
+/// stores by address and reads back whatever is there. A wider account key would
+/// remove the collapse entirely.
+///
+/// [`RethEntityStore`]: crate::store::RethEntityStore
 #[inline]
 pub fn entity_address(key: EntityKey) -> Address {
-    Address::from_slice(&key[..ADDRESS_LEN])
+    Address::from_slice(&key[..ETH_ADDRESS_LEN])
 }
 
 /// Storage slot on [`SYSTEM_ACCOUNT_ADDRESS`] holding `caller`'s entity-key minting
 /// nonce: `keccak256("nonces" || caller)`. The nonce feeds `Create` key derivation
 /// (and the SDK's `nonces(address)` view), and is advanced once per created entity.
 pub fn nonce_slot(caller: Address) -> B256 {
-    let mut buf = [0u8; 6 + ADDRESS_LEN];
+    let mut buf = [0u8; 6 + ETH_ADDRESS_LEN];
     buf[..6].copy_from_slice(b"nonces");
     buf[6..].copy_from_slice(caller.as_slice());
     keccak256(buf)
@@ -62,12 +73,12 @@ mod tests {
 
     #[test]
     fn address_is_exactly_the_key_prefix() {
-        // Two keys that agree on the first ADDRESS_LEN bytes but differ afterwards
+        // Two keys that agree on the first ETH_ADDRESS_LEN bytes but differ afterwards
         // must map to the same account — the address is the prefix, nothing more.
         let mut a: EntityKey = [9u8; 32];
         let mut b: EntityKey = [9u8; 32];
-        a[ADDRESS_LEN] = 1;
-        b[ADDRESS_LEN] = 2;
+        a[ETH_ADDRESS_LEN] = 1;
+        b[ETH_ADDRESS_LEN] = 2;
         assert_eq!(entity_address(a), entity_address(b));
     }
 

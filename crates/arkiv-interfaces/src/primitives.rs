@@ -4,10 +4,19 @@
 //! boundary, e.g. `let addr: Address = alloy_addr.into_array();` (and back with
 //! `Address::from`).
 
-/// A 20-byte address — an entity's owner or creator, or a transaction's caller.
+/// An **Ethereum account** address — an entity's owner or creator, or a
+/// transaction's caller. All three are accounts that hold a key and sign, so this
+/// is [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN) wide by Ethereum's
+/// definition, not by Arkiv's.
+///
+/// Not to be confused with a location Arkiv *derives* — an entity key, an index
+/// bucket — which is [`tyalias@Hash`]-wide. See
+/// [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN) for why the two are kept
+/// apart.
 pub type Address = [u8; 20];
 
-/// A 32-byte hash — a commitment root, or the shape of an entity key.
+/// A 32-byte hash — a commitment root, or the shape of an entity key. Also the
+/// width Arkiv addresses its own derived locations in.
 pub type Hash = [u8; 32];
 
 /// An entity's unique, stable identifier.
