@@ -87,6 +87,7 @@ use reth_ethereum::{
                 EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError, Output,
                 ResultAndState, ResultGas, SuccessReason,
             },
+            database_interface::DBErrorMarker,
             inspector::{Inspector, NoOpInspector},
             interpreter::interpreter::EthInterpreter,
             precompile::Precompiles,
@@ -730,7 +731,7 @@ pub struct ArkivEvmFactory;
 impl EvmFactory for ArkivEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>, EthInterpreter>> = ArkivEvm<DB, I>;
     type Tx = TxEnv;
-    type Error<DBError: core::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+    type Error<DBError: DBErrorMarker> = EVMError<DBError>;
     type HaltReason = HaltReason;
     type Context<DB: Database> = EthEvmContext<DB>;
     type Spec = SpecId;

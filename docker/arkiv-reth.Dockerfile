@@ -7,7 +7,7 @@
 
 # ---- chef ----
 # This stage contains the workspace dependency build used by arkiv-reth.
-FROM rust:1.94-slim-bookworm AS chef
+FROM rust:1.97-slim-bookworm AS chef
 WORKDIR /build
 
 # Native deps for the reth/alloy stack: libclang for bindgen (reth-mdbx-sys),
@@ -53,7 +53,7 @@ RUN apt-get update \
     && mkdir -p /data && chown arkiv:arkiv /data
 
 COPY --from=builder /build/target/release/arkiv-reth /usr/local/bin/arkiv-reth-bin
-# ethereum-package currently supplies ENR bootnodes to the EL. Reth v2.2.0
+# ethereum-package currently supplies ENR bootnodes to the EL. Reth v2.5.0
 # accepts enode URLs for --bootnodes, but not ENRs; remove incompatible values
 # while leaving consensus-layer bootnodes untouched.
 RUN <<'EOF'

@@ -30,7 +30,7 @@ use reth_ethereum::evm::{
     revm::{
         bytecode::JumpTable,
         primitives::KECCAK_EMPTY,
-        state::{Account, AccountInfo, Bytecode, EvmState, EvmStorageSlot},
+        state::{Account, AccountInfo, Bytecode, EvmState, EvmStorageSlot, TransactionId},
     },
 };
 
@@ -70,7 +70,14 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
         }
         let n = bytes.len();
         let table = JumpTable::from_slice(&vec![0u8; n.div_ceil(8)], n);
-        Bytecode::new_analyzed(bytes, n, table)
+        // SAFETY: `new_analyzed` is unsafe because unpadded bytecode would let the
+        // interpreter read past the allocation while decoding PUSH immediates. This
+        // node never runs the interpreter over entity code: `ArkivEvm::transact_raw`
+        // applies the state transition directly, and the one revm-delegating path
+        // (`transact_system_call`) only touches the EIP-4788/EIP-2935 system
+        // contracts, whose code comes from the chainspec, not from here. Padding is
+        // also not an option — entity records must round-trip byte-for-byte.
+        unsafe { Bytecode::new_analyzed(bytes, n, table) }
     }
 
     /// The account's current info: the pending diff if it's been touched, else the
@@ -148,8 +155,10 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
                 .map_err(|e| eyre::eyre!("db.storage({addr}): {e:?}"))?,
         };
         let acc = self.account_mut(addr)?;
-        acc.storage
-            .insert(slot, EvmStorageSlot::new_changed(original, value, 0));
+        acc.storage.insert(
+            slot,
+            EvmStorageSlot::new_changed(original, value, TransactionId::ZERO),
+        );
         acc.mark_touch();
         Ok(())
     }

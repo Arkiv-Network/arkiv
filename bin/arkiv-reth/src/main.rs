@@ -12,6 +12,17 @@
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
+// jemalloc, as reth's own binary does it. reth fragments badly under the stock
+// system allocator on long syncs, and the allocator can only be chosen by the
+// binary — enabling reth's "jemalloc" feature alone just turns on its stats
+// reporting.
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
+// Pulls jemalloc-sys into the link so the allocator override actually takes.
+#[cfg(unix)]
+use reth_cli_util::allocator::tikv_jemalloc_sys as _;
+
 mod cursor;
 mod errors;
 mod rpc;
