@@ -1496,8 +1496,10 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.4",
+ "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-types",
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",

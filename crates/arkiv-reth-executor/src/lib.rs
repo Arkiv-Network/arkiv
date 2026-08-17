@@ -29,6 +29,10 @@
 //!   `entityNonce(address)`, is answered directly from the minting-nonce slot —
 //!   see [`arkiv_entity_nonce_call`].
 //! - **Contract creation** — rejected (neutered): user programs never execute.
+//!   The rejection is a *typed* invalid-tx error, so the payload builder skips a
+//!   pooled deploy tx instead of aborting the build over it (the pool accepts
+//!   creates and never evicts an unmined tx — a fatal error there would stall
+//!   block production forever).
 //!
 //! ## Honest scope
 //!
@@ -268,13 +272,19 @@ fn arkiv_transact<DB: Database>(
     block_number: u64,
     tx: TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    // Neuter: user programs never execute.
+    // Neuter: user programs never execute. The rejection must be a *typed*
+    // invalid-tx error, for the same reason [`validate_nonce`]'s is: the stock
+    // pool accepts deployment transactions, and reth's payload builder skips a
+    // transaction only when the error converts into
+    // `BlockValidationError::InvalidTx`. An `EVMError::Custom` is fatal to the
+    // whole build instead — and since an unmined transaction is never evicted
+    // from the pool, one pooled deploy tx would stall block production forever.
     let to = match tx.kind {
         TxKind::Call(addr) => addr,
         TxKind::Create => {
-            return Err(EVMError::Custom(
-                "contract creation is disabled (no-EVM Arkiv executor)".to_string(),
-            ));
+            return Err(EVMError::Transaction(InvalidTransaction::Str(
+                "contract creation is disabled (no-EVM Arkiv executor)".into(),
+            )));
         }
     };
 
@@ -950,6 +960,41 @@ mod tests {
         assert!(
             invalid.is_nonce_too_low(),
             "must satisfy is_nonce_too_low(), or reth stops skipping the duplicate",
+        );
+    }
+
+    /// **Contract creation is rejected as a typed invalid-tx error, not a fatal
+    /// one.** The stock pool accepts deployment transactions and never evicts an
+    /// unmined one, so the executor's rejection is what the payload builder
+    /// sees on every build — an error that fails
+    /// [`try_into_invalid_tx_err`](alloy_evm::EvmError::try_into_invalid_tx_err)
+    /// (as [`EVMError::Custom`] does) aborts the whole build, and one pooled
+    /// deploy tx stalls block production forever. Weaken this back to `Custom`
+    /// and that stall returns.
+    #[test]
+    fn a_create_transaction_is_rejected_as_invalid_not_fatal() {
+        use alloy_evm::{EvmError, InvalidTxError};
+
+        let mut db = EmptyDB::default();
+        let alice = Address::repeat_byte(0xAA);
+        let tx = TxEnv {
+            kind: TxKind::Create,
+            ..arkiv_tx(alice, Bytes::from_static(&[0x00]))
+        };
+
+        let err = arkiv_transact(&mut db, 10, tx).expect_err("creates must be rejected");
+        let invalid = err.try_into_invalid_tx_err().expect(
+            "must convert to an invalid-tx error, or reth aborts the build instead of skipping",
+        );
+        assert!(
+            !invalid.is_nonce_too_low(),
+            "a create rejection is not a nonce problem",
+        );
+        assert!(
+            invalid
+                .to_string()
+                .contains("contract creation is disabled"),
+            "the rejection should say why, got: {invalid}",
         );
     }
 
