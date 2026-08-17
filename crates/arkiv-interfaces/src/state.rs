@@ -6,17 +6,11 @@ use crate::entity::{AttributeValue, Entity};
 use crate::primitives::{BlockNumber, EntityKey, Hash};
 use crate::query::{PageParams, Query, QueryMatches};
 
-/// Holds the **entities** — the state that is Arkiv's reason to exist.
+/// Holds the **entities**: a map from [`EntityKey`] to [`Entity`], plus a
+/// [`commitment`](EntityStore::commitment) over the whole map.
 ///
-/// It is a map from [`EntityKey`] to [`Entity`], plus a
-/// [`commitment`](EntityStore::commitment) over the whole map. You read one entity
-/// with [`get`](EntityStore::get); you apply a whole block's changes at once with
-/// [`apply_delta`](EntityStore::apply_delta). The store deals in whole
-/// [`Entity`] values — **how** it serializes them for storage (its codec,
-/// compression, layout) is entirely its own concern, hidden behind this trait.
-///
-/// The host decides where the entities actually live and handles any low-level
-/// bookkeeping underneath (persistence markers, tombstones).
+/// The store deals in whole [`Entity`] values — how it serializes them, and where
+/// the host puts them, are its own concern behind this trait.
 ///
 /// Every method takes `&mut self`, reads included: a host's read path may need to
 /// update a cache.

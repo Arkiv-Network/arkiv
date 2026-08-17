@@ -9,22 +9,17 @@
 //! ([`AuxiliaryStore`](arkiv_interfaces::state::AuxiliaryStore)) is a separate
 //! concern and lives in its own crate; this crate holds no index/auxiliary data.
 //!
-//! This is host-specific by design. Per the Arkiv/host boundary (see the
-//! `arkiv-interfaces` crate docs), *where* an entity physically lives — which
-//! account address, which storage slot — is reth's concern, not the Arkiv
-//! specification's. The spec says "there is a committed entity store"; this crate
-//! is one concrete answer to that on reth.
+//! Host-specific by design: *where* an entity physically lives is reth's concern,
+//! not the specification's. Ported from the `arkiv-db-engine` reference.
 //!
-//! It is being ported, module by module, from the proven `arkiv-db-engine`
-//! reference. Here so far: [`layout`] — the entity address anchor; [`record`] —
-//! the versioned `Entity` ⇄ account-code byte codec (`0xFE00 || RLP`), which
-//! implements the spec's [`EntityCodec`](arkiv_interfaces::codec::EntityCodec) via
+//! [`layout`] — the entity address anchor; [`record`] — the versioned `Entity` ⇄
+//! account-code byte codec (`0xFE00 || RLP`), implementing the spec's
+//! [`EntityCodec`](arkiv_interfaces::codec::EntityCodec) via
 //! [`RecordCodec`](record::RecordCodec); [`store`] — the
 //! [`EntityStore`](arkiv_interfaces::state::EntityStore) impl over an
 //! [`EntityBackend`](store::EntityBackend) seam; [`account`] — the [`AccountCode`]
-//! reth code seam; and [`backend`] — [`CodeBackend`], the `EntityBackend` that
-//! keeps each entity in its account's code. The reth [`AccountCode`] bridges (over
-//! a revm `Journal` and a `StateProvider` snapshot) land next.
+//! reth code seam; [`backend`] — [`CodeBackend`], the `EntityBackend` keeping each
+//! entity in its account's code.
 //!
 //! [`AccountCode`]: account::AccountCode
 //! [`CodeBackend`]: backend::CodeBackend
