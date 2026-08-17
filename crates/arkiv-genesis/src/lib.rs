@@ -19,12 +19,16 @@ use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English
 use eyre::{Result, bail};
 use std::collections::BTreeMap;
 
-/// Address the custom `EvmFactory` registers the Arkiv precompile at.
+/// Address entity calldata is sent to, as an alloy [`Address`].
+///
 /// EOAs / SDKs `CALL` this address with the `execute(Operation[])` /
 /// `nonces(address)` ABI declared by `IEntityRegistry`. No genesis
-/// allocation is required — registration is programmatic.
-pub const ARKIV_ADDRESS: Address =
-    alloy_primitives::address!("0x4400000000000000000000000000000000000044");
+/// allocation is required — registration is programmatic, which is what
+/// `tests::genesis_alloc_has_dev_funding_only` pins.
+///
+/// The bytes are [`arkiv_interfaces::constants::ARKIV_ADDRESS`], shared with the
+/// executor so genesis and execution cannot disagree about where the engine lives.
+pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_ADDRESS);
 
 /// First account derived from [`ARKIV_DEV_MNEMONIC`] at standard BIP-44
 /// path `m/44'/60'/0'/0/0`. Kept as a `const` so callers that only need

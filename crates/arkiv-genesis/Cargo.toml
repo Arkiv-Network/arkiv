@@ -10,6 +10,10 @@ license.workspace = true
 # locally so genesis setup does not depend on another node architecture.
 
 [dependencies]
+# Only for `constants::ARKIV_ADDRESS` — genesis has to name the same address the
+# executor routes to, and this is where that one value lives. Zero-dep no_std, so
+# it costs nothing to depend on.
+arkiv-interfaces.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-signer-local.workspace = true

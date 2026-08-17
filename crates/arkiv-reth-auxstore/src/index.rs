@@ -15,14 +15,14 @@
 //! [`was_empty`]: insert
 
 use alloy_primitives::Address;
-use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::constants::WORD_LEN;
 use arkiv_interfaces::entity::{AttributeType, AttributeValue};
 use arkiv_reth_entitystore::AccountCode;
 
 use crate::address::pair_address;
 use crate::annotation::QueryCapabilities;
 use crate::bitmap::Bitmap;
-use crate::cascade::{self, MAX_STR_LEN};
+use crate::cascade::{self, MAX_STR_BYTES};
 use crate::error::AuxError;
 use crate::range;
 use crate::storage::IndexStorage;
@@ -121,7 +121,7 @@ where
         QueryCapabilities::EqualityAndRange if value.len() <= WORD_LEN => {
             range::insert(backend, attr, ty, value).map_err(AuxError::Backend)
         }
-        QueryCapabilities::EqualityAndPrefix if value.len() <= MAX_STR_LEN => {
+        QueryCapabilities::EqualityAndPrefix if value.len() <= MAX_STR_BYTES => {
             cascade::insert(backend, attr, ty, value).map_err(AuxError::Backend)
         }
         _ => Ok(()),
@@ -144,7 +144,7 @@ where
         QueryCapabilities::EqualityAndRange if value.len() <= WORD_LEN => {
             range::remove(backend, attr, ty, value).map_err(AuxError::Backend)
         }
-        QueryCapabilities::EqualityAndPrefix if value.len() <= MAX_STR_LEN => {
+        QueryCapabilities::EqualityAndPrefix if value.len() <= MAX_STR_BYTES => {
             cascade::remove(backend, attr, ty, value).map_err(AuxError::Backend)
         }
         _ => Ok(()),

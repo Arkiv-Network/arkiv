@@ -26,7 +26,7 @@
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::constants::WORD_LEN;
 
 use crate::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
 use crate::slot::{storage_to_u64, u64_to_storage};

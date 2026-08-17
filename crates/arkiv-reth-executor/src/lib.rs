@@ -71,7 +71,7 @@ pub use decode::{DecodeError, decode_ops, derive_entity_key};
 pub use state::ExecutorState;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
-use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256, address};
+use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use arkiv_bindings::IEntityRegistry;
 use reth_ethereum::{
@@ -108,12 +108,14 @@ use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
 use arkiv_reth_auxstore::RethAuxStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
 
-/// The Arkiv address — `0x4400…0044`.
+/// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
-/// Matches the SDK's `ARKIV_ADDRESS`: EOAs `CALL` here with entity
-/// `execute(Operation[])` calldata. There is no precompile object and no
-/// bytecode — calls to this address are routed directly in [`arkiv_transact`].
-pub const ARKIV_ADDRESS: Address = address!("0x4400000000000000000000000000000000000044");
+/// EOAs `CALL` here with entity `execute(Operation[])` calldata. There is no
+/// precompile object and no bytecode — calls to this address are routed directly
+/// in [`arkiv_transact`]. The bytes come from
+/// [`arkiv_interfaces::constants::ARKIV_ADDRESS`], which is also what
+/// `arkiv-genesis` asserts against; this is the reth-typed view of that one value.
+pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_ADDRESS);
 
 /// Flat gas charged per transaction by the fixed-function executor.
 const ARKIV_TX_GAS: u64 = 21_000;

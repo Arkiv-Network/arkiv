@@ -47,7 +47,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotat
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
 use arkiv_interfaces::primitives::{BlockNumber, EntityKey, EntityNonce};
 
-use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
 
 use crate::ARKIV_ADDRESS;
 

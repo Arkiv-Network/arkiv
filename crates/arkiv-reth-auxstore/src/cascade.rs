@@ -18,7 +18,7 @@
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::constants::WORD_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::address::{list_address_for, str_level_address};
@@ -26,14 +26,21 @@ use crate::range::{Bound, slot_presence, slot_to_val_len};
 use crate::slot::{storage_to_u64, u64_to_storage};
 use crate::storage::IndexStorage;
 
-/// The longest string value the cascade indexes: four 32-byte chunks.
-pub const MAX_STR_LEN: usize = 4 * WORD_LEN;
+/// The longest string value the cascade indexes — the protocol's `str` limit,
+/// which the cascade is sized to hold exactly.
+pub use arkiv_interfaces::constants::MAX_STR_BYTES;
 
-/// Split a value (≤ [`MAX_STR_LEN`] bytes) into 32-byte right-padded chunks. An
+/// The cascade addresses a value as a fixed number of word-sized chunks, so its
+/// depth is only correct while the protocol limit is that many words. Checked
+/// here rather than assumed, because widening `MAX_STR_BYTES` without adding a
+/// level would silently truncate indexed values.
+const _: () = assert!(MAX_STR_BYTES == 4 * WORD_LEN);
+
+/// Split a value (≤ [`MAX_STR_BYTES`] bytes) into 32-byte right-padded chunks. An
 /// empty value produces a single zero chunk (so it still occupies a level-0 slot).
 pub fn value_chunks(value: &[u8]) -> Vec<B256> {
     debug_assert!(
-        value.len() <= MAX_STR_LEN,
+        value.len() <= MAX_STR_BYTES,
         "value_chunks: value too long ({} bytes)",
         value.len()
     );

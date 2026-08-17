@@ -7,7 +7,8 @@ use alloy_rpc_types::eth::Log as RpcLog;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use arkiv_bindings::*;
-use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_rpc_types::method::BlockTimingView;
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
 use rand::Rng;
@@ -1024,13 +1025,9 @@ async fn main() -> Result<()> {
         }
 
         Command::BlockTiming => {
-            #[derive(Debug, Deserialize)]
-            struct BlockTiming {
-                current_block: u64,
-                current_block_time: u64,
-                duration: u64,
-            }
-            let t: BlockTiming = provider
+            // The node's own response type, not a local restatement of it — the
+            // two cannot drift apart.
+            let t: BlockTimingView = provider
                 .raw_request("arkiv_getBlockTiming".into(), ())
                 .await?;
             println!("block:     {}", t.current_block);

@@ -6,6 +6,7 @@
 //! These impl blocks mirror the validation rules in `contracts/types/Ident32.sol`.
 
 use alloy_primitives::FixedBytes;
+use arkiv_interfaces::entity::annotations::SYSTEM_PREFIX;
 use eyre::{Result, bail};
 
 use crate::Ident32;
@@ -60,9 +61,6 @@ pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> 
     }
     Ok(())
 }
-
-/// The `$` prefix marking a system attribute name.
-const SYSTEM_PREFIX: u8 = b'$';
 
 /// Validate a **system** attribute name (`$payload`, `$contentType`).
 ///

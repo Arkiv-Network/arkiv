@@ -1382,9 +1382,9 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",
- "arkiv-constants",
  "arkiv-genesis",
  "arkiv-interfaces",
+ "arkiv-rpc-types",
  "clap",
  "eyre",
  "hex",
@@ -1398,16 +1398,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "arkiv-constants"
-version = "0.1.0"
-
-[[package]]
 name = "arkiv-genesis"
 version = "0.1.0"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-signer-local",
+ "arkiv-interfaces",
  "eyre",
 ]
 
@@ -1445,8 +1442,6 @@ dependencies = [
 name = "arkiv-reth"
 version = "0.1.0"
 dependencies = [
- "alloy-consensus",
- "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
@@ -1455,21 +1450,14 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-harness",
- "arkiv-interfaces",
- "arkiv-query",
- "arkiv-reth-auxstore",
- "arkiv-reth-entitystore",
  "arkiv-reth-executor",
- "base64 0.22.1",
+ "arkiv-reth-rpc",
  "clap",
  "eyre",
- "jsonrpsee",
  "reth",
  "reth-cli-util",
  "reth-ethereum-cli",
  "reth-node-ethereum",
- "reth-storage-api",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -1480,7 +1468,6 @@ name = "arkiv-reth-auxstore"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "arkiv-constants",
  "arkiv-interfaces",
  "arkiv-reth-entitystore",
  "roaring",
@@ -1492,7 +1479,6 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
- "arkiv-constants",
  "arkiv-interfaces",
 ]
 
@@ -1504,13 +1490,43 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "arkiv-bindings",
- "arkiv-constants",
  "arkiv-interfaces",
  "arkiv-reth-auxstore",
  "arkiv-reth-entitystore",
  "eyre",
  "reth-ethereum",
  "tracing",
+]
+
+[[package]]
+name = "arkiv-reth-rpc"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "arkiv-interfaces",
+ "arkiv-query",
+ "arkiv-reth-auxstore",
+ "arkiv-reth-entitystore",
+ "arkiv-rpc-types",
+ "base64 0.22.1",
+ "eyre",
+ "jsonrpsee",
+ "reth-storage-api",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "arkiv-rpc-types"
+version = "0.1.0"
+dependencies = [
+ "alloy-eips",
+ "alloy-primitives",
+ "arkiv-interfaces",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -15,7 +15,7 @@
 //! Arkiv specification's.
 
 use alloy_primitives::{Address, B256, keccak256};
-use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::primitives::EntityKey;
 
 // The named widths must match the types this module bridges: an entity key is a

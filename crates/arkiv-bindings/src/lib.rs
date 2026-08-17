@@ -140,10 +140,11 @@ pub use arkiv_interfaces::entity::CreationFlags;
 /// they live in the spec crate and are re-exported here rather than mirrored.
 pub use arkiv_interfaces::entity::{AttributeType, AttributeValue, DECIMAL_SCALE};
 
-/// Maximum number of attributes per entity operation (mirrors Entity.sol's
-/// internal `MAX_ATTRIBUTES`). The contract reverts `TooManyAttributes` past
-/// this count; SDKs can validate locally before sending a transaction.
-pub const MAX_ATTRIBUTES: usize = 32;
+/// Maximum number of attributes per entity operation. The engine rejects an
+/// operation past this count with `TooManyAttributes`; SDKs can validate locally
+/// before sending a transaction. A protocol limit, so it lives in the spec crate
+/// and is re-exported here rather than mirrored.
+pub use arkiv_interfaces::constants::MAX_ATTRIBUTES;
 
 /// Human-readable label for an operation tag, mirroring the `OP_*` constants.
 /// Returns `"UNKNOWN"` for any unrecognised discriminator.

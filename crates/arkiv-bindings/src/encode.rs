@@ -28,6 +28,7 @@ use core::fmt;
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
+use arkiv_interfaces::constants::{ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::entity::{AttributeType, AttributeValue, TOMBSTONE_TYPE_ID};
 
 use crate::{
@@ -35,13 +36,10 @@ use crate::{
     OP_PATCH, OP_TRANSFER_OWNERSHIP, Operation, Patch, TransferOwnership,
 };
 
-/// The longest `string` value — `arkiv-engine.md` §2.
-pub const MAX_STRING_BYTES: usize = 128;
-
-/// The longest `$payload` (`bytes`) value — `arkiv-engine.md` §2.
-pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
-
-const WORD: usize = 32;
+/// The protocol's value limits — `arkiv-engine.md` §2. Re-exported rather than
+/// restated so the check this crate runs before a transaction is sent is the same
+/// number the engine applies on decode.
+pub use arkiv_interfaces::constants::{MAX_PAYLOAD_BYTES, MAX_STR_BYTES};
 
 // -----------------------------------------------------------------------------
 // Operation constructors
@@ -225,8 +223,8 @@ impl Attribute {
 /// types, raw bytes for `string`/`bytes`.
 fn encode_value(value: &AttributeValue) -> Result<Vec<u8>, AttrAbiError> {
     let word = |fill: u8, tail: &[u8]| {
-        let mut w = [fill; WORD];
-        w[WORD - tail.len()..].copy_from_slice(tail);
+        let mut w = [fill; WORD_LEN];
+        w[WORD_LEN - tail.len()..].copy_from_slice(tail);
         Vec::from(w)
     };
     Ok(match value {
@@ -240,7 +238,7 @@ fn encode_value(value: &AttributeValue) -> Result<Vec<u8>, AttrAbiError> {
         | AttributeValue::EntityKey(w) => Vec::from(*w),
         AttributeValue::EthereumAddress(a) => word(0x00, a),
         AttributeValue::Str(s) => {
-            if s.len() > MAX_STRING_BYTES {
+            if s.len() > MAX_STR_BYTES {
                 return Err(AttrAbiError::StringTooLong(s.len()));
             }
             Vec::from(s.as_bytes())
@@ -259,7 +257,7 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
     // The variable-width types first: everything else must be exactly one word.
     match ty {
         AttributeType::Str => {
-            if bytes.len() > MAX_STRING_BYTES {
+            if bytes.len() > MAX_STR_BYTES {
                 return Err(AttrAbiError::StringTooLong(bytes.len()));
             }
             return core::str::from_utf8(bytes)
@@ -275,37 +273,41 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
         _ => {}
     }
 
-    let w: [u8; WORD] = bytes
+    let w: [u8; WORD_LEN] = bytes
         .try_into()
         .map_err(|_| AttrAbiError::BadWordLength(bytes.len()))?;
     match ty {
         AttributeType::Bool => {
-            zero_prefix(&w, WORD - 1)?;
-            match w[WORD - 1] {
+            zero_prefix(&w, WORD_LEN - 1)?;
+            match w[WORD_LEN - 1] {
                 0 => Ok(AttributeValue::Bool(false)),
                 1 => Ok(AttributeValue::Bool(true)),
                 other => Err(AttrAbiError::BadBool(other)),
             }
         }
         AttributeType::Int => {
-            let fill = if w[WORD - 4] & 0x80 == 0 { 0x00 } else { 0xFF };
-            if w[..WORD - 4].iter().any(|b| *b != fill) {
+            let fill = if w[WORD_LEN - 4] & 0x80 == 0 {
+                0x00
+            } else {
+                0xFF
+            };
+            if w[..WORD_LEN - 4].iter().any(|b| *b != fill) {
                 return Err(AttrAbiError::BadSignExtension);
             }
             Ok(AttributeValue::Int(i32::from_be_bytes(
-                w[WORD - 4..].try_into().unwrap(),
+                w[WORD_LEN - 4..].try_into().unwrap(),
             )))
         }
         AttributeType::U64 => {
-            zero_prefix(&w, WORD - 8)?;
+            zero_prefix(&w, WORD_LEN - 8)?;
             Ok(AttributeValue::U64(u64::from_be_bytes(
-                w[WORD - 8..].try_into().unwrap(),
+                w[WORD_LEN - 8..].try_into().unwrap(),
             )))
         }
         AttributeType::EthereumAddress => {
-            zero_prefix(&w, WORD - 20)?;
+            zero_prefix(&w, WORD_LEN - ADDRESS_LEN)?;
             Ok(AttributeValue::EthereumAddress(
-                w[WORD - 20..].try_into().unwrap(),
+                w[WORD_LEN - ADDRESS_LEN..].try_into().unwrap(),
             ))
         }
         AttributeType::U256 => Ok(AttributeValue::U256(w)),
@@ -318,7 +320,7 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
 }
 
 /// Check that a right-aligned value's leading `len` bytes are zero padding.
-fn zero_prefix(word: &[u8; WORD], len: usize) -> Result<(), AttrAbiError> {
+fn zero_prefix(word: &[u8; WORD_LEN], len: usize) -> Result<(), AttrAbiError> {
     if word[..len].iter().any(|b| *b != 0) {
         Err(AttrAbiError::NonZeroValuePadding)
     } else {
@@ -364,7 +366,7 @@ pub enum AttrAbiError {
     BadSignExtension,
     /// A `string` value wasn't valid UTF-8.
     NotUtf8,
-    /// A `string` value exceeded [`MAX_STRING_BYTES`].
+    /// A `string` value exceeded [`MAX_STR_BYTES`].
     StringTooLong(usize),
     /// A `bytes` value exceeded [`MAX_PAYLOAD_BYTES`].
     PayloadTooLong(usize),
@@ -383,7 +385,7 @@ impl fmt::Display for AttrAbiError {
             Self::BadSignExtension => write!(f, "int value is not sign-extended"),
             Self::NotUtf8 => write!(f, "string value is not valid UTF-8"),
             Self::StringTooLong(n) => {
-                write!(f, "string value exceeds {MAX_STRING_BYTES} bytes ({n})")
+                write!(f, "string value exceeds {MAX_STR_BYTES} bytes ({n})")
             }
             Self::PayloadTooLong(n) => {
                 write!(f, "payload exceeds {MAX_PAYLOAD_BYTES} bytes ({n})")
@@ -584,15 +586,15 @@ mod tests {
 
     #[test]
     fn rejects_oversized_values() {
-        let long = AttributeValue::Str("x".repeat(MAX_STRING_BYTES + 1));
+        let long = AttributeValue::Str("x".repeat(MAX_STR_BYTES + 1));
         assert_eq!(
             Attribute::from_value(name("big"), &long),
-            Err(AttrAbiError::StringTooLong(MAX_STRING_BYTES + 1))
+            Err(AttrAbiError::StringTooLong(MAX_STR_BYTES + 1))
         );
         assert!(
             Attribute::from_value(
                 name("full"),
-                &AttributeValue::Str("x".repeat(MAX_STRING_BYTES))
+                &AttributeValue::Str("x".repeat(MAX_STR_BYTES))
             )
             .is_ok()
         );
@@ -613,8 +615,8 @@ mod tests {
             value: Bytes::from(bytes),
         };
         let word = |tail: &[u8]| {
-            let mut w = vec![0u8; WORD];
-            w[WORD - tail.len()..].copy_from_slice(tail);
+            let mut w = vec![0u8; WORD_LEN];
+            w[WORD_LEN - tail.len()..].copy_from_slice(tail);
             w
         };
 
@@ -633,13 +635,13 @@ mod tests {
 
         // An address with junk in its leading padding.
         assert_eq!(
-            with(AttributeType::EthereumAddress.id(), vec![0xAB; WORD]).to_value(),
+            with(AttributeType::EthereumAddress.id(), vec![0xAB; WORD_LEN]).to_value(),
             Err(AttrAbiError::NonZeroValuePadding)
         );
 
         // A u64 with junk above its eight bytes.
         assert_eq!(
-            with(AttributeType::U64.id(), vec![0xAB; WORD]).to_value(),
+            with(AttributeType::U64.id(), vec![0xAB; WORD_LEN]).to_value(),
             Err(AttrAbiError::NonZeroValuePadding)
         );
 

@@ -1,14 +1,36 @@
-//! The `arkiv_*` JSON-RPC namespace.
+//! The `arkiv_*` JSON-RPC namespace, served over reth state.
 //!
-//! Methods are registered directly on a jsonrpsee [`RpcModule`] with native async
-//! closures — no `#[rpc]` macro and no async-trait — and merged into reth's rpc
-//! modules from `main`. Each read takes a fresh [`SnapshotAccountCode`] view of the
-//! requested state — the tip by default, or a past block when the caller asks
-//! (`block`), since the Arkiv index lives in ordinary reth state and a historical
-//! state snapshot carries a historical index for free.
-//!
-//! Methods: `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`,
+//! The read-path counterpart to `arkiv-reth-executor`: where the executor writes
+//! entities and the query index into reth's account/slot model, this crate reads
+//! them back out and answers the four methods an SDK depends on —
+//! `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`,
 //! `arkiv_getBlockTiming`.
+//!
+//! [`arkiv_module`] builds a jsonrpsee [`RpcModule`] the binary merges into reth's
+//! rpc modules; that call is all `arkiv-reth`'s `main` does with this crate.
+//! Methods are registered directly with native async closures — no `#[rpc]` macro
+//! and no async-trait.
+//!
+//! ## One snapshot per call
+//!
+//! Each read takes a fresh [`SnapshotAccountCode`] view of the requested state:
+//! the tip by default, or a past block when the caller asks. Because the Arkiv
+//! index lives in ordinary reth state rather than a sidecar database, a historical
+//! state snapshot carries a historical index for free — history costs no
+//! per-store machinery. Within one `arkiv_query` the *same* snapshot resolves the
+//! query and then reads the matched entities, so a page is always internally
+//! consistent.
+//!
+//! ## What lives here and what doesn't
+//!
+//! The wire shapes are the client's too, so they live in
+//! [`arkiv_rpc_types`]; this crate holds only what a *server* decides — which
+//! snapshot to read, whether a cursor is resumable ([`cursor`]), how a failure
+//! becomes a jsonrpsee error object ([`error`]).
+
+pub mod cursor;
+pub mod error;
+pub mod snapshot;
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
@@ -18,21 +40,14 @@ use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
 use arkiv_reth_auxstore::RethAuxStore;
 use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
+use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
+use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
 use jsonrpsee::RpcModule;
 use jsonrpsee::types::ErrorObjectOwned;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
-use serde::{Deserialize, Serialize};
 
-use crate::cursor;
-use crate::errors::{block_unavailable, cursor_error, internal_error, invalid_params, query_error};
+use crate::error::{block_unavailable, cursor_error, internal_error, invalid_params, query_error};
 use crate::snapshot::SnapshotAccountCode;
-use crate::view::{EntityData, Projection, Select, entity_data_from, ser_u64_hex};
-
-/// Default page size when an `arkiv_query` request omits `limit`.
-const DEFAULT_PAGE_SIZE: u64 = 100;
-/// The largest `limit` the node will serve. Asking for more is an error, not a
-/// silent trim — a caller that thinks it received a full page would page wrong.
-const MAX_PAGE_SIZE: u64 = 200;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
 ///
@@ -238,7 +253,8 @@ where
 {
     let query = arkiv_query::parse(q).map_err(|e| query_error(&e))?;
     let projection = Projection::resolve(options.select.as_ref()).map_err(invalid_params)?;
-    let page_size = resolve_limit(options.limit)?;
+    let page_size =
+        arkiv_rpc_types::method::resolve_limit(options.limit).map_err(invalid_params)?;
 
     // Resolve the block before the cursor: a cursor is bound to the block it was
     // issued against, so "latest" has to become a number first.
@@ -286,19 +302,6 @@ where
             .next_cursor
             .map(|entity_id| cursor::encode(entity_id, binding)),
     })
-}
-
-/// The page size to serve. Over the ceiling is an error: trimming silently would
-/// leave a caller believing it had seen a full page.
-fn resolve_limit(requested: Option<u64>) -> Result<u64, ErrorObjectOwned> {
-    match requested {
-        None => Ok(DEFAULT_PAGE_SIZE),
-        Some(0) => Err(invalid_params("limit must be at least 1".to_string())),
-        Some(limit) if limit > MAX_PAGE_SIZE => Err(invalid_params(format!(
-            "limit {limit} exceeds the node maximum of {MAX_PAGE_SIZE}"
-        ))),
-        Some(limit) => Ok(limit),
-    }
 }
 
 /// Count the entities matching `request.query` (default `$all`), at the tip or as
@@ -364,66 +367,6 @@ where
         current_block_time,
         duration,
     })
-}
-
-/// The `arkiv_query` options — the SDK's second positional param.
-///
-/// The full call is `["<query>", { "atBlock": "0x8e1ff", "select": { … },
-/// "limit": "0x64", "cursor": "b64:…" }]`; the options object and each of its
-/// fields are optional.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct QueryOptions {
-    /// Block to evaluate against. `None` / `"latest"` reads head state; a hex
-    /// number reads historical state, and must be within the retained range.
-    pub at_block: Option<BlockNumberOrTag>,
-    /// Fields to return. Absent means [`Projection::default`] — the key alone.
-    pub select: Option<Select>,
-    /// Page size, as a hex quantity or a JSON number. Defaults to
-    /// [`DEFAULT_PAGE_SIZE`]; above [`MAX_PAGE_SIZE`] is an error.
-    #[serde(default, deserialize_with = "crate::view::de_u64_flexible")]
-    pub limit: Option<u64>,
-    /// Opaque cursor from the previous page, bound to that page's query, block
-    /// and projection.
-    pub cursor: Option<String>,
-}
-
-/// The `arkiv_getEntityCount` request: an optional query to filter by (default
-/// `$all`) and an optional past block (default the tip).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CountRequest {
-    #[serde(default)]
-    pub query: Option<String>,
-    #[serde(default)]
-    pub block: Option<u64>,
-}
-
-/// The `arkiv_query` response: one page of matched entities, the block the
-/// query evaluated against (hex), and an opaque continuation cursor (absent on
-/// the last page).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryResponse {
-    pub data: Vec<EntityData>,
-    #[serde(serialize_with = "ser_u64_hex")]
-    pub block_number: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
-}
-
-/// The `arkiv_getBlockTiming` response.
-///
-/// Serialized in `snake_case` — the shape the `arkiv-cli` `block-timing` command
-/// deserializes.
-#[derive(Debug, Clone, Serialize)]
-pub struct BlockTimingView {
-    /// The chain tip's block number.
-    pub current_block: u64,
-    /// The tip block's timestamp (unix seconds).
-    pub current_block_time: u64,
-    /// Seconds between the tip and its predecessor (`0` at genesis).
-    pub duration: u64,
 }
 
 fn hex_prefixed(bytes: &[u8]) -> String {

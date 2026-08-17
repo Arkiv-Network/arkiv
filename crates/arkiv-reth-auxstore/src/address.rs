@@ -13,7 +13,7 @@
 //! adjust them to "clean up" the encoding.
 
 use alloy_primitives::{Address, keccak256};
-use arkiv_constants::ADDRESS_LEN;
+use arkiv_interfaces::constants::ADDRESS_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
 /// Every domain tag is this many bytes (`b"arkiv.pair"`, `b"arkiv.ibth"`, …), so
