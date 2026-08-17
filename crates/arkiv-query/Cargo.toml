@@ -7,13 +7,12 @@ license.workspace = true
 
 # The Arkiv query language: parse a query string into the `arkiv-interfaces`
 # `Query` AST. A hand-rolled lexer + recursive-descent parser, kept `no_std` and
-# free of external deps (only the internal arkiv-interfaces AST and arkiv-constants
-# widths) so it stays deterministic and portable — the query grammar is part of the
-# Arkiv spec, but a parser is logic, so it lives here rather than bloating the
-# pure-traits interfaces crate.
+# free of external deps (only the internal arkiv-interfaces AST) so it stays
+# deterministic and portable — the query grammar is part of the Arkiv spec, but a
+# parser is logic, so it lives here rather than bloating the pure-traits
+# interfaces crate.
 
 [dependencies]
-arkiv-constants.workspace = true
 arkiv-interfaces.workspace = true
 # Only for keccak256, which EIP-55 address checksums are defined in terms of.
 # Declared directly rather than inherited so `default-features = false` can keep

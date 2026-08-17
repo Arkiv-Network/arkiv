@@ -1438,7 +1438,6 @@ name = "arkiv-query"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "arkiv-constants",
  "arkiv-interfaces",
 ]
 
