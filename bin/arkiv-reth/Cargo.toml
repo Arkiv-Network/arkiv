@@ -9,9 +9,8 @@ license.workspace = true
 name = "arkiv-reth"
 path = "src/main.rs"
 
-# This crate is the assembly point and nothing else: it wires reth's host to the
-# two things Arkiv replaces (the executor and the arkiv_* RPC namespace), both of
-# which live in their own crates. Anything more than that belongs in one of them.
+# The assembly point and nothing else: reth's host plus the two things Arkiv
+# replaces. Anything more than wiring belongs in one of the crates below.
 
 [dependencies]
 reth.workspace = true

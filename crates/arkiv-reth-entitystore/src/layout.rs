@@ -36,16 +36,11 @@ pub const SYSTEM_ACCOUNT_ADDRESS: Address = Address::new([
 /// The address is a pure identity anchor; the entity's content is committed via
 /// the account's `codeHash`, not its address.
 ///
-/// **This truncation is a host adaptation, not an Arkiv property.** An entity key
-/// is a full [`WORD_LEN`]-byte value; reth keys accounts by 20 bytes, so 12 are
-/// dropped here and the effective account space is 160 bits rather than 256. Two
-/// keys agreeing on their first [`ETH_ADDRESS_LEN`] bytes therefore share one
-/// account — see `address_is_exactly_the_key_prefix` below, which pins that
-/// behaviour — and nothing downstream distinguishes them: [`RethEntityStore`]
-/// stores by address and reads back whatever is there. A wider account key would
-/// remove the collapse entirely.
-///
-/// [`RethEntityStore`]: crate::store::RethEntityStore
+/// The truncation is a host adaptation, not an Arkiv property: an entity key is a
+/// full [`WORD_LEN`] bytes, and dropping 12 to fit reth's account key leaves a
+/// 160-bit space. Two keys sharing a prefix collapse onto one account, and nothing
+/// downstream distinguishes them — [`RethEntityStore`](crate::store::RethEntityStore)
+/// stores by address and reads back whatever is there.
 #[inline]
 pub fn entity_address(key: EntityKey) -> Address {
     Address::from_slice(&key[..ETH_ADDRESS_LEN])

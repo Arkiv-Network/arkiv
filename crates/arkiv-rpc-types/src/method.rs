@@ -1,10 +1,8 @@
 //! Per-method request and response shapes.
 //!
-//! Chain quantities go over as hex strings, like the `eth_*` namespace
-//! (`"0x8e1ff"`), because a block number or an expiry can exceed what a JSON
-//! number holds exactly. On the way *in* both spellings are accepted — see
-//! [`de_u64_flexible`](crate::entity::de_u64_flexible()) — since a hand-written
-//! client usually sends a plain number.
+//! Chain quantities go over as hex strings like the `eth_*` namespace, since a
+//! block number can exceed what a JSON number holds exactly. Both spellings are
+//! accepted on the way in — see [`de_u64_flexible`](crate::entity::de_u64_flexible()).
 
 use alloy_eips::BlockNumberOrTag;
 use serde::{Deserialize, Serialize};
@@ -14,41 +12,32 @@ use crate::entity::{EntityData, Select, de_u64_flexible, ser_u64_hex};
 /// Page size served when an `arkiv_query` request omits `limit`.
 pub const DEFAULT_PAGE_SIZE: u64 = 100;
 
-/// The largest `limit` a node will serve. Asking for more is an error, not a
-/// silent trim — a caller that thinks it received a full page would page wrong.
-///
-/// Part of the client contract rather than node policy, so an SDK can bound its
-/// own paging without discovering the ceiling by being rejected.
+/// The largest `limit` a node will serve. Part of the client contract, so an SDK
+/// can bound its own paging instead of discovering the ceiling by being rejected.
 pub const MAX_PAGE_SIZE: u64 = 200;
 
-/// The `arkiv_query` options — the second positional param.
-///
-/// The full call is `["<query>", { "atBlock": "0x8e1ff", "select": { … },
-/// "limit": "0x64", "cursor": "b64:…" }]`; the options object and each of its
-/// fields are optional.
+/// The `arkiv_query` options — the second positional param. The full call is
+/// `["<query>", { "atBlock": …, "select": …, "limit": …, "cursor": … }]`; the
+/// object and every field in it are optional.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryOptions {
     /// Block to evaluate against. `None` / `"latest"` reads head state; a hex
     /// number reads historical state, and must be within the retained range.
     pub at_block: Option<BlockNumberOrTag>,
-    /// Fields to return. Absent means [`Projection::default`](crate::entity::Projection::default)
-    /// — the key alone.
+    /// Fields to return. Absent means the key alone.
     pub select: Option<Select>,
-    /// Page size, as a hex quantity or a JSON number. Resolved by
-    /// [`resolve_limit`].
+    /// Page size, hex or JSON number. Resolved by [`resolve_limit`].
     #[serde(default, deserialize_with = "de_u64_flexible")]
     pub limit: Option<u64>,
-    /// Opaque cursor from the previous page, bound to that page's query, block
-    /// and projection. Clients must not parse or arithmetic on it.
+    /// Opaque cursor from the previous page, bound to its query, block and
+    /// projection. Clients must not parse it.
     pub cursor: Option<String>,
 }
 
-/// The page size to serve for a requested `limit`.
-///
-/// Over the ceiling is an error rather than a trim: silently serving 200 of a
-/// requested 500 would leave a caller believing it had seen a partial page and
-/// stop early. `Err` carries the message a node reports as invalid params.
+/// The page size to serve. Over the ceiling is an error rather than a trim —
+/// silently serving 200 of a requested 500 reads as a short page, so a caller
+/// would stop early. `Err` carries the node's invalid-params message.
 pub fn resolve_limit(requested: Option<u64>) -> Result<u64, String> {
     match requested {
         None => Ok(DEFAULT_PAGE_SIZE),
@@ -98,8 +87,7 @@ pub struct BlockTimingView {
     pub duration: u64,
 }
 
-/// A required chain quantity, in either spelling — the non-optional counterpart
-/// of [`de_u64_flexible`](crate::entity::de_u64_flexible()).
+/// A required chain quantity, in either spelling.
 fn de_u64_required<'de, D>(de: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -117,8 +105,6 @@ mod tests {
         assert_eq!(resolve_limit(None).unwrap(), DEFAULT_PAGE_SIZE);
     }
 
-    /// Both ends are refused rather than clamped, so a caller can't mistake a
-    /// trimmed page for a short one.
     #[test]
     fn a_limit_outside_the_range_is_refused_not_clamped() {
         assert!(resolve_limit(Some(0)).is_err());
@@ -127,8 +113,6 @@ mod tests {
         assert_eq!(resolve_limit(Some(1)).unwrap(), 1);
     }
 
-    /// The response round-trips, which is what lets a client deserialize into the
-    /// same type the node serialized from.
     #[test]
     fn a_query_response_round_trips_through_json() {
         let response = QueryResponse {
@@ -167,8 +151,6 @@ mod tests {
         assert_eq!(number.limit, Some(100));
     }
 
-    /// A typo'd option must not be silently ignored — it would look like the
-    /// node disregarded a request the caller believed it had made.
     #[test]
     fn an_unknown_query_option_is_rejected() {
         let bad = serde_json::from_value::<QueryOptions>(serde_json::json!({ "atBlok": "latest" }));

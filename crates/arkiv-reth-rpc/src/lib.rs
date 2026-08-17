@@ -1,32 +1,18 @@
 //! The `arkiv_*` JSON-RPC namespace, served over reth state.
 //!
-//! The read-path counterpart to `arkiv-reth-executor`: where the executor writes
-//! entities and the query index into reth's account/slot model, this crate reads
-//! them back out and answers the four methods an SDK depends on —
-//! `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`,
+//! The read-path counterpart to `arkiv-reth-executor`: [`arkiv_module`] builds a
+//! jsonrpsee [`RpcModule`] the binary merges into reth's rpc modules, answering
+//! `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount` and
 //! `arkiv_getBlockTiming`.
 //!
-//! [`arkiv_module`] builds a jsonrpsee [`RpcModule`] the binary merges into reth's
-//! rpc modules; that call is all `arkiv-reth`'s `main` does with this crate.
-//! Methods are registered directly with native async closures — no `#[rpc]` macro
-//! and no async-trait.
+//! Each read takes a fresh [`SnapshotAccountCode`] of the requested state — the
+//! tip, or a past block. Because the Arkiv index lives in ordinary reth state
+//! rather than a sidecar database, a historical snapshot carries a historical
+//! index for free. Within one `arkiv_query` the *same* snapshot resolves the query
+//! and reads the matched entities, so a page is always internally consistent.
 //!
-//! ## One snapshot per call
-//!
-//! Each read takes a fresh [`SnapshotAccountCode`] view of the requested state:
-//! the tip by default, or a past block when the caller asks. Because the Arkiv
-//! index lives in ordinary reth state rather than a sidecar database, a historical
-//! state snapshot carries a historical index for free — history costs no
-//! per-store machinery. Within one `arkiv_query` the *same* snapshot resolves the
-//! query and then reads the matched entities, so a page is always internally
-//! consistent.
-//!
-//! ## What lives here and what doesn't
-//!
-//! The wire shapes are the client's too, so they live in
-//! [`arkiv_rpc_types`]; this crate holds only what a *server* decides — which
-//! snapshot to read, whether a cursor is resumable ([`cursor`]), how a failure
-//! becomes a jsonrpsee error object ([`error`]).
+//! Wire shapes are the client's too and live in [`arkiv_rpc_types`]; this crate
+//! holds only what a server decides.
 
 pub mod cursor;
 pub mod error;

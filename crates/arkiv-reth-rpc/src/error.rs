@@ -1,12 +1,6 @@
-//! Failures, as jsonrpsee error objects.
-//!
-//! The **codes** are the client's contract and are defined in
-//! [`arkiv_rpc_types::error`], which is also where the table of what each one
-//! means lives; the parse-side codes come from that crate's authority in turn,
-//! [`ParseErrorKind`](arkiv_query::ParseErrorKind), so the language and the wire
-//! cannot drift. This module is only the server half: turning each failure into
-//! the [`ErrorObjectOwned`] jsonrpsee puts on the wire, with the machine-readable
-//! `data` object a client reads instead of scraping the message.
+//! Failures, as jsonrpsee error objects. The codes and their meanings live in
+//! [`arkiv_rpc_types::error`]; this is the server half that builds the wire object
+//! and its machine-readable `data`.
 
 use arkiv_query::ParseError;
 use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE};

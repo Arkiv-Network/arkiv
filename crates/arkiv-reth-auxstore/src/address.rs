@@ -12,18 +12,10 @@
 //! `arkiv-db-engine` and locked with golden vectors in the tests below — never
 //! adjust them to "clean up" the encoding.
 //!
-//! ## The `[..ETH_ADDRESS_LEN]` truncation
-//!
-//! Every derivation here computes a full 32-byte keccak and then keeps 20 bytes.
-//! That is **not** because these are Ethereum addresses — no bucket has a key, a
-//! signer, or an owner; they are storage locations that must wear an address
-//! because reth keys accounts by one. The truncation costs 96 bits: the buckets
-//! live in a 160-bit space instead of the 256-bit one the hash already gave us.
-//!
-//! Removing it means a wider account key in the host, which these golden vectors
-//! correctly treat as a fork. Kept deliberately for now, and named
-//! [`ETH_ADDRESS_LEN`] rather than a generic "address length" so the adaptation
-//! stays visible.
+//! Every derivation keeps 20 of a 32-byte keccak. Not because these are Ethereum
+//! addresses — no bucket has a key or a signer — but because reth keys accounts by
+//! 20 bytes. That costs 96 bits, and undoing it needs a wider account key, which
+//! the golden vectors below correctly treat as a fork.
 
 use alloy_primitives::{Address, keccak256};
 use arkiv_interfaces::constants::ETH_ADDRESS_LEN;

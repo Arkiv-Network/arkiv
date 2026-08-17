@@ -5,21 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# The `arkiv_*` JSON-RPC wire contract: the request and response shapes, the
-# projection rules, and the error codes.
-#
-# Deliberately free of reth, jsonrpsee and any transport: this is the type set a
-# *client* deserializes into, so arkiv-cli, arkiv-harness and a future Rust SDK
-# share one definition with the node that serves it instead of hand-navigating
-# `serde_json::Value`. The server side lives in arkiv-reth-rpc.
+# The `arkiv_*` wire contract: request/response shapes, projection rules, error
+# codes. Free of reth, jsonrpsee and any transport, so clients deserialize the
+# same types the node serves. Server side is in arkiv-reth-rpc.
 
 [dependencies]
-# The entity model these shapes project onto the wire, plus the protocol limits.
 arkiv-interfaces.workspace = true
 alloy-primitives.workspace = true
 # `BlockNumberOrTag` for the `atBlock` query option.
 alloy-eips.workspace = true
 serde.workspace = true
-# Attribute values are rendered per type (number, bool, string, hex), so the wire
-# value is a JSON value rather than a formatted string.
+# Attribute values are rendered per type, so the wire value is a JSON value.
 serde_json.workspace = true

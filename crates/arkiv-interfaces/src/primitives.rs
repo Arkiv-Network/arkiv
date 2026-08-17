@@ -5,18 +5,12 @@
 //! `Address::from`).
 
 /// An **Ethereum account** address — an entity's owner or creator, or a
-/// transaction's caller. All three are accounts that hold a key and sign, so this
-/// is [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN) wide by Ethereum's
-/// definition, not by Arkiv's.
-///
-/// Not to be confused with a location Arkiv *derives* — an entity key, an index
-/// bucket — which is [`tyalias@Hash`]-wide. See
-/// [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN) for why the two are kept
-/// apart.
+/// transaction's caller: accounts that hold a key and sign. A location Arkiv
+/// *derives* is [`tyalias@Hash`]-wide instead; see
+/// [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN).
 pub type Address = [u8; 20];
 
-/// A 32-byte hash — a commitment root, or the shape of an entity key. Also the
-/// width Arkiv addresses its own derived locations in.
+/// A 32-byte hash — a commitment root, an entity key, or a derived location.
 pub type Hash = [u8; 32];
 
 /// An entity's unique, stable identifier.

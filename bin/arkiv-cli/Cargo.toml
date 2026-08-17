@@ -12,8 +12,7 @@ path = "src/main.rs"
 [dependencies]
 arkiv-bindings.workspace = true
 arkiv-interfaces.workspace = true
-# The node's own arkiv_* response types, so the CLI decodes what the node
-# encoded instead of restating the shapes locally.
+# The node's own arkiv_* response types, rather than local restatements.
 arkiv-rpc-types.workspace = true
 arkiv-genesis.workspace = true
 

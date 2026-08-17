@@ -5,23 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# The `arkiv_*` JSON-RPC namespace, served over a reth state snapshot.
-#
-# The reth-side half of the read path, mirroring what arkiv-reth-executor is for
-# the write path: it reads the entity store and the query index through a
-# `StateProviderBox` and answers in the shapes arkiv-rpc-types defines. The
-# binary only merges the module this crate builds.
+# The `arkiv_*` namespace, served over a reth state snapshot. The read-path half
+# of what arkiv-reth-executor is for writes; the binary just merges the module.
 
 [dependencies]
-# The wire contract this crate implements — request/response shapes, projection
-# rules, error codes.
+# The wire contract this crate implements.
 arkiv-rpc-types.workspace = true
 # The two stores a read goes through, plus the query-language parser.
 arkiv-reth-entitystore.workspace = true
 arkiv-reth-auxstore.workspace = true
 arkiv-query.workspace = true
 arkiv-interfaces.workspace = true
-# Read-side state access: the `StateProvider` snapshot each call is served from.
+# The `StateProvider` snapshot each call is served from.
 reth-storage-api.workspace = true
 jsonrpsee.workspace = true
 alloy-primitives.workspace = true
@@ -30,10 +25,8 @@ alloy-consensus.workspace = true
 # `BlockNumberOrTag` for the `atBlock` query option.
 alloy-eips.workspace = true
 serde_json.workspace = true
-# Query cursors are opaque and bound to their query — base64 of an id plus a
-# binding hash, per the `b64:` form in the spec.
+# Cursors are base64 of an id plus a binding hash — the spec's `b64:` form.
 base64 = "0.22"
-# Store reads hit MDBX, so they run on `spawn_blocking` rather than the async
-# runtime the RPC server drives.
+# Store reads hit MDBX, so they run on `spawn_blocking`.
 tokio.workspace = true
 eyre.workspace = true

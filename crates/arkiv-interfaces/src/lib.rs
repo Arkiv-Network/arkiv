@@ -52,12 +52,8 @@
 //! Finally, [`ArkivRpc`] is the `arkiv_*` surface a node serves to clients (with
 //! [`ArkivHistoricalRpc`] for nodes that answer against past blocks).
 //!
-//! ## Constants
-//!
-//! [`constants`] holds the numbers more than one crate has to agree on — the byte
-//! widths the encodings are built on, the protocol limits the ABI encoder and the
-//! engine both enforce, and [`ARKIV_ADDRESS`]. A value
-//! only one crate reads stays in that crate.
+//! [`constants`] holds the numbers more than one crate has to agree on: the byte
+//! widths, the protocol limits, and [`ARKIV_ADDRESS`].
 
 #![no_std]
 #![forbid(unsafe_code)]
