@@ -8,14 +8,9 @@
 //! [`Query`](arkiv_interfaces::query::Query) and it returns the keys of the
 //! entities that match.
 //!
-//! ## Host-specific by design
-//!
-//! Per the Arkiv/host boundary (see the `arkiv-interfaces` crate docs), the spec
-//! only says "there is a committed query index that answers the query language".
-//! *How* that index is physically realized — bitmaps of entity ids stored at
-//! keccak-derived account addresses, ordered values in storage-slot B+ trees — is
-//! reth's concern. This crate is one concrete answer to that on reth, ported from
-//! the proven `arkiv-db-engine` reference.
+//! Host-specific by design: the spec says only "there is a committed query index",
+//! and *how* it is realized is reth's concern. Ported from the `arkiv-db-engine`
+//! reference.
 //!
 //! ## The index, in two tiers
 //!
@@ -27,8 +22,8 @@
 //! - **Tier 2 — range.** For range-queried keys (`$expiration`, `$createdAtBlock`,
 //!   uint/string attributes) an ordered structure over the *values* lets `Gt`/`Lt`
 //!   scans enumerate the matching values, each of which resolves back to its tier-1
-//!   bitmap. The int-mode half — values ≤ 32 bytes, backed by a storage-slot
-//!   [`btree`] — is [`range`]; the string cascade for longer values lands next.
+//!   bitmap. Values ≤ 32 bytes go through [`range`], backed by a storage-slot
+//!   [`btree`]; longer strings go through the [`cascade`].
 //!
 //! ## Consensus
 //!

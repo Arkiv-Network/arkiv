@@ -23,19 +23,21 @@
 
 use alloc::string::String;
 
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
 use arkiv_interfaces::entity::{AttributeValue, DECIMAL_SCALE};
 use arkiv_interfaces::primitives::Address;
 
 use crate::error::{ParseError, literal_err};
 use crate::lexer::{TypeTag, scan_single_quoted};
 
-/// The longest `str` value the language accepts, in bytes. Matches the width the
-/// ABI and the index's string cascade carry.
-pub const MAX_STR_BYTES: usize = 128;
+/// The longest `str` value the language accepts, in bytes. The same protocol
+/// limit the ABI encoder and the engine enforce, so a literal this parser accepts
+/// is one an operation could have carried.
+pub use arkiv_interfaces::constants::MAX_STR_BYTES;
 
-/// Hex characters in an address and in a 32-byte value.
-const ADDRESS_HEX_LEN: usize = 40;
-const WORD_HEX_LEN: usize = 64;
+/// Hex characters in an address and in a 32-byte value — two per byte.
+const ADDRESS_HEX_LEN: usize = 2 * ETH_ADDRESS_LEN;
+const WORD_HEX_LEN: usize = 2 * WORD_LEN;
 
 /// Validate a typed literal's raw body against its tag.
 pub(crate) fn parse_tagged(

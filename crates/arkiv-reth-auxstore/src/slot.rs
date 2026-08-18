@@ -5,7 +5,7 @@
 //! storage words this way, so the encoders live here rather than in either.
 
 use alloy_primitives::B256;
-use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::constants::WORD_LEN;
 
 const _: () = assert!(size_of::<B256>() == WORD_LEN, "a storage word is a B256");
 

@@ -9,34 +9,19 @@ license.workspace = true
 name = "arkiv-reth"
 path = "src/main.rs"
 
+# The assembly point and nothing else: reth's host plus the two things Arkiv
+# replaces. Anything more than wiring belongs in one of the crates below.
+
 [dependencies]
 reth.workspace = true
 # Only for the `#[global_allocator]` declaration in main.rs.
 reth-cli-util.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-ethereum.workspace = true
-reth-storage-api.workspace = true
+# The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
-# The entity store + spec types the arkiv_getEntity read path reads through.
-arkiv-reth-entitystore.workspace = true
-# The query index (arkiv_query evaluates against it) + the query-language parser.
-arkiv-reth-auxstore.workspace = true
-arkiv-query.workspace = true
-arkiv-interfaces.workspace = true
-jsonrpsee.workspace = true
-alloy-primitives.workspace = true
-# The `BlockHeader` trait (timestamp/number) for arkiv_getBlockTiming.
-alloy-consensus.workspace = true
-# `BlockNumberOrTag` for the `atBlock` query option.
-alloy-eips.workspace = true
-serde.workspace = true
-# Attribute values are rendered per type (number, bool, string, hex), so the wire
-# value is a JSON value rather than a formatted string.
-serde_json.workspace = true
-# Query cursors are opaque and bound to their query — base64 of an id plus a
-# binding hash, per the `b64:` form in the spec.
-base64 = "0.22"
-tokio.workspace = true
+# The arkiv_* namespace merged into reth's rpc modules.
+arkiv-reth-rpc.workspace = true
 eyre.workspace = true
 clap.workspace = true
 tracing.workspace = true

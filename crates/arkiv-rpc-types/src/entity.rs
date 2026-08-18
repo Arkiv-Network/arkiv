@@ -9,8 +9,9 @@
 //! *projected field*; the rest are absent, and `serde` skips them, so a caller
 //! can tell "I did not ask for this" from "this has no value".
 //!
-//! Pure data mapping — no reth types, no JSON-RPC plumbing. The RPC layer calls
-//! [`entity_data_from`] once per matched entity.
+//! Pure data mapping — no reth types, no JSON-RPC plumbing. The server calls
+//! [`entity_data_from`] once per matched entity; a client deserializes the same
+//! [`EntityData`] straight back.
 //!
 //! Two rules from the spec drive everything here:
 //!
@@ -238,41 +239,51 @@ pub struct AttributeEntry {
     pub value: serde_json::Value,
 }
 
-/// One entity in an `arkiv_query` response. Every field is omitted unless the
-/// caller selected it.
-#[derive(Debug, Clone, Serialize, Default)]
+/// One entity in an `arkiv_query` or `arkiv_getEntity` response. Every field is
+/// omitted unless the caller selected it.
+///
+/// `Deserialize` as well as `Serialize`: a client reads the same type the node
+/// wrote, and an absent field arrives as `None` — which is how "I did not ask for
+/// this" stays distinguishable from "this has no value".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EntityData {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<B256>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<Address>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator: Option<Address>,
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "ser_opt_u64_hex"
+        serialize_with = "ser_opt_u64_hex",
+        deserialize_with = "de_u64_flexible"
     )]
     pub created_at: Option<u64>,
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "ser_opt_u64_hex"
+        serialize_with = "ser_opt_u64_hex",
+        deserialize_with = "de_u64_flexible"
     )]
     pub updated_at: Option<u64>,
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "ser_opt_u64_hex"
+        serialize_with = "ser_opt_u64_hex",
+        deserialize_with = "de_u64_flexible"
     )]
     pub expires_at: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_flags: Option<CreationFlags>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Bytes>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribute_schema: Option<Vec<SchemaEntry>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<Vec<AttributeEntry>>,
 }
 

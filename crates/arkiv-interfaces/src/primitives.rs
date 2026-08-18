@@ -4,10 +4,13 @@
 //! boundary, e.g. `let addr: Address = alloy_addr.into_array();` (and back with
 //! `Address::from`).
 
-/// A 20-byte address — an entity's owner or creator, or a transaction's caller.
+/// An **Ethereum account** address — an entity's owner or creator, or a
+/// transaction's caller: accounts that hold a key and sign. A location Arkiv
+/// *derives* is [`tyalias@Hash`]-wide instead; see
+/// [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN).
 pub type Address = [u8; 20];
 
-/// A 32-byte hash — a commitment root, or the shape of an entity key.
+/// A 32-byte hash — a commitment root, an entity key, or a derived location.
 pub type Hash = [u8; 32];
 
 /// An entity's unique, stable identifier.

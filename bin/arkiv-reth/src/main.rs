@@ -6,9 +6,10 @@
 //! 1. **The executor** — replaced by [`arkiv_reth_executor::ArkivExecutorBuilder`],
 //!    the no-EVM entity state transition (a call to `ARKIV_ADDRESS` creates,
 //!    updates, transfers, and expires entities).
-//! 2. **The `arkiv_*` RPC** — the read surface the SDK depends on, injected via
-//!    `extend_rpc_modules` (see [`rpc`]): `arkiv_getEntity`, `arkiv_query`,
-//!    `arkiv_getEntityCount`, `arkiv_getBlockTiming`.
+//! 2. **The `arkiv_*` RPC** — the read surface the SDK depends on, built by
+//!    [`arkiv_reth_rpc::arkiv_module`] and injected via `extend_rpc_modules`:
+//!    `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`,
+//!    `arkiv_getBlockTiming`.
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
@@ -22,12 +23,6 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 // Pulls jemalloc-sys into the link so the allocator override actually takes.
 #[cfg(unix)]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
-
-mod cursor;
-mod errors;
-mod rpc;
-mod snapshot;
-mod view;
 
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use clap::Parser;
@@ -53,7 +48,7 @@ fn main() {
             .with_add_ons(EthereumAddOns::default())
             // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
             .extend_rpc_modules(|ctx| {
-                let module = rpc::arkiv_module(ctx.provider().clone())?;
+                let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone())?;
                 ctx.modules.merge_configured(module)?;
                 info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                 Ok(())

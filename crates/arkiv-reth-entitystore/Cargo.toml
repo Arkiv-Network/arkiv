@@ -16,7 +16,6 @@ license.workspace = true
 # Arkiv spec's.
 
 [dependencies]
-arkiv-constants.workspace = true
 arkiv-interfaces.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp = { workspace = true, features = ["derive"] }

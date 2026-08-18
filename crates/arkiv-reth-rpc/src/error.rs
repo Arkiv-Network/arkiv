@@ -1,30 +1,12 @@
-//! The `arkiv_*` JSON-RPC error taxonomy.
-//!
-//! The codes are part of the frozen client surface: an SDK branches on the code,
-//! not on the message. Each error also carries a machine-readable `data` object,
-//! so a client can point at the offending character without scraping prose.
-//!
-//! | code | meaning |
-//! |---|---|
-//! | −32001 | parse error — malformed query text |
-//! | −32002 | type error — a predicate that cannot be typed |
-//! | −32003 | literal validation — a value that doesn't fit its tag |
-//! | −32004 | limits exceeded — query too long, too many predicates, too deep |
-//! | −32005 | cursor error — malformed, or bound to a different request |
-//! | −32006 | block unavailable — outside the node's retained range |
-//!
-//! The parse-side codes come straight from
-//! [`ParseErrorKind`](arkiv_query::ParseErrorKind), so the language and the wire
-//! cannot drift: a new failure class in the parser has to pick a code there.
+//! Failures, as jsonrpsee error objects. The codes and their meanings live in
+//! [`arkiv_rpc_types::error`]; this is the server half that builds the wire object
+//! and its machine-readable `data`.
 
 use arkiv_query::ParseError;
 use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 
-/// A cursor that is malformed or bound to a different request.
-pub const CURSOR_ERROR_CODE: i32 = -32005;
-/// An `atBlock` outside the node's retained range.
-pub const BLOCK_UNAVAILABLE_CODE: i32 = -32006;
+pub use arkiv_rpc_types::error::{BLOCK_UNAVAILABLE_CODE, CURSOR_ERROR_CODE};
 
 /// Turn a query-language failure into its RPC error, preserving the position.
 pub fn query_error(error: &ParseError) -> ErrorObjectOwned {

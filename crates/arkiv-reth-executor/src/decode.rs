@@ -47,7 +47,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotat
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
 use arkiv_interfaces::primitives::{BlockNumber, EntityKey, EntityNonce};
 
-use arkiv_constants::{ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
 
 use crate::ARKIV_ADDRESS;
 
@@ -199,7 +199,7 @@ pub fn derive_entity_key(
 ) -> EntityKey {
     // chain_id ‖ ARKIV_ADDRESS ‖ owner ‖ nonce ‖ salt
     let mut buf = Vec::with_capacity(
-        WORD_LEN + ADDRESS_LEN + ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
+        WORD_LEN + ETH_ADDRESS_LEN + ETH_ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
     );
     buf.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
     buf.extend_from_slice(ARKIV_ADDRESS.as_slice());

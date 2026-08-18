@@ -1,0 +1,32 @@
+[package]
+name = "arkiv-reth-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The `arkiv_*` namespace, served over a reth state snapshot. The read-path half
+# of what arkiv-reth-executor is for writes; the binary just merges the module.
+
+[dependencies]
+# The wire contract this crate implements.
+arkiv-rpc-types.workspace = true
+# The two stores a read goes through, plus the query-language parser.
+arkiv-reth-entitystore.workspace = true
+arkiv-reth-auxstore.workspace = true
+arkiv-query.workspace = true
+arkiv-interfaces.workspace = true
+# The `StateProvider` snapshot each call is served from.
+reth-storage-api.workspace = true
+jsonrpsee.workspace = true
+alloy-primitives.workspace = true
+# The `BlockHeader` trait (timestamp/number) for arkiv_getBlockTiming.
+alloy-consensus.workspace = true
+# `BlockNumberOrTag` for the `atBlock` query option.
+alloy-eips.workspace = true
+serde_json.workspace = true
+# Cursors are base64 of an id plus a binding hash — the spec's `b64:` form.
+base64 = "0.22"
+# Store reads hit MDBX, so they run on `spawn_blocking`.
+tokio.workspace = true
+eyre.workspace = true

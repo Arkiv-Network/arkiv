@@ -51,6 +51,9 @@
 //!
 //! Finally, [`ArkivRpc`] is the `arkiv_*` surface a node serves to clients (with
 //! [`ArkivHistoricalRpc`] for nodes that answer against past blocks).
+//!
+//! [`constants`] holds the numbers more than one crate has to agree on: the byte
+//! widths, the protocol limits, and [`ARKIV_ADDRESS`].
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -58,6 +61,7 @@
 extern crate alloc;
 
 pub mod codec;
+pub mod constants;
 pub mod entity;
 pub mod execution;
 pub mod gas;
@@ -67,6 +71,7 @@ pub mod rpc;
 pub mod state;
 
 pub use codec::*;
+pub use constants::*;
 pub use entity::*;
 pub use execution::*;
 pub use gas::*;

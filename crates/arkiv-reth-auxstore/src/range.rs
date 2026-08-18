@@ -19,7 +19,7 @@
 //! later module).
 
 use alloy_primitives::B256;
-use arkiv_constants::WORD_LEN;
+use arkiv_interfaces::constants::WORD_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::address::btree_header_address;

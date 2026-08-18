@@ -140,10 +140,11 @@ pub use arkiv_interfaces::entity::CreationFlags;
 /// they live in the spec crate and are re-exported here rather than mirrored.
 pub use arkiv_interfaces::entity::{AttributeType, AttributeValue, DECIMAL_SCALE};
 
-/// Maximum number of attributes per entity operation (mirrors Entity.sol's
-/// internal `MAX_ATTRIBUTES`). The contract reverts `TooManyAttributes` past
-/// this count; SDKs can validate locally before sending a transaction.
-pub const MAX_ATTRIBUTES: usize = 32;
+/// Maximum number of attributes per entity operation. The engine rejects an
+/// operation past this count with `TooManyAttributes`; SDKs can validate locally
+/// before sending a transaction. A protocol limit, so it lives in the spec crate
+/// and is re-exported here rather than mirrored.
+pub use arkiv_interfaces::constants::MAX_ATTRIBUTES;
 
 /// Human-readable label for an operation tag, mirroring the `OP_*` constants.
 /// Returns `"UNKNOWN"` for any unrecognised discriminator.
@@ -182,18 +183,11 @@ mod tests {
 
     /// Wire constants shared with the SDK — they must never drift silently.
     ///
-    /// A selector is `keccak256(canonicalSignature)[..4]`, and a struct
-    /// parameter contributes its *flattened tuple*, so **reordering or
-    /// retyping any field of [`Operation`] changes these**. That is the drift
-    /// this test exists to catch. Recomputed independently rather than copied
-    /// from the code:
-    ///
-    /// The check is genuinely independent: the right-hand sides above were
-    /// computed by `cast` from the Solidity signature, while the left-hand
-    /// sides are what `alloy` derives from the `sol!` block. Nothing in this
-    /// file feeds both, so a field reordering — which changes the flattened
-    /// tuple and therefore the selector — fails here rather than silently
-    /// forking the wire.
+    /// A selector is `keccak256(canonicalSignature)[..4]` and a struct parameter
+    /// contributes its *flattened tuple*, so reordering or retyping any field of
+    /// [`Operation`] changes these. The check is independent: the constants above
+    /// came from `cast`, the values here from what `alloy` derives from the `sol!`
+    /// block, and nothing in this file feeds both.
     #[test]
     fn selectors_are_pinned() {
         assert_eq!(IEntityRegistry::executeCall::SELECTOR, EXECUTE_SELECTOR);
