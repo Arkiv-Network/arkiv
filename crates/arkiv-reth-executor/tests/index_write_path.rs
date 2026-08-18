@@ -2,10 +2,10 @@
 //! feed the `draft.auxiliary` it stages into a real [`RethAuxStore`], and query the
 //! entities back by their attributes.
 //!
-//! This is the join between module 5 (the executor building the index delta) and
-//! module 4 (the auxiliary store applying it and answering queries). The executor's
-//! delta and the store's encoding must agree exactly for a query to find anything,
-//! so proving a create/transfer round-trips through both is the real test.
+//! This is the join between the executor (building the index delta) and the
+//! auxiliary store (applying it and answering queries). The executor's delta and
+//! the store's encoding must agree exactly for a query to find anything, so
+//! proving a create/transfer round-trips through both is the real test.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -52,8 +52,8 @@ impl EntityStore for MemEntities {
     }
 }
 
-/// A combined code + storage backend — the shape the reth bridge will have — for
-/// the [`RethAuxStore`].
+/// A combined code + storage backend — the shape the reth bridge has — for the
+/// [`RethAuxStore`].
 #[derive(Default)]
 struct MemIndex {
     code: HashMap<Address, Vec<u8>>,

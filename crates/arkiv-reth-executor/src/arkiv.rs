@@ -649,7 +649,7 @@ mod tests {
     }
 
     /// Comfortably more gas than any op in these tests costs, so the state-logic
-    /// tests never trip the (now non-zero) [`PlaceholderCost`] out-of-gas path.
+    /// tests never trip the [`PlaceholderCost`] out-of-gas path.
     const AMPLE_GAS: u64 = 100_000_000;
 
     /// A minimal [`ExecEnv`] for a given caller and block, with ample gas so the

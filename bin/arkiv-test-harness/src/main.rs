@@ -1,8 +1,7 @@
 //! Black-box test harness driver (skeleton).
 //!
-//! For now this only resolves the target topology and prints it, so the wiring
-//! is verifiable end-to-end before any real orchestration exists. Container
-//! lifecycle management and the EL/CL keep-up assertions land in a later leg.
+//! Resolves the target topology and prints it, so the wiring is verifiable
+//! before any real orchestration exists.
 
 use arkiv_harness::{HarnessConfig, VERSION};
 

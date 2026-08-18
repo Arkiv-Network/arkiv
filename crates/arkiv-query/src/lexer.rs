@@ -5,7 +5,7 @@
 //! - keywords, case-insensitive: `AND` `OR` `NOT` `TRUE` `FALSE` `STARTSWITH`
 //!   `EXISTS` `TYPEOF`. The last two are **reserved but unimplemented** — they
 //!   lex so the parser can reject them by name instead of mistaking them for an
-//!   attribute (see `docs/v1-typed-query-scope.md`).
+//!   attribute.
 //! - typed literals: a [`TypeTag`] immediately followed by `(`, whose body is
 //!   captured **raw** and validated later by [`literal`](crate::literal). Keeping
 //!   the body raw is what lets one lexer handle bodies as different as `-5`,
