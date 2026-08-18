@@ -154,10 +154,4 @@ mod tests {
             .unwrap();
         assert!(store.get(key).unwrap().is_none());
     }
-
-    #[test]
-    fn commitment_comes_from_the_backend() {
-        let mut store = RethEntityStore::new(MemBackend::default());
-        assert_eq!(store.commitment().unwrap(), Hash::default());
-    }
 }

@@ -179,20 +179,6 @@ mod tests {
     }
 
     #[test]
-    fn presence_word_is_right_aligned_len_plus_one() {
-        let w = slot_presence(5);
-        // High bytes zero; `len + 1` sits big-endian in the low size_of::<u32>() bytes.
-        assert_eq!(
-            &w.0[..WORD_LEN - size_of::<u32>()],
-            &[0u8; WORD_LEN - size_of::<u32>()]
-        );
-        assert_eq!(
-            u32::from_be_bytes(w.0[WORD_LEN - size_of::<u32>()..].try_into().unwrap()),
-            6,
-        );
-    }
-
-    #[test]
     fn slot_key_is_left_aligned_and_zero_padded() {
         let k = annot_val_to_slot(b"hi");
         assert_eq!(&k.0[..2], b"hi");

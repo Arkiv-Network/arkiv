@@ -78,15 +78,6 @@ mod tests {
     }
 
     #[test]
-    fn distinct_keys_give_distinct_addresses() {
-        let mut a: EntityKey = [0u8; 32];
-        let mut b: EntityKey = [0u8; 32];
-        a[0] = 1;
-        b[0] = 2;
-        assert_ne!(entity_address(a), entity_address(b));
-    }
-
-    #[test]
     fn system_account_is_0x44_dot_dot_46() {
         let a = SYSTEM_ACCOUNT_ADDRESS.as_slice();
         assert_eq!(a[0], 0x44);

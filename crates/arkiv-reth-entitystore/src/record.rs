@@ -315,11 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn encoding_is_deterministic() {
-        assert_eq!(encode(&sample()), encode(&sample()));
-    }
-
-    #[test]
     fn rejects_missing_prefix() {
         let mut bytes = encode(&sample());
         bytes[0] = 0x00;

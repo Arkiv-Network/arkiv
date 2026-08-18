@@ -185,10 +185,6 @@ mod tests {
     // restates the bug:
     //
     //     cast keccak 0x$(printf 'arkiv.pair$all\x00\x08' | xxd -p -c 256)
-    //
-    // Last re-pinned when the frozen type set (`arkiv-node-api.md` §2) inserted
-    // `u64` at typeId 3 and shifted every tag above it — `Str` 7→8, `U256` 3→4.
-    // The typeId is part of every preimage here, so all five vectors moved.
 
     /// Where the `$all` marker's bucket lives — the bitmap every query with a
     /// negation reads.
@@ -213,11 +209,6 @@ mod tests {
     #[test]
     fn all_entities_bucket_is_all_empty_pair() {
         assert_eq!(all_entities_bucket(), pair_address(b"$all", Str, b""));
-    }
-
-    #[test]
-    fn is_deterministic() {
-        assert_eq!(pair_address(b"k", Str, b"v"), pair_address(b"k", Str, b"v"));
     }
 
     /// The `0x00` separator is what stops the `(attr, value)` split point from

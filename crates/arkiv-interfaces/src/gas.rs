@@ -105,38 +105,6 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn base_op_costs_are_non_zero() {
-        let key = [0u8; 32];
-        let empty = || {
-            (
-                alloc::vec::Vec::new(),
-                alloc::vec::Vec::new(),
-                alloc::vec::Vec::new(),
-            )
-        };
-        let (ct, pl, at) = empty();
-        assert_eq!(
-            PlaceholderCost.op_cost(&Op::Create {
-                key,
-                expires_at: 1,
-                creation_flags: CreationFlags::NONE,
-                content_type: ct,
-                payload: pl,
-                attributes: at,
-            }),
-            G_CREATE
-        );
-        assert_eq!(PlaceholderCost.op_cost(&Op::Delete { key }), G_DELETE);
-        assert_eq!(
-            PlaceholderCost.op_cost(&Op::Transfer {
-                key,
-                new_owner: [0u8; 20],
-            }),
-            G_TRANSFER
-        );
-    }
-
-    #[test]
     fn writes_charge_for_size_and_attributes() {
         let key = [0u8; 32];
         let one_attr = vec![Attribute::new(

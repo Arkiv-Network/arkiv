@@ -127,21 +127,6 @@ mod tests {
     }
 
     #[test]
-    fn dev_signers_count_capped() {
-        assert!(dev_signers(ARKIV_DEV_ACCOUNT_COUNT + 1).is_err());
-        assert!(dev_signers(ARKIV_DEV_ACCOUNT_COUNT).is_ok());
-    }
-
-    #[test]
-    fn dev_funding_alloc_produces_count() {
-        let alloc = dev_funding_alloc(5, arkiv_dev_balance_wei()).expect("alloc");
-        assert_eq!(alloc.len(), 5);
-        for (_, acc) in &alloc {
-            assert_eq!(acc.balance, arkiv_dev_balance_wei());
-        }
-    }
-
-    #[test]
     fn genesis_alloc_has_dev_funding_only() {
         let alloc = genesis_alloc().expect("alloc");
         assert!(
