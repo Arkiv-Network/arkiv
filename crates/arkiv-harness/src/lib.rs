@@ -7,10 +7,7 @@
 //!
 //! Protocol constants a client needs ([`ARKIV_ADDRESS`], [`derive_entity_key`])
 //! and the `--dev` test identities are re-exported here so a test imports from one
-//! place. [`HarnessConfig`] remains the topology descriptor for the (future)
-//! multi-node network runner.
-
-use std::path::PathBuf;
+//! place.
 
 mod client;
 mod node;
@@ -33,33 +30,3 @@ pub const DEV_KEY_0: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae7
 
 /// Test-mnemonic account #1 — also pre-funded by `--dev`; a handy non-owner.
 pub const DEV_KEY_1: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-
-/// Endpoints the harness uses to reach a running execution + consensus pair.
-#[derive(Debug, Clone)]
-pub struct HarnessConfig {
-    /// Execution-layer JSON-RPC (`eth_*`) endpoint.
-    pub el_rpc_url: String,
-    /// Authenticated Engine API endpoint (CL <-> EL).
-    pub el_engine_url: String,
-    /// Consensus-layer beacon HTTP API endpoint.
-    pub cl_beacon_url: String,
-    /// Shared JWT secret used to authenticate the Engine API.
-    pub jwt_path: PathBuf,
-}
-
-impl Default for HarnessConfig {
-    /// Defaults match the deterministic host ports Kurtosis publishes for the
-    /// Arkiv chain via ethereum-package `port_publisher` (EL base 32000, CL
-    /// base 33000). No discovery — these are fixed by config, not allocated at
-    /// random.
-    fn default() -> Self {
-        Self {
-            // EL block (base 32000): rpc=+3, engine-rpc=+1.
-            el_rpc_url: "http://127.0.0.1:32003".to_string(),
-            el_engine_url: "http://127.0.0.1:32001".to_string(),
-            // CL block (base 33000): beacon http=+1.
-            cl_beacon_url: "http://127.0.0.1:33001".to_string(),
-            jwt_path: PathBuf::from("jwt.hex"),
-        }
-    }
-}
