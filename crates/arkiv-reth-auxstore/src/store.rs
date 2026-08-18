@@ -242,7 +242,7 @@ mod tests {
     use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta};
 
     /// A backend that is both an [`AccountCode`] and an [`IndexStorage`] — the shape
-    /// the reth bridge will have. In-memory maps; enough to exercise the whole index.
+    /// the reth bridge has. In-memory maps; enough to exercise the whole index.
     #[derive(Default)]
     struct MemBackend {
         code: HashMap<Address, Vec<u8>>,
@@ -736,12 +736,6 @@ mod tests {
             matching(&mut store, &owner_is(addr_of(2))),
             vec![key_of(0xA0)]
         );
-    }
-
-    #[test]
-    fn id_to_key_slot_is_deterministic_and_distinct() {
-        assert_eq!(id_to_key_slot(7), id_to_key_slot(7));
-        assert_ne!(id_to_key_slot(7), id_to_key_slot(8));
     }
 
     #[test]

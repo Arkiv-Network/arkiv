@@ -45,8 +45,7 @@
 //! three need a per-`(attribute, type)` presence index the host does not
 //! maintain, and answering them from what exists would silently return the wider
 //! `NOT` complement instead. They parse to a directive error naming the
-//! alternative; `NOT (attr = value)` gives the complement explicitly. The
-//! reasoning is written up in `docs/v1-typed-query-scope.md`.
+//! alternative; `NOT (attr = value)` gives the complement explicitly.
 //!
 //! ```
 //! use arkiv_query::parse;

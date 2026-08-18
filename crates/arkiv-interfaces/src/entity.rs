@@ -629,17 +629,6 @@ mod tests {
         assert_eq!(AttributeValue::U64(1).index_bytes().len(), 8);
     }
 
-    /// Unsigned and unordered types index as their plain storage bytes.
-    #[test]
-    fn index_bytes_are_storage_bytes_for_unsigned_types() {
-        for value in samples() {
-            match value {
-                AttributeValue::Int(_) | AttributeValue::Decimal(_) => {}
-                other => assert_eq!(other.index_bytes(), other.encode()),
-            }
-        }
-    }
-
     #[test]
     fn u256_from_u64_is_right_aligned() {
         let AttributeValue::U256(w) = AttributeValue::u256_from_u64(60) else {

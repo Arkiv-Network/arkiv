@@ -2,10 +2,10 @@
 //! surface, and this crate is its source of truth.
 //!
 //! The shape here is the **frozen client surface** specified in
-//! `arkiv-architecture`, `planning/260713-followup/arkiv-node-api.md` §3. The
-//! `arkiv-contracts` `IEntityRegistry.sol` this was originally vendored from
-//! is retired — the node answers calls to `ARKIV_ADDRESS` directly — so the
-//! spec document, not a compiled artifact, is what these types track.
+//! `arkiv-node-api.md` §3. The `arkiv-contracts` `IEntityRegistry.sol` this was
+//! originally vendored from is retired — the node answers calls to
+//! `ARKIV_ADDRESS` directly — so the spec document, not a compiled artifact, is
+//! what these types track.
 //!
 //! Two shapes carry the whole write path:
 //!

@@ -21,8 +21,7 @@ use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, Histor
 /// There is deliberately **no `!=` variant**. Value-negation restricted to
 /// "attribute is set with this type, and differs" needs a per-`(attribute, type)`
 /// presence index the host does not maintain, so the language omits the operator
-/// rather than silently answering the wider [`Not`](Self::Not) complement. See
-/// `docs/v1-typed-query-scope.md`.
+/// rather than silently answering the wider [`Not`](Self::Not) complement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     /// Matches every live entity (`*`).

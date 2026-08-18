@@ -32,20 +32,6 @@
 //! are therefore **consensus-critical**: a change to either changes the state root,
 //! so they are locked with golden test vectors and must never drift silently.
 //!
-//! The primitives: [`bitmap`] — the roaring64 entity-id set; [`address`] — the
-//! keccak-derived index bucket addresses; [`storage`] — the [`IndexStorage`] seam
-//! the tier-2 index writes through; [`btree`] — the int-mode B+ tree over that seam;
-//! [`range`] — the caller-facing int range index (encode a value, scan a bound); and
-//! [`cascade`] — the str-mode counterpart, a chunk-by-chunk cascade for string
-//! values up to 128 bytes.
-//!
-//! And the store that combines them into an [`AuxiliaryStore`]: [`annotation`] —
-//! which physical index a `(attr, value)` pair uses, shared by both paths;
-//! [`index`] — the write path folding a delta into the bitmaps and tier-2
-//! structures; [`interpret`] — the read path walking a [`Query`] to a bitmap of ids;
-//! and [`store`] — [`RethAuxStore`], the [`AuxiliaryStore`] impl that owns the
-//! id→key map and pages query results.
-//!
 //! [`Bitmap`]: bitmap::Bitmap
 //! [`pair_address`]: address::pair_address
 //! [`IndexStorage`]: storage::IndexStorage

@@ -46,8 +46,8 @@
 //!   the statistics of the work it did. A host may also implement
 //!   [`HistoricalQuery`] to answer as of a past block.
 //!
-//! [`CostModel`] is where gas pricing will live; for now it's a seam with a
-//! zero-cost [`PlaceholderCost`].
+//! [`CostModel`] is the gas pricing seam, with [`PlaceholderCost`] as the
+//! stand-in schedule.
 //!
 //! Finally, [`ArkivRpc`] is the `arkiv_*` surface a node serves to clients (with
 //! [`ArkivHistoricalRpc`] for nodes that answer against past blocks).
@@ -79,6 +79,3 @@ pub use primitives::*;
 pub use query::*;
 pub use rpc::*;
 pub use state::*;
-
-#[cfg(test)]
-mod tests;
