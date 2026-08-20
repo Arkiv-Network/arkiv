@@ -1,9 +1,9 @@
-//! The reth-host implementation of the Arkiv **auxiliary store** — the query
-//! index over the entities.
+//! The index lane: the reth-host **auxiliary store** — the query index over
+//! the entities.
 //!
-//! Sibling to `arkiv-reth-entitystore`. Where that crate implements
+//! Where [`entities`](crate::entities) implements
 //! [`EntityStore`](arkiv_interfaces::state::EntityStore) — the entities
-//! themselves — this crate implements
+//! themselves — this module implements
 //! [`AuxiliaryStore`](arkiv_interfaces::state::AuxiliaryStore): give it a
 //! [`Query`](arkiv_interfaces::query::Query) and it returns the keys of the
 //! entities that match.
@@ -12,18 +12,23 @@
 //! and *how* it is realized is reth's concern. Ported from the `arkiv-db-engine`
 //! reference.
 //!
-//! ## The index, in two tiers
+//! ## Two indexes inside
 //!
-//! - **Tier 1 — equality.** Every `(attribute, value)` pair maps to a *pair
+//! Internally the store is the composition of two sub-indexes (the private
+//! `EqualityIndex` and `RangeIndex` types):
+//!
+//! - **The equality index.** Every `(attribute, value)` pair maps to a *pair
 //!   account* at [`pair_address`](address::pair_address), whose contents are a
 //!   [`Bitmap`](bitmap::Bitmap) of the entity ids carrying that pair. Equality
 //!   (`Eq`/`In`) and their negations are answered by reading and combining these
 //!   bitmaps. This is the whole index for keys whose values aren't range-queried.
-//! - **Tier 2 — range.** For range-queried keys (`$expiration`, `$createdAtBlock`,
-//!   uint/string attributes) an ordered structure over the *values* lets `Gt`/`Lt`
-//!   scans enumerate the matching values, each of which resolves back to its tier-1
-//!   bitmap. Values ≤ 32 bytes go through [`range`], backed by a storage-slot
-//!   [`btree`]; longer strings go through the [`cascade`].
+//! - **The range index.** For range-queried keys (`$expiration`,
+//!   `$createdAtBlock`, uint/string attributes) an ordered structure over the
+//!   *values* lets `Gt`/`Lt` scans enumerate the matching values, each of which
+//!   resolves back to its equality bitmap. Values ≤ 32 bytes go through
+//!   [`range`], backed by a storage-slot [`btree`]; longer strings go through
+//!   the [`cascade`]. It holds values only, never entity ids, and is touched
+//!   only when a value's equality bitmap crosses the empty boundary.
 //!
 //! ## Consensus
 //!
@@ -47,9 +52,11 @@ pub mod range;
 pub mod storage;
 pub mod store;
 
+mod equality_index;
 mod error;
 mod index;
 mod interpret;
+mod range_index;
 mod slot;
 
 pub use address::{all_entities_bucket, pair_address};

@@ -1,7 +1,7 @@
 //! Shared storage-slot encoding: a `u64` right-aligned in a 32-byte word.
 //!
-//! Both the [`btree`](crate::btree) (node ids, child pointers, slot numbers) and
-//! the string [`cascade`](crate::cascade)'s enumeration lists pack `u64`s into
+//! Both the [`btree`](crate::indices::btree) (node ids, child pointers, slot numbers) and
+//! the string [`cascade`](crate::indices::cascade)'s enumeration lists pack `u64`s into
 //! storage words this way, so the encoders live here rather than in either.
 
 use alloy_primitives::B256;

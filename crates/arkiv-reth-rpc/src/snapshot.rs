@@ -1,6 +1,6 @@
 //! [`SnapshotAccountCode`] — the reth **read-path** bridge.
 //!
-//! The mirror of the executor's write-path `ExecutorState`: it implements both the
+//! The mirror of the write path's `WriteOverlay` (arkiv-reth-statemanager): it implements both the
 //! entity store's [`AccountCode`] seam (entity bytes + tier-1 pair bitmaps live in
 //! account code) and the query index's [`IndexStorage`] seam (tier-2 range
 //! structures + the id maps live in storage slots) over a committed reth state
@@ -9,8 +9,8 @@
 //! only — the write halves (`set_*`) never run here.
 
 use alloy_primitives::{Address, B256};
-use arkiv_reth_auxstore::IndexStorage;
-use arkiv_reth_entitystore::AccountCode;
+use arkiv_reth_mpt_committed_store::AccountCode;
+use arkiv_reth_mpt_committed_store::IndexStorage;
 use reth_storage_api::StateProviderBox;
 
 /// [`AccountCode`] over a read-only reth state snapshot.

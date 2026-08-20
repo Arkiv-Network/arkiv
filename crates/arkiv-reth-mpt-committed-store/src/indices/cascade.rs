@@ -1,15 +1,15 @@
 //! The tier-2 **str-mode** index: a cascade for string values up to 128 bytes.
 //!
-//! The [`btree`](crate::btree) range index keys on a single 32-byte word, so it
+//! The [`btree`](crate::indices::btree) range index keys on a single 32-byte word, so it
 //! can't order values longer than that. The cascade handles the rest by indexing a
 //! value **chunk by chunk**: level 0 stores its first 32-byte chunk, level 1 stores
 //! the second chunk under the account named by the first, and so on
-//! ([`str_level_address`](crate::address::str_level_address)). A range or glob scan
+//! ([`str_level_address`](crate::indices::address::str_level_address)). A range or glob scan
 //! walks the levels depth-first, reconstructing each stored value.
 //!
 //! Each level account is an unordered EVM-storage map, so — as elsewhere in the
 //! index — it carries a companion **enumeration list**
-//! ([`list_address_for`](crate::address::list_address_for)) recording every distinct
+//! ([`list_address_for`](crate::indices::address::list_address_for)) recording every distinct
 //! chunk written to it, which is how the reader knows what's there.
 //!
 //! Encoding is **consensus-critical** and ported verbatim from `arkiv-db-engine`.
@@ -21,10 +21,10 @@ use alloy_primitives::{Address, B256};
 use arkiv_interfaces::constants::WORD_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
-use crate::address::{list_address_for, str_level_address};
-use crate::range::{Bound, slot_presence, slot_to_val_len};
-use crate::slot::{storage_to_u64, u64_to_storage};
-use crate::storage::IndexStorage;
+use crate::indices::address::{list_address_for, str_level_address};
+use crate::indices::range::{Bound, slot_presence, slot_to_val_len};
+use crate::indices::slot::{storage_to_u64, u64_to_storage};
+use crate::indices::storage::IndexStorage;
 
 /// The longest string value the cascade indexes — the protocol's `str` limit,
 /// which the cascade is sized to hold exactly.
@@ -213,7 +213,7 @@ fn list_entries<Storage: IndexStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemStorage;
+    use crate::indices::storage::MemStorage;
 
     const TY: AttributeType = AttributeType::Str;
 

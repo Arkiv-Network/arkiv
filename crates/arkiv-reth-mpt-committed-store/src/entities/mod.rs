@@ -1,13 +1,11 @@
-//! The reth-host implementation of the Arkiv entity store.
-//!
-//! Sibling to `arkiv-reth-executor`. Where the executor implements the
-//! [`arkiv_interfaces`] executor traits, this crate implements
+//! The entity lane: the reth-host
 //! [`EntityStore`](arkiv_interfaces::state::EntityStore) — **the entities
 //! themselves** — against reth's account/slot state model.
 //!
 //! Scope is the entity store *only*. The query index
 //! ([`AuxiliaryStore`](arkiv_interfaces::state::AuxiliaryStore)) is a separate
-//! concern and lives in its own crate; this crate holds no index/auxiliary data.
+//! lane and lives in [`indices`](crate::indices); this module holds no
+//! index/auxiliary data.
 //!
 //! Host-specific by design: *where* an entity physically lives is reth's concern,
 //! not the specification's. Ported from the `arkiv-db-engine` reference.

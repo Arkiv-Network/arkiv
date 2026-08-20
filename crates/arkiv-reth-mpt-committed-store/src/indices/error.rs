@@ -1,12 +1,12 @@
 //! The auxiliary store's error type.
 
-use crate::bitmap::BitmapError;
+use crate::indices::bitmap::BitmapError;
 
 /// Something went wrong reading or writing the index.
 ///
 /// Generic over the backend's own error `E` (an
-/// [`AccountCode`](arkiv_reth_entitystore::AccountCode) or
-/// [`IndexStorage`](crate::storage::IndexStorage) failure), plus the one error the
+/// [`AccountCode`](crate::entities::AccountCode) or
+/// [`IndexStorage`](crate::indices::storage::IndexStorage) failure), plus the one error the
 /// index logic itself can raise: a stored pair bitmap whose bytes won't deserialize.
 #[derive(Debug)]
 pub enum AuxError<E> {

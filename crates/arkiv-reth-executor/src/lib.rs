@@ -52,10 +52,12 @@
 //! This file is the **exact executor** — the reth-specific wiring (the [`Evm`],
 //! [`EvmFactory`] and [`ExecutorBuilder`] reth injects). The **entity business
 //! logic** is not here: it lives in [`arkiv`], written against the host-agnostic
-//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. [`arkiv_transact`]
-//! drives [`arkiv::ArkivExecutor`] over a reth-backed
-//! [`arkiv_interfaces::state::EntityStore`] (`RethEntityStore` → `CodeBackend` →
-//! [`ExecutorState`]) and returns the diff for reth to commit.
+//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. And the
+//! **state machinery** is not here either: all state — entities, the query
+//! index, minting nonces, sender balances and EOA nonces — is reached through
+//! one [`write_manager`] (arkiv-reth-statemanager's `MptStateManager` over its
+//! `WriteOverlay`), so a transaction's every effect lands in a single
+//! `EvmState` diff for reth to commit.
 
 /// Entity business logic, implementing the `arkiv-interfaces` executor interface.
 pub mod arkiv;
@@ -63,12 +65,9 @@ pub mod arkiv;
 pub mod decode;
 /// Revert-payload encoding: `RevertReason` / `DecodeError` → Solidity error data.
 pub mod revert;
-/// The reth write-path bridge: `AccountCode` over the `Database` + `EvmState` diff.
-pub mod state;
 
 pub use arkiv::{ArkivExecutor, OpEffect};
 pub use decode::{DecodeError, decode_ops, derive_entity_key};
-pub use state::ExecutorState;
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
@@ -92,7 +91,7 @@ use reth_ethereum::{
             interpreter::interpreter::EthInterpreter,
             precompile::Precompiles,
             primitives::hardfork::SpecId,
-            state::{Account, EvmState},
+            state::EvmState,
         },
     },
     node::{
@@ -104,9 +103,12 @@ use reth_ethereum::{
 use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op, OpKind};
+use arkiv_interfaces::manager::{
+    AccountBalancesStore, AccountNoncesStore, EntityCreationNoncesStore,
+};
+use arkiv_interfaces::primitives::Balance;
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
-use arkiv_reth_auxstore::RethAuxStore;
-use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
+use arkiv_reth_statemanager::{WriteManager, write_manager};
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
@@ -137,6 +139,45 @@ fn intrinsic_gas(data: &[u8]) -> u64 {
     let initial = 21_000 + 4 * tokens;
     let floor = 21_000 + 10 * tokens;
     initial.max(floor)
+}
+
+/// An alloy `U256` as the spec's [`Balance`] bytes.
+fn as_balance(value: U256) -> Balance {
+    Balance::from_be_bytes(value.to_be_bytes())
+}
+
+/// Map a state-manager fault into the executor's fatal error channel. Faults
+/// here are host/store failures — business-rule reverts never travel this path.
+fn state_fault<T: core::fmt::Debug, DBError>(
+    context: &'static str,
+) -> impl FnOnce(T) -> EVMError<DBError> {
+    move |e| EVMError::Custom(format!("{context}: {e:?}"))
+}
+
+/// Charge `sender` for `gas_cost` (plus `value_out`, for transfers) and bump its
+/// EOA nonce — the sender-side accounting every transaction shape shares.
+fn charge_sender<DB: Database>(
+    mgr: &mut WriteManager<'_, DB>,
+    sender: Address,
+    value_out: U256,
+    gas_cost: U256,
+) -> Result<(), EVMError<DB::Error>> {
+    let sender = sender.into_array();
+    let balance = mgr
+        .get_balance(sender)
+        .map_err(state_fault("sender balance"))?;
+    mgr.set_balance(
+        sender,
+        balance
+            .saturating_sub(as_balance(value_out))
+            .saturating_sub(as_balance(gas_cost)),
+    )
+    .map_err(state_fault("debit sender"))?;
+    let nonce = mgr
+        .get_account_nonce(sender)
+        .map_err(state_fault("sender nonce"))?;
+    mgr.set_account_nonce(sender, nonce.saturating_add(1))
+        .map_err(state_fault("bump sender nonce"))
 }
 
 // ---------------------------------------------------------------------------
@@ -318,33 +359,19 @@ fn arkiv_transact<DB: Database>(
         tx.value
     };
 
-    // Sender: debit value + gas, bump nonce, mark touched.
-    let mut sender = db
-        .basic(tx.caller)
-        .map_err(EVMError::Database)?
-        .unwrap_or_default();
-    sender.balance = sender
-        .balance
-        .saturating_sub(value_out)
-        .saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-
-    let mut state = EvmState::default();
-    state.insert(tx.caller, sender_acc);
-
-    // Recipient: credit value.
+    // Sender debit + nonce bump and recipient credit, through the state manager
+    // — a transfer stages the same way every other state change does.
+    let mut mgr = write_manager(db);
+    charge_sender(&mut mgr, tx.caller, value_out, gas_cost)?;
     if to != tx.caller {
-        let mut recipient = db
-            .basic(to)
-            .map_err(EVMError::Database)?
-            .unwrap_or_default();
-        recipient.balance = recipient.balance.saturating_add(tx.value);
-        let mut recipient_acc = Account::from(recipient);
-        recipient_acc.mark_touch();
-        state.insert(to, recipient_acc);
+        let recipient = to.into_array();
+        let balance = mgr
+            .get_balance(recipient)
+            .map_err(state_fault("recipient balance"))?;
+        mgr.set_balance(recipient, balance.saturating_add(as_balance(tx.value)))
+            .map_err(state_fault("credit recipient"))?;
     }
+    let state = mgr.into_base().into_state();
 
     let result = ExecutionResult::Success {
         reason: SuccessReason::Stop,
@@ -392,37 +419,29 @@ fn arkiv_entity_transact<DB: Database>(
         chain_id: tx.chain_id.unwrap_or(1),
     };
 
-    // Entity phase — borrows `db` until `into_state` releases it.
-    let mut state = ExecutorState::new(db);
-    let start_nonce = state
-        .read_nonce(caller)
-        .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
+    // One state manager for the whole transaction: the entity phase and the
+    // sender phase stage into the same overlay, and one `into_state` at the end
+    // hands reth everything together.
+    let mut mgr = write_manager(db);
+    let start_nonce = mgr
+        .get_entity_nonce(env.caller)
+        .map_err(state_fault("read minting nonce"))?;
     let outcome = match decode_ops(&env, &tx.data, start_nonce) {
-        Ok(ops) => run_ops(state, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
+        Ok(ops) => run_ops(&mut mgr, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
         Err(e) => Outcome {
             gas_used: 0,
             revert: Some(revert::decode_revert_data(&e)),
-            entity_state: state.into_state(),
             logs: Vec::new(),
         },
     };
 
-    // Sender phase — `db` is free again: charge gas, bump the EOA nonce. The
-    // charged/reported figure is floored at the pool's intrinsic minimum so a
-    // cheap batch still estimates to a pool-acceptable gas limit.
+    // Sender phase: charge gas, bump the EOA nonce. The charged/reported figure
+    // is floored at the pool's intrinsic minimum so a cheap batch still
+    // estimates to a pool-acceptable gas limit.
     let gas_used = outcome.gas_used.max(floor);
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
-    let mut sender = db
-        .basic(caller)
-        .map_err(EVMError::Database)?
-        .unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-
-    let mut evm_state = outcome.entity_state;
-    evm_state.insert(caller, sender_acc);
+    charge_sender(&mut mgr, caller, U256::ZERO, gas_cost)?;
+    let evm_state = mgr.into_base().into_state();
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
@@ -459,16 +478,9 @@ fn arkiv_view_call<DB: Database>(
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
-    let mut sender = db
-        .basic(tx.caller)
-        .map_err(EVMError::Database)?
-        .unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-    let mut state = EvmState::default();
-    state.insert(tx.caller, sender_acc);
+    let mut mgr = write_manager(db);
+    charge_sender(&mut mgr, tx.caller, U256::ZERO, gas_cost)?;
+    let state = mgr.into_base().into_state();
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match output {
@@ -497,10 +509,7 @@ fn view_entity<DB: Database>(
     db: &mut DB,
     key: B256,
 ) -> Result<Option<arkiv_interfaces::entity::Entity>, EVMError<DB::Error>> {
-    let mut store = RethEntityStore::new(CodeBackend::new(ExecutorState::new(db)));
-    store
-        .get(key.0)
-        .map_err(|e| EVMError::Custom(format!("read entity: {e:?}")))
+    EntityStore::get(&mut write_manager(db), key.0).map_err(state_fault("read entity"))
 }
 
 /// `entityNonce(owner)`: the owner's entity-key minting nonce, as a `uint64`.
@@ -517,9 +526,9 @@ fn arkiv_entity_nonce_call<DB: Database>(
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
         };
-        let nonce = ExecutorState::new(db)
-            .read_nonce(call.owner)
-            .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
+        let nonce = write_manager(db)
+            .get_entity_nonce(call.owner.into_array())
+            .map_err(state_fault("read minting nonce"))?;
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
             &nonce.get(),
         )))
@@ -610,20 +619,21 @@ fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
 }
 
 /// What running an op batch produced: the gas metered, the ABI-encoded revert
-/// payload if the batch failed a business rule, the entity `EvmState` diff
-/// (empty on revert), and the `EntityOperation` logs to emit (empty on revert).
+/// payload if the batch failed a business rule, and the `EntityOperation` logs
+/// to emit (empty on revert). The state itself needs no field here — it is
+/// staged in the [`WriteManager`] the batch ran over.
 struct Outcome {
     gas_used: u64,
     revert: Option<Bytes>,
-    entity_state: EvmState,
     logs: Vec<Log>,
 }
 
-/// Run a decoded batch over the reth-backed stores. On success it commits the draft
-/// and advances the minting nonce by the number of entities created; on a revert it
+/// Run a decoded batch through the write-path state manager. On success it
+/// applies the draft's two lanes and advances the minting nonce by the number of
+/// entities created — all through `mgr`, into the one overlay; on a revert it
 /// stages nothing.
 fn run_ops<DB: Database>(
-    state: ExecutorState<'_, DB>,
+    mgr: &mut WriteManager<'_, DB>,
     env: &ExecEnv,
     ops: Vec<Op>,
 ) -> Result<Outcome, eyre::Report> {
@@ -631,43 +641,31 @@ fn run_ops<DB: Database>(
         .iter()
         .filter(|o| matches!(o, Op::Create { .. }))
         .count() as u64;
-    let caller = Address::from(env.caller);
 
-    let mut store = RethEntityStore::new(CodeBackend::new(state));
     let mut draft = BlockDraft::default();
     let mut effects = Vec::new();
-    let out = ArkivExecutor::new()
-        .apply_with_effects(env, &mut store, &mut draft, &ops, &mut effects)
+    let out = ArkivExecutor::with_cost(*mgr.cost_model())
+        .apply_with_effects(env, mgr, &mut draft, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
     match out.status {
         ExecStatus::Ok => {
-            store
-                .apply_delta(&draft.entities)
+            EntityStore::apply_delta(mgr, &draft.entities)
                 .map_err(|e| eyre::eyre!("entity apply_delta: {e:?}"))?;
-            let state = store.into_backend().into_inner();
-
-            // Commit the query-index changes over the same state overlay, so the
-            // index accounts land in the one `EvmState` diff alongside the entities.
-            let mut index = RethAuxStore::new(state);
-            index
-                .apply_delta(&draft.auxiliary)
+            AuxiliaryStore::apply_delta(mgr, &draft.auxiliary)
                 .map_err(|e| eyre::eyre!("index apply_delta: {e:?}"))?;
-            let mut state = index.into_backend();
-
-            state.bump_nonce(caller, create_count)?;
+            mgr.advance_entity_nonce(env.caller, create_count)
+                .map_err(|e| eyre::eyre!("advance minting nonce: {e:?}"))?;
             let logs = effects.iter().map(entity_operation_log).collect();
             Ok(Outcome {
                 gas_used: out.gas_used,
                 revert: None,
-                entity_state: state.into_state(),
                 logs,
             })
         }
         ExecStatus::Reverted => Ok(Outcome {
             gas_used: out.gas_used,
             revert: out.revert.as_ref().map(revert::revert_data),
-            entity_state: store.into_backend().into_inner().into_state(),
             logs: Vec::new(),
         }),
     }
@@ -804,8 +802,10 @@ mod tests {
     use alloy_sol_types::SolCall;
     use arkiv_bindings::{IEntityRegistry, Operation};
     use arkiv_interfaces::primitives::EntityNonce;
-    use arkiv_reth_entitystore::decode;
-    use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot};
+    use arkiv_reth_mpt_committed_store::decode;
+    use arkiv_reth_mpt_committed_store::entities::layout::{
+        SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot,
+    };
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
     /// A create with a purely relative lifetime of `min_lifetime` blocks,
@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn entity_create_commits_index_accounts() {
         use arkiv_interfaces::entity::{AttributeType, annotations};
-        use arkiv_reth_auxstore::{Bitmap, all_entities_bucket, pair_address};
+        use arkiv_reth_mpt_committed_store::{Bitmap, all_entities_bucket, pair_address};
 
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);

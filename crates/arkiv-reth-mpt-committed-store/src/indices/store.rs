@@ -1,17 +1,17 @@
 //! [`RethAuxStore`] — the [`AuxiliaryStore`] implementation.
 //!
 //! Sits on a backend that is both an
-//! [`AccountCode`](arkiv_reth_entitystore::AccountCode) (tier-1 pair bitmaps live in
+//! [`AccountCode`](crate::entities::AccountCode) (tier-1 pair bitmaps live in
 //! account code) and an [`IndexStorage`] (tier-2 range structures, and the id→key
 //! map, live in storage slots). The reth adapter fills both over revm state; the
 //! store logic here is agnostic to how.
 //!
 //! Its three jobs:
 //! - [`apply_delta`](RethAuxStore::apply_delta) folds a block's per-entity changes
-//!   into the index (via [`index`](crate::index)), resolving each entity's key to
+//!   into the index (via [`index`](crate::indices::index)), resolving each entity's key to
 //!   its id first.
 //! - [`evaluate`](RethAuxStore::evaluate) runs a query (via
-//!   [`interpret`](crate::interpret)) to a set of ids, pages them newest-first, and
+//!   [`interpret`](crate::indices::interpret)) to a set of ids, pages them newest-first, and
 //!   maps the page back to entity keys.
 //! - [`commitment`](RethAuxStore::commitment) — see the note on the method.
 //!
@@ -32,18 +32,18 @@
 //! left in place. Both maps store `id + 1`, so an unwritten slot (`0`) reads as
 //! "absent" without colliding with the genuine id `0`.
 
+use crate::entities::AccountCode;
+use crate::entities::layout::SYSTEM_ACCOUNT_ADDRESS;
 use alloy_primitives::{B256, keccak256};
 use arkiv_interfaces::primitives::{EntityKey, Hash};
 use arkiv_interfaces::query::{PageParams, Query, QueryMatches, QueryStats};
 use arkiv_interfaces::state::{AuxiliaryStore, BlockAuxiliaryStoreDelta};
-use arkiv_reth_entitystore::AccountCode;
-use arkiv_reth_entitystore::layout::SYSTEM_ACCOUNT_ADDRESS;
 
-use crate::annotation::capabilities_for;
-use crate::error::AuxError;
-use crate::slot::{storage_to_u64, u64_to_storage};
-use crate::storage::IndexStorage;
-use crate::{index, interpret};
+use crate::indices::annotation::capabilities_for;
+use crate::indices::error::AuxError;
+use crate::indices::slot::{storage_to_u64, u64_to_storage};
+use crate::indices::storage::IndexStorage;
+use crate::indices::{index, interpret};
 
 /// [`SYSTEM_ACCOUNT_ADDRESS`] slot holding the next entity id to allocate:
 /// `keccak256("arkiv.entity_count")`. Domain-tagged to stay clear of the entity

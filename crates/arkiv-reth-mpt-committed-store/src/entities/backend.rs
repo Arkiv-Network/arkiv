@@ -10,9 +10,9 @@ use alloy_primitives::Address;
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::primitives::Hash;
 
-use crate::account::AccountCode;
-use crate::record::{self, RecordError};
-use crate::store::EntityBackend;
+use crate::entities::account::AccountCode;
+use crate::entities::record::{self, RecordError};
+use crate::entities::store::EntityBackend;
 
 /// An [`EntityBackend`] that keeps each entity in its account's `code`, over any
 /// [`AccountCode`].
@@ -83,7 +83,7 @@ pub enum CodeBackendError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::RethEntityStore;
+    use crate::entities::store::RethEntityStore;
     use arkiv_interfaces::entity::CreationFlags;
     use arkiv_interfaces::entity::{Attribute, AttributeValue};
     use arkiv_interfaces::primitives::EntityKey;

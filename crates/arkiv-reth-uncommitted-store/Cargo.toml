@@ -1,0 +1,15 @@
+[package]
+name = "arkiv-reth-uncommitted-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The reth-host implementation of Arkiv's UNCOMMITTED state — the node-local
+# stores that carry no commitment and feed no root, sibling to
+# arkiv-reth-mpt-committed-store (the consensus stores). One module per lane;
+# today that is the pruning map, and this crate is the placeholder home for the
+# uncommitted lanes still to come.
+
+[dependencies]
+arkiv-interfaces.workspace = true

@@ -23,7 +23,8 @@ pub const WORD_LEN: usize = 32;
 ///   `creator`, the `addr` type and its EIP-55 checksums, [`ARKIV_ADDRESS`], the
 ///   ABI `address` word.
 /// - A 32-byte Arkiv value truncated to fit reth's account key, dropping 96 bits:
-///   every `arkiv-reth-auxstore` index address, and `entity_address`. Those hold
+///   every index address in `arkiv-reth-mpt-committed-store`, and
+///   `entity_address`. Those hold
 ///   no keys and no signer — they are storage locations that must wear an address
 ///   because reth keys accounts by one.
 pub const ETH_ADDRESS_LEN: usize = 20;

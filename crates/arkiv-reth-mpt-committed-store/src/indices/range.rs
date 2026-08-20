@@ -1,9 +1,9 @@
 //! The int-mode range index: attribute values in sorted order, range-scannable.
 //!
-//! This is the caller-facing layer over the [`btree`](crate::btree). It turns an
+//! This is the caller-facing layer over the [`btree`](crate::indices::btree). It turns an
 //! attribute *value* (≤ 32 bytes) into a B+ tree key and back, so a `$expiration >
 //! N` style predicate can enumerate the matching values — each of which the query
-//! layer then resolves to its tier-1 [`pair_address`](crate::address::pair_address)
+//! layer then resolves to its tier-1 [`pair_address`](crate::indices::address::pair_address)
 //! bitmap.
 //!
 //! Encoding, ported verbatim from `arkiv-db-engine` and **consensus-critical**:
@@ -22,9 +22,9 @@ use alloy_primitives::B256;
 use arkiv_interfaces::constants::WORD_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
-use crate::address::btree_header_address;
-use crate::btree;
-use crate::storage::IndexStorage;
+use crate::indices::address::btree_header_address;
+use crate::indices::btree;
+use crate::indices::storage::IndexStorage;
 
 /// Encode a value (≤ [`WORD_LEN`] bytes) as its B+ tree **key** by **left**-aligning
 /// it and zero-padding the tail:
@@ -167,7 +167,7 @@ pub fn scan<S: IndexStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemStorage;
+    use crate::indices::storage::MemStorage;
 
     const TY: AttributeType = AttributeType::U256;
 

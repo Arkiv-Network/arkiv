@@ -17,10 +17,10 @@ use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecSt
 use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, BlockEntityStoreDelta, EntityStore};
-use arkiv_reth_auxstore::IndexStorage;
-use arkiv_reth_auxstore::RethAuxStore;
-use arkiv_reth_entitystore::AccountCode;
 use arkiv_reth_executor::ArkivExecutor;
+use arkiv_reth_mpt_committed_store::AccountCode;
+use arkiv_reth_mpt_committed_store::IndexStorage;
+use arkiv_reth_mpt_committed_store::RethAuxStore;
 
 // ── In-memory stores (stand-ins for the reth-backed ones) ──────────────────
 

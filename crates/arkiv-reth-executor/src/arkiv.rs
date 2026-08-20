@@ -52,7 +52,7 @@ use arkiv_interfaces::execution::{
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
 use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey, EntityNonce};
 use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta, EntityStore};
-use arkiv_reth_auxstore::annotation::entity_annotations;
+use arkiv_reth_mpt_committed_store::indices::annotation::entity_annotations;
 
 /// What a successfully-applied op did — enough for the host to emit its
 /// entity-operation log. Host-agnostic (spec types only); the reth wiring turns

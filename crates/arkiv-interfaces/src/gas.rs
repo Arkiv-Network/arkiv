@@ -12,6 +12,12 @@ use crate::primitives::Gas;
 use crate::query::QueryStats;
 
 /// Prices operations and queries. Deterministic.
+///
+/// This is the **schedule** building block — a pure price list. The question
+/// "how much for operation `o`?" is asked of the
+/// [`StateManager`](crate::manager::StateManager) (its `get_operation_cost`),
+/// which may consult committed state on the way to an answer; a schedule like
+/// this is what it answers with.
 pub trait CostModel {
     /// The gas for one operation. The [`Op`] carries all the schedule needs — its
     /// kind, payload size, and attribute counts.

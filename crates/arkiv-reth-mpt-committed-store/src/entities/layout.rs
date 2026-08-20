@@ -39,7 +39,7 @@ pub const SYSTEM_ACCOUNT_ADDRESS: Address = Address::new([
 /// The truncation is a host adaptation, not an Arkiv property: an entity key is a
 /// full [`WORD_LEN`] bytes, and dropping 12 to fit reth's account key leaves a
 /// 160-bit space. Two keys sharing a prefix collapse onto one account, and nothing
-/// downstream distinguishes them — [`RethEntityStore`](crate::store::RethEntityStore)
+/// downstream distinguishes them — [`RethEntityStore`](crate::entities::store::RethEntityStore)
 /// stores by address and reads back whatever is there.
 #[inline]
 pub fn entity_address(key: EntityKey) -> Address {

@@ -1,30 +1,26 @@
-//! [`ExecutorState`] — the reth **write-path** bridge for the no-EVM executor.
+//! [`WriteOverlay`] — the reth **write-path** bridge, and the base a
+//! [`MptStateManager`](crate::MptStateManager) wraps on that path.
 //!
-//! The custom executor doesn't run the interpreter and has no revm `Journal`:
-//! [`arkiv_transact`](crate::arkiv) reads accounts through the revm
-//! [`Database`] trait and *returns* an [`EvmState`] diff that reth's block
-//! executor commits. `ExecutorState` is that model as a state handle — base reads
-//! fall through to the `Database`, writes accumulate into an in-flight `EvmState`
-//! overlay (with read-your-own-writes), and [`into_state`](ExecutorState::into_state)
-//! hands the diff back for the `ResultAndState`.
+//! The no-EVM executor has no revm `Journal`: it reads accounts through the
+//! revm [`Database`] trait and *returns* an [`EvmState`] diff that reth's block
+//! executor commits. `WriteOverlay` is that model as a state handle — base
+//! reads fall through to the `Database`, writes accumulate into an in-flight
+//! `EvmState` overlay (with read-your-own-writes), and
+//! [`into_state`](WriteOverlay::into_state) hands the diff back for the
+//! `ResultAndState`.
 //!
-//! It implements **both** store seams over that one overlay: the entity store's
-//! [`AccountCode`] (an account's code), so the reth-free [`CodeBackend`] logic can
-//! drive entity writes; and the auxiliary index's [`IndexStorage`] (an account's
-//! storage slots), so [`RethAuxStore`] can drive index writes. Both land in the same
-//! [`EvmState`] diff, so one [`into_state`](ExecutorState::into_state) hands reth the
-//! entities and the index together.
+//! It implements **every** raw store seam over that one overlay: the entity
+//! store's [`AccountCode`] (an account's code), the index's [`IndexStorage`]
+//! (its storage slots), the balance store's [`BalanceAccess`] and the nonce
+//! store's [`NonceAccess`] (the account's two remaining fields). Every store
+//! therefore stages into the same diff — which is the point of
+//! [`write_manager`](crate::write_manager): one `into_state` hands reth a
+//! transaction's entities, index writes, and sender accounting together.
 //!
 //! [`Database`]: reth_ethereum::evm::primitives::Database
-//! [`CodeBackend`]: arkiv_reth_entitystore::CodeBackend
-//! [`IndexStorage`]: arkiv_reth_auxstore::IndexStorage
-//! [`RethAuxStore`]: arkiv_reth_auxstore::RethAuxStore
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use arkiv_interfaces::primitives::EntityNonce;
-use arkiv_reth_auxstore::IndexStorage;
-use arkiv_reth_entitystore::AccountCode;
-use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, nonce_slot};
+use arkiv_reth_mpt_committed_store::{AccountCode, BalanceAccess, IndexStorage, NonceAccess};
 use reth_ethereum::evm::{
     primitives::Database,
     revm::{
@@ -36,14 +32,14 @@ use reth_ethereum::evm::{
 
 /// A read-through / write-accumulate view of account state for one transaction:
 /// reads consult the pending diff then the base [`Database`]; writes land in the
-/// diff. Consume it with [`into_state`](ExecutorState::into_state) to get the
+/// diff. Consume it with [`into_state`](WriteOverlay::into_state) to get the
 /// `EvmState` for the transaction's `ResultAndState`.
-pub struct ExecutorState<'a, DB: Database> {
+pub struct WriteOverlay<'a, DB: Database> {
     db: &'a mut DB,
     state: EvmState,
 }
 
-impl<'a, DB: Database> ExecutorState<'a, DB> {
+impl<'a, DB: Database> WriteOverlay<'a, DB> {
     /// Start an empty diff over `db`.
     pub fn new(db: &'a mut DB) -> Self {
         Self {
@@ -121,7 +117,7 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
 
     /// A storage slot's value: the pending diff if it's been written, else the base
     /// `Database` (zero if never written). The `U256` counterpart of the
-    /// [`IndexStorage::storage`](arkiv_reth_auxstore::IndexStorage::storage) seam.
+    /// [`IndexStorage::storage`] seam.
     pub fn read_slot(&mut self, addr: Address, slot: U256) -> Result<U256, eyre::Report> {
         if let Some(s) = self.state.get(&addr).and_then(|acc| acc.storage.get(&slot)) {
             return Ok(s.present_value);
@@ -132,8 +128,7 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
     }
 
     /// Write a storage slot into the diff. The `U256` counterpart of the
-    /// [`IndexStorage::set_storage`](arkiv_reth_auxstore::IndexStorage::set_storage)
-    /// seam.
+    /// [`IndexStorage::set_storage`] seam.
     pub fn write_slot(
         &mut self,
         addr: Address,
@@ -165,8 +160,7 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
 
     /// Keep `addr` alive against EIP-161 pruning (raise its nonce to ≥ 1). Used to
     /// materialise the system account on its first storage write. The counterpart of
-    /// the [`IndexStorage::ensure_account_persists`](arkiv_reth_auxstore::IndexStorage::ensure_account_persists)
-    /// seam.
+    /// the [`IndexStorage::ensure_account_persists`] seam.
     pub fn persist_account(&mut self, addr: Address) -> Result<(), eyre::Report> {
         let acc = self.account_mut(addr)?;
         if acc.info.nonce == 0 {
@@ -175,32 +169,9 @@ impl<'a, DB: Database> ExecutorState<'a, DB> {
         acc.mark_touch();
         Ok(())
     }
-
-    /// Read `caller`'s entity-key minting nonce from the system account.
-    pub fn read_nonce(&mut self, caller: Address) -> Result<EntityNonce, eyre::Report> {
-        let slot = U256::from_be_bytes(nonce_slot(caller).0);
-        Ok(EntityNonce::new(
-            self.read_slot(SYSTEM_ACCOUNT_ADDRESS, slot)?
-                .saturating_to::<u64>(),
-        ))
-    }
-
-    /// Advance `caller`'s minting nonce by `by` (one per entity created), returning
-    /// the value it had *before* the bump — the `start_nonce` the batch decoded with.
-    pub fn bump_nonce(&mut self, caller: Address, by: u64) -> Result<EntityNonce, eyre::Report> {
-        self.persist_account(SYSTEM_ACCOUNT_ADDRESS)?;
-        let current = self.read_nonce(caller)?;
-        let slot = U256::from_be_bytes(nonce_slot(caller).0);
-        self.write_slot(
-            SYSTEM_ACCOUNT_ADDRESS,
-            slot,
-            U256::from(current.advanced_by(by).get()),
-        )?;
-        Ok(current)
-    }
 }
 
-impl<DB: Database> AccountCode for ExecutorState<'_, DB> {
+impl<DB: Database> AccountCode for WriteOverlay<'_, DB> {
     type Error = eyre::Report;
 
     fn code(&mut self, addr: Address) -> Result<Vec<u8>, Self::Error> {
@@ -250,11 +221,12 @@ impl<DB: Database> AccountCode for ExecutorState<'_, DB> {
     }
 }
 
-/// The auxiliary index's storage seam over the same overlay: the tier-2 range
-/// structures and the index's id bookkeeping live in account storage slots. It is a
-/// thin `B256`⇄`U256` adapter over the inherent [`read_slot`](ExecutorState::read_slot)
-/// / [`write_slot`](ExecutorState::write_slot) / [`persist_account`](ExecutorState::persist_account).
-impl<DB: Database> IndexStorage for ExecutorState<'_, DB> {
+/// The storage-slot seam over the same overlay: the tier-2 range structures, the
+/// index's id bookkeeping, and the minting-nonce slots all live in account
+/// storage. A thin `B256`⇄`U256` adapter over the inherent
+/// [`read_slot`](WriteOverlay::read_slot) / [`write_slot`](WriteOverlay::write_slot)
+/// / [`persist_account`](WriteOverlay::persist_account).
+impl<DB: Database> IndexStorage for WriteOverlay<'_, DB> {
     type Error = eyre::Report;
 
     fn storage(&mut self, addr: Address, slot: B256) -> Result<B256, Self::Error> {
@@ -275,12 +247,47 @@ impl<DB: Database> IndexStorage for ExecutorState<'_, DB> {
     }
 }
 
+/// The balance seam over the same overlay: sender accounting (the gas charge)
+/// and plain transfers stage into the one diff alongside the entities and the
+/// index. Writes stage the account touched, *without* an EIP-161 keep-alive —
+/// a plain account emptied of funds must stay prunable.
+impl<DB: Database> BalanceAccess for WriteOverlay<'_, DB> {
+    type Error = eyre::Report;
+
+    fn get_balance(&mut self, addr: Address) -> Result<U256, Self::Error> {
+        Ok(self.load_info(addr)?.balance)
+    }
+
+    fn set_balance(&mut self, addr: Address, balance: U256) -> Result<(), Self::Error> {
+        let mut info = self.load_info(addr)?;
+        info.balance = balance;
+        self.stage(addr, info);
+        Ok(())
+    }
+}
+
+/// The nonce seam, with the same staging conventions as [`BalanceAccess`]
+/// above.
+impl<DB: Database> NonceAccess for WriteOverlay<'_, DB> {
+    type Error = eyre::Report;
+
+    fn get_nonce(&mut self, addr: Address) -> Result<u64, Self::Error> {
+        Ok(self.load_info(addr)?.nonce)
+    }
+
+    fn set_nonce(&mut self, addr: Address, nonce: u64) -> Result<(), Self::Error> {
+        let mut info = self.load_info(addr)?;
+        info.nonce = nonce;
+        self.stage(addr, info);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arkiv_interfaces::entity::CreationFlags;
     use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
-    use arkiv_interfaces::primitives::EntityNonce;
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
     fn addr() -> Address {
@@ -290,7 +297,7 @@ mod tests {
     #[test]
     fn absent_account_has_empty_code() {
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         assert!(state.code(addr()).unwrap().is_empty());
     }
 
@@ -299,7 +306,7 @@ mod tests {
         // Bytes that would confuse the legacy analyzer: 0xFE (INVALID) marker, a
         // 0x5B (JUMPDEST) mid-stream, and a length not a multiple of 32.
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         let raw = vec![0xFE, 0x00, 0x5B, 0x01, 0x02, 0xAB, 0xCD, 0xEF, 0x5B];
         state.set_code(addr(), raw.clone()).unwrap();
         assert_eq!(state.code(addr()).unwrap(), raw);
@@ -324,16 +331,16 @@ mod tests {
                 Attribute::new(b"size".to_vec(), AttributeValue::u256_from_u64(1)),
             ],
         };
-        let encoded = arkiv_reth_entitystore::encode(&entity);
+        let encoded = arkiv_reth_mpt_committed_store::encode(&entity);
 
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         state.set_code(addr(), encoded.clone()).unwrap();
 
         let read_back = state.code(addr()).unwrap();
         assert_eq!(read_back, encoded, "code must round-trip byte-for-byte");
         assert_eq!(
-            arkiv_reth_entitystore::decode(&read_back).unwrap(),
+            arkiv_reth_mpt_committed_store::decode(&read_back).unwrap(),
             entity,
             "the record must still decode after the round-trip"
         );
@@ -342,7 +349,7 @@ mod tests {
     #[test]
     fn clear_code_tombstones_to_empty() {
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         state.set_code(addr(), vec![0xFE, 0x00, 0x01]).unwrap();
         assert!(!state.code(addr()).unwrap().is_empty());
         state.clear_code(addr()).unwrap();
@@ -353,7 +360,7 @@ mod tests {
     #[test]
     fn into_state_carries_the_touched_diff() {
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         state.set_code(addr(), vec![0xFE, 0x00, 0x01]).unwrap();
         let diff = state.into_state();
         let acc = diff.get(&addr()).expect("account staged in the diff");
@@ -364,7 +371,7 @@ mod tests {
     #[test]
     fn storage_reads_and_writes_through_the_overlay() {
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         let slot = U256::from(7);
         assert_eq!(state.read_slot(addr(), slot).unwrap(), U256::ZERO);
         state.write_slot(addr(), slot, U256::from(42)).unwrap();
@@ -376,7 +383,7 @@ mod tests {
     #[test]
     fn index_storage_seam_shares_the_overlay() {
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
+        let mut state = WriteOverlay::new(&mut db);
         let slot = B256::from(U256::from(9));
         IndexStorage::set_storage(&mut state, addr(), slot, B256::from(U256::from(123))).unwrap();
         assert_eq!(
@@ -390,42 +397,28 @@ mod tests {
         );
     }
 
+    /// The balance and nonce seams stage balance and nonce into the same diff, and
+    /// deliberately without an EIP-161 keep-alive — a plain account must stay
+    /// prunable.
     #[test]
-    fn minting_nonce_starts_zero_and_advances() {
+    fn account_seams_stage_balance_and_nonce() {
         let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
-        let caller = Address::from([0xAA; 20]);
-        assert_eq!(state.read_nonce(caller).unwrap(), EntityNonce::ZERO);
-        // A batch of two creates: bump returns the pre-bump start (0), leaves 2.
-        assert_eq!(state.bump_nonce(caller, 2).unwrap(), EntityNonce::ZERO);
-        assert_eq!(state.read_nonce(caller).unwrap(), EntityNonce::new(2));
-        // Next batch of one: start 2, leaves 3.
-        assert_eq!(state.bump_nonce(caller, 1).unwrap(), EntityNonce::new(2));
-        assert_eq!(state.read_nonce(caller).unwrap(), EntityNonce::new(3));
-    }
+        let mut state = WriteOverlay::new(&mut db);
+        let a = addr();
 
-    #[test]
-    fn nonces_are_per_caller() {
-        let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
-        let a = Address::from([0xAA; 20]);
-        let b = Address::from([0xBB; 20]);
-        state.bump_nonce(a, 5).unwrap();
-        assert_eq!(state.read_nonce(a).unwrap(), EntityNonce::new(5));
-        assert_eq!(state.read_nonce(b).unwrap(), EntityNonce::ZERO);
-    }
+        assert_eq!(state.get_balance(a).unwrap(), U256::ZERO);
+        assert_eq!(state.get_nonce(a).unwrap(), 0);
 
-    /// The nonce bump materialises the system account in the diff, kept alive.
-    #[test]
-    fn bump_persists_the_system_account() {
-        let mut db = EmptyDB::default();
-        let mut state = ExecutorState::new(&mut db);
-        state.bump_nonce(Address::from([0xAA; 20]), 1).unwrap();
+        state.set_balance(a, U256::from(42)).unwrap();
+        state.set_nonce(a, 7).unwrap();
+        // Read-your-own-writes through the overlay.
+        assert_eq!(state.get_balance(a).unwrap(), U256::from(42));
+        assert_eq!(state.get_nonce(a).unwrap(), 7);
+
         let diff = state.into_state();
-        let sys = diff
-            .get(&SYSTEM_ACCOUNT_ADDRESS)
-            .expect("system account staged");
-        assert!(sys.is_touched());
-        assert_eq!(sys.info.nonce, 1); // EIP-161-safe
+        let acc = diff.get(&a).expect("account staged in the diff");
+        assert!(acc.is_touched());
+        assert_eq!(acc.info.balance, U256::from(42));
+        assert_eq!(acc.info.nonce, 7);
     }
 }

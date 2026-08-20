@@ -7,8 +7,8 @@
 //! values fit in 32 bytes (block numbers, uint attributes); longer string values
 //! use the cascade (a later module) instead.
 //!
-//! Layout, per [`btree_header_address`](crate::address::btree_header_address) /
-//! [`btree_node_address`](crate::address::btree_node_address):
+//! Layout, per [`btree_header_address`](crate::indices::address::btree_header_address) /
+//! [`btree_node_address`](crate::indices::address::btree_node_address):
 //! - **Header** (slot 0 of the header account): `[0..8]` root node id, `[8..16]`
 //!   next id to allocate, `[16]` = [`BTREE_MAGIC`] — all big-endian.
 //! - **Node** (in its own account): slot 0 meta = `[0..8]` right-sibling id,
@@ -28,9 +28,9 @@ use alloy_primitives::{Address, B256};
 
 use arkiv_interfaces::constants::WORD_LEN;
 
-use crate::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
-use crate::slot::{storage_to_u64, u64_to_storage};
-use crate::storage::IndexStorage;
+use crate::indices::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
+use crate::indices::slot::{storage_to_u64, u64_to_storage};
+use crate::indices::storage::IndexStorage;
 
 // ── Slot numbering within a node account ──────────────────────────────
 
@@ -400,8 +400,8 @@ pub fn iter_from<S: IndexStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::btree_header_address;
-    use crate::storage::MemStorage;
+    use crate::indices::address::btree_header_address;
+    use crate::indices::storage::MemStorage;
     use arkiv_interfaces::entity::AttributeType;
 
     fn slot(n: u64) -> B256 {

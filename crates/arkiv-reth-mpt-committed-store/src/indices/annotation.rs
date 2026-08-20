@@ -1,9 +1,9 @@
 //! Shared annotation classification: which physical index an attribute uses, and
 //! how a query key/value maps to the index bytes.
 //!
-//! The write path ([`apply_delta`](crate::store::RethAuxStore)) and the read path
-//! ([`evaluate`](crate::store::RethAuxStore)) must agree here *exactly*: a query
-//! value has to hash to the same [`pair_address`](crate::address::pair_address) as
+//! The write path ([`apply_delta`](crate::indices::store::RethAuxStore)) and the read path
+//! ([`evaluate`](crate::indices::store::RethAuxStore)) must agree here *exactly*: a query
+//! value has to hash to the same [`pair_address`](crate::indices::address::pair_address) as
 //! the stored value, and a range predicate has to consult the same tier-2 structure
 //! (int B+ tree vs str cascade) the writer maintained. Both sides go through this
 //! one module so they cannot drift.
@@ -17,7 +17,7 @@
 //! `$createdAtBlock`) are plain `u256`s, sharing the user `u256` encoding.
 //!
 //! The value's *type* is part of the index key too (see
-//! [`address`](crate::address)), so one attribute name holding two types keeps two
+//! [`address`](crate::indices::address)), so one attribute name holding two types keeps two
 //! disjoint sets of buckets and one ordered structure per type.
 
 use arkiv_interfaces::entity::{AttributeType, AttributeValue, Entity, annotations};

@@ -36,6 +36,15 @@
 //! [`HistoricalEntityStore`] and [`HistoricalAuxiliaryStore`], which add
 //! past-block reads.
 //!
+//! [`StateManager`] is the umbrella over state: one seam bundling the two
+//! stores with the account lanes execution touches (balances, transaction
+//! nonces, entity-minting nonces) and the node-local [`PruningMap`]. It also
+//! answers pricing directly — "what would operation `o` cost against this
+//! state?" — deterministically, with access to every committed store. And it
+//! can hand out shallow copies for simulation or block building, and rewind.
+//! A host implements it once, and everything above stops caring how state is
+//! physically kept.
+//!
 //! Three **operations** run against those stores:
 //!
 //! - [`TransactionExecutor`] — runs one transaction, staging its changes into a
@@ -65,6 +74,7 @@ pub mod constants;
 pub mod entity;
 pub mod execution;
 pub mod gas;
+pub mod manager;
 pub mod primitives;
 pub mod query;
 pub mod rpc;
@@ -75,6 +85,7 @@ pub use constants::*;
 pub use entity::*;
 pub use execution::*;
 pub use gas::*;
+pub use manager::*;
 pub use primitives::*;
 pub use query::*;
 pub use rpc::*;

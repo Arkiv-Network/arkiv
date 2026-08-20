@@ -3,8 +3,8 @@
 //!
 //! ```text
 //!   ArkivExecutor::apply(ops)                       → BlockDraft (the entity delta)
-//!     reading RethEntityStore<CodeBackend<ExecutorState<EmptyDB>>>
-//!   store.apply_delta(&draft.entities)              → CodeBackend → ExecutorState
+//!     reading RethEntityStore<CodeBackend<WriteOverlay<EmptyDB>>>
+//!   store.apply_delta(&draft.entities)              → CodeBackend → WriteOverlay
 //!                                                     → EvmState overlay
 //!   store.get(key)                                  → reads its own writes back
 //!   ...into_state()                                 → the EvmState reth would commit
@@ -16,15 +16,16 @@
 use arkiv_interfaces::entity::{AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::state::EntityStore;
-use arkiv_reth_entitystore::layout::entity_address;
-use arkiv_reth_entitystore::{CodeBackend, RethEntityStore, decode, encode};
-use arkiv_reth_executor::{ArkivExecutor, ExecutorState};
+use arkiv_reth_executor::ArkivExecutor;
+use arkiv_reth_mpt_committed_store::entities::layout::entity_address;
+use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore, decode, encode};
+use arkiv_reth_statemanager::WriteOverlay;
 use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
-type Store<'a> = RethEntityStore<CodeBackend<ExecutorState<'a, EmptyDB>>>;
+type Store<'a> = RethEntityStore<CodeBackend<WriteOverlay<'a, EmptyDB>>>;
 
 fn store(db: &mut EmptyDB) -> Store<'_> {
-    RethEntityStore::new(CodeBackend::new(ExecutorState::new(db)))
+    RethEntityStore::new(CodeBackend::new(WriteOverlay::new(db)))
 }
 
 fn env(caller: [u8; 20], block: u64) -> ExecEnv {
@@ -67,7 +68,7 @@ fn create_commits_the_entity_as_account_code() {
     assert_eq!(staged.owner, alice); // lifecycle fields came from the env
     assert_eq!(staged.created_at_block, 10);
 
-    // 2) Commit the delta — flows through CodeBackend → ExecutorState → EvmState.
+    // 2) Commit the delta — flows through CodeBackend → WriteOverlay → EvmState.
     store.apply_delta(&draft.entities).unwrap();
 
     // 3) Full-stack read-your-own-writes: the committed entity reads back by key.

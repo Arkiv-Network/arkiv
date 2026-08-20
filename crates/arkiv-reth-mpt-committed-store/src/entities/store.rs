@@ -1,7 +1,7 @@
 //! [`RethEntityStore`] — the [`EntityStore`] implementation.
 //!
 //! The store's own job is small and host-agnostic: map an [`EntityKey`] to its
-//! account via [`entity_address`](crate::layout::entity_address), then load, store,
+//! account via [`entity_address`](crate::entities::layout::entity_address), then load, store,
 //! or remove the entity there. The *raw* persistence — how an entity is encoded
 //! into an account's code and where those accounts actually live — is the
 //! [`EntityBackend`] seam, which a reth adapter fills over revm's state (next
@@ -13,7 +13,7 @@ use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::primitives::{EntityKey, Hash};
 use arkiv_interfaces::state::{BlockEntityStoreDelta, EntityStore};
 
-use crate::layout::entity_address;
+use crate::entities::layout::entity_address;
 
 /// Raw account-level persistence the entity store sits on.
 ///
@@ -39,7 +39,7 @@ pub trait EntityBackend {
 }
 
 /// The reth-host [`EntityStore`]: entity keys resolve to accounts through
-/// [`entity_address`](crate::layout::entity_address); persistence is delegated to
+/// [`entity_address`](crate::entities::layout::entity_address); persistence is delegated to
 /// an [`EntityBackend`].
 #[derive(Debug, Default, Clone)]
 pub struct RethEntityStore<B> {

@@ -37,6 +37,26 @@ pub trait IndexStorage {
     fn ensure_account_persists(&mut self, addr: Address) -> Result<(), Self::Error>;
 }
 
+/// Forwarding impl, so a seam consumer (a [`RethAuxStore`](crate::indices::store::RethAuxStore),
+/// which takes its backend by value) can be built over a *borrowed* backend too —
+/// e.g. a state manager lending out its one underlying state for the duration of
+/// a call.
+impl<T: IndexStorage + ?Sized> IndexStorage for &mut T {
+    type Error = T::Error;
+
+    fn storage(&mut self, addr: Address, slot: B256) -> Result<B256, Self::Error> {
+        (**self).storage(addr, slot)
+    }
+
+    fn set_storage(&mut self, addr: Address, slot: B256, value: B256) -> Result<(), Self::Error> {
+        (**self).set_storage(addr, slot, value)
+    }
+
+    fn ensure_account_persists(&mut self, addr: Address) -> Result<(), Self::Error> {
+        (**self).ensure_account_persists(addr)
+    }
+}
+
 #[cfg(test)]
 pub(crate) use mock::MemStorage;
 

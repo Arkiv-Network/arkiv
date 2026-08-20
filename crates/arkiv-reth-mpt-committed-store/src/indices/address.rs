@@ -61,7 +61,7 @@ pub const BTREE_ORDER: usize = 32;
 /// Address of the *pair account* for the `(attr, value)` equality bucket.
 ///
 /// `pair_address = keccak256("arkiv.pair" || attr || 0x00 || typeId || value)[:20]`.
-/// The account's contents are the [`Bitmap`](crate::bitmap::Bitmap) of entity ids
+/// The account's contents are the [`Bitmap`](crate::indices::bitmap::Bitmap) of entity ids
 /// carrying this pair. The `0x00` separator prevents prefix collisions between the
 /// attribute and value, so `attr` must not itself contain `0x00` (the precompile
 /// enforces this on the write path); the fixed-width `typeId` that follows it keeps
