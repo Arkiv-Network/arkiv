@@ -18,7 +18,7 @@
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_interfaces::constants::WORD_LEN;
+use arkiv_interfaces::constants::EVM_WORD_LENGTH;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::indices::address::{list_address_for, str_level_address};
@@ -34,7 +34,7 @@ pub use arkiv_interfaces::constants::MAX_STR_BYTES;
 /// depth is only correct while the protocol limit is that many words. Checked
 /// here rather than assumed, because widening `MAX_STR_BYTES` without adding a
 /// level would silently truncate indexed values.
-const _: () = assert!(MAX_STR_BYTES == 4 * WORD_LEN);
+const _: () = assert!(MAX_STR_BYTES == 4 * EVM_WORD_LENGTH);
 
 /// Split a value (≤ [`MAX_STR_BYTES`] bytes) into 32-byte right-padded chunks. An
 /// empty value produces a single zero chunk (so it still occupies a level-0 slot).
@@ -47,12 +47,12 @@ pub fn value_chunks(value: &[u8]) -> Vec<B256> {
     if value.is_empty() {
         return vec![B256::ZERO];
     }
-    let chunk_count = value.len().div_ceil(WORD_LEN);
+    let chunk_count = value.len().div_ceil(EVM_WORD_LENGTH);
     let mut chunks = Vec::with_capacity(chunk_count);
     for chunk_index in 0..chunk_count {
-        let start = chunk_index * WORD_LEN;
-        let end = (start + WORD_LEN).min(value.len());
-        let mut chunk = [0u8; WORD_LEN];
+        let start = chunk_index * EVM_WORD_LENGTH;
+        let end = (start + EVM_WORD_LENGTH).min(value.len());
+        let mut chunk = [0u8; EVM_WORD_LENGTH];
         chunk[..end - start].copy_from_slice(&value[start..end]);
         chunks.push(B256::from(chunk));
     }
@@ -149,14 +149,14 @@ fn collect_all<Storage: IndexStorage>(
     prefix: &[u8],
     values: &mut Vec<Vec<u8>>,
 ) -> Result<(), Storage::Error> {
-    let level = prefix.len() / WORD_LEN;
+    let level = prefix.len() / EVM_WORD_LENGTH;
     let level_address = str_level_address(attr, ty, prefix);
     for (chunk, presence) in list_entries(storage, level_address)? {
         let Some(total_len) = slot_to_val_len(presence) else {
             continue; // zeroed (removed) slot
         };
-        if total_len <= (level + 1) * WORD_LEN {
-            let tail_len = total_len - level * WORD_LEN;
+        if total_len <= (level + 1) * EVM_WORD_LENGTH {
+            let tail_len = total_len - level * EVM_WORD_LENGTH;
             let mut value = prefix.to_vec();
             value.extend_from_slice(&chunk.0[..tail_len]);
             values.push(value);

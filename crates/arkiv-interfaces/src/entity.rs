@@ -7,18 +7,18 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::primitives::{Address, BlockNumber, EntityKey};
+use crate::primitives::{BlockNumber, EntityAddress, EthAddress, UserAddress};
 
 /// A stored entity: a fixed identity, a changing lifecycle, opaque contents, and
 /// queryable attributes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Entity {
     /// Unique key. Set at creation, never changes.
-    pub key: EntityKey,
+    pub key: EntityAddress,
     /// Who created it. Set at creation, never changes.
-    pub creator: Address,
+    pub creator: UserAddress,
     /// Who owns it now. Changes on transfer.
-    pub owner: Address,
+    pub owner: UserAddress,
     /// The block it was created in.
     pub created_at_block: BlockNumber,
     /// The block of its last change (create, update, extend, or transfer).
@@ -41,9 +41,9 @@ pub struct Entity {
 /// needs identity and lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EntityMeta {
-    pub key: EntityKey,
-    pub creator: Address,
-    pub owner: Address,
+    pub key: EntityAddress,
+    pub creator: UserAddress,
+    pub owner: UserAddress,
     pub created_at_block: BlockNumber,
     pub last_modified_at_block: BlockNumber,
     pub expires_at: BlockNumber,
@@ -121,10 +121,10 @@ pub enum AttributeValue {
     /// A UTF-8 string.
     Str(String),
     /// A 20-byte Ethereum address.
-    EthereumAddress(Address),
+    EthereumAddress(EthAddress),
     /// A reference to another entity. Weak by spec: no existence check at write
     /// time, and dangling references are permitted.
-    EntityKey(EntityKey),
+    EntityKey(EntityAddress),
 }
 
 /// Decimal places a [`Decimal`](AttributeValue::Decimal) is scaled by — fixed, so

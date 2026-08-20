@@ -11,9 +11,9 @@
 //! The crate is `#![no_std]` (only [`alloc`], for `Vec`/`String`/`Box`) and pulls
 //! in **no external crates**. Two consequences:
 //!
-//! - Values are fixed-width byte arrays ([`primitives`]), not some library's
-//!   types. A host converts at the boundary — `[u8; 20]` ⇄ an alloy `Address` is
-//!   free.
+//! - Values are Arkiv-named types ([`primitives`]) over fixed-width byte
+//!   arrays, not some library's types. A host converts to its own primitives at
+//!   the boundary, and that conversion never leaks back through these traits.
 //! - Errors are an associated `type Error` on every trait, bounded only by
 //!   [`core::fmt::Debug`], so a host can use `eyre`, `anyhow`, its own enum, …
 //!
@@ -62,7 +62,7 @@
 //! [`ArkivHistoricalRpc`] for nodes that answer against past blocks).
 //!
 //! [`constants`] holds the numbers more than one crate has to agree on: the byte
-//! widths, the protocol limits, and [`ARKIV_ADDRESS`].
+//! widths, the protocol limits, and [`ARKIV_RETH_ADDRESS`].
 
 #![no_std]
 #![forbid(unsafe_code)]

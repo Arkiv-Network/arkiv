@@ -23,9 +23,9 @@
 
 use alloc::string::String;
 
-use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_interfaces::entity::{AttributeValue, DECIMAL_SCALE};
-use arkiv_interfaces::primitives::Address;
+use arkiv_interfaces::primitives::EthAddress;
 
 use crate::error::{ParseError, literal_err};
 use crate::lexer::{TypeTag, scan_single_quoted};
@@ -37,7 +37,7 @@ pub use arkiv_interfaces::constants::MAX_STR_BYTES;
 
 /// Hex characters in an address and in a 32-byte value — two per byte.
 const ADDRESS_HEX_LEN: usize = 2 * ETH_ADDRESS_LEN;
-const WORD_HEX_LEN: usize = 2 * WORD_LEN;
+const WORD_HEX_LEN: usize = 2 * EVM_WORD_LENGTH;
 
 /// Validate a typed literal's raw body against its tag.
 pub(crate) fn parse_tagged(
@@ -200,7 +200,7 @@ pub(crate) fn validate_str_len(content: &str, position: usize) -> Result<(), Par
 }
 
 /// `addr(0x…)` — 40 hex, with EIP-55 enforced on mixed-case input.
-pub(crate) fn parse_addr(body: &str, position: usize) -> Result<Address, ParseError> {
+pub(crate) fn parse_addr(body: &str, position: usize) -> Result<EthAddress, ParseError> {
     let text = body.trim();
     let Some(hex) = strip_hex_prefix(text) else {
         return literal_err(

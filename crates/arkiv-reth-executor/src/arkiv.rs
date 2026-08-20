@@ -50,7 +50,7 @@ use arkiv_interfaces::execution::{
     TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
-use arkiv_interfaces::primitives::{Address, BlockNumber, EntityKey, EntityNonce};
+use arkiv_interfaces::primitives::{BlockNumber, EntityAddress, EntityCreationNonce, UserAddress};
 use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta, EntityStore};
 use arkiv_reth_mpt_committed_store::indices::annotation::entity_annotations;
 
@@ -60,12 +60,12 @@ use arkiv_reth_mpt_committed_store::indices::annotation::entity_annotations;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpEffect {
     /// The entity the op targeted.
-    pub key: EntityKey,
+    pub key: EntityAddress,
     /// Which operation it was.
     pub kind: OpKind,
     /// The entity's owner after the op (the new owner for a transfer; the prior
     /// owner for a delete).
-    pub owner: Address,
+    pub owner: UserAddress,
     /// The entity's expiry after the op.
     pub expires_at: BlockNumber,
     /// The entity's creation flags. Only meaningful for a create — the event it
@@ -73,7 +73,7 @@ pub struct OpEffect {
     pub creation_flags: CreationFlags,
     /// The owner *before* a transfer. `None` for every other op, which have no
     /// ownership change to report.
-    pub previous_owner: Option<Address>,
+    pub previous_owner: Option<UserAddress>,
 }
 
 /// The fixed-function entity executor.
@@ -140,7 +140,7 @@ impl<E: EntityStore, C: CostModel> TransactionExecutor for ArkivExecutor<E, C> {
         // `start_nonce` is zero here: threading the caller's persistent nonce from the
         // system account is the wiring step's job (this trait path isn't the live
         // reth executor yet). Decode failures are host faults surfaced as errors.
-        let ops = crate::decode::decode_ops(env, op_bytes, EntityNonce::ZERO)
+        let ops = crate::decode::decode_ops(env, op_bytes, EntityCreationNonce::ZERO)
             .map_err(|e| ExecError::Decode(e.to_string()))?;
         self.apply(env, entities, draft, &ops)
     }
@@ -175,7 +175,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         // Per-transaction overlay: Some(entity) = staged write, None = staged
         // delete. Reads consult it before the draft and the store, so operations
         // in this transaction see each other's effects.
-        let mut tx_state_overlay = BTreeMap::<EntityKey, Option<Entity>>::new();
+        let mut tx_state_overlay = BTreeMap::<EntityAddress, Option<Entity>>::new();
         let mut gas_used = 0u64;
         let mut staged_effects = Vec::with_capacity(ops.len());
 
@@ -243,7 +243,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         env: &ExecEnv,
         entities: &mut E,
         draft: &BlockDraft,
-        overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
+        overlay: &mut BTreeMap<EntityAddress, Option<Entity>>,
         op: &Op,
     ) -> Result<Result<OpEffect, RevertReason>, ExecError> {
         match op {
@@ -396,9 +396,9 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     /// Assemble an [`OpEffect`] (a tiny helper so the op arms stay one-liners).
     fn effect(
         &self,
-        key: EntityKey,
+        key: EntityAddress,
         kind: OpKind,
-        owner: Address,
+        owner: UserAddress,
         expires_at: BlockNumber,
     ) -> OpEffect {
         OpEffect {
@@ -424,12 +424,12 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         env: &ExecEnv,
         entities: &mut E,
         draft: &BlockDraft,
-        overlay: &mut BTreeMap<EntityKey, Option<Entity>>,
-        key: EntityKey,
+        overlay: &mut BTreeMap<EntityAddress, Option<Entity>>,
+        key: EntityAddress,
         auth: Auth,
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
         edit: impl FnOnce(&mut Entity),
-    ) -> Result<Result<(Address, BlockNumber), RevertReason>, ExecError> {
+    ) -> Result<Result<(UserAddress, BlockNumber), RevertReason>, ExecError> {
         let Some(mut entity) = self.current(entities, draft, overlay, key)? else {
             return Ok(Err(RevertReason::NotFound { key }));
         };
@@ -462,8 +462,8 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         &self,
         entities: &mut E,
         draft: &BlockDraft,
-        overlay: &BTreeMap<EntityKey, Option<Entity>>,
-        key: EntityKey,
+        overlay: &BTreeMap<EntityAddress, Option<Entity>>,
+        key: EntityAddress,
     ) -> Result<Option<Entity>, ExecError> {
         if let Some(staged) = overlay.get(&key) {
             return Ok(staged.clone());
@@ -478,7 +478,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         &self,
         entities: &mut E,
         draft: &BlockDraft,
-        key: EntityKey,
+        key: EntityAddress,
     ) -> Result<Option<Entity>, ExecError> {
         if draft.entities.deletes.contains(&key) {
             return Ok(None);
@@ -510,7 +510,7 @@ enum Auth {
 }
 
 impl Auth {
-    fn permits(self, entity: &Entity, caller: &Address) -> bool {
+    fn permits(self, entity: &Entity, caller: &UserAddress) -> bool {
         if entity.owner == *caller {
             return true;
         }
@@ -564,7 +564,7 @@ fn apply_mutations(entity: &mut Entity, mutations: &[AttributeMutation]) {
 /// it is correct for every op kind without special-casing: whatever the two states
 /// disagree on is exactly what the index must change.
 fn auxiliary_delta(
-    key: EntityKey,
+    key: EntityAddress,
     before: Option<&Entity>,
     after: Option<&Entity>,
 ) -> Option<AuxiliaryEntityDelta> {
@@ -623,13 +623,13 @@ mod tests {
     /// In-memory [`EntityStore`] for the tests.
     #[derive(Default)]
     struct MemStore {
-        map: BTreeMap<EntityKey, Entity>,
+        map: BTreeMap<EntityAddress, Entity>,
     }
 
     impl EntityStore for MemStore {
         type Error = Infallible;
 
-        fn get(&mut self, entity: EntityKey) -> Result<Option<Entity>, Infallible> {
+        fn get(&mut self, entity: EntityAddress) -> Result<Option<Entity>, Infallible> {
             Ok(self.map.get(&entity).cloned())
         }
 
@@ -689,7 +689,7 @@ mod tests {
     }
 
     /// [`sample_entity`] with a chosen key, for seeding the store.
-    fn entity_with_key(key: EntityKey) -> Entity {
+    fn entity_with_key(key: EntityAddress) -> Entity {
         Entity {
             key,
             ..sample_entity()

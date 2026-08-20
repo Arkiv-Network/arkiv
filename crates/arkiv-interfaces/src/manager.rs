@@ -8,12 +8,14 @@
 //! its layout (who stores what where, in how many trees) into every consumer.
 //!
 //! [`StateManager`] is the one handle the business layer, the executor, and the
-//! read paths go through instead. What it conceals is exactly what varies by
-//! host: the reth host multiplexes everything onto Ethereum's single keccak-MPT
-//! account state (entities as account code, index bitmaps and B-trees as code
-//! and storage slots, 32-byte Arkiv keys truncated to 20-byte account
-//! addresses); another host may keep every store in its own tree. Swapping that
-//! engine must never move this API.
+//! read paths go through instead. It speaks **Arkiv's types only** —
+//! [`UserAddress`], [`EntityAddress`], [`UserBalance`], [`UserNonce`],
+//! [`EntityCreationNonce`] — never a host primitive. What it conceals is exactly
+//! what varies by host: the reth host multiplexes everything onto Ethereum's
+//! single keccak-MPT account state (entities as account code, index bitmaps and
+//! B-trees as code and storage slots, each 32-byte [`EntityAddress`] anchored to
+//! a 20-byte account key by prefix); another host may keep every store in its
+//! own tree. Swapping that engine must never move this API.
 //!
 //! ## The stores behind it
 //!
@@ -48,7 +50,9 @@
 use alloc::vec::Vec;
 
 use crate::execution::{BlockDraft, Op};
-use crate::primitives::{Address, Balance, BlockNumber, EntityKey, EntityNonce, Gas};
+use crate::primitives::{
+    BlockNumber, EntityAddress, EntityCreationNonce, Gas, UserAddress, UserBalance, UserNonce,
+};
 use crate::query::QueryStats;
 use crate::state::{AuxiliaryStore, EntityStore};
 
@@ -56,49 +60,62 @@ use crate::state::{AuxiliaryStore, EntityStore};
 ///
 /// Reads and writes are raw: what a debit means — checked against funds, or
 /// saturating — is the business layer's policy, expressed with
-/// [`Balance`]'s checked/saturating arithmetic, not the store's.
+/// [`UserBalance`]'s checked/saturating arithmetic, not the store's.
 pub trait AccountBalancesStore {
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// The account's balance; [`Balance::ZERO`] if the account doesn't exist.
-    fn get_balance(&mut self, account: Address) -> Result<Balance, Self::Error>;
+    /// The account's balance; [`UserBalance::ZERO`] if the account doesn't exist.
+    fn get_balance(&mut self, account: UserAddress) -> Result<UserBalance, Self::Error>;
 
     /// Set the account's balance, creating the account if needed.
-    fn set_balance(&mut self, account: Address, balance: Balance) -> Result<(), Self::Error>;
+    fn set_balance(
+        &mut self,
+        account: UserAddress,
+        balance: UserBalance,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Holds the **account transaction nonces** — replay protection, advanced once
 /// per transaction.
 ///
-/// This is the *other* nonce, deliberately a bare `u64`: the entity-minting
-/// nonce is the newtyped [`EntityNonce`] in [`EntityCreationNoncesStore`], and
-/// the two advance at different rates (see [`EntityNonce`]'s docs).
+/// This is the *other* nonce: the entity-minting one is the
+/// [`EntityCreationNonce`] in [`EntityCreationNoncesStore`], and the two advance
+/// at different rates (see [`UserNonce`]'s docs) — distinct newtypes so they
+/// cannot be handed to the wrong store.
 pub trait AccountNoncesStore {
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// The account's transaction nonce; `0` if the account doesn't exist.
-    fn get_account_nonce(&mut self, account: Address) -> Result<u64, Self::Error>;
+    /// The account's transaction nonce; [`UserNonce::ZERO`] if the account
+    /// doesn't exist.
+    fn get_account_nonce(&mut self, account: UserAddress) -> Result<UserNonce, Self::Error>;
 
     /// Set the account's transaction nonce.
-    fn set_account_nonce(&mut self, account: Address, nonce: u64) -> Result<(), Self::Error>;
+    fn set_account_nonce(
+        &mut self,
+        account: UserAddress,
+        nonce: UserNonce,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Holds the **entity-minting nonces**: how many entities each account has
-/// created, an input to every minted [`EntityKey`].
+/// created, an input to every minted [`EntityAddress`].
 pub trait EntityCreationNoncesStore {
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// The owner's minting nonce; [`EntityNonce::ZERO`] if it never created one.
-    fn get_entity_nonce(&mut self, owner: Address) -> Result<EntityNonce, Self::Error>;
+    /// The owner's minting nonce; [`EntityCreationNonce::ZERO`] if it never created one.
+    fn get_entity_nonce(&mut self, owner: UserAddress) -> Result<EntityCreationNonce, Self::Error>;
 
     /// Advance the owner's minting nonce by `by` (one per entity created),
     /// returning the value it had **before** the advance — the nonce the batch's
     /// first create was derived with.
-    fn advance_entity_nonce(&mut self, owner: Address, by: u64)
-    -> Result<EntityNonce, Self::Error>;
+    fn advance_entity_nonce(
+        &mut self,
+        owner: UserAddress,
+        by: u64,
+    ) -> Result<EntityCreationNonce, Self::Error>;
 }
 
 /// How urgently a tombstoned entity should be pruned. Higher prunes first.
@@ -125,17 +142,17 @@ pub trait PruningMap {
     /// with `priority` deciding its place in the queue once due.
     fn schedule_pruning(
         &mut self,
-        entity: EntityKey,
+        entity: EntityAddress,
         prune_at: BlockNumber,
         priority: PruningPriority,
     ) -> Result<(), Self::Error>;
 
     /// Every entity due at `block` (scheduled at or before it): highest
     /// priority first, ties in ascending key order.
-    fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityKey>, Self::Error>;
+    fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityAddress>, Self::Error>;
 
     /// Forget `entities` — they were physically removed (or deleted early).
-    fn clear_pruning(&mut self, entities: &[EntityKey]) -> Result<(), Self::Error>;
+    fn clear_pruning(&mut self, entities: &[EntityAddress]) -> Result<(), Self::Error>;
 }
 
 /// The umbrella: every state lane behind **one handle with one error type**,

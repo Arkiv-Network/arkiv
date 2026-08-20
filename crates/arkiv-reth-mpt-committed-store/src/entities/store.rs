@@ -1,7 +1,7 @@
 //! [`RethEntityStore`] — the [`EntityStore`] implementation.
 //!
-//! The store's own job is small and host-agnostic: map an [`EntityKey`] to its
-//! account via [`entity_address`](crate::entities::layout::entity_address), then load, store,
+//! The store's own job is small and host-agnostic: map an [`EntityAddress`] to its
+//! account via [`entity_leaf_address`](crate::entities::layout::entity_leaf_address), then load, store,
 //! or remove the entity there. The *raw* persistence — how an entity is encoded
 //! into an account's code and where those accounts actually live — is the
 //! [`EntityBackend`] seam, which a reth adapter fills over revm's state (next
@@ -10,10 +10,10 @@
 use alloy_primitives::Address;
 
 use arkiv_interfaces::entity::Entity;
-use arkiv_interfaces::primitives::{EntityKey, Hash};
+use arkiv_interfaces::primitives::{EntityAddress, Hash};
 use arkiv_interfaces::state::{BlockEntityStoreDelta, EntityStore};
 
-use crate::entities::layout::entity_address;
+use crate::entities::layout::entity_leaf_address;
 
 /// Raw account-level persistence the entity store sits on.
 ///
@@ -39,7 +39,7 @@ pub trait EntityBackend {
 }
 
 /// The reth-host [`EntityStore`]: entity keys resolve to accounts through
-/// [`entity_address`](crate::entities::layout::entity_address); persistence is delegated to
+/// [`entity_leaf_address`](crate::entities::layout::entity_leaf_address); persistence is delegated to
 /// an [`EntityBackend`].
 #[derive(Debug, Default, Clone)]
 pub struct RethEntityStore<B> {
@@ -66,16 +66,17 @@ impl<B> RethEntityStore<B> {
 impl<B: EntityBackend> EntityStore for RethEntityStore<B> {
     type Error = B::Error;
 
-    fn get(&mut self, entity: EntityKey) -> Result<Option<Entity>, Self::Error> {
-        self.backend.load(entity_address(entity))
+    fn get(&mut self, entity: EntityAddress) -> Result<Option<Entity>, Self::Error> {
+        self.backend.load(entity_leaf_address(entity))
     }
 
     fn apply_delta(&mut self, delta: &BlockEntityStoreDelta) -> Result<(), Self::Error> {
         for entity in &delta.puts {
-            self.backend.store(entity_address(entity.key), entity)?;
+            self.backend
+                .store(entity_leaf_address(entity.key), entity)?;
         }
         for key in &delta.deletes {
-            self.backend.remove(entity_address(*key))?;
+            self.backend.remove(entity_leaf_address(*key))?;
         }
         Ok(())
     }
@@ -117,7 +118,7 @@ mod tests {
         }
     }
 
-    fn entity_with_key(key: EntityKey) -> Entity {
+    fn entity_with_key(key: EntityAddress) -> Entity {
         Entity {
             key,
             owner: [2u8; 20],
@@ -130,7 +131,7 @@ mod tests {
     #[test]
     fn put_get_delete_roundtrips_through_entity_address() {
         let mut store = RethEntityStore::new(MemBackend::default());
-        let key: EntityKey = [7u8; 32];
+        let key: EntityAddress = [7u8; 32];
 
         assert!(store.get(key).unwrap().is_none());
 
@@ -143,8 +144,13 @@ mod tests {
             .unwrap();
         assert_eq!(store.get(key).unwrap().as_ref(), Some(&entity));
 
-        // The entity really landed at its `entity_address`, not some other key.
-        assert!(store.backend().accounts.contains_key(&entity_address(key)));
+        // The entity really landed at its `entity_leaf_address`, not some other key.
+        assert!(
+            store
+                .backend()
+                .accounts
+                .contains_key(&entity_leaf_address(key))
+        );
 
         store
             .apply_delta(&BlockEntityStoreDelta {

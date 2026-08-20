@@ -57,7 +57,7 @@ use arkiv_interfaces::manager::{
     PruningPriority, StateManager,
 };
 use arkiv_interfaces::primitives::{
-    Address as ArkivAddress, Balance, BlockNumber, EntityKey, EntityNonce, Gas, Hash,
+    BlockNumber, EntityAddress, EntityCreationNonce, Gas, Hash, UserAddress, UserBalance, UserNonce,
 };
 use arkiv_interfaces::query::{PageParams, Query, QueryMatches, QueryStats};
 use arkiv_interfaces::state::{
@@ -144,7 +144,7 @@ where
 {
     type Error = MptError<E>;
 
-    fn get(&mut self, entity: EntityKey) -> Result<Option<Entity>, Self::Error> {
+    fn get(&mut self, entity: EntityAddress) -> Result<Option<Entity>, Self::Error> {
         RethEntityStore::new(CodeBackend::new(&mut self.base))
             .get(entity)
             .map_err(MptError::Entity)
@@ -197,13 +197,17 @@ where
 {
     type Error = MptError<E>;
 
-    fn get_balance(&mut self, account: ArkivAddress) -> Result<Balance, Self::Error> {
+    fn get_balance(&mut self, account: UserAddress) -> Result<UserBalance, Self::Error> {
         RethAccountBalancesStore::new(&mut self.base)
             .get_balance(account)
             .map_err(MptError::Backend)
     }
 
-    fn set_balance(&mut self, account: ArkivAddress, balance: Balance) -> Result<(), Self::Error> {
+    fn set_balance(
+        &mut self,
+        account: UserAddress,
+        balance: UserBalance,
+    ) -> Result<(), Self::Error> {
         RethAccountBalancesStore::new(&mut self.base)
             .set_balance(account, balance)
             .map_err(MptError::Backend)
@@ -217,13 +221,17 @@ where
 {
     type Error = MptError<E>;
 
-    fn get_account_nonce(&mut self, account: ArkivAddress) -> Result<u64, Self::Error> {
+    fn get_account_nonce(&mut self, account: UserAddress) -> Result<UserNonce, Self::Error> {
         RethAccountNoncesStore::new(&mut self.base)
             .get_account_nonce(account)
             .map_err(MptError::Backend)
     }
 
-    fn set_account_nonce(&mut self, account: ArkivAddress, nonce: u64) -> Result<(), Self::Error> {
+    fn set_account_nonce(
+        &mut self,
+        account: UserAddress,
+        nonce: UserNonce,
+    ) -> Result<(), Self::Error> {
         RethAccountNoncesStore::new(&mut self.base)
             .set_account_nonce(account, nonce)
             .map_err(MptError::Backend)
@@ -237,7 +245,7 @@ where
 {
     type Error = MptError<E>;
 
-    fn get_entity_nonce(&mut self, owner: ArkivAddress) -> Result<EntityNonce, Self::Error> {
+    fn get_entity_nonce(&mut self, owner: UserAddress) -> Result<EntityCreationNonce, Self::Error> {
         RethEntityCreationNoncesStore::new(&mut self.base)
             .get_entity_nonce(owner)
             .map_err(MptError::Backend)
@@ -245,9 +253,9 @@ where
 
     fn advance_entity_nonce(
         &mut self,
-        owner: ArkivAddress,
+        owner: UserAddress,
         by: u64,
-    ) -> Result<EntityNonce, Self::Error> {
+    ) -> Result<EntityCreationNonce, Self::Error> {
         RethEntityCreationNoncesStore::new(&mut self.base)
             .advance_entity_nonce(owner, by)
             .map_err(MptError::Backend)
@@ -267,7 +275,7 @@ where
 
     fn schedule_pruning(
         &mut self,
-        entity: EntityKey,
+        entity: EntityAddress,
         prune_at: BlockNumber,
         priority: PruningPriority,
     ) -> Result<(), Self::Error> {
@@ -276,11 +284,11 @@ where
             .map_err(|e| match e {})
     }
 
-    fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityKey>, Self::Error> {
+    fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityAddress>, Self::Error> {
         self.pruning.pruning_due(block).map_err(|e| match e {})
     }
 
-    fn clear_pruning(&mut self, entities: &[EntityKey]) -> Result<(), Self::Error> {
+    fn clear_pruning(&mut self, entities: &[EntityAddress]) -> Result<(), Self::Error> {
         self.pruning.clear_pruning(entities).map_err(|e| match e {})
     }
 }
@@ -335,7 +343,7 @@ mod tests {
     use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn};
     use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta};
     use arkiv_reth_mpt_committed_store::entities::layout::{
-        SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot,
+        SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address, nonce_slot,
     };
 
     /// An in-memory base implementing every raw seam — the shape any real base
@@ -409,7 +417,7 @@ mod tests {
 
     type Mgr = MptStateManager<MemState>;
 
-    fn key_of(byte: u8) -> EntityKey {
+    fn key_of(byte: u8) -> EntityAddress {
         [byte; 32]
     }
 
@@ -447,7 +455,7 @@ mod tests {
         .unwrap();
     }
 
-    fn owned_by(mgr: &mut Mgr, owner: u8) -> Vec<EntityKey> {
+    fn owned_by(mgr: &mut Mgr, owner: u8) -> Vec<EntityAddress> {
         let query = Query::Eq {
             key: AnnotKey::BuiltIn(BuiltIn::Owner),
             value: AnnotVal::EthereumAddress([owner; 20]),
@@ -472,7 +480,7 @@ mod tests {
         put(&mut mgr, entity_of(7, 2));
 
         assert_eq!(mgr.get(key).unwrap(), Some(entity_of(7, 2)));
-        assert!(mgr.base().code.contains_key(&entity_address(key)));
+        assert!(mgr.base().code.contains_key(&entity_leaf_address(key)));
 
         EntityStore::apply_delta(
             &mut mgr,
@@ -500,7 +508,7 @@ mod tests {
 
         assert_eq!(owned_by(&mut mgr, 1), vec![key_of(0xA0)]);
         assert_eq!(owned_by(&mut mgr, 2), vec![key_of(0xB0)]);
-        assert_eq!(owned_by(&mut mgr, 9), Vec::<EntityKey>::new());
+        assert_eq!(owned_by(&mut mgr, 9), Vec::<EntityAddress>::new());
     }
 
     /// Balances and tx nonces read through to the base and write back to it, in
@@ -516,18 +524,19 @@ mod tests {
         let alice_key = alice.into_array();
         assert_eq!(
             mgr.get_balance(alice_key).unwrap(),
-            Balance::from_u64(1_000)
+            UserBalance::from_u64(1_000)
         );
-        assert_eq!(mgr.get_account_nonce(alice_key).unwrap(), 4);
+        assert_eq!(mgr.get_account_nonce(alice_key).unwrap(), UserNonce::new(4));
 
-        mgr.set_balance(alice_key, Balance::from_u64(250)).unwrap();
-        mgr.set_account_nonce(alice_key, 5).unwrap();
+        mgr.set_balance(alice_key, UserBalance::from_u64(250))
+            .unwrap();
+        mgr.set_account_nonce(alice_key, UserNonce::new(5)).unwrap();
         assert_eq!(mgr.base().balances[&alice], U256::from(250u64));
         assert_eq!(mgr.base().nonces[&alice], 5);
 
         // An untouched account reads as empty, not as an error.
-        assert_eq!(mgr.get_balance([0xBB; 20]).unwrap(), Balance::ZERO);
-        assert_eq!(mgr.get_account_nonce([0xBB; 20]).unwrap(), 0);
+        assert_eq!(mgr.get_balance([0xBB; 20]).unwrap(), UserBalance::ZERO);
+        assert_eq!(mgr.get_account_nonce([0xBB; 20]).unwrap(), UserNonce::ZERO);
     }
 
     /// The minting-nonce lane is wired to the system account — the manager
@@ -537,14 +546,20 @@ mod tests {
     #[test]
     fn entity_nonces_live_on_the_system_account() {
         let mut mgr = Mgr::new(MemState::default());
-        let alice: ArkivAddress = [0xAA; 20];
+        let alice: UserAddress = [0xAA; 20];
 
-        assert_eq!(mgr.get_entity_nonce(alice).unwrap(), EntityNonce::ZERO);
+        assert_eq!(
+            mgr.get_entity_nonce(alice).unwrap(),
+            EntityCreationNonce::ZERO
+        );
         assert_eq!(
             mgr.advance_entity_nonce(alice, 2).unwrap(),
-            EntityNonce::ZERO
+            EntityCreationNonce::ZERO
         );
-        assert_eq!(mgr.get_entity_nonce(alice).unwrap(), EntityNonce::new(2));
+        assert_eq!(
+            mgr.get_entity_nonce(alice).unwrap(),
+            EntityCreationNonce::new(2)
+        );
 
         assert!(mgr.base().persisted.contains(&SYSTEM_ACCOUNT_ADDRESS));
         assert!(
@@ -561,7 +576,8 @@ mod tests {
     fn shallow_copies_are_independent() {
         let mut mgr = Mgr::new(MemState::default());
         put(&mut mgr, entity_of(1, 1));
-        mgr.set_balance([0xAA; 20], Balance::from_u64(100)).unwrap();
+        mgr.set_balance([0xAA; 20], UserBalance::from_u64(100))
+            .unwrap();
         mgr.schedule_pruning(key_of(1), 50, 0).unwrap();
 
         let mut copy = mgr.shallow_copy();
@@ -570,18 +586,21 @@ mod tests {
         assert_eq!(copy.get(key_of(1)).unwrap(), Some(entity_of(1, 1)));
         assert_eq!(
             copy.get_balance([0xAA; 20]).unwrap(),
-            Balance::from_u64(100)
+            UserBalance::from_u64(100)
         );
         assert_eq!(copy.pruning_due(50).unwrap(), vec![key_of(1)]);
 
         // The copy diverges: new entity, spent balance, extra tombstone.
         put(&mut copy, entity_of(2, 1));
-        copy.set_balance([0xAA; 20], Balance::ZERO).unwrap();
+        copy.set_balance([0xAA; 20], UserBalance::ZERO).unwrap();
         copy.schedule_pruning(key_of(2), 60, 0).unwrap();
 
         // The original never sees any of it…
         assert!(mgr.get(key_of(2)).unwrap().is_none());
-        assert_eq!(mgr.get_balance([0xAA; 20]).unwrap(), Balance::from_u64(100));
+        assert_eq!(
+            mgr.get_balance([0xAA; 20]).unwrap(),
+            UserBalance::from_u64(100)
+        );
         assert_eq!(mgr.pruning_due(60).unwrap(), vec![key_of(1)]);
 
         // …and the original's later writes never reach the copy.

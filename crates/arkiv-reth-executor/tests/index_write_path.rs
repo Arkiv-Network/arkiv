@@ -14,7 +14,7 @@ use alloy_primitives::{Address, B256};
 
 use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags};
 use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecStatus, Op};
-use arkiv_interfaces::primitives::EntityKey;
+use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_interfaces::state::{AuxiliaryStore, BlockEntityStoreDelta, EntityStore};
 use arkiv_reth_executor::ArkivExecutor;
@@ -27,14 +27,14 @@ use arkiv_reth_mpt_committed_store::RethAuxStore;
 /// A minimal [`EntityStore`] the executor reads through.
 #[derive(Default)]
 struct MemEntities {
-    map: HashMap<EntityKey, arkiv_interfaces::entity::Entity>,
+    map: HashMap<EntityAddress, arkiv_interfaces::entity::Entity>,
 }
 
 impl EntityStore for MemEntities {
     type Error = Infallible;
     fn get(
         &mut self,
-        key: EntityKey,
+        key: EntityAddress,
     ) -> Result<Option<arkiv_interfaces::entity::Entity>, Infallible> {
         Ok(self.map.get(&key).cloned())
     }
@@ -131,7 +131,7 @@ fn all(page: u64) -> PageParams {
     }
 }
 
-fn keys(index: &mut RethAuxStore<MemIndex>, query: &Query) -> Vec<EntityKey> {
+fn keys(index: &mut RethAuxStore<MemIndex>, query: &Query) -> Vec<EntityAddress> {
     let mut keys = index.evaluate(query, all(100)).unwrap().keys;
     keys.sort();
     keys
@@ -148,7 +148,7 @@ fn create_is_queryable_by_its_attributes() {
     let mut entities = MemEntities::default();
     let mut index = RethAuxStore::new(MemIndex::default());
     let alice = [0xAA; 20];
-    let key: EntityKey = [1u8; 32];
+    let key: EntityAddress = [1u8; 32];
 
     run(
         &exec,
@@ -222,7 +222,7 @@ fn transfer_moves_the_entity_between_owner_queries() {
     let mut index = RethAuxStore::new(MemIndex::default());
     let alice = [0xAA; 20];
     let bob = [0xBB; 20];
-    let key: EntityKey = [1u8; 32];
+    let key: EntityAddress = [1u8; 32];
 
     run(
         &exec,
@@ -269,7 +269,7 @@ fn delete_removes_the_entity_from_queries() {
     let mut entities = MemEntities::default();
     let mut index = RethAuxStore::new(MemIndex::default());
     let alice = [0xAA; 20];
-    let key: EntityKey = [1u8; 32];
+    let key: EntityAddress = [1u8; 32];
 
     run(
         &exec,
@@ -317,7 +317,7 @@ fn update_reindexes_attributes() {
     let mut entities = MemEntities::default();
     let mut index = RethAuxStore::new(MemIndex::default());
     let alice = [0xAA; 20];
-    let key: EntityKey = [1u8; 32];
+    let key: EntityAddress = [1u8; 32];
 
     run(
         &exec,

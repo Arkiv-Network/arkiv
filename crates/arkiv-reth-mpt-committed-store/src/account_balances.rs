@@ -1,6 +1,6 @@
 //! [`RethAccountBalancesStore`] — the [`AccountBalancesStore`] implementation.
 //!
-//! The store's own job is one conversion: the spec speaks in [`Balance`]
+//! The store's own job is one conversion: the spec speaks in [`UserBalance`]
 //! big-endian bytes, the host in alloy [`U256`]s. Where a balance physically
 //! lives is the [`BalanceAccess`] seam's concern — on this host, in the
 //! Ethereum account itself. Keeping the seam a trait means the store logic is
@@ -10,7 +10,7 @@
 use alloy_primitives::{Address, U256};
 
 use arkiv_interfaces::manager::AccountBalancesStore;
-use arkiv_interfaces::primitives::{Address as ArkivAddress, Balance};
+use arkiv_interfaces::primitives::{UserAddress, UserBalance};
 
 /// This store's raw seam: an Ethereum account's **balance** field.
 pub trait BalanceAccess {
@@ -66,12 +66,16 @@ impl<B> RethAccountBalancesStore<B> {
 impl<B: BalanceAccess> AccountBalancesStore for RethAccountBalancesStore<B> {
     type Error = B::Error;
 
-    fn get_balance(&mut self, account: ArkivAddress) -> Result<Balance, Self::Error> {
+    fn get_balance(&mut self, account: UserAddress) -> Result<UserBalance, Self::Error> {
         let balance = self.backend.get_balance(Address::from(account))?;
-        Ok(Balance::from_be_bytes(balance.to_be_bytes()))
+        Ok(UserBalance::from_be_bytes(balance.to_be_bytes()))
     }
 
-    fn set_balance(&mut self, account: ArkivAddress, balance: Balance) -> Result<(), Self::Error> {
+    fn set_balance(
+        &mut self,
+        account: UserAddress,
+        balance: UserBalance,
+    ) -> Result<(), Self::Error> {
         self.backend.set_balance(
             Address::from(account),
             U256::from_be_bytes(balance.to_be_bytes()),
@@ -106,13 +110,18 @@ mod tests {
     #[test]
     fn balances_round_trip_the_spec_boundary() {
         let mut store = RethAccountBalancesStore::new(MemBalances::default());
-        let alice: ArkivAddress = [0xAA; 20];
+        let alice: UserAddress = [0xAA; 20];
 
         // Absent reads as zero, not as an error.
-        assert_eq!(store.get_balance(alice).unwrap(), Balance::ZERO);
+        assert_eq!(store.get_balance(alice).unwrap(), UserBalance::ZERO);
 
-        store.set_balance(alice, Balance::from_u64(1_000)).unwrap();
-        assert_eq!(store.get_balance(alice).unwrap(), Balance::from_u64(1_000));
+        store
+            .set_balance(alice, UserBalance::from_u64(1_000))
+            .unwrap();
+        assert_eq!(
+            store.get_balance(alice).unwrap(),
+            UserBalance::from_u64(1_000)
+        );
 
         // The backend holds the alloy-typed value at the alloy-typed address.
         assert_eq!(
@@ -125,8 +134,8 @@ mod tests {
     #[test]
     fn wide_balances_survive_the_conversion() {
         let mut store = RethAccountBalancesStore::new(MemBalances::default());
-        let alice: ArkivAddress = [0xAA; 20];
-        let wide = Balance::from_be_bytes([0xAB; 32]);
+        let alice: UserAddress = [0xAA; 20];
+        let wide = UserBalance::from_be_bytes([0xAB; 32]);
 
         store.set_balance(alice, wide).unwrap();
         assert_eq!(store.get_balance(alice).unwrap(), wide);

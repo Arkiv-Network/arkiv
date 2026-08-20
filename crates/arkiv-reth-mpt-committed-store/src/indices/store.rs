@@ -18,7 +18,7 @@
 //! ## Entity ids: allocation and the two maps
 //!
 //! Bitmaps are keyed on a compact, dense `u64` entity id, but a delta names an
-//! entity by its [`EntityKey`] and a query answers in keys — so the store owns the
+//! entity by its [`EntityAddress`] and a query answers in keys — so the store owns the
 //! whole id bookkeeping, all at [`SYSTEM_ACCOUNT_ADDRESS`]:
 //! - a **counter** (next id to hand out),
 //! - **key → id**, so a later op on an existing entity reuses its id, and
@@ -35,7 +35,7 @@
 use crate::entities::AccountCode;
 use crate::entities::layout::SYSTEM_ACCOUNT_ADDRESS;
 use alloy_primitives::{B256, keccak256};
-use arkiv_interfaces::primitives::{EntityKey, Hash};
+use arkiv_interfaces::primitives::{EntityAddress, Hash};
 use arkiv_interfaces::query::{PageParams, Query, QueryMatches, QueryStats};
 use arkiv_interfaces::state::{AuxiliaryStore, BlockAuxiliaryStoreDelta};
 
@@ -54,15 +54,15 @@ fn entity_count_slot() -> B256 {
 
 /// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `key` to its entity id (stored as
 /// `id + 1`): `keccak256("arkiv.key2id" || key)`.
-fn key_to_id_slot(key: EntityKey) -> B256 {
+fn key_to_id_slot(key: EntityAddress) -> B256 {
     const DOMAIN: &[u8] = b"arkiv.key2id";
-    let mut buf = [0u8; DOMAIN.len() + size_of::<EntityKey>()];
+    let mut buf = [0u8; DOMAIN.len() + size_of::<EntityAddress>()];
     buf[..DOMAIN.len()].copy_from_slice(DOMAIN);
     buf[DOMAIN.len()..].copy_from_slice(&key);
     keccak256(buf)
 }
 
-/// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `entity_id` to its [`EntityKey`]:
+/// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `entity_id` to its [`EntityAddress`]:
 /// `keccak256("arkiv.id2key" || entity_id_be)`.
 fn id_to_key_slot(entity_id: u64) -> B256 {
     const DOMAIN: &[u8] = b"arkiv.id2key";
@@ -101,7 +101,7 @@ where
 {
     /// The entity id for `key`: its existing id, or a freshly allocated one if this
     /// is the key's first appearance (bumping the counter and writing both maps).
-    fn id_for_key(&mut self, key: EntityKey) -> Result<u64, AuxError<E>> {
+    fn id_for_key(&mut self, key: EntityAddress) -> Result<u64, AuxError<E>> {
         let key_slot = key_to_id_slot(key);
         let existing = self
             .backend
@@ -128,7 +128,7 @@ where
     }
 
     /// The key for `entity_id`, or `None` if the id was never allocated.
-    fn id_key(&mut self, entity_id: u64) -> Result<Option<EntityKey>, AuxError<E>> {
+    fn id_key(&mut self, entity_id: u64) -> Result<Option<EntityAddress>, AuxError<E>> {
         let word = self
             .backend
             .storage(SYSTEM_ACCOUNT_ADDRESS, id_to_key_slot(entity_id))
@@ -289,7 +289,7 @@ mod tests {
         AttrEntry::new(attr, value)
     }
 
-    fn key_of(byte: u8) -> EntityKey {
+    fn key_of(byte: u8) -> EntityAddress {
         [byte; 32]
     }
 
@@ -298,7 +298,7 @@ mod tests {
     }
 
     struct NewEntity {
-        key: EntityKey,
+        key: EntityAddress,
         owner: [u8; 20],
         expires: u64,
         content_type: String,
@@ -336,7 +336,7 @@ mod tests {
     }
 
     /// Evaluate `query` and return the matching keys, sorted for stable assertions.
-    fn matching(store: &mut RethAuxStore<MemBackend>, query: &Query) -> Vec<EntityKey> {
+    fn matching(store: &mut RethAuxStore<MemBackend>, query: &Query) -> Vec<EntityAddress> {
         let page = PageParams {
             page_size: 1000,
             cursor: None,
@@ -398,7 +398,7 @@ mod tests {
         );
         assert_eq!(
             matching(&mut store, &owner_is(addr_of(9))),
-            Vec::<EntityKey>::new()
+            Vec::<EntityAddress>::new()
         );
     }
 
@@ -730,7 +730,7 @@ mod tests {
 
         assert_eq!(
             matching(&mut store, &owner_is(addr_of(1))),
-            Vec::<EntityKey>::new()
+            Vec::<EntityAddress>::new()
         );
         assert_eq!(
             matching(&mut store, &owner_is(addr_of(2))),

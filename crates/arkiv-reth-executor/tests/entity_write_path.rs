@@ -17,7 +17,7 @@ use arkiv_interfaces::entity::{AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::state::EntityStore;
 use arkiv_reth_executor::ArkivExecutor;
-use arkiv_reth_mpt_committed_store::entities::layout::entity_address;
+use arkiv_reth_mpt_committed_store::entities::layout::entity_leaf_address;
 use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore, decode, encode};
 use arkiv_reth_statemanager::WriteOverlay;
 use reth_ethereum::evm::revm::database_interface::EmptyDB;
@@ -79,7 +79,7 @@ fn create_commits_the_entity_as_account_code() {
     //    byte-for-byte and still decodable.
     let diff = store.into_backend().into_inner().into_state();
     let acc = diff
-        .get(&entity_address(key))
+        .get(&entity_leaf_address(key))
         .expect("entity account staged in the diff");
     assert!(acc.is_touched());
     assert_eq!(acc.info.nonce, 1);
@@ -154,7 +154,7 @@ fn update_recommits_the_entity_as_new_code() {
     );
     let diff = store.into_backend().into_inner().into_state();
     let code = diff
-        .get(&entity_address(key))
+        .get(&entity_leaf_address(key))
         .and_then(|a| a.info.code.as_ref())
         .expect("entity code")
         .original_bytes();
@@ -290,7 +290,7 @@ fn create_then_delete_commits_a_tombstone() {
     assert!(store.get(key).unwrap().is_none());
     let diff = store.into_backend().into_inner().into_state();
     let acc = diff
-        .get(&entity_address(key))
+        .get(&entity_leaf_address(key))
         .expect("tombstoned account staged in the diff");
     assert!(acc.info.code.as_ref().is_none_or(|c| c.is_empty()));
     assert_eq!(acc.info.nonce, 1);

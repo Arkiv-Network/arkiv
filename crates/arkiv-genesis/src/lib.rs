@@ -26,9 +26,9 @@ use std::collections::BTreeMap;
 /// allocation is required — registration is programmatic, which is what
 /// `tests::genesis_alloc_has_dev_funding_only` pins.
 ///
-/// The bytes are [`arkiv_interfaces::constants::ARKIV_ADDRESS`], shared with the
+/// The bytes are [`arkiv_interfaces::constants::ARKIV_RETH_ADDRESS`], shared with the
 /// executor so genesis and execution cannot disagree about where the engine lives.
-pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_ADDRESS);
+pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_RETH_ADDRESS);
 
 /// First account derived from [`ARKIV_DEV_MNEMONIC`] at standard BIP-44
 /// path `m/44'/60'/0'/0/0`. Kept as a `const` so callers that only need

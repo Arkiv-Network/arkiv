@@ -19,18 +19,18 @@
 //! later module).
 
 use alloy_primitives::B256;
-use arkiv_interfaces::constants::WORD_LEN;
+use arkiv_interfaces::constants::EVM_WORD_LENGTH;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::indices::address::btree_header_address;
 use crate::indices::btree;
 use crate::indices::storage::IndexStorage;
 
-/// Encode a value (≤ [`WORD_LEN`] bytes) as its B+ tree **key** by **left**-aligning
+/// Encode a value (≤ [`EVM_WORD_LENGTH`] bytes) as its B+ tree **key** by **left**-aligning
 /// it and zero-padding the tail:
 ///
 /// ```text
-///   byte:  0 ....... value.len() ....... WORD_LEN
+///   byte:  0 ....... value.len() ....... EVM_WORD_LENGTH
 ///          | value             | 0 (padding)     |
 /// ```
 ///
@@ -39,11 +39,11 @@ use crate::indices::storage::IndexStorage;
 /// null bytes (the precompile enforces it), so the padding is unambiguous.
 pub fn annot_val_to_slot(value: &[u8]) -> B256 {
     debug_assert!(
-        value.len() <= WORD_LEN,
+        value.len() <= EVM_WORD_LENGTH,
         "annot_val_to_slot: value too long ({} bytes)",
         value.len()
     );
-    let mut buf = [0u8; WORD_LEN];
+    let mut buf = [0u8; EVM_WORD_LENGTH];
     buf[..value.len()].copy_from_slice(value);
     B256::from(buf)
 }
@@ -59,15 +59,19 @@ pub fn annot_val_to_slot(value: &[u8]) -> B256 {
 /// The `+ 1` is what lets `0` mean "absent" (a never-written or lazy-deleted slot)
 /// while still recording a genuinely empty value: `slot_presence(0)` = `1`.
 pub fn slot_presence(len: usize) -> B256 {
-    let mut buf = [0u8; WORD_LEN];
-    buf[WORD_LEN - size_of::<u32>()..].copy_from_slice(&(len as u32 + 1).to_be_bytes());
+    let mut buf = [0u8; EVM_WORD_LENGTH];
+    buf[EVM_WORD_LENGTH - size_of::<u32>()..].copy_from_slice(&(len as u32 + 1).to_be_bytes());
     B256::from(buf)
 }
 
 /// Decode a value's original length from a presence word, or `None` if absent —
 /// the exact inverse of [`slot_presence`].
 pub fn slot_to_val_len(word: B256) -> Option<usize> {
-    let n = u32::from_be_bytes(word.0[WORD_LEN - size_of::<u32>()..].try_into().unwrap());
+    let n = u32::from_be_bytes(
+        word.0[EVM_WORD_LENGTH - size_of::<u32>()..]
+            .try_into()
+            .unwrap(),
+    );
     if n == 0 { None } else { Some((n - 1) as usize) }
 }
 
@@ -182,7 +186,7 @@ mod tests {
     fn slot_key_is_left_aligned_and_zero_padded() {
         let k = annot_val_to_slot(b"hi");
         assert_eq!(&k.0[..2], b"hi");
-        assert_eq!(&k.0[2..], &[0u8; WORD_LEN - 2]);
+        assert_eq!(&k.0[2..], &[0u8; EVM_WORD_LENGTH - 2]);
     }
 
     #[test]

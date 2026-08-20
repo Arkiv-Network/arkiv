@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use arkiv_interfaces::manager::{PruningMap, PruningPriority};
-use arkiv_interfaces::primitives::{BlockNumber, EntityKey};
+use arkiv_interfaces::primitives::{BlockNumber, EntityAddress};
 
 /// An in-memory pruning map: entity → (due block, priority).
 ///
@@ -18,7 +18,7 @@ use arkiv_interfaces::primitives::{BlockNumber, EntityKey};
 /// highest-priority-first sort.
 #[derive(Debug, Default, Clone)]
 pub struct MemPruningMap {
-    due: BTreeMap<EntityKey, (BlockNumber, PruningPriority)>,
+    due: BTreeMap<EntityAddress, (BlockNumber, PruningPriority)>,
 }
 
 impl MemPruningMap {
@@ -35,7 +35,7 @@ impl PruningMap for MemPruningMap {
 
     fn schedule_pruning(
         &mut self,
-        entity: EntityKey,
+        entity: EntityAddress,
         prune_at: BlockNumber,
         priority: PruningPriority,
     ) -> Result<(), Self::Error> {
@@ -43,8 +43,8 @@ impl PruningMap for MemPruningMap {
         Ok(())
     }
 
-    fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityKey>, Self::Error> {
-        let mut due: Vec<(PruningPriority, EntityKey)> = self
+    fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityAddress>, Self::Error> {
+        let mut due: Vec<(PruningPriority, EntityAddress)> = self
             .due
             .iter()
             .filter(|(_, (prune_at, _))| *prune_at <= block)
@@ -56,7 +56,7 @@ impl PruningMap for MemPruningMap {
         Ok(due.into_iter().map(|(_, key)| key).collect())
     }
 
-    fn clear_pruning(&mut self, entities: &[EntityKey]) -> Result<(), Self::Error> {
+    fn clear_pruning(&mut self, entities: &[EntityAddress]) -> Result<(), Self::Error> {
         for key in entities {
             self.due.remove(key);
         }
@@ -68,7 +68,7 @@ impl PruningMap for MemPruningMap {
 mod tests {
     use super::*;
 
-    fn key_of(byte: u8) -> EntityKey {
+    fn key_of(byte: u8) -> EntityAddress {
         [byte; 32]
     }
 
@@ -81,7 +81,7 @@ mod tests {
         // A reschedule is an upsert — the entity moves, it doesn't duplicate.
         map.schedule_pruning(key_of(2), 20, 0).unwrap();
 
-        assert_eq!(map.pruning_due(5).unwrap(), Vec::<EntityKey>::new());
+        assert_eq!(map.pruning_due(5).unwrap(), Vec::<EntityAddress>::new());
         // Equal priority: ascending key order, regardless of insertion order.
         assert_eq!(
             map.pruning_due(30).unwrap(),

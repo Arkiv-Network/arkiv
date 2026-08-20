@@ -86,7 +86,7 @@ mod tests {
     use crate::entities::store::RethEntityStore;
     use arkiv_interfaces::entity::CreationFlags;
     use arkiv_interfaces::entity::{Attribute, AttributeValue};
-    use arkiv_interfaces::primitives::EntityKey;
+    use arkiv_interfaces::primitives::EntityAddress;
     use arkiv_interfaces::state::{BlockEntityStoreDelta, EntityStore};
     use core::convert::Infallible;
     use std::collections::HashMap;
@@ -170,7 +170,7 @@ mod tests {
         // RethEntityStore → CodeBackend → MemCode: apply a delta, read it back by
         // key (which resolves to the entity address internally).
         let mut store = RethEntityStore::new(CodeBackend::new(MemCode::default()));
-        let key: EntityKey = [7u8; 32];
+        let key: EntityAddress = [7u8; 32];
         let e = sample();
 
         store

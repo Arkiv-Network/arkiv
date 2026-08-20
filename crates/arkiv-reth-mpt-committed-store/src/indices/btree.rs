@@ -26,7 +26,7 @@
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_interfaces::constants::WORD_LEN;
+use arkiv_interfaces::constants::EVM_WORD_LENGTH;
 
 use crate::indices::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
 use crate::indices::slot::{storage_to_u64, u64_to_storage};
@@ -43,11 +43,11 @@ const VALUES_BASE_SLOT: u64 = KEYS_BASE_SLOT + BTREE_ORDER as u64;
 // Layout invariants, checked at compile time so a stray edit to the node order or a
 // field type can't silently corrupt the on-chain encoding:
 const _: () = assert!(
-    size_of::<u64>() + size_of::<u16>() + size_of::<u8>() <= WORD_LEN,
+    size_of::<u64>() + size_of::<u16>() + size_of::<u8>() <= EVM_WORD_LENGTH,
     "the node meta word (u64 sibling id + u16 key count + u8 leaf flag) must fit one word",
 );
 const _: () = assert!(
-    2 * size_of::<u64>() < WORD_LEN,
+    2 * size_of::<u64>() < EVM_WORD_LENGTH,
     "the header word (root id + next id + a magic byte) must fit one word",
 );
 const _: () = assert!(
@@ -106,7 +106,7 @@ fn write_header<S: IndexStorage>(
     root_id: u64,
     next_id: u64,
 ) -> Result<(), S::Error> {
-    let mut buf = [0u8; WORD_LEN];
+    let mut buf = [0u8; EVM_WORD_LENGTH];
     buf[0..8].copy_from_slice(&root_id.to_be_bytes());
     buf[8..16].copy_from_slice(&next_id.to_be_bytes());
     buf[16] = BTREE_MAGIC;
@@ -180,7 +180,7 @@ fn write_node<S: IndexStorage>(
 ) -> Result<(), S::Error> {
     let node_addr = btree_node_address(header_addr, node_id);
     storage.ensure_account_persists(node_addr)?;
-    let mut meta = [0u8; WORD_LEN];
+    let mut meta = [0u8; EVM_WORD_LENGTH];
     meta[0..8].copy_from_slice(&node.right_sibling.to_be_bytes());
     meta[8..10].copy_from_slice(&(node.keys.len() as u16).to_be_bytes());
     meta[10] = if node.is_leaf { 1 } else { 0 };

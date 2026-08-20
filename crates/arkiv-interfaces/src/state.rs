@@ -3,10 +3,10 @@
 use alloc::vec::Vec;
 
 use crate::entity::{AttributeValue, Entity};
-use crate::primitives::{BlockNumber, EntityKey, Hash};
+use crate::primitives::{BlockNumber, EntityAddress, Hash};
 use crate::query::{PageParams, Query, QueryMatches};
 
-/// Holds the **entities**: a map from [`EntityKey`] to [`Entity`], plus a
+/// Holds the **entities**: a map from [`EntityAddress`] to [`Entity`], plus a
 /// [`commitment`](EntityStore::commitment) over the whole map.
 ///
 /// The store deals in whole [`Entity`] values — how it serializes them, and where
@@ -19,7 +19,7 @@ pub trait EntityStore {
     type Error: core::fmt::Debug;
 
     /// This entity, or `None` if there is no such entity.
-    fn get(&mut self, entity: EntityKey) -> Result<Option<Entity>, Self::Error>;
+    fn get(&mut self, entity: EntityAddress) -> Result<Option<Entity>, Self::Error>;
 
     /// Apply one block's entity changes: the writes and removals in `delta`.
     fn apply_delta(&mut self, delta: &BlockEntityStoreDelta) -> Result<(), Self::Error>;
@@ -33,8 +33,11 @@ pub trait EntityStore {
 /// reconstruct — history. Extends [`EntityStore`] (whose reads are at the tip).
 pub trait HistoricalEntityStore: EntityStore {
     /// This entity as of block `at`, or `None` if it didn't exist then.
-    fn get_at(&mut self, entity: EntityKey, at: BlockNumber)
-    -> Result<Option<Entity>, Self::Error>;
+    fn get_at(
+        &mut self,
+        entity: EntityAddress,
+        at: BlockNumber,
+    ) -> Result<Option<Entity>, Self::Error>;
 }
 
 /// Holds the **query index** over the entities.
@@ -75,11 +78,11 @@ pub trait HistoricalAuxiliaryStore: AuxiliaryStore {
 /// One block's changes to the [`EntityStore`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BlockEntityStoreDelta {
-    /// Entities written this block. Each carries its own [`EntityKey`]; the store
+    /// Entities written this block. Each carries its own [`EntityAddress`]; the store
     /// serializes them however it likes.
     pub puts: Vec<Entity>,
     /// Entities removed this block.
-    pub deletes: Vec<EntityKey>,
+    pub deletes: Vec<EntityAddress>,
 }
 
 /// One block's changes to the [`AuxiliaryStore`], with one entry per entity
@@ -93,14 +96,14 @@ pub struct BlockAuxiliaryStoreDelta {
 /// One entity's index changes: attribute values to add and to remove. A transfer,
 /// for example, removes the old `$owner` value and adds the new one.
 ///
-/// The entity is named only by its [`EntityKey`]. The index's own compact `u64`
+/// The entity is named only by its [`EntityAddress`]. The index's own compact `u64`
 /// id — what its bitmaps are keyed on — is the store's concern: it maps key → id
 /// itself (allocating on the key's first appearance), so a producer of deltas never
 /// deals in ids.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuxiliaryEntityDelta {
     /// The entity whose index entries are changing.
-    pub entity_key: EntityKey,
+    pub entity_key: EntityAddress,
     /// Values to add to the index.
     pub inserts: Vec<AttrEntry>,
     /// Values to remove from the index.
@@ -113,7 +116,7 @@ pub struct AuxiliaryEntityDelta {
 /// needs its type twice over: to decide whether — and how — the value is *ordered*
 /// for range queries (a [`U256`](AttributeValue::U256) numerically, a
 /// [`Str`](AttributeValue::Str) lexically, an
-/// [`EntityKey`](AttributeValue::EntityKey) not at all), and to keep the buckets of
+/// [`EntityAddress`](AttributeValue::EntityKey) not at all), and to keep the buckets of
 /// different types disjoint. The bytes it is actually keyed on are
 /// [`AttributeValue::index_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]

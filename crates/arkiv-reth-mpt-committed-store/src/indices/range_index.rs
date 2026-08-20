@@ -8,12 +8,12 @@
 //! back to its equality bitmap.
 //!
 //! Two structures back it, chosen by the attribute's [`QueryCapabilities`]:
-//! values ≤ [`WORD_LEN`] with range capability go through the storage-slot
+//! values ≤ [`EVM_WORD_LENGTH`] with range capability go through the storage-slot
 //! B-tree ([`range`](crate::indices::range)); strings with prefix capability go
 //! through the [`cascade`](crate::indices::cascade). Equality-only attributes
 //! have no tier 2 at all — inserts and scans are no-ops for them.
 
-use arkiv_interfaces::constants::WORD_LEN;
+use arkiv_interfaces::constants::EVM_WORD_LENGTH;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::indices::annotation::QueryCapabilities;
@@ -49,7 +49,7 @@ where
         capabilities: QueryCapabilities,
     ) -> Result<(), AuxError<E>> {
         match capabilities {
-            QueryCapabilities::EqualityAndRange if value_bytes.len() <= WORD_LEN => {
+            QueryCapabilities::EqualityAndRange if value_bytes.len() <= EVM_WORD_LENGTH => {
                 range::insert(&mut self.backend, attr, ty, value_bytes).map_err(AuxError::Backend)
             }
             QueryCapabilities::EqualityAndPrefix if value_bytes.len() <= MAX_STR_BYTES => {
@@ -69,7 +69,7 @@ where
         capabilities: QueryCapabilities,
     ) -> Result<(), AuxError<E>> {
         match capabilities {
-            QueryCapabilities::EqualityAndRange if value_bytes.len() <= WORD_LEN => {
+            QueryCapabilities::EqualityAndRange if value_bytes.len() <= EVM_WORD_LENGTH => {
                 range::remove(&mut self.backend, attr, ty, value_bytes).map_err(AuxError::Backend)
             }
             QueryCapabilities::EqualityAndPrefix if value_bytes.len() <= MAX_STR_BYTES => {

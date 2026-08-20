@@ -2,14 +2,14 @@
 //!
 //! The **transaction** nonce (replay protection), not the entity-minting one —
 //! that is [`RethEntityCreationNoncesStore`](crate::RethEntityCreationNoncesStore),
-//! and the two must never mix (see `EntityNonce`'s docs in `arkiv_interfaces`).
+//! and the two must never mix (see `EntityCreationNonce`'s docs in `arkiv_interfaces`).
 //! On this host the transaction nonce is the Ethereum account's own nonce
 //! field, reached through the [`NonceAccess`] seam.
 
 use alloy_primitives::Address;
 
 use arkiv_interfaces::manager::AccountNoncesStore;
-use arkiv_interfaces::primitives::Address as ArkivAddress;
+use arkiv_interfaces::primitives::{UserAddress, UserNonce};
 
 /// This store's raw seam: an Ethereum account's **nonce** field.
 pub trait NonceAccess {
@@ -65,12 +65,18 @@ impl<B> RethAccountNoncesStore<B> {
 impl<B: NonceAccess> AccountNoncesStore for RethAccountNoncesStore<B> {
     type Error = B::Error;
 
-    fn get_account_nonce(&mut self, account: ArkivAddress) -> Result<u64, Self::Error> {
-        self.backend.get_nonce(Address::from(account))
+    fn get_account_nonce(&mut self, account: UserAddress) -> Result<UserNonce, Self::Error> {
+        self.backend
+            .get_nonce(Address::from(account))
+            .map(UserNonce::new)
     }
 
-    fn set_account_nonce(&mut self, account: ArkivAddress, nonce: u64) -> Result<(), Self::Error> {
-        self.backend.set_nonce(Address::from(account), nonce)
+    fn set_account_nonce(
+        &mut self,
+        account: UserAddress,
+        nonce: UserNonce,
+    ) -> Result<(), Self::Error> {
+        self.backend.set_nonce(Address::from(account), nonce.get())
     }
 }
 
@@ -101,13 +107,13 @@ mod tests {
     #[test]
     fn nonces_read_zero_then_stick() {
         let mut store = RethAccountNoncesStore::new(MemNonces::default());
-        let alice: ArkivAddress = [0xAA; 20];
-        let bob: ArkivAddress = [0xBB; 20];
+        let alice: UserAddress = [0xAA; 20];
+        let bob: UserAddress = [0xBB; 20];
 
-        assert_eq!(store.get_account_nonce(alice).unwrap(), 0);
-        store.set_account_nonce(alice, 7).unwrap();
-        assert_eq!(store.get_account_nonce(alice).unwrap(), 7);
+        assert_eq!(store.get_account_nonce(alice).unwrap(), UserNonce::ZERO);
+        store.set_account_nonce(alice, UserNonce::new(7)).unwrap();
+        assert_eq!(store.get_account_nonce(alice).unwrap(), UserNonce::new(7));
         // Per-account, not global.
-        assert_eq!(store.get_account_nonce(bob).unwrap(), 0);
+        assert_eq!(store.get_account_nonce(bob).unwrap(), UserNonce::ZERO);
     }
 }

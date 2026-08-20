@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256, U256};
 use crate::entities::layout::{SYSTEM_ACCOUNT_ADDRESS, nonce_slot};
 use crate::indices::IndexStorage;
 use arkiv_interfaces::manager::EntityCreationNoncesStore;
-use arkiv_interfaces::primitives::{Address as ArkivAddress, EntityNonce};
+use arkiv_interfaces::primitives::{EntityCreationNonce, UserAddress};
 
 /// The reth-host [`EntityCreationNoncesStore`]: minting nonces are
 /// system-account storage slots, reached through an [`IndexStorage`].
@@ -42,20 +42,20 @@ impl<B> RethEntityCreationNoncesStore<B> {
 impl<B: IndexStorage> EntityCreationNoncesStore for RethEntityCreationNoncesStore<B> {
     type Error = B::Error;
 
-    fn get_entity_nonce(&mut self, owner: ArkivAddress) -> Result<EntityNonce, Self::Error> {
+    fn get_entity_nonce(&mut self, owner: UserAddress) -> Result<EntityCreationNonce, Self::Error> {
         let word = self
             .backend
             .storage(SYSTEM_ACCOUNT_ADDRESS, nonce_slot(Address::from(owner)))?;
-        Ok(EntityNonce::new(
+        Ok(EntityCreationNonce::new(
             U256::from_be_bytes(word.0).saturating_to::<u64>(),
         ))
     }
 
     fn advance_entity_nonce(
         &mut self,
-        owner: ArkivAddress,
+        owner: UserAddress,
         by: u64,
-    ) -> Result<EntityNonce, Self::Error> {
+    ) -> Result<EntityCreationNonce, Self::Error> {
         // Materialise the system account on its first write, or EIP-161 prunes
         // it (and the nonce with it) at end of block.
         self.backend
@@ -110,21 +110,30 @@ mod tests {
     #[test]
     fn advance_returns_the_pre_advance_nonce() {
         let mut store = RethEntityCreationNoncesStore::new(MemSlots::default());
-        let alice: ArkivAddress = [0xAA; 20];
+        let alice: UserAddress = [0xAA; 20];
 
-        assert_eq!(store.get_entity_nonce(alice).unwrap(), EntityNonce::ZERO);
+        assert_eq!(
+            store.get_entity_nonce(alice).unwrap(),
+            EntityCreationNonce::ZERO
+        );
         // A batch of two creates: advance returns the start (0), leaves 2.
         assert_eq!(
             store.advance_entity_nonce(alice, 2).unwrap(),
-            EntityNonce::ZERO
+            EntityCreationNonce::ZERO
         );
-        assert_eq!(store.get_entity_nonce(alice).unwrap(), EntityNonce::new(2));
+        assert_eq!(
+            store.get_entity_nonce(alice).unwrap(),
+            EntityCreationNonce::new(2)
+        );
         // Next batch of one: start 2, leaves 3.
         assert_eq!(
             store.advance_entity_nonce(alice, 1).unwrap(),
-            EntityNonce::new(2)
+            EntityCreationNonce::new(2)
         );
-        assert_eq!(store.get_entity_nonce(alice).unwrap(), EntityNonce::new(3));
+        assert_eq!(
+            store.get_entity_nonce(alice).unwrap(),
+            EntityCreationNonce::new(3)
+        );
     }
 
     #[test]
@@ -133,11 +142,11 @@ mod tests {
         store.advance_entity_nonce([0xAA; 20], 5).unwrap();
         assert_eq!(
             store.get_entity_nonce([0xAA; 20]).unwrap(),
-            EntityNonce::new(5)
+            EntityCreationNonce::new(5)
         );
         assert_eq!(
             store.get_entity_nonce([0xBB; 20]).unwrap(),
-            EntityNonce::ZERO
+            EntityCreationNonce::ZERO
         );
     }
 
@@ -146,7 +155,7 @@ mod tests {
     #[test]
     fn advance_writes_the_system_account_slot() {
         let mut store = RethEntityCreationNoncesStore::new(MemSlots::default());
-        let alice: ArkivAddress = [0xAA; 20];
+        let alice: UserAddress = [0xAA; 20];
         store.advance_entity_nonce(alice, 1).unwrap();
 
         let backend = store.into_backend();

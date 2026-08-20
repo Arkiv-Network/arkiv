@@ -67,7 +67,7 @@ pub mod decode;
 pub mod revert;
 
 pub use arkiv::{ArkivExecutor, OpEffect};
-pub use decode::{DecodeError, decode_ops, derive_entity_key};
+pub use decode::{DecodeError, decode_ops, derive_entity_address};
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
@@ -106,7 +106,7 @@ use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::manager::{
     AccountBalancesStore, AccountNoncesStore, EntityCreationNoncesStore,
 };
-use arkiv_interfaces::primitives::Balance;
+use arkiv_interfaces::primitives::UserBalance;
 use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
 use arkiv_reth_statemanager::{WriteManager, write_manager};
 
@@ -115,9 +115,9 @@ use arkiv_reth_statemanager::{WriteManager, write_manager};
 /// EOAs `CALL` here with entity `execute(Operation[])` calldata. There is no
 /// precompile object and no bytecode — calls to this address are routed directly
 /// in [`arkiv_transact`]. The bytes come from
-/// [`arkiv_interfaces::constants::ARKIV_ADDRESS`], which is also what
+/// [`arkiv_interfaces::constants::ARKIV_RETH_ADDRESS`], which is also what
 /// `arkiv-genesis` asserts against; this is the reth-typed view of that one value.
-pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_ADDRESS);
+pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_RETH_ADDRESS);
 
 /// Flat gas charged per transaction by the fixed-function executor.
 const ARKIV_TX_GAS: u64 = 21_000;
@@ -141,9 +141,9 @@ fn intrinsic_gas(data: &[u8]) -> u64 {
     initial.max(floor)
 }
 
-/// An alloy `U256` as the spec's [`Balance`] bytes.
-fn as_balance(value: U256) -> Balance {
-    Balance::from_be_bytes(value.to_be_bytes())
+/// An alloy `U256` as the spec's [`UserBalance`] bytes.
+fn as_balance(value: U256) -> UserBalance {
+    UserBalance::from_be_bytes(value.to_be_bytes())
 }
 
 /// Map a state-manager fault into the executor's fatal error channel. Faults
@@ -176,7 +176,7 @@ fn charge_sender<DB: Database>(
     let nonce = mgr
         .get_account_nonce(sender)
         .map_err(state_fault("sender nonce"))?;
-    mgr.set_account_nonce(sender, nonce.saturating_add(1))
+    mgr.set_account_nonce(sender, nonce.next())
         .map_err(state_fault("bump sender nonce"))
 }
 
@@ -515,7 +515,7 @@ fn view_entity<DB: Database>(
 /// `entityNonce(owner)`: the owner's entity-key minting nonce, as a `uint64`.
 ///
 /// SDKs `eth_call` this before sending creates to predict the keys the batch
-/// will mint (`derive_entity_key(chain_id, owner, nonce + i, salt)`), so it
+/// will mint (`derive_entity_address(chain_id, owner, nonce + i, salt)`), so it
 /// reads the same system-account slot the execute path mints from.
 fn arkiv_entity_nonce_call<DB: Database>(
     db: &mut DB,
@@ -801,10 +801,10 @@ mod tests {
     use alloy_primitives::Bytes;
     use alloy_sol_types::SolCall;
     use arkiv_bindings::{IEntityRegistry, Operation};
-    use arkiv_interfaces::primitives::EntityNonce;
+    use arkiv_interfaces::primitives::EntityCreationNonce;
     use arkiv_reth_mpt_committed_store::decode;
     use arkiv_reth_mpt_committed_store::entities::layout::{
-        SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot,
+        SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address, nonce_slot,
     };
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
@@ -848,10 +848,10 @@ mod tests {
         assert!(rs.result.is_success());
 
         // The entity landed at the derived key, decodable, with env-resolved fields.
-        let key = derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0);
+        let key = derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(0), 0);
         let acc = rs
             .state
-            .get(&entity_address(key))
+            .get(&entity_leaf_address(key))
             .expect("entity account in the diff");
         let entity = decode(&acc.info.code.as_ref().unwrap().original_bytes()).unwrap();
         assert_eq!(entity.owner, [0xAA; 20]);
@@ -1140,7 +1140,12 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
         let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, names_calldata(key))).unwrap();
         assert_eq!(names_from(&rs), vec!["color", "rank"]);
     }
@@ -1160,7 +1165,12 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
 
         let rs =
             arkiv_transact(&mut db, 11, arkiv_tx(alice, type_id_calldata(key, "rank"))).unwrap();
@@ -1213,7 +1223,12 @@ mod tests {
             arkiv_transact(&mut db, 10, arkiv_tx(alice, create_with_attrs_calldata(50))).unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
 
         // Last live block is 59.
         let rs = arkiv_transact(&mut db, 59, arkiv_tx(alice, names_calldata(key))).unwrap();
@@ -1274,7 +1289,12 @@ mod tests {
 
         // A patch batch: cheap in the cost model (40k base) but with calldata
         // whose intrinsic floor exceeds it.
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
         let big_payload = arkiv_bindings::Attribute::from_value(
             arkiv_bindings::Ident32::system("$payload").unwrap(),
             // 4k nonzero bytes → floor ≈ 181k
