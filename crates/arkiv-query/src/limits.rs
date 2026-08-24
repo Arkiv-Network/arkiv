@@ -1,11 +1,12 @@
 //! Bounds on how big a query may be.
 //!
-//! [`parse`](crate::parse) runs on whatever an unauthenticated RPC caller sends,
+//! [`parse`](fn@crate::parse) runs on whatever an unauthenticated RPC caller sends,
 //! and both the parser and the evaluator walk the query tree recursively — so an
 //! unbounded query is an unbounded stack. These caps make the work a query can
 //! ask for finite before any of it is done. Exceeding one is a
-//! [`Limit`](crate::ParseErrorKind::Limit) error, which a node reports as
-//! `-32004`.
+//! [`QueryLimitError`](crate::ParseErrorKind::QueryLimitError), which a node
+//! reports as
+//! [`rpc_error_codes::QUERY_LIMIT`](arkiv_interfaces::constants::rpc_error_codes::QUERY_LIMIT).
 //!
 //! The numbers below are policy, not protocol: they bound a node's own work and
 //! can be retuned without changing what any query *means*. The one exception is

@@ -11,6 +11,63 @@ pub mod ethereum {
     ];
 }
 
+/// The JSON-RPC error codes the `arkiv_*` methods answer with.
+///
+/// **Frozen** — an SDK branches on the code, not the message. They are listed
+/// here, in one block, because they are allocated from a single range that
+/// several crates draw on: the query language classifies the first four
+/// (`arkiv-query`), the node raises the last two (`arkiv-rpc-types`), and a code
+/// picked independently in either place could silently land on one already
+/// taken. Adding a code means adding it here and to [`ALL`](rpc_error_codes::ALL),
+/// which is what proves it distinct at compile time.
+pub mod rpc_error_codes {
+    /// Malformed query text: an unexpected token, an unclosed group, trailing
+    /// junk.
+    pub const MALFORMED_INPUT: i32 = -32001;
+
+    /// Well-formed but not well-typed: a range operator on an equality-only
+    /// type, an unknown type tag, a value whose type doesn't fit the attribute.
+    pub const TYPE_ERROR: i32 = -32002;
+
+    /// A literal that doesn't fit its tag: `i32` out of range, a bad EIP-55
+    /// checksum, more than 18 decimal places, an over-long string.
+    pub const LITERAL_ERROR: i32 = -32003;
+
+    /// The query is too big: too long, too many predicates, nested too deeply.
+    pub const QUERY_LIMIT: i32 = -32004;
+
+    /// A cursor that is malformed, or bound to a different request.
+    pub const CURSOR_ERROR: i32 = -32005;
+
+    /// An `atBlock` outside the node's retained range.
+    pub const BLOCK_UNAVAILABLE: i32 = -32006;
+
+    /// Every code above, in allocation order.
+    pub const ALL: [i32; 6] = [
+        MALFORMED_INPUT,
+        TYPE_ERROR,
+        LITERAL_ERROR,
+        QUERY_LIMIT,
+        CURSOR_ERROR,
+        BLOCK_UNAVAILABLE,
+    ];
+
+    // Invariant: no two codes collide. This is the reason the list is
+    // centralized — a duplicate is a build failure, not a client that silently
+    // mistakes one failure for another.
+    const _: () = {
+        let mut i = 0;
+        while i < ALL.len() {
+            let mut j = i + 1;
+            while j < ALL.len() {
+                assert!(ALL[i] != ALL[j], "two arkiv RPC error codes collide");
+                j += 1;
+            }
+            i += 1;
+        }
+    };
+}
+
 /// The longest `str` value in bytes, allowed in arkiv.
 pub const MAX_STR_BYTES: usize = 128;
 

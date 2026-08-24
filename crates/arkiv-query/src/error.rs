@@ -1,62 +1,71 @@
 //! Why a query string was rejected.
 //!
 //! The [`kind`](ParseError::kind) is part of the node's public surface: it maps
-//! one-to-one onto the JSON-RPC error codes the spec freezes, so a client can act
-//! on the failure without reading the message.
+//! one-to-one onto the JSON-RPC error codes the spec freezes
+//! ([`rpc_error_codes`]), so a client can act on the failure without reading the
+//! message.
 
 use alloc::string::{String, ToString};
+use arkiv_interfaces::constants::rpc_error_codes;
 use core::fmt;
 
 /// What sort of failure this is — and, for a node, which RPC code to answer with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseErrorKind {
     /// Malformed input: an unexpected token, an unclosed group, trailing junk.
-    /// RPC `-32001`.
-    Syntax,
+    ///
+    /// Reported as [`rpc_error_codes::MALFORMED_INPUT`].
+    MalformedInputError,
+
     /// Well-formed but not well-typed: a range operator on an equality-only type,
     /// an unknown type tag, a value whose type doesn't fit the attribute.
-    /// RPC `-32002`.
-    Type,
+    ///
+    /// Reported as [`rpc_error_codes::TYPE_ERROR`].
+    TypeError,
+
     /// A literal that doesn't fit its tag: `i32` out of range, a bad EIP-55
     /// checksum, more than 18 decimal places, an over-long string.
-    /// RPC `-32003`.
-    Literal,
+    ///
+    /// Reported as [`rpc_error_codes::LITERAL_ERROR`].
+    LiteralError,
+
     /// The query is too big: too long, too many predicates, nested too deeply.
-    /// RPC `-32004`.
-    Limit,
+    ///
+    /// Reported as [`rpc_error_codes::QUERY_LIMIT`].
+    QueryLimitError,
 }
 
 impl ParseErrorKind {
     /// The JSON-RPC error code this kind answers with.
     pub const fn rpc_code(self) -> i32 {
         match self {
-            Self::Syntax => -32001,
-            Self::Type => -32002,
-            Self::Literal => -32003,
-            Self::Limit => -32004,
+            Self::MalformedInputError => rpc_error_codes::MALFORMED_INPUT,
+            Self::TypeError => rpc_error_codes::TYPE_ERROR,
+            Self::LiteralError => rpc_error_codes::LITERAL_ERROR,
+            Self::QueryLimitError => rpc_error_codes::QUERY_LIMIT,
         }
     }
 }
 
-/// Why a query string failed to parse.
+/// Description of a query-language failure, including its position in the string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    /// Which class of failure — see [`ParseErrorKind`].
     pub kind: ParseErrorKind,
-    /// Human-readable description. Written to be actionable: it names the fix
-    /// ("use i32(10)") rather than only the problem.
     pub message: String,
-    /// Byte offset into the input where the failure was detected, when known.
-    pub position: Option<usize>,
+    pub failure_position: Option<usize>,
 }
 
 impl ParseError {
     /// An error at a known byte offset.
-    pub(crate) fn at(position: usize, kind: ParseErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn at(
+        failure_position: usize,
+        kind: ParseErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
             message: message.into(),
-            position: Some(position),
+            failure_position: Some(failure_position),
         }
     }
 
@@ -65,29 +74,33 @@ impl ParseError {
         Self {
             kind,
             message: message.into(),
-            position: None,
+            failure_position: None,
         }
     }
 
     /// A syntax error at `position`.
-    pub(crate) fn syntax(position: usize, message: impl Into<String>) -> Self {
-        Self::at(position, ParseErrorKind::Syntax, message)
+    pub(crate) fn syntax(failure_position: usize, message: impl Into<String>) -> Self {
+        Self::at(
+            failure_position,
+            ParseErrorKind::MalformedInputError,
+            message,
+        )
     }
 
     /// A type error at `position`.
-    pub(crate) fn type_error(position: usize, message: impl Into<String>) -> Self {
-        Self::at(position, ParseErrorKind::Type, message)
+    pub(crate) fn type_error(failure_position: usize, message: impl Into<String>) -> Self {
+        Self::at(failure_position, ParseErrorKind::TypeError, message)
     }
 
     /// A literal-validation error at `position`.
-    pub(crate) fn literal(position: usize, message: impl Into<String>) -> Self {
-        Self::at(position, ParseErrorKind::Literal, message)
+    pub(crate) fn literal(failure_position: usize, message: impl Into<String>) -> Self {
+        Self::at(failure_position, ParseErrorKind::LiteralError, message)
     }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.position {
+        match self.failure_position {
             Some(p) => write!(f, "query error at byte {p}: {}", self.message),
             None => write!(f, "query error: {}", self.message),
         }
