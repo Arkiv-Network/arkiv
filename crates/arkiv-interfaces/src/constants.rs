@@ -12,14 +12,6 @@ pub mod ethereum {
 }
 
 /// The JSON-RPC error codes the `arkiv_*` methods answer with.
-///
-/// **Frozen** — an SDK branches on the code, not the message. They are listed
-/// here, in one block, because they are allocated from a single range that
-/// several crates draw on: the query language classifies the first four
-/// (`arkiv-query`), the node raises the last two (`arkiv-rpc-types`), and a code
-/// picked independently in either place could silently land on one already
-/// taken. Adding a code means adding it here and to [`ALL`](rpc_error_codes::ALL),
-/// which is what proves it distinct at compile time.
 pub mod rpc_error_codes {
     /// Malformed query text: an unexpected token, an unclosed group, trailing
     /// junk.
