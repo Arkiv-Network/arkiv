@@ -5,7 +5,7 @@
 //! storage words this way, so the encoders live here rather than in either.
 
 use alloy_primitives::B256;
-use arkiv_interfaces::constants::EVM_WORD_LENGTH;
+use arkiv_interfaces::constants::ethereum::EVM_WORD_LENGTH;
 
 const _: () = assert!(
     size_of::<B256>() == EVM_WORD_LENGTH,

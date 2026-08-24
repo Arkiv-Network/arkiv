@@ -28,7 +28,7 @@ use core::fmt;
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
-use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
+use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_interfaces::entity::{AttributeType, AttributeValue, TOMBSTONE_TYPE_ID};
 
 use crate::{

@@ -16,7 +16,7 @@
 /// It just so happens to be equivalent to Ethereum's account addressing space
 /// ([`EthAddress`]), which is what lets an Ethereum-style host use it verbatim —
 /// but it is an Arkiv type, not a borrowed one. See
-/// [`ETH_ADDRESS_LEN`](crate::constants::ETH_ADDRESS_LEN).
+/// [`ETH_ADDRESS_LEN`](crate::constants::ethereum::ETH_ADDRESS_LEN).
 pub type UserAddress = [u8; 20];
 
 /// A 20-byte **Ethereum** account address — deliberately Eth-prefixed, because

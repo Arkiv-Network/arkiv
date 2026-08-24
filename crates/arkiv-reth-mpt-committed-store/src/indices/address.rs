@@ -18,7 +18,7 @@
 //! the golden vectors below correctly treat as a fork.
 
 use alloy_primitives::{Address, keccak256};
-use arkiv_interfaces::constants::ETH_ADDRESS_LEN;
+use arkiv_interfaces::constants::ethereum::ETH_ADDRESS_LEN;
 use arkiv_interfaces::entity::AttributeType;
 
 /// Every domain tag is this many bytes (`b"arkiv.pair"`, `b"arkiv.ibth"`, …), so

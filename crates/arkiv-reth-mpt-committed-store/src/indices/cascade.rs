@@ -18,7 +18,7 @@
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_interfaces::constants::EVM_WORD_LENGTH;
+use arkiv_interfaces::constants::ethereum::EVM_WORD_LENGTH;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::indices::address::{list_address_for, str_level_address};

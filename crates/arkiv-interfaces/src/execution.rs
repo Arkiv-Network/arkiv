@@ -4,8 +4,9 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::entity::{Attribute, AttributeValue, CreationFlags};
+use crate::manager::StateManager;
 use crate::primitives::{BlockNumber, EntityAddress, Gas, Hash, UserAddress};
-use crate::state::{BlockAuxiliaryStoreDelta, BlockEntityStoreDelta, EntityStore};
+use crate::state::{BlockAuxiliaryStoreDelta, BlockEntityStoreDelta};
 
 /// What a transaction executor needs to know about its context. No EVM call
 /// types — just these fields.
@@ -257,24 +258,24 @@ pub struct BlockDraft {
 /// Runs one transaction: decode its operations, check them, and stage the
 /// resulting changes into the block's [`BlockDraft`].
 ///
-/// Reads see the committed [`EntityStore`] plus whatever earlier transactions in
+/// Reads see the committed [`StateManager`] plus whatever earlier transactions in
 /// the same block already staged in `draft`. Nothing touches the stores until the
 /// block commits.
 ///
 /// A transaction is all-or-nothing: if any operation fails, `draft` is left
 /// exactly as it was.
 pub trait TransactionExecutor {
-    /// The entity store this executor reads from.
-    type Entities: EntityStore;
+    /// The state this executor reads through.
+    type State: StateManager;
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// Run `op_bytes` under `env`, reading `entities` and `draft` and staging this
+    /// Run `op_bytes` under `env`, reading `state` and `draft` and staging this
     /// transaction's changes into `draft`.
     fn execute(
         &self,
         env: &ExecEnv,
-        entities: &mut Self::Entities,
+        state: &mut Self::State,
         draft: &mut BlockDraft,
         op_bytes: &[u8],
     ) -> Result<ExecOutput, Self::Error>;

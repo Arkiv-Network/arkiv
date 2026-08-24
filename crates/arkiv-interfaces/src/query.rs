@@ -5,8 +5,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::entity::{AttributeValue, Entity};
+use crate::manager::StateManager;
 use crate::primitives::{BlockNumber, EntityAddress, Gas};
-use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, HistoricalEntityStore};
 
 /// A query — a tree of predicates over an entity's attributes.
 ///
@@ -94,7 +94,7 @@ pub struct PageParams {
     pub cursor: Option<u64>,
 }
 
-/// The [`AuxiliaryStore`]'s answer to a query: the matching entity **keys** and
+/// The index's answer to a query: the matching entity **keys** and
 /// the work it took. The [`QueryProcessor`] turns the keys into full [`Entity`]
 /// values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -136,14 +136,14 @@ pub struct QueryStats {
 
 /// Answers a query with a page of entities.
 ///
-/// It asks the [`AuxiliaryStore`] which entity keys match, then reads those
-/// entities' bytes from the [`EntityStore`] and decodes them — adding paging and
-/// statistics along the way.
+/// It asks the [`StateManager`] which entity keys match, then reads those
+/// entities back from it — adding paging and statistics along the way. One handle
+/// for both halves: the index and the entities are lanes of the same manager, so
+/// a processor never holds two stores that could disagree about which block they
+/// are at.
 pub trait QueryProcessor {
-    /// The entity store it reads matched entities from.
-    type Entities: EntityStore;
-    /// The index it evaluates queries against.
-    type Auxiliary: AuxiliaryStore;
+    /// The state this processor reads the index and the entities through.
+    type State: StateManager;
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
@@ -155,18 +155,12 @@ pub trait QueryProcessor {
 /// Optional: answer queries against a **past block**, not just the current tip.
 ///
 /// A host implements this on top of [`QueryProcessor`] only if it can serve
-/// history. That requires history from both stores, so its [`Entities`] and
-/// [`Auxiliary`] must be a [`HistoricalEntityStore`] and a
-/// [`HistoricalAuxiliaryStore`]. The query runs exactly as
-/// [`QueryProcessor::query`], but as of the state committed through block `at`.
-///
-/// [`Entities`]: QueryProcessor::Entities
-/// [`Auxiliary`]: QueryProcessor::Auxiliary
-pub trait HistoricalQuery: QueryProcessor
-where
-    Self::Entities: HistoricalEntityStore,
-    Self::Auxiliary: HistoricalAuxiliaryStore,
-{
+/// history — which is to say, only if its [`State`](QueryProcessor::State)
+/// answers [`get_at`](StateManager::get_at) and
+/// [`evaluate_at`](StateManager::evaluate_at) rather than rejecting them. The
+/// query runs exactly as [`QueryProcessor::query`], but as of the state committed
+/// through block `at`.
+pub trait HistoricalQuery: QueryProcessor {
     /// Answer `query` as of block `at`.
     fn query_at(
         &self,

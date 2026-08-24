@@ -39,21 +39,25 @@
 //!
 //! ## Shallow copies
 //!
-//! [`shallow_copy`](StateManager::shallow_copy) is the load-bearing capability:
-//! a cheap, independent copy sharing the committed base. The caller may be about
-//! to simulate, or about to actually build a block — the manager doesn't know
-//! and doesn't need to. Work runs against the copy either way; dropping it is
-//! the simulation outcome, keeping it (and letting the host persist its staged
-//! changes) is the block-building one. Writes to a copy must never be visible
-//! through the original or through sibling copies.
+//! [`shallow_copy`](SimulatableState::shallow_copy) is the load-bearing
+//! capability for simulation: a cheap, independent copy sharing the committed
+//! base. The caller may be about to simulate, or about to actually build a block
+//! — the manager doesn't know and doesn't need to. Work runs against the copy
+//! either way; dropping it is the simulation outcome, keeping it (and letting the
+//! host persist its staged changes) is the block-building one. Writes to a copy
+//! must never be visible through the original or through sibling copies.
+//!
+//! It lives on [`SimulatableState`], not [`StateManager`], because a manager over
+//! a borrowed backend cannot produce an owned copy of itself — see that trait.
 
 use alloc::vec::Vec;
 
+use crate::entity::Entity;
 use crate::execution::{BlockDraft, Op};
 use crate::primitives::{
     BlockNumber, EntityAddress, EntityCreationNonce, Gas, UserAddress, UserBalance, UserNonce,
 };
-use crate::query::QueryStats;
+use crate::query::{PageParams, Query, QueryMatches, QueryStats};
 use crate::state::{AuxiliaryStore, EntityStore};
 
 /// Holds the **account balances**.
@@ -196,6 +200,48 @@ pub trait StateManager:
     /// [`get_operation_cost`](StateManager::get_operation_cost).
     fn get_query_cost(&mut self, stats: &QueryStats) -> Result<Gas, <Self as StateManager>::Error>;
 
+    /// This entity as of block `at`, or `None` if it didn't exist then.
+    ///
+    /// A host that keeps no history rejects this with its own error rather than
+    /// answering from the tip — a silently-wrong "as of" answer is worse than a
+    /// refusal.
+    fn get_at(
+        &mut self,
+        entity: EntityAddress,
+        at: BlockNumber,
+    ) -> Result<Option<Entity>, <Self as StateManager>::Error>;
+
+    /// The keys matching `query` as of block `at`, one page at a time. Same
+    /// history contract as [`get_at`](StateManager::get_at).
+    fn evaluate_at(
+        &mut self,
+        query: &Query,
+        page: PageParams,
+        at: BlockNumber,
+    ) -> Result<QueryMatches, <Self as StateManager>::Error>;
+
+    /// Apply one block's staged changes — both lanes of `draft`, entities
+    /// before index (the index delta may allocate ids for keys the entity
+    /// delta just wrote).
+    fn apply_draft(&mut self, draft: &BlockDraft) -> Result<(), <Self as StateManager>::Error> {
+        EntityStore::apply_delta(self, &draft.entities)?;
+        AuxiliaryStore::apply_delta(self, &draft.auxiliary)
+    }
+}
+
+/// A [`StateManager`] that can **fork and rewind itself**.
+///
+/// Deliberately separate from [`StateManager`]: a manager built over a borrowed,
+/// exclusively-held backend cannot hand out an owned copy of itself at all, and
+/// that is a property of the host's storage, not a missing feature. The reth
+/// host's write path is exactly this case — it holds `&mut DB` for the length of
+/// a transaction — so it implements [`StateManager`] and stops there, while a
+/// host that owns its storage implements both and unlocks simulation and reorg.
+///
+/// Consumers that only read and stage state (the executor, the query paths)
+/// bound on [`StateManager`]; only code that actually forks or steps back asks
+/// for this.
+pub trait SimulatableState: StateManager {
     /// A cheap, independent copy sharing the committed base.
     ///
     /// The copy sees everything committed plus this manager's staged-but-
@@ -206,19 +252,7 @@ pub trait StateManager:
     where
         Self: Sized;
 
-    /// Apply one block's staged changes — both lanes of `draft`, entities
-    /// before index (the index delta may allocate ids for keys the entity
-    /// delta just wrote).
-    fn apply_draft(&mut self, draft: &BlockDraft) -> Result<(), <Self as StateManager>::Error> {
-        EntityStore::apply_delta(self, &draft.entities)?;
-        AuxiliaryStore::apply_delta(self, &draft.auxiliary)
-    }
-
     /// Rewind every store to its state as of `block` — a reorg, the way any
     /// blockchain backend must be able to step back.
-    ///
-    /// A host whose storage engine reorgs *itself* (reth rewinds its own MPT)
-    /// may reject this and instead hand out a fresh manager over the target
-    /// block's state; a host that owns its storage implements it for real.
     fn rewind_to(&mut self, block: BlockNumber) -> Result<(), <Self as StateManager>::Error>;
 }

@@ -46,8 +46,8 @@ pub mod indices;
 pub use account_balances::{BalanceAccess, RethAccountBalancesStore};
 pub use account_nonces::{NonceAccess, RethAccountNoncesStore};
 pub use entities::{
-    AccountCode, CodeBackend, CodeBackendError, EntityBackend, RecordCodec, RecordError,
-    RethEntityStore, decode, encode,
+    AccountCode, CodeBackend, CodeBackendError, EntityBackend, RecordError, RethEntityStore,
+    decode, encode,
 };
 pub use entity_creation_nonces::RethEntityCreationNoncesStore;
 pub use indices::{

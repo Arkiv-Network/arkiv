@@ -4,13 +4,13 @@
 //! This is the counterpart to the reth plumbing in [`crate`] (the "exact"
 //! executor reth injects). Here there is no reth, no revm, no EVM: just the
 //! fixed-function entity state transition, expressed over the generic
-//! [`EntityStore`] / [`Op`] / [`BlockDraft`] vocabulary. Any host that can supply
-//! an [`EntityStore`] can drive it.
+//! [`StateManager`] / [`Op`] / [`BlockDraft`] vocabulary. Any host that can supply
+//! a [`StateManager`] can drive it.
 //!
 //! ## What it does
 //!
 //! [`ArkivExecutor::apply`] runs a transaction's operations against the committed
-//! [`EntityStore`] plus whatever earlier transactions in the same block already
+//! [`StateManager`] plus whatever earlier transactions in the same block already
 //! staged in the [`BlockDraft`]. It is **all-or-nothing**: operations are staged
 //! into a private overlay and only merged into the caller's `draft` if every one
 //! succeeds. A business-rule violation (missing entity, wrong owner, …) is a
@@ -18,7 +18,7 @@
 //! untouched — not an [`Err`]. [`Err`] is reserved for host/store faults.
 //!
 //! The executor works in whole [`Entity`] values throughout; serializing them for
-//! storage is the [`EntityStore`]'s concern, not this crate's.
+//! storage is the [`StateManager`]'s concern, not this crate's.
 //!
 //! ## The index delta
 //!
@@ -50,8 +50,9 @@ use arkiv_interfaces::execution::{
     TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
+use arkiv_interfaces::manager::StateManager;
 use arkiv_interfaces::primitives::{BlockNumber, EntityAddress, EntityCreationNonce, UserAddress};
-use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta, EntityStore};
+use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta};
 use arkiv_reth_mpt_committed_store::indices::annotation::entity_annotations;
 
 /// What a successfully-applied op did — enough for the host to emit its
@@ -78,47 +79,47 @@ pub struct OpEffect {
 
 /// The fixed-function entity executor.
 ///
-/// Generic over the [`EntityStore`] it reads (`E`) and the [`CostModel`] it prices
+/// Generic over the [`StateManager`] it reads (`S`) and the [`CostModel`] it prices
 /// with (`C`, [`PlaceholderCost`] by default). Holds no state itself — a `draft`
 /// carries the in-progress block changes.
-pub struct ArkivExecutor<E, C = PlaceholderCost> {
+pub struct ArkivExecutor<S, C = PlaceholderCost> {
     cost: C,
-    _store: PhantomData<fn() -> E>,
+    _state: PhantomData<fn() -> S>,
 }
 
-impl<E> ArkivExecutor<E, PlaceholderCost> {
+impl<S> ArkivExecutor<S, PlaceholderCost> {
     /// An executor with the zero-cost placeholder schedule.
     pub const fn new() -> Self {
         Self {
             cost: PlaceholderCost,
-            _store: PhantomData,
+            _state: PhantomData,
         }
     }
 }
 
-impl<E, C> ArkivExecutor<E, C> {
+impl<S, C> ArkivExecutor<S, C> {
     /// An executor with a specific cost model.
     pub const fn with_cost(cost: C) -> Self {
         Self {
             cost,
-            _store: PhantomData,
+            _state: PhantomData,
         }
     }
 }
 
-impl<E> Default for ArkivExecutor<E, PlaceholderCost> {
+impl<S> Default for ArkivExecutor<S, PlaceholderCost> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<E, C: Clone> Clone for ArkivExecutor<E, C> {
+impl<S, C: Clone> Clone for ArkivExecutor<S, C> {
     fn clone(&self) -> Self {
         Self::with_cost(self.cost.clone())
     }
 }
 
-impl<E, C: fmt::Debug> fmt::Debug for ArkivExecutor<E, C> {
+impl<S, C: fmt::Debug> fmt::Debug for ArkivExecutor<S, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ArkivExecutor")
             .field("cost", &self.cost)
@@ -126,14 +127,14 @@ impl<E, C: fmt::Debug> fmt::Debug for ArkivExecutor<E, C> {
     }
 }
 
-impl<E: EntityStore, C: CostModel> TransactionExecutor for ArkivExecutor<E, C> {
-    type Entities = E;
+impl<S: StateManager, C: CostModel> TransactionExecutor for ArkivExecutor<S, C> {
+    type State = S;
     type Error = ExecError;
 
     fn execute(
         &self,
         env: &ExecEnv,
-        entities: &mut Self::Entities,
+        state: &mut Self::State,
         draft: &mut BlockDraft,
         op_bytes: &[u8],
     ) -> Result<ExecOutput, Self::Error> {
@@ -142,23 +143,23 @@ impl<E: EntityStore, C: CostModel> TransactionExecutor for ArkivExecutor<E, C> {
         // reth executor yet). Decode failures are host faults surfaced as errors.
         let ops = crate::decode::decode_ops(env, op_bytes, EntityCreationNonce::ZERO)
             .map_err(|e| ExecError::Decode(e.to_string()))?;
-        self.apply(env, entities, draft, &ops)
+        self.apply(env, state, draft, &ops)
     }
 }
 
-impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
-    /// Run pre-decoded `ops` against `entities` + `draft`, all-or-nothing.
+impl<S: StateManager, C: CostModel> ArkivExecutor<S, C> {
+    /// Run pre-decoded `ops` against `state` + `draft`, all-or-nothing.
     ///
     /// The interpreter counterpart of [`TransactionExecutor::execute`] with the
     /// decode step removed — the real business logic, so it is directly testable.
     pub fn apply(
         &self,
         env: &ExecEnv,
-        entities: &mut E,
+        state: &mut S,
         draft: &mut BlockDraft,
         ops: &[Op],
     ) -> Result<ExecOutput, ExecError> {
-        self.apply_with_effects(env, entities, draft, ops, &mut Vec::new())
+        self.apply_with_effects(env, state, draft, ops, &mut Vec::new())
     }
 
     /// Like [`apply`](Self::apply), but on success also records one [`OpEffect`]
@@ -167,7 +168,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     pub fn apply_with_effects(
         &self,
         env: &ExecEnv,
-        entities: &mut E,
+        state: &mut S,
         draft: &mut BlockDraft,
         ops: &[Op],
         effects: &mut Vec<OpEffect>,
@@ -191,7 +192,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                     revert: Some(RevertReason::OutOfGas),
                 });
             }
-            match self.stage_op(env, entities, draft, &mut tx_state_overlay, op)? {
+            match self.stage_op(env, state, draft, &mut tx_state_overlay, op)? {
                 Ok(effect) => staged_effects.push(effect),
                 Err(reason) => {
                     // Business-rule revert: discard the overlay, leave `draft` as it was.
@@ -209,7 +210,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         // read from the draft + store *without* this transaction's overlay, so the
         // diff captures the transaction's net effect on the entity.
         for (key, staged_new) in &tx_state_overlay {
-            let before = self.committed_or_drafted(entities, draft, *key)?;
+            let before = self.committed_or_drafted(state, draft, *key)?;
             if let Some(entity_delta) = auxiliary_delta(*key, before.as_ref(), staged_new.as_ref())
             {
                 draft.auxiliary.entities.push(entity_delta);
@@ -241,7 +242,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     fn stage_op(
         &self,
         env: &ExecEnv,
-        entities: &mut E,
+        state: &mut S,
         draft: &BlockDraft,
         overlay: &mut BTreeMap<EntityAddress, Option<Entity>>,
         op: &Op,
@@ -255,7 +256,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 payload,
                 attributes,
             } => {
-                if self.current(entities, draft, overlay, *key)?.is_some() {
+                if self.current(state, draft, overlay, *key)?.is_some() {
                     return Ok(Err(RevertReason::AlreadyExists { key: *key }));
                 }
                 let entity = Entity {
@@ -283,7 +284,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             Op::Patch { key, mutations } => self
                 .mutate(
                     env,
-                    entities,
+                    state,
                     draft,
                     overlay,
                     *key,
@@ -308,7 +309,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
             } => self
                 .mutate(
                     env,
-                    entities,
+                    state,
                     draft,
                     overlay,
                     *key,
@@ -343,12 +344,10 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 // event reports both sides of the handover, and afterwards the
                 // old one is gone. `None` here means the entity is missing,
                 // which `mutate` reports as `NotFound`.
-                let previous_owner = self
-                    .current(entities, draft, overlay, *key)?
-                    .map(|e| e.owner);
+                let previous_owner = self.current(state, draft, overlay, *key)?.map(|e| e.owner);
                 self.mutate(
                     env,
-                    entities,
+                    state,
                     draft,
                     overlay,
                     *key,
@@ -372,7 +371,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
                 })
             }
             Op::Delete { key } => {
-                let Some(entity) = self.current(entities, draft, overlay, *key)? else {
+                let Some(entity) = self.current(state, draft, overlay, *key)? else {
                     return Ok(Err(RevertReason::NotFound { key: *key }));
                 };
                 if entity.owner != env.caller {
@@ -422,7 +421,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     fn mutate(
         &self,
         env: &ExecEnv,
-        entities: &mut E,
+        state: &mut S,
         draft: &BlockDraft,
         overlay: &mut BTreeMap<EntityAddress, Option<Entity>>,
         key: EntityAddress,
@@ -430,7 +429,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
         edit: impl FnOnce(&mut Entity),
     ) -> Result<Result<(UserAddress, BlockNumber), RevertReason>, ExecError> {
-        let Some(mut entity) = self.current(entities, draft, overlay, key)? else {
+        let Some(mut entity) = self.current(state, draft, overlay, key)? else {
             return Ok(Err(RevertReason::NotFound { key }));
         };
         if !auth.permits(&entity, &env.caller) {
@@ -460,7 +459,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     /// block's `draft`, then the committed store.
     fn current(
         &self,
-        entities: &mut E,
+        state: &mut S,
         draft: &BlockDraft,
         overlay: &BTreeMap<EntityAddress, Option<Entity>>,
         key: EntityAddress,
@@ -468,7 +467,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         if let Some(staged) = overlay.get(&key) {
             return Ok(staged.clone());
         }
-        self.committed_or_drafted(entities, draft, key)
+        self.committed_or_drafted(state, draft, key)
     }
 
     /// The entity for `key` as of before this transaction: the block's `draft`
@@ -476,7 +475,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
     /// overlay. Used to diff the index changes against the pre-transaction state.
     fn committed_or_drafted(
         &self,
-        entities: &mut E,
+        state: &mut S,
         draft: &BlockDraft,
         key: EntityAddress,
     ) -> Result<Option<Entity>, ExecError> {
@@ -486,7 +485,7 @@ impl<E: EntityStore, C: CostModel> ArkivExecutor<E, C> {
         if let Some(entity) = draft.entities.puts.iter().rev().find(|e| e.key == key) {
             return Ok(Some(entity.clone()));
         }
-        entities.get(key).map_err(ExecError::store)
+        state.get(key).map_err(ExecError::store)
     }
 }
 
@@ -617,13 +616,27 @@ impl std::error::Error for ExecError {}
 mod tests {
     use super::*;
     use arkiv_interfaces::entity::{Attribute, AttributeValue};
-    use arkiv_interfaces::state::BlockEntityStoreDelta;
+    use arkiv_interfaces::manager::{
+        AccountBalancesStore, AccountNoncesStore, EntityCreationNoncesStore, PruningMap,
+        PruningPriority,
+    };
+    use arkiv_interfaces::primitives::{Hash, UserBalance, UserNonce};
+    use arkiv_interfaces::query::{PageParams, Query, QueryMatches, QueryStats};
+    use arkiv_interfaces::state::{
+        AuxiliaryStore, BlockAuxiliaryStoreDelta, BlockEntityStoreDelta, EntityStore,
+    };
     use core::convert::Infallible;
 
-    /// In-memory [`EntityStore`] for the tests.
-    #[derive(Default)]
+    /// In-memory [`StateManager`] for the tests. Only the entity lane is
+    /// exercised here — the executor reads nothing else — but every lane is
+    /// implemented so the double satisfies the same bound a real host does.
+    #[derive(Default, Clone)]
     struct MemStore {
         map: BTreeMap<EntityAddress, Entity>,
+        balances: BTreeMap<UserAddress, UserBalance>,
+        nonces: BTreeMap<UserAddress, UserNonce>,
+        entity_nonces: BTreeMap<UserAddress, EntityCreationNonce>,
+        pruning: BTreeMap<EntityAddress, (BlockNumber, PruningPriority)>,
     }
 
     impl EntityStore for MemStore {
@@ -643,8 +656,146 @@ mod tests {
             Ok(())
         }
 
-        fn commitment(&mut self) -> Result<arkiv_interfaces::primitives::Hash, Infallible> {
+        fn commitment(&mut self) -> Result<Hash, Infallible> {
             Ok(Default::default())
+        }
+    }
+
+    impl AuxiliaryStore for MemStore {
+        type Error = Infallible;
+
+        fn evaluate(
+            &mut self,
+            _query: &Query,
+            _page: PageParams,
+        ) -> Result<QueryMatches, Infallible> {
+            Ok(QueryMatches::default())
+        }
+
+        fn apply_delta(&mut self, _delta: &BlockAuxiliaryStoreDelta) -> Result<(), Infallible> {
+            Ok(())
+        }
+
+        fn commitment(&mut self) -> Result<Hash, Infallible> {
+            Ok(Default::default())
+        }
+    }
+
+    impl AccountBalancesStore for MemStore {
+        type Error = Infallible;
+
+        fn get_balance(&mut self, account: UserAddress) -> Result<UserBalance, Infallible> {
+            Ok(self.balances.get(&account).copied().unwrap_or_default())
+        }
+
+        fn set_balance(
+            &mut self,
+            account: UserAddress,
+            balance: UserBalance,
+        ) -> Result<(), Infallible> {
+            self.balances.insert(account, balance);
+            Ok(())
+        }
+    }
+
+    impl AccountNoncesStore for MemStore {
+        type Error = Infallible;
+
+        fn get_account_nonce(&mut self, account: UserAddress) -> Result<UserNonce, Infallible> {
+            Ok(self.nonces.get(&account).copied().unwrap_or_default())
+        }
+
+        fn set_account_nonce(
+            &mut self,
+            account: UserAddress,
+            nonce: UserNonce,
+        ) -> Result<(), Infallible> {
+            self.nonces.insert(account, nonce);
+            Ok(())
+        }
+    }
+
+    impl EntityCreationNoncesStore for MemStore {
+        type Error = Infallible;
+
+        fn get_entity_nonce(
+            &mut self,
+            owner: UserAddress,
+        ) -> Result<EntityCreationNonce, Infallible> {
+            Ok(self.entity_nonces.get(&owner).copied().unwrap_or_default())
+        }
+
+        fn advance_entity_nonce(
+            &mut self,
+            owner: UserAddress,
+            by: u64,
+        ) -> Result<EntityCreationNonce, Infallible> {
+            let slot = self.entity_nonces.entry(owner).or_default();
+            let before = *slot;
+            *slot = before.advanced_by(by);
+            Ok(before)
+        }
+    }
+
+    impl PruningMap for MemStore {
+        type Error = Infallible;
+
+        fn schedule_pruning(
+            &mut self,
+            entity: EntityAddress,
+            prune_at: BlockNumber,
+            priority: PruningPriority,
+        ) -> Result<(), Infallible> {
+            self.pruning.insert(entity, (prune_at, priority));
+            Ok(())
+        }
+
+        fn pruning_due(&mut self, block: BlockNumber) -> Result<Vec<EntityAddress>, Infallible> {
+            let mut due: Vec<_> = self
+                .pruning
+                .iter()
+                .filter(|(_, (at, _))| *at <= block)
+                .map(|(key, (_, priority))| (*priority, *key))
+                .collect();
+            // Highest priority first, ties in ascending key order.
+            due.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            Ok(due.into_iter().map(|(_, key)| key).collect())
+        }
+
+        fn clear_pruning(&mut self, entities: &[EntityAddress]) -> Result<(), Infallible> {
+            for key in entities {
+                self.pruning.remove(key);
+            }
+            Ok(())
+        }
+    }
+
+    impl StateManager for MemStore {
+        type Error = Infallible;
+
+        fn get_operation_cost(&mut self, op: &Op) -> Result<u64, Infallible> {
+            Ok(PlaceholderCost.op_cost(op))
+        }
+
+        fn get_query_cost(&mut self, stats: &QueryStats) -> Result<u64, Infallible> {
+            Ok(PlaceholderCost.query_cost(stats))
+        }
+
+        fn get_at(
+            &mut self,
+            entity: EntityAddress,
+            _at: BlockNumber,
+        ) -> Result<Option<Entity>, Infallible> {
+            EntityStore::get(self, entity)
+        }
+
+        fn evaluate_at(
+            &mut self,
+            query: &Query,
+            page: PageParams,
+            _at: BlockNumber,
+        ) -> Result<QueryMatches, Infallible> {
+            AuxiliaryStore::evaluate(self, query, page)
         }
     }
 
@@ -737,12 +888,14 @@ mod tests {
     fn create_on_existing_reverts_and_leaves_draft_untouched() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![entity_with_key([1u8; 32])],
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         let out = exec
@@ -774,12 +927,14 @@ mod tests {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
         let owner = [2u8; 20];
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()],
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         // Wrong caller reverts.
@@ -822,12 +977,14 @@ mod tests {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
         let owner = [2u8; 20];
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()],
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         let out = exec
@@ -856,12 +1013,14 @@ mod tests {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
         let owner = [2u8; 20];
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()], // expires_at 100
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         // Equal expiry succeeds as a no-op: the client asked for a lifetime the
@@ -1006,12 +1165,14 @@ mod tests {
     fn transfer_stages_only_the_owner_swap() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()], // owner [2; 20]
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         exec.apply(
@@ -1049,12 +1210,14 @@ mod tests {
     fn patch_stages_only_changed_annotations() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()], // content text/plain, attrs color + size
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         exec.apply(
@@ -1101,12 +1264,14 @@ mod tests {
     fn patch_merges_content_and_stamps_modified() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()], // owner [2; 20], expires_at 100
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         let out = exec
@@ -1150,12 +1315,14 @@ mod tests {
     fn extend_expiry_moves_expiry_and_stamps_modified() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()], // expires_at 100
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut draft = BlockDraft::default();
 
         let out = exec
@@ -1185,12 +1352,14 @@ mod tests {
     fn cannot_mutate_after_expiry() {
         let exec = ArkivExecutor::<MemStore>::new();
         let mut store = MemStore::default();
-        store
-            .apply_delta(&BlockEntityStoreDelta {
+        EntityStore::apply_delta(
+            &mut store,
+            &BlockEntityStoreDelta {
                 puts: vec![sample_entity()], // expires_at 100
                 deletes: Vec::new(),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let owner = [2u8; 20];
 
         let expired_ops = [

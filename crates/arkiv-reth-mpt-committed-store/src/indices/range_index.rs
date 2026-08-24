@@ -13,7 +13,7 @@
 //! through the [`cascade`](crate::indices::cascade). Equality-only attributes
 //! have no tier 2 at all — inserts and scans are no-ops for them.
 
-use arkiv_interfaces::constants::EVM_WORD_LENGTH;
+use arkiv_interfaces::constants::ethereum::EVM_WORD_LENGTH;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::indices::annotation::QueryCapabilities;

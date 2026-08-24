@@ -26,7 +26,7 @@
 
 use alloy_primitives::{Address, B256};
 
-use arkiv_interfaces::constants::EVM_WORD_LENGTH;
+use arkiv_interfaces::constants::ethereum::EVM_WORD_LENGTH;
 
 use crate::indices::address::{BTREE_MAGIC, BTREE_ORDER, btree_node_address};
 use crate::indices::slot::{storage_to_u64, u64_to_storage};

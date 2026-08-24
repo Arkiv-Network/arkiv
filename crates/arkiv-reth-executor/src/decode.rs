@@ -47,7 +47,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotat
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
 use arkiv_interfaces::primitives::{BlockNumber, EntityAddress, EntityCreationNonce};
 
-use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
+use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 
 use crate::ARKIV_ADDRESS;
 

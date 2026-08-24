@@ -3,8 +3,8 @@
 //!
 //! ```text
 //!   ArkivExecutor::apply(ops)                       → BlockDraft (the entity delta)
-//!     reading RethEntityStore<CodeBackend<WriteOverlay<EmptyDB>>>
-//!   store.apply_delta(&draft.entities)              → CodeBackend → WriteOverlay
+//!     reading WriteManager<EmptyDB>
+//!   store.apply_delta(&draft.entities)              → WriteManager → WriteOverlay
 //!                                                     → EvmState overlay
 //!   store.get(key)                                  → reads its own writes back
 //!   ...into_state()                                 → the EvmState reth would commit
@@ -18,14 +18,14 @@ use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecSt
 use arkiv_interfaces::state::EntityStore;
 use arkiv_reth_executor::ArkivExecutor;
 use arkiv_reth_mpt_committed_store::entities::layout::entity_leaf_address;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore, decode, encode};
-use arkiv_reth_statemanager::WriteOverlay;
+use arkiv_reth_mpt_committed_store::{decode, encode};
+use arkiv_reth_statemanager::{WriteManager, write_manager};
 use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
-type Store<'a> = RethEntityStore<CodeBackend<WriteOverlay<'a, EmptyDB>>>;
+type Store<'a> = WriteManager<'a, EmptyDB>;
 
 fn store(db: &mut EmptyDB) -> Store<'_> {
-    RethEntityStore::new(CodeBackend::new(WriteOverlay::new(db)))
+    write_manager(db)
 }
 
 fn env(caller: [u8; 20], block: u64) -> ExecEnv {
@@ -77,7 +77,7 @@ fn create_commits_the_entity_as_account_code() {
     // 4) The recovered EvmState diff is what reth would commit: the entity account
     //    exists, is touched, survives EIP-161, and holds the record as code —
     //    byte-for-byte and still decodable.
-    let diff = store.into_backend().into_inner().into_state();
+    let diff = store.into_base().into_state();
     let acc = diff
         .get(&entity_leaf_address(key))
         .expect("entity account staged in the diff");
@@ -152,7 +152,7 @@ fn update_recommits_the_entity_as_new_code() {
         got.last_modified_at_block, 11,
         "patch advances lastModified"
     );
-    let diff = store.into_backend().into_inner().into_state();
+    let diff = store.into_base().into_state();
     let code = diff
         .get(&entity_leaf_address(key))
         .and_then(|a| a.info.code.as_ref())
@@ -288,7 +288,7 @@ fn create_then_delete_commits_a_tombstone() {
     // The account is tombstoned: no entity reads back, and the committed account
     // holds no code (kept alive against pruning).
     assert!(store.get(key).unwrap().is_none());
-    let diff = store.into_backend().into_inner().into_state();
+    let diff = store.into_base().into_state();
     let acc = diff
         .get(&entity_leaf_address(key))
         .expect("tombstoned account staged in the diff");

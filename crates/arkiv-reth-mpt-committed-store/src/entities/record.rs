@@ -5,21 +5,18 @@
 //! opcode, so a `CALL` to an entity account halts immediately (entities are data,
 //! never executed); the next byte is the **record version** — currently `0x00`, so
 //! the prefix is `0xFE00` today. [`decode`] dispatches on the version and migrates
-//! older layouts up to the canonical [`Entity`] — the same versioning model as the
-//! spec's [`EntityCodec`]. The RLP **field order is consensus-critical**: it hashes
-//! into the state root, so a shipped version must never change — add a new version
-//! instead.
+//! older layouts up to the canonical [`Entity`]. The RLP **field order is
+//! consensus-critical**: it hashes into the state root, so a shipped version must
+//! never change — add a new version instead.
 //!
 //! This is host-specific (RLP + account code is reth's storage form), which is why
-//! it lives in the entity-store crate, not the spec. [`RecordCodec`] implements the
-//! spec's [`EntityCodec`] over these functions.
+//! it lives in the entity-store crate, not the spec.
 
 use core::fmt;
 
 use alloy_primitives::{Address, B256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 
-use arkiv_interfaces::codec::EntityCodec;
 use arkiv_interfaces::entity::{
     Attribute, AttributeType, AttributeValue, AttributeValueError, CreationFlags, Entity,
 };
@@ -128,28 +125,6 @@ impl fmt::Display for RecordError {
 }
 
 impl std::error::Error for RecordError {}
-
-/// The concrete [`EntityCodec`] for reth-hosted entities — the version-tagged
-/// `0xFE || version || RLP` format above. The version byte follows the `0xFE`
-/// marker (so it's byte 1, not byte 0).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RecordCodec;
-
-impl EntityCodec for RecordCodec {
-    type Error = RecordError;
-
-    fn current_version(&self) -> u8 {
-        RECORD_VERSION
-    }
-
-    fn encode(&self, entity: &Entity) -> Vec<u8> {
-        encode(entity)
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Entity, RecordError> {
-        decode(bytes)
-    }
-}
 
 // ── On-code representation (RLP field order is consensus-critical) ──────
 
@@ -335,20 +310,6 @@ mod tests {
             decode(&bytes),
             Err(RecordError::UnsupportedVersion(0xFF))
         ));
-    }
-
-    #[test]
-    fn record_codec_implements_entity_codec() {
-        let e = sample();
-        let codec = RecordCodec;
-        assert_eq!(codec.current_version(), RECORD_VERSION);
-        assert_eq!(codec.encode(&e), encode(&e));
-        assert_eq!(codec.decode(&codec.encode(&e)).unwrap(), e);
-        // Default `decode_meta` projects the header.
-        let meta = codec.decode_meta(&codec.encode(&e)).unwrap();
-        assert_eq!(meta.key, e.key);
-        assert_eq!(meta.owner, e.owner);
-        assert_eq!(meta.expires_at, e.expires_at);
     }
 
     #[test]

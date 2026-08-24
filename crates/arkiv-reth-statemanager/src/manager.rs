@@ -32,21 +32,25 @@
 //!
 //! ## Shallow copies
 //!
-//! [`StateManager::shallow_copy`] is `Clone`: the pruning map and cost schedule
-//! are copied, and the base is cloned — so the impl exists only for `B: Clone`,
-//! and the base's own `Clone` must mean "share the committed state, copy any
-//! private overlay". An in-memory or snapshot-backed base has exactly that
-//! shape. The live write base ([`WriteOverlay`](crate::WriteOverlay)) holds
-//! `&mut` exclusivity over reth's `Database` and is deliberately *not* `Clone`:
-//! within one transaction there is nothing to fork, and simulate-vs-build forks
-//! happen at the block level, over per-block state snapshots.
+//! [`SimulatableState::shallow_copy`] is `Clone`: the pruning map and cost
+//! schedule are copied, and the base is cloned — so the impl exists only for
+//! `B: Clone`, and the base's own `Clone` must mean "share the committed state,
+//! copy any private overlay". An in-memory or snapshot-backed base has exactly
+//! that shape.
+//!
+//! The live write base ([`WriteOverlay`](crate::WriteOverlay)) holds `&mut`
+//! exclusivity over reth's `Database` and so can never be `Clone`. That is why
+//! [`SimulatableState`] is a trait apart from [`StateManager`]: the write path
+//! implements the latter and stops there. Within one transaction there is
+//! nothing to fork anyway, and simulate-vs-build forks happen at the block
+//! level, over per-block state snapshots.
 //!
 //! ## Commitments and rewind
 //!
 //! On this host both store commitments answer the all-zero [`Hash`](type@Hash): every lane
 //! lands in the one state trie, so the only real commitment is the block's
 //! unified state root, which reth computes at seal time. Likewise
-//! [`StateManager::rewind_to`] is refused — reth rewinds its own trie on a
+//! [`SimulatableState::rewind_to`] is refused — reth rewinds its own trie on a
 //! reorg; rewinding *here* would mean lying about state we don't own.
 
 use arkiv_interfaces::entity::Entity;
@@ -54,7 +58,7 @@ use arkiv_interfaces::execution::Op;
 use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
 use arkiv_interfaces::manager::{
     AccountBalancesStore, AccountNoncesStore, EntityCreationNoncesStore, PruningMap,
-    PruningPriority, StateManager,
+    PruningPriority, SimulatableState, StateManager,
 };
 use arkiv_interfaces::primitives::{
     BlockNumber, EntityAddress, EntityCreationNonce, Gas, Hash, UserAddress, UserBalance, UserNonce,
@@ -300,9 +304,8 @@ where
     B: AccountCode<Error = E>
         + IndexStorage<Error = E>
         + BalanceAccess<Error = E>
-        + NonceAccess<Error = E>
-        + Clone,
-    C: CostModel + Clone,
+        + NonceAccess<Error = E>,
+    C: CostModel,
     E: core::fmt::Debug,
 {
     type Error = MptError<E>;
@@ -317,6 +320,45 @@ where
         Ok(self.costs.query_cost(stats))
     }
 
+    /// Refused on this host — it keeps only the tip; see the module docs.
+    fn get_at(
+        &mut self,
+        _entity: EntityAddress,
+        _at: BlockNumber,
+    ) -> Result<Option<Entity>, MptError<E>> {
+        Err(MptError::Unsupported(
+            "the reth host keeps only tip state; build a manager over the \
+             target block's state instead",
+        ))
+    }
+
+    /// Refused on this host — it keeps only the tip; see the module docs.
+    fn evaluate_at(
+        &mut self,
+        _query: &Query,
+        _page: PageParams,
+        _at: BlockNumber,
+    ) -> Result<QueryMatches, MptError<E>> {
+        Err(MptError::Unsupported(
+            "the reth host keeps only tip state; build a manager over the \
+             target block's state instead",
+        ))
+    }
+}
+
+/// Only for a base that can be cloned. The live write path holds `&mut DB`
+/// exclusively and so is deliberately **not** simulatable — a caller that wants
+/// to fork builds a manager over an owned base instead.
+impl<B, C, E> SimulatableState for MptStateManager<B, C>
+where
+    B: AccountCode<Error = E>
+        + IndexStorage<Error = E>
+        + BalanceAccess<Error = E>
+        + NonceAccess<Error = E>
+        + Clone,
+    C: CostModel + Clone,
+    E: core::fmt::Debug,
+{
     fn shallow_copy(&self) -> Self {
         self.clone()
     }
@@ -613,7 +655,7 @@ mod tests {
     /// rewind on this host.
     #[test]
     fn state_manager_umbrella_applies_drafts_prices_and_refuses_rewind() {
-        fn drive<M: StateManager>(mgr: &mut M, draft: &BlockDraft, op: &Op) {
+        fn drive<M: SimulatableState>(mgr: &mut M, draft: &BlockDraft, op: &Op) {
             mgr.apply_draft(draft).unwrap();
             // Pricing is asked of the manager, and the answer is deterministic.
             let first = mgr.get_operation_cost(op).unwrap();

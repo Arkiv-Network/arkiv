@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use crate::entity::{AttributeValue, Entity};
-use crate::primitives::{BlockNumber, EntityAddress, Hash};
+use crate::primitives::{EntityAddress, Hash};
 use crate::query::{PageParams, Query, QueryMatches};
 
 /// Holds the **entities**: a map from [`EntityAddress`] to [`Entity`], plus a
@@ -29,17 +29,6 @@ pub trait EntityStore {
     fn commitment(&mut self) -> Result<Hash, Self::Error>;
 }
 
-/// Optional: read entities as of a **past block**, for a host that keeps — or can
-/// reconstruct — history. Extends [`EntityStore`] (whose reads are at the tip).
-pub trait HistoricalEntityStore: EntityStore {
-    /// This entity as of block `at`, or `None` if it didn't exist then.
-    fn get_at(
-        &mut self,
-        entity: EntityAddress,
-        at: BlockNumber,
-    ) -> Result<Option<Entity>, Self::Error>;
-}
-
 /// Holds the **query index** over the entities.
 ///
 /// Where the [`EntityStore`] is a plain key→entity map, this store understands the
@@ -60,19 +49,6 @@ pub trait AuxiliaryStore {
     /// Commitment over the index. Separate from the entities'
     /// ([`EntityStore::commitment`]).
     fn commitment(&mut self) -> Result<Hash, Self::Error>;
-}
-
-/// Optional: evaluate queries against the index as of a **past block**. Extends
-/// [`AuxiliaryStore`] (whose evaluation is at the tip).
-pub trait HistoricalAuxiliaryStore: AuxiliaryStore {
-    /// The keys matching `query` as of block `at`, one page at a time, with the
-    /// statistics of the work done.
-    fn evaluate_at(
-        &mut self,
-        query: &Query,
-        page: PageParams,
-        at: BlockNumber,
-    ) -> Result<QueryMatches, Self::Error>;
 }
 
 /// One block's changes to the [`EntityStore`].

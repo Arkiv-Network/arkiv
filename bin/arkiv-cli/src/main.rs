@@ -7,7 +7,7 @@ use alloy_rpc_types::eth::Log as RpcLog;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolEvent;
 use arkiv_bindings::*;
-use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
+use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_rpc_types::method::BlockTimingView;
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};

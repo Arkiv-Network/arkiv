@@ -11,9 +11,7 @@
 //! not the specification's. Ported from the `arkiv-db-engine` reference.
 //!
 //! [`layout`] — the entity address anchor; [`record`] — the versioned `Entity` ⇄
-//! account-code byte codec (`0xFE00 || RLP`), implementing the spec's
-//! [`EntityCodec`](arkiv_interfaces::codec::EntityCodec) via
-//! [`RecordCodec`](record::RecordCodec); [`store`] — the
+//! account-code byte codec (`0xFE00 || RLP`); [`store`] — the
 //! [`EntityStore`](arkiv_interfaces::state::EntityStore) impl over an
 //! [`EntityBackend`](store::EntityBackend) seam; [`account`] — the [`AccountCode`]
 //! reth code seam; [`backend`] — [`CodeBackend`], the `EntityBackend` keeping each
@@ -30,5 +28,5 @@ pub mod store;
 
 pub use account::AccountCode;
 pub use backend::{CodeBackend, CodeBackendError};
-pub use record::{RecordCodec, RecordError, decode, encode};
+pub use record::{RecordError, decode, encode};
 pub use store::{EntityBackend, RethEntityStore};

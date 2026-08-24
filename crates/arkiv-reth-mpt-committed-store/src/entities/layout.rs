@@ -14,7 +14,7 @@
 //! Arkiv specification's.
 
 use alloy_primitives::{Address, B256, keccak256};
-use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
+use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_interfaces::primitives::EntityAddress;
 
 // The named widths must match the types this module bridges: an entity address

@@ -19,7 +19,7 @@
 //! later module).
 
 use alloy_primitives::B256;
-use arkiv_interfaces::constants::EVM_WORD_LENGTH;
+use arkiv_interfaces::constants::ethereum::EVM_WORD_LENGTH;
 use arkiv_interfaces::entity::AttributeType;
 
 use crate::indices::address::btree_header_address;

@@ -115,9 +115,10 @@ use arkiv_reth_statemanager::{WriteManager, write_manager};
 /// EOAs `CALL` here with entity `execute(Operation[])` calldata. There is no
 /// precompile object and no bytecode — calls to this address are routed directly
 /// in [`arkiv_transact`]. The bytes come from
-/// [`arkiv_interfaces::constants::ARKIV_RETH_ADDRESS`], which is also what
+/// [`arkiv_interfaces::constants::ethereum::ARKIV_RETH_ADDRESS`], which is also what
 /// `arkiv-genesis` asserts against; this is the reth-typed view of that one value.
-pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_RETH_ADDRESS);
+pub const ARKIV_ADDRESS: Address =
+    Address::new(arkiv_interfaces::constants::ethereum::ARKIV_RETH_ADDRESS);
 
 /// Flat gas charged per transaction by the fixed-function executor.
 const ARKIV_TX_GAS: u64 = 21_000;
