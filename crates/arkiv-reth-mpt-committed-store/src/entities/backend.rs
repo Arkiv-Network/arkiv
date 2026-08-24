@@ -87,7 +87,6 @@ mod tests {
     use arkiv_interfaces::entity::CreationFlags;
     use arkiv_interfaces::entity::{Attribute, AttributeValue};
     use arkiv_interfaces::primitives::EntityAddress;
-    use arkiv_interfaces::state::{BlockEntityStoreDelta, EntityStore};
     use core::convert::Infallible;
     use std::collections::HashMap;
 
@@ -167,26 +166,16 @@ mod tests {
 
     #[test]
     fn drives_a_reth_entity_store_end_to_end() {
-        // RethEntityStore → CodeBackend → MemCode: apply a delta, read it back by
+        // RethEntityStore → CodeBackend → MemCode: put an entity, read it back by
         // key (which resolves to the entity address internally).
         let mut store = RethEntityStore::new(CodeBackend::new(MemCode::default()));
         let key: EntityAddress = [7u8; 32];
         let e = sample();
 
-        store
-            .apply_delta(&BlockEntityStoreDelta {
-                puts: vec![e.clone()],
-                deletes: Vec::new(),
-            })
-            .unwrap();
+        store.put(&e).unwrap();
         assert_eq!(store.get(key).unwrap(), Some(e));
 
-        store
-            .apply_delta(&BlockEntityStoreDelta {
-                puts: Vec::new(),
-                deletes: vec![key],
-            })
-            .unwrap();
+        store.remove(key).unwrap();
         assert!(store.get(key).unwrap().is_none());
     }
 }

@@ -2,7 +2,7 @@
 //! and write an account's `code` at an address.
 //!
 //! An entity lives entirely in its account's `code` (`0xFE || RLP`, see
-//! [`record`](crate::entities::record)), so this code lane is all [`CodeBackend`] needs. The
+//! [`record`](crate::entities::record)), so this code seam is all [`CodeBackend`] needs. The
 //! query index (storage slots) is a separate concern (`AuxiliaryStore`), not here.
 //!
 //! Keeping it a trait lets the entity-persistence logic ([`CodeBackend`]) be tested

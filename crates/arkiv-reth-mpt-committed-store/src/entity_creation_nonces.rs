@@ -1,5 +1,5 @@
-//! [`RethEntityCreationNoncesStore`] — the [`EntityCreationNoncesStore`]
-//! implementation.
+//! [`RethEntityCreationNoncesStore`] — raw entity-minting-nonce
+//! reads and writes.
 //!
 //! On this host an owner's entity-minting nonce lives as a storage slot on the
 //! system account ([`nonce_slot`] on [`SYSTEM_ACCOUNT_ADDRESS`]) — the same
@@ -12,10 +12,9 @@ use alloy_primitives::{Address, B256, U256};
 
 use crate::entities::layout::{SYSTEM_ACCOUNT_ADDRESS, nonce_slot};
 use crate::indices::IndexStorage;
-use arkiv_interfaces::manager::EntityCreationNoncesStore;
 use arkiv_interfaces::primitives::{EntityCreationNonce, UserAddress};
 
-/// The reth-host [`EntityCreationNoncesStore`]: minting nonces are
+/// The reth-host entity-minting-nonce store: minting nonces are
 /// system-account storage slots, reached through an [`IndexStorage`].
 #[derive(Debug, Default, Clone)]
 pub struct RethEntityCreationNoncesStore<B> {
@@ -39,10 +38,11 @@ impl<B> RethEntityCreationNoncesStore<B> {
     }
 }
 
-impl<B: IndexStorage> EntityCreationNoncesStore for RethEntityCreationNoncesStore<B> {
-    type Error = B::Error;
-
-    fn get_entity_nonce(&mut self, owner: UserAddress) -> Result<EntityCreationNonce, Self::Error> {
+impl<B: IndexStorage> RethEntityCreationNoncesStore<B> {
+    pub fn get_entity_nonce(
+        &mut self,
+        owner: UserAddress,
+    ) -> Result<EntityCreationNonce, B::Error> {
         let word = self
             .backend
             .storage(SYSTEM_ACCOUNT_ADDRESS, nonce_slot(Address::from(owner)))?;
@@ -51,23 +51,31 @@ impl<B: IndexStorage> EntityCreationNoncesStore for RethEntityCreationNoncesStor
         ))
     }
 
-    fn advance_entity_nonce(
+    /// Returns the nonce **before** the advance.
+    pub fn advance_entity_nonce(
         &mut self,
         owner: UserAddress,
         by: u64,
-    ) -> Result<EntityCreationNonce, Self::Error> {
+    ) -> Result<EntityCreationNonce, B::Error> {
+        let current = self.get_entity_nonce(owner)?;
+        self.set_entity_nonce(owner, current.advanced_by(by))?;
+        Ok(current)
+    }
+
+    pub fn set_entity_nonce(
+        &mut self,
+        owner: UserAddress,
+        nonce: EntityCreationNonce,
+    ) -> Result<(), B::Error> {
         // Materialise the system account on its first write, or EIP-161 prunes
         // it (and the nonce with it) at end of block.
         self.backend
             .ensure_account_persists(SYSTEM_ACCOUNT_ADDRESS)?;
-        let current = self.get_entity_nonce(owner)?;
-        let next = U256::from(current.advanced_by(by).get());
         self.backend.set_storage(
             SYSTEM_ACCOUNT_ADDRESS,
             nonce_slot(Address::from(owner)),
-            B256::from(next.to_be_bytes()),
-        )?;
-        Ok(current)
+            B256::from(U256::from(nonce.get()).to_be_bytes()),
+        )
     }
 }
 

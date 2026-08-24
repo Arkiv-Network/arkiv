@@ -1,7 +1,7 @@
 //! The entity data types passed across the traits.
 //!
 //! Plain data, no encoding: turning an [`Entity`] into the bytes an
-//! [`EntityStore`](crate::state::EntityStore) holds (and back) is the host's job.
+//! [`EntityStore`](crate::statemanager::EntityStore) holds (and back) is the host's job.
 
 use alloc::string::String;
 use alloc::vec::Vec;

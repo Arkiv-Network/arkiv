@@ -21,9 +21,10 @@
 //! disjoint sets of buckets and one ordered structure per type.
 
 use arkiv_interfaces::entity::{AttributeType, AttributeValue, Entity, annotations};
-use arkiv_interfaces::primitives::BlockNumber;
+use arkiv_interfaces::primitives::{BlockNumber, EntityAddress};
 use arkiv_interfaces::query::{AnnotKey, BuiltIn};
-use arkiv_interfaces::state::AttrEntry;
+
+use crate::indices::delta::{AttrEntry, AuxiliaryEntityDelta};
 
 /// What an attribute can be queried by — the spec's indexing column, and with it
 /// the physical structures the value is recorded in.
@@ -107,8 +108,8 @@ fn block_number_value(block: BlockNumber) -> AttributeValue {
 
 /// Every indexable `(attr, value)` pair for an entity: the seven built-ins plus its
 /// user attributes. This is the write-side counterpart to the query-side
-/// [`attr_bytes`]/[`value_bytes`] — the executor diffs an entity's annotations
-/// before and after an op to build a [delta](AttrEntry), so both sides must produce
+/// [`attr_bytes`] — [`annotation_delta`] diffs an entity's annotations before
+/// and after a change to build a [delta](AttrEntry), so both sides must produce
 /// identical bytes, and both live here.
 ///
 /// The built-ins, in order: `$all` (empty value), `$creator`, `$owner`, `$key`,
@@ -137,6 +138,31 @@ pub fn entity_annotations(entity: &Entity) -> Vec<AttrEntry> {
             .map(|a| AttrEntry::new(a.key.clone(), a.value.clone())),
     );
     out
+}
+
+/// The annotations a `before → after` transition adds and removes, as a
+/// symmetric set difference. `None` when nothing changed.
+pub fn annotation_delta(
+    key: EntityAddress,
+    before: Option<&Entity>,
+    after: Option<&Entity>,
+) -> Option<AuxiliaryEntityDelta> {
+    let old = before.map(entity_annotations).unwrap_or_default();
+    let new = after.map(entity_annotations).unwrap_or_default();
+
+    let contains = |set: &[AttrEntry], entry: &AttrEntry| set.iter().any(|other| other == entry);
+    let removes: Vec<AttrEntry> = old.iter().filter(|a| !contains(&new, a)).cloned().collect();
+    let inserts: Vec<AttrEntry> = new.iter().filter(|a| !contains(&old, a)).cloned().collect();
+
+    if inserts.is_empty() && removes.is_empty() {
+        None
+    } else {
+        Some(AuxiliaryEntityDelta {
+            entity_key: key,
+            inserts,
+            removes,
+        })
+    }
 }
 
 #[cfg(test)]

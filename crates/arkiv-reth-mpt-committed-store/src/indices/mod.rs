@@ -1,11 +1,9 @@
-//! The index lane: the reth-host **auxiliary store** — the query index over
-//! the entities.
+//! The query index over the entities.
 //!
-//! Where [`entities`](crate::entities) implements
-//! [`EntityStore`](arkiv_interfaces::state::EntityStore) — the entities
-//! themselves — this module implements
-//! [`AuxiliaryStore`](arkiv_interfaces::state::AuxiliaryStore): give it a
-//! [`Query`](arkiv_interfaces::query::Query) and it returns the keys of the
+//! Where [`entities`](crate::entities) holds the entities themselves, this
+//! module answers queries about them: give it a
+//! [`Query`](arkiv_interfaces::query::Query) — or one of the spec's index
+//! primitives (equality, prefix, range) — and it returns the keys of the
 //! entities that match.
 //!
 //! Host-specific by design: the spec says only "there is a committed query index",
@@ -40,7 +38,6 @@
 //! [`Bitmap`]: bitmap::Bitmap
 //! [`pair_address`]: address::pair_address
 //! [`IndexStorage`]: storage::IndexStorage
-//! [`AuxiliaryStore`]: arkiv_interfaces::state::AuxiliaryStore
 //! [`Query`]: arkiv_interfaces::query::Query
 
 pub mod address;
@@ -48,6 +45,7 @@ pub mod annotation;
 pub mod bitmap;
 pub mod btree;
 pub mod cascade;
+pub mod delta;
 pub mod range;
 pub mod storage;
 pub mod store;
@@ -62,6 +60,7 @@ mod slot;
 pub use address::{all_entities_bucket, pair_address};
 pub use annotation::QueryCapabilities;
 pub use bitmap::{Bitmap, BitmapError};
+pub use delta::{AttrEntry, AuxiliaryEntityDelta};
 pub use error::AuxError;
 pub use range::Bound;
 pub use storage::IndexStorage;

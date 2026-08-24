@@ -38,17 +38,18 @@ pub(crate) fn eval<B, E>(query: &Query, backend: &mut B) -> Result<Bitmap, AuxEr
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
+    let attr = |key: &AnnotKey| annotation::attr_bytes(key);
     match query {
         Query::All => EqualityIndex::new(backend).all_entities(),
 
-        Query::Eq { key, value } => read_eq(backend, key, value),
+        Query::Eq { key, value } => eq_bitmap(backend, &attr(key), value),
 
-        Query::Gt { key, value } => range_bitmaps(backend, key, value, Bound::Gt),
-        Query::Gte { key, value } => range_bitmaps(backend, key, value, Bound::Gte),
-        Query::Lt { key, value } => range_bitmaps(backend, key, value, Bound::Lt),
-        Query::Lte { key, value } => range_bitmaps(backend, key, value, Bound::Lte),
+        Query::Gt { key, value } => range_bitmap(backend, &attr(key), value, Bound::Gt),
+        Query::Gte { key, value } => range_bitmap(backend, &attr(key), value, Bound::Gte),
+        Query::Lt { key, value } => range_bitmap(backend, &attr(key), value, Bound::Lt),
+        Query::Lte { key, value } => range_bitmap(backend, &attr(key), value, Bound::Lte),
 
-        Query::StartsWith { key, value } => prefix_bitmaps(backend, key, value),
+        Query::StartsWith { key, value } => prefix_bitmap(backend, &attr(key), value),
 
         Query::And(left, right) => {
             let mut hits = eval(left, backend)?;
@@ -81,55 +82,51 @@ where
     Ok(all)
 }
 
-/// The equality bitmap for a single `(key, value)` — the query value's own type
+/// The equality bitmap for a single `(attr, value)` — the query value's own type
 /// and bytes name the same bucket the writer derived.
-fn read_eq<B, E>(backend: &mut B, key: &AnnotKey, value: &AnnotVal) -> Result<Bitmap, AuxError<E>>
+pub(crate) fn eq_bitmap<B, E>(
+    backend: &mut B,
+    attr: &[u8],
+    value: &AnnotVal,
+) -> Result<Bitmap, AuxError<E>>
 where
     B: AccountCode<Error = E>,
 {
-    let attr = annotation::attr_bytes(key);
-    EqualityIndex::new(backend).get(&attr, value.attr_type(), &value.index_bytes())
+    EqualityIndex::new(backend).get(attr, value.attr_type(), &value.index_bytes())
 }
 
 /// Resolve a range predicate: scan the [`RangeIndex`] for the matching values,
 /// then union their equality bitmaps.
-fn range_bitmaps<B, E>(
+pub(crate) fn range_bitmap<B, E>(
     backend: &mut B,
-    key: &AnnotKey,
+    attr: &[u8],
     value: &AnnotVal,
     bound: Bound,
 ) -> Result<Bitmap, AuxError<E>>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
-    let attr = annotation::attr_bytes(key);
     let ty = value.attr_type();
-    let capabilities = annotation::capabilities_for(&attr, ty);
-    let values = RangeIndex::new(&mut *backend).scan(
-        &attr,
-        ty,
-        &value.index_bytes(),
-        bound,
-        capabilities,
-    )?;
-    union_pair_bitmaps(backend, &attr, ty, values)
+    let capabilities = annotation::capabilities_for(attr, ty);
+    let values =
+        RangeIndex::new(&mut *backend).scan(attr, ty, &value.index_bytes(), bound, capabilities)?;
+    union_pair_bitmaps(backend, attr, ty, values)
 }
 
 /// Resolve a `STARTSWITH` predicate: a str-mode prefix scan, then union the
 /// equality bitmaps.
-fn prefix_bitmaps<B, E>(
+pub(crate) fn prefix_bitmap<B, E>(
     backend: &mut B,
-    key: &AnnotKey,
+    attr: &[u8],
     value: &AnnotVal,
 ) -> Result<Bitmap, AuxError<E>>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
 {
-    let attr = annotation::attr_bytes(key);
     let ty = value.attr_type();
     let values =
-        RangeIndex::new(&mut *backend).get_prefix_matches(&attr, ty, &value.index_bytes())?;
-    union_pair_bitmaps(backend, &attr, ty, values)
+        RangeIndex::new(&mut *backend).get_prefix_matches(attr, ty, &value.index_bytes())?;
+    union_pair_bitmaps(backend, attr, ty, values)
 }
 
 /// Union the equality bitmaps of `attr` for each value a range scan returned.

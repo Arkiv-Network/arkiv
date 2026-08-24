@@ -8,7 +8,7 @@
 //! spec's [`EntityAddress`](arkiv_interfaces::primitives::EntityAddress).
 //!
 //! Scope: **entities only**. The query index (equality "pair" accounts, range
-//! indexes) is [`AuxiliaryStore`](arkiv_interfaces::state::AuxiliaryStore) data —
+//! indexes) is index data —
 //! a separate concern that lives in its own crate, not here. This layout is
 //! reth-specific: mapping Arkiv onto accounts/slots is the host's job, not the
 //! Arkiv specification's.

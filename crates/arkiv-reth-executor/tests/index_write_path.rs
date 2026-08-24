@@ -1,38 +1,28 @@
-//! End-to-end index write path: run entity ops through [`ArkivExecutor::apply`]
-//! and query the entities back by their attributes.
-//!
-//! This is the join between the executor (building the index delta) and the
-//! auxiliary store (applying it and answering queries). The executor's delta and
-//! the store's encoding must agree exactly for a query to find anything, so
-//! proving a create/transfer round-trips through both is the real test.
-//!
-//! Both lanes are the *one* [`MptStateManager`] the executor reads through, over
-//! an in-memory base standing in for the reth bridge — so the entity store and
-//! the index cannot drift apart the way two separate handles could.
+//! End-to-end index write path: ops → deltas → index stores → commit → query
+//! back through the view's index primitives, all over the one [`MptStateView`].
 
+use core::ops::Bound;
 use std::collections::HashMap;
 use std::convert::Infallible;
 
 use alloy_primitives::{Address, B256, U256};
 
+use arkiv_interfaces::entity::annotations::{ALL, EXPIRATION, OWNER};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags};
-use arkiv_interfaces::execution::{AttributeMutation, BlockDraft, ExecEnv, ExecStatus, Op};
-use arkiv_interfaces::manager::StateManager;
+use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::primitives::EntityAddress;
-use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
-use arkiv_interfaces::state::AuxiliaryStore;
+use arkiv_interfaces::statemanager::{
+    BlockRef, EntityStore, EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
+};
 use arkiv_reth_executor::ArkivExecutor;
-use arkiv_reth_mpt_committed_store::AccountCode;
-use arkiv_reth_mpt_committed_store::IndexStorage;
-use arkiv_reth_mpt_committed_store::{BalanceAccess, NonceAccess};
-use arkiv_reth_statemanager::MptStateManager;
+use arkiv_reth_mpt_committed_store::{AccountCode, BalanceAccess, IndexStorage, NonceAccess};
+use arkiv_reth_statemanager::MptStateView;
 
-/// The one handle both lanes go through.
-type Mgr = MptStateManager<MemIndex>;
+/// The one handle everything goes through.
+type Mgr = MptStateView<MemIndex>;
 
 // ── In-memory base (stand-in for the reth bridge) ──────────────────────────
 
-/// Every raw seam the manager multiplexes its lanes over.
 #[derive(Default, Clone)]
 struct MemIndex {
     code: HashMap<Address, Vec<u8>>,
@@ -108,38 +98,44 @@ fn uint(n: u64) -> AttributeValue {
     AttributeValue::u256_from_u64(n)
 }
 
-/// Run `ops` under `caller`/`block` and commit both lanes of the draft.
+/// Run `ops`, fold the staged deltas into the index stores, commit the view.
 fn run(exec: &ArkivExecutor<Mgr>, mgr: &mut Mgr, caller: [u8; 20], block: u64, ops: &[Op]) {
-    let mut draft = BlockDraft::default();
-    let out = exec
-        .apply(&env(caller, block), mgr, &mut draft, ops)
-        .unwrap();
+    let out = exec.apply(&env(caller, block), mgr, ops).unwrap();
     assert_eq!(out.status, ExecStatus::Ok);
-    mgr.apply_draft(&draft).unwrap();
+    let deltas = mgr.get_uncommitted_deltas().unwrap();
+    EqualityIndexStore::apply_deltas(mgr, &deltas).unwrap();
+    RangeIndexStore::apply_deltas(mgr, &deltas).unwrap();
+    StateView::commit(mgr).unwrap();
 }
 
-fn all(page: u64) -> PageParams {
-    PageParams {
-        page_size: page,
-        cursor: None,
-    }
+fn owned_by(mgr: &Mgr, owner: [u8; 20]) -> Vec<EntityAddress> {
+    mgr.get_equal_entities(
+        OWNER,
+        &AttributeValue::EthereumAddress(owner),
+        ReadMode::ViewOnBase,
+    )
+    .unwrap()
 }
 
-fn keys(mgr: &mut Mgr, query: &Query) -> Vec<EntityAddress> {
-    let mut keys = AuxiliaryStore::evaluate(mgr, query, all(100)).unwrap().keys;
-    keys.sort();
-    keys
+/// Every live entity — the `$all` marker's bucket.
+fn all_entities(mgr: &Mgr) -> Vec<EntityAddress> {
+    mgr.get_equal_entities(
+        ALL,
+        &AttributeValue::Str(String::new()),
+        ReadMode::ViewOnBase,
+    )
+    .unwrap()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-/// A create's staged index delta, applied to the store, makes the entity findable
-/// by owner, by an exact user attribute, by a numeric range on that attribute, and
-/// under `$all` — proving the executor's encoding matches the store's.
+/// A create's staged delta, folded into the index, makes the entity findable by
+/// owner, by an exact user attribute, by a numeric range on it, and under
+/// `$all` — proving the view's delta derivation matches the store's encoding.
 #[test]
 fn create_is_queryable_by_its_attributes() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default());
+    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
     let alice = [0xAA; 20];
     let key: EntityAddress = [1u8; 32];
 
@@ -158,59 +154,42 @@ fn create_is_queryable_by_its_attributes() {
         }],
     );
 
-    // By owner.
+    assert_eq!(owned_by(&mgr, alice), vec![key]);
     assert_eq!(
-        keys(
-            &mut mgr,
-            &Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                value: AnnotVal::EthereumAddress(alice),
-            }
-        ),
-        vec![key],
-    );
-    // By exact user attribute.
-    assert_eq!(
-        keys(
-            &mut mgr,
-            &Query::Eq {
-                key: AnnotKey::User("rank".into()),
-                value: AnnotVal::u256_from_u64(42),
-            }
-        ),
+        mgr.get_equal_entities(b"rank", &uint(42), ReadMode::ViewOnBase)
+            .unwrap(),
         vec![key],
     );
     // By numeric range: rank >= 42 matches, rank > 42 does not.
     assert_eq!(
-        keys(
-            &mut mgr,
-            &Query::Gte {
-                key: AnnotKey::User("rank".into()),
-                value: AnnotVal::u256_from_u64(42),
-            }
-        ),
+        mgr.get_within_range(
+            b"rank",
+            Bound::Included(&uint(42)),
+            Bound::Unbounded,
+            ReadMode::ViewOnBase,
+        )
+        .unwrap(),
         vec![key],
     );
     assert!(
-        keys(
-            &mut mgr,
-            &Query::Gt {
-                key: AnnotKey::User("rank".into()),
-                value: AnnotVal::u256_from_u64(42),
-            }
+        mgr.get_within_range(
+            b"rank",
+            Bound::Excluded(&uint(42)),
+            Bound::Unbounded,
+            ReadMode::ViewOnBase,
         )
+        .unwrap()
         .is_empty()
     );
-    // Under $all.
-    assert_eq!(keys(&mut mgr, &Query::All), vec![key]);
+    assert_eq!(all_entities(&mgr), vec![key]);
 }
 
 /// After a transfer, the entity leaves the old owner's bucket and joins the new
-/// one — the executor's remove/insert diff flowing through the store.
+/// one — the derived remove/insert diff flowing through the store.
 #[test]
 fn transfer_moves_the_entity_between_owner_queries() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default());
+    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
     let alice = [0xAA; 20];
     let bob = [0xBB; 20];
     let key: EntityAddress = [1u8; 32];
@@ -240,22 +219,18 @@ fn transfer_moves_the_entity_between_owner_queries() {
         }],
     );
 
-    let owned_by = |owner: [u8; 20]| Query::Eq {
-        key: AnnotKey::BuiltIn(BuiltIn::Owner),
-        value: AnnotVal::EthereumAddress(owner),
-    };
-    assert!(keys(&mut mgr, &owned_by(alice)).is_empty());
-    assert_eq!(keys(&mut mgr, &owned_by(bob)), vec![key]);
+    assert!(owned_by(&mgr, alice).is_empty());
+    assert_eq!(owned_by(&mgr, bob), vec![key]);
     // Still one live entity overall.
-    assert_eq!(keys(&mut mgr, &Query::All), vec![key]);
+    assert_eq!(all_entities(&mgr), vec![key]);
 }
 
-/// A delete drops the entity from every query — its ids leave all buckets,
+/// A delete drops the entity from every query — its id leaves all buckets,
 /// including `$all`.
 #[test]
 fn delete_removes_the_entity_from_queries() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default());
+    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
     let alice = [0xAA; 20];
     let key: EntityAddress = [1u8; 32];
 
@@ -275,26 +250,16 @@ fn delete_removes_the_entity_from_queries() {
     );
     run(&exec, &mut mgr, alice, 11, &[Op::Delete { key }]);
 
-    assert!(keys(&mut mgr, &Query::All).is_empty());
-    assert!(
-        keys(
-            &mut mgr,
-            &Query::Eq {
-                key: AnnotKey::BuiltIn(BuiltIn::Owner),
-                value: AnnotVal::EthereumAddress(alice),
-            }
-        )
-        .is_empty()
-    );
+    assert!(all_entities(&mgr).is_empty());
+    assert!(owned_by(&mgr, alice).is_empty());
 }
 
-/// An update swaps the entity's old attribute value for the new one in the index:
-/// the executor's before→after diff removes the old bucket entry and inserts the
-/// new, so the old value stops matching and the new one starts.
+/// An update swaps the entity's old attribute value for the new one in the
+/// index: the old value stops matching and the new one starts.
 #[test]
 fn update_reindexes_attributes() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default());
+    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
     let alice = [0xAA; 20];
     let key: EntityAddress = [1u8; 32];
 
@@ -323,23 +288,20 @@ fn update_reindexes_attributes() {
         }],
     );
 
-    let rank_eq = |n: u64| Query::Eq {
-        key: AnnotKey::User("rank".into()),
-        value: AnnotVal::u256_from_u64(n),
+    let rank_eq = |mgr: &Mgr, n: u64| {
+        mgr.get_equal_entities(b"rank", &uint(n), ReadMode::ViewOnBase)
+            .unwrap()
     };
-    assert!(
-        keys(&mut mgr, &rank_eq(10)).is_empty(),
-        "old rank de-indexed"
-    );
-    assert_eq!(keys(&mut mgr, &rank_eq(20)), vec![key], "new rank indexed");
+    assert!(rank_eq(&mgr, 10).is_empty(), "old rank de-indexed");
+    assert_eq!(rank_eq(&mgr, 20), vec![key], "new rank indexed");
 }
 
-/// The built-in `$expiration` field is range-indexed: entities are findable by a
-/// numeric bound on their expiry block, exactly like a user uint attribute.
+/// The built-in `$expiration` field is range-indexed: entities are findable by
+/// a numeric bound on their expiry block, exactly like a user uint attribute.
 #[test]
 fn expiration_is_range_queryable() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default());
+    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
     let alice = [0xAA; 20];
 
     let mut make = |key_byte: u8, expires_at: u64| {
@@ -363,9 +325,14 @@ fn expiration_is_range_queryable() {
     make(3, 150);
 
     // $expiration >= 100 matches the two later-expiring entities, not the first.
-    let by_expiry = Query::Gte {
-        key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
-        value: AnnotVal::u256_from_u64(100),
-    };
-    assert_eq!(keys(&mut mgr, &by_expiry), vec![[2u8; 32], [3u8; 32]]);
+    assert_eq!(
+        mgr.get_within_range(
+            EXPIRATION,
+            Bound::Included(&uint(100)),
+            Bound::Unbounded,
+            ReadMode::ViewOnBase,
+        )
+        .unwrap(),
+        vec![[2u8; 32], [3u8; 32]],
+    );
 }

@@ -4,9 +4,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::entity::{Attribute, AttributeValue, CreationFlags};
-use crate::manager::StateManager;
-use crate::primitives::{BlockNumber, EntityAddress, Gas, Hash, UserAddress};
-use crate::state::{BlockAuxiliaryStoreDelta, BlockEntityStoreDelta};
+use crate::primitives::{BlockNumber, EntityAddress, Gas, UserAddress};
+use crate::statemanager::{BlockRef, StateCommit, StateView};
 
 /// What a transaction executor needs to know about its context. No EVM call
 /// types — just these fields.
@@ -245,71 +244,53 @@ pub enum OpKind {
     Delete,
 }
 
-/// A block's changes-in-progress: what execution has staged so far, to be applied
-/// to the stores when the block commits.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlockDraft {
-    /// Entity changes staged so far.
-    pub entities: BlockEntityStoreDelta,
-    /// Index changes staged so far.
-    pub auxiliary: BlockAuxiliaryStoreDelta,
-}
-
 /// Runs one transaction: decode its operations, check them, and stage the
-/// resulting changes into the block's [`BlockDraft`].
+/// resulting changes into the block's [`StateView`].
 ///
-/// Reads see the committed [`StateManager`] plus whatever earlier transactions in
-/// the same block already staged in `draft`. Nothing touches the stores until the
-/// block commits.
+/// There is no separate draft: the view's overlay **is** the block's
+/// changes-in-progress. Reads through the view
+/// ([`ViewWithOverlay`](crate::statemanager::ReadMode::ViewWithOverlay)) see the
+/// committed base plus whatever earlier transactions in the same block already
+/// staged; nothing reaches the base until the block commits the view.
 ///
-/// A transaction is all-or-nothing: if any operation fails, `draft` is left
-/// exactly as it was.
+/// A transaction is all-or-nothing: if any operation fails, the overlay must be
+/// left exactly as it was. How — validating every operation before staging any
+/// write, or working a scratch view and folding it in on success — is the
+/// implementor's choice.
 pub trait TransactionExecutor {
-    /// The state this executor reads through.
-    type State: StateManager;
+    /// The view this executor reads and stages through.
+    type State: StateView;
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// Run `op_bytes` under `env`, reading `state` and `draft` and staging this
-    /// transaction's changes into `draft`.
+    /// Run `op_bytes` under `env`, reading `state` and staging this
+    /// transaction's changes into its overlay.
     fn execute(
         &self,
         env: &ExecEnv,
         state: &mut Self::State,
-        draft: &mut BlockDraft,
         op_bytes: &[u8],
     ) -> Result<ExecOutput, Self::Error>;
 }
 
-/// Runs a block of transactions and, on commit, produces its commitments. Also
-/// undoes blocks on a reorg.
+/// Runs a block of transactions and, on commit, produces its commitments.
+///
+/// One block, one view: `begin_block` opens a [`StateView`] at the parent,
+/// every transaction stages into it, and `commit_block` commits the view and
+/// graduates it into the block's [`StateCommit`]. There is no rollback — a
+/// reorg is served by opening a view at the surviving block, never by undoing
+/// this one.
 pub trait BlockExecutor {
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// Start a new block.
-    fn begin_block(&mut self, block: BlockNumber) -> Result<(), Self::Error>;
+    /// Start a new block on top of `parent`.
+    fn begin_block(&mut self, parent: BlockRef) -> Result<(), Self::Error>;
 
     /// Run one transaction in the current block.
     fn execute_tx(&mut self, env: &ExecEnv, op_bytes: &[u8]) -> Result<ExecOutput, Self::Error>;
 
-    /// Finish the block: apply its staged changes and return its commitments.
-    fn commit_block(&mut self) -> Result<BlockCommit, Self::Error>;
-
-    /// Undo every block from `block` onward (a reorg).
-    fn rollback_to(&mut self, block: BlockNumber) -> Result<(), Self::Error>;
-}
-
-/// What committing a block produces. The entities and the index commit to
-/// **separate** roots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BlockCommit {
-    /// The block just committed.
-    pub block: BlockNumber,
-    /// Root of the entities after this block.
-    pub committed_root: Hash,
-    /// Root of the index after this block.
-    pub auxiliary_root: Hash,
-    /// Running hash of all changes through this block.
-    pub change_set_hash: Hash,
+    /// Finish the block: commit the view, seal the block, and graduate the
+    /// view into its [`StateCommit`].
+    fn commit_block(&mut self) -> Result<StateCommit, Self::Error>;
 }

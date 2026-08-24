@@ -15,6 +15,9 @@ pub enum AuxError<E> {
     /// A tier-1 pair account held bytes that aren't a valid bitmap — a corrupt or
     /// forked index.
     Bitmap(BitmapError),
+    /// A range lookup with no typed bound on either side — nothing names the
+    /// `(attribute, type)` buckets to scan, so the request is unanswerable.
+    UnboundedRange,
 }
 
 impl<E> From<BitmapError> for AuxError<E> {

@@ -1,4 +1,4 @@
-//! [`RethAuxStore`] — the [`AuxiliaryStore`] implementation.
+//! [`RethAuxStore`] — the query index over the entities.
 //!
 //! Sits on a backend that is both an
 //! [`AccountCode`](crate::entities::AccountCode) (tier-1 pair bitmaps live in
@@ -6,14 +6,10 @@
 //! map, live in storage slots). The reth adapter fills both over revm state; the
 //! store logic here is agnostic to how.
 //!
-//! Its three jobs:
-//! - [`apply_delta`](RethAuxStore::apply_delta) folds a block's per-entity changes
-//!   into the index (via [`index`](crate::indices::index)), resolving each entity's key to
-//!   its id first.
-//! - [`evaluate`](RethAuxStore::evaluate) runs a query (via
-//!   [`interpret`](crate::indices::interpret)) to a set of ids, pages them newest-first, and
-//!   maps the page back to entity keys.
-//! - [`commitment`](RethAuxStore::commitment) — see the note on the method.
+//! Its jobs: [`apply_delta`](RethAuxStore::apply_delta) folds per-entity changes
+//! in; [`evaluate`](RethAuxStore::evaluate) runs a whole [`Query`] (the RPC read
+//! path); and the three primitives the spec's view exposes — `equal_entities`,
+//! `prefixed_entities`, `entities_in_range` — answer one lookup each.
 //!
 //! ## Entity ids: allocation and the two maps
 //!
@@ -32,15 +28,20 @@
 //! left in place. Both maps store `id + 1`, so an unwritten slot (`0`) reads as
 //! "absent" without colliding with the genuine id `0`.
 
+use core::ops::Bound;
+
 use crate::entities::AccountCode;
 use crate::entities::layout::SYSTEM_ACCOUNT_ADDRESS;
 use alloy_primitives::{B256, keccak256};
-use arkiv_interfaces::primitives::{EntityAddress, Hash};
+use arkiv_interfaces::entity::AttributeValue;
+use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::query::{PageParams, Query, QueryMatches, QueryStats};
-use arkiv_interfaces::state::{AuxiliaryStore, BlockAuxiliaryStoreDelta};
 
 use crate::indices::annotation::capabilities_for;
+use crate::indices::bitmap::Bitmap;
+use crate::indices::delta::AuxiliaryEntityDelta;
 use crate::indices::error::AuxError;
+use crate::indices::range;
 use crate::indices::slot::{storage_to_u64, u64_to_storage};
 use crate::indices::storage::IndexStorage;
 use crate::indices::{index, interpret};
@@ -72,7 +73,7 @@ fn id_to_key_slot(entity_id: u64) -> B256 {
     keccak256(buf)
 }
 
-/// The reth-host [`AuxiliaryStore`]: the index over a code + storage backend.
+/// The reth-host query index over a code + storage backend.
 #[derive(Debug, Default, Clone)]
 pub struct RethAuxStore<B> {
     backend: B,
@@ -148,14 +149,17 @@ where
     }
 }
 
-impl<B, E> AuxiliaryStore for RethAuxStore<B>
+impl<B, E> RethAuxStore<B>
 where
     B: AccountCode<Error = E> + IndexStorage<Error = E>,
     E: core::fmt::Debug,
 {
-    type Error = AuxError<E>;
-
-    fn evaluate(&mut self, query: &Query, page: PageParams) -> Result<QueryMatches, Self::Error> {
+    /// Run a whole [`Query`] to one page of matching keys, newest-first.
+    pub fn evaluate(
+        &mut self,
+        query: &Query,
+        page: PageParams,
+    ) -> Result<QueryMatches, AuxError<E>> {
         let matches = interpret::eval(query, &mut self.backend)?;
 
         // Roaring iterates ascending; page the largest ids first (newest entities),
@@ -191,8 +195,8 @@ where
         })
     }
 
-    fn apply_delta(&mut self, delta: &BlockAuxiliaryStoreDelta) -> Result<(), Self::Error> {
-        for entity in &delta.entities {
+    pub fn apply_delta(&mut self, deltas: &[AuxiliaryEntityDelta]) -> Result<(), AuxError<E>> {
+        for entity in deltas {
             let entity_id = self.id_for_key(entity.entity_key)?;
             for entry in &entity.inserts {
                 let capabilities = capabilities_for(&entry.attr, entry.value.attr_type());
@@ -218,12 +222,87 @@ where
         Ok(())
     }
 
-    fn commitment(&mut self) -> Result<Hash, Self::Error> {
-        // On the reth host the index commits through the block's unified state root:
-        // every pair, tier-2, and bookkeeping account lives in the one state trie,
-        // alongside the entities. A store-scoped sub-commitment would need its own
-        // sub-trie, which the host does not maintain, so this returns the default.
-        Ok(Hash::default())
+    /// Same type, same bytes. Ascending.
+    pub fn equal_entities(
+        &mut self,
+        attr: &[u8],
+        value: &AttributeValue,
+    ) -> Result<Vec<EntityAddress>, AuxError<E>> {
+        let hits = interpret::eq_bitmap(&mut self.backend, attr, value)?;
+        self.keys_of(&hits)
+    }
+
+    /// Str-typed prefix match. Ascending.
+    pub fn prefixed_entities(
+        &mut self,
+        attr: &[u8],
+        prefix: &str,
+    ) -> Result<Vec<EntityAddress>, AuxError<E>> {
+        let value = AttributeValue::Str(prefix.into());
+        let hits = interpret::prefix_bitmap(&mut self.backend, attr, &value)?;
+        self.keys_of(&hits)
+    }
+
+    /// The bounds' type names the buckets scanned; a fully unbounded pair is
+    /// [`AuxError::UnboundedRange`]. Ascending.
+    pub fn entities_in_range(
+        &mut self,
+        attr: &[u8],
+        low: Bound<&AttributeValue>,
+        high: Bound<&AttributeValue>,
+    ) -> Result<Vec<EntityAddress>, AuxError<E>> {
+        let low_hits = match low {
+            Bound::Included(v) => Some(interpret::range_bitmap(
+                &mut self.backend,
+                attr,
+                v,
+                range::Bound::Gte,
+            )?),
+            Bound::Excluded(v) => Some(interpret::range_bitmap(
+                &mut self.backend,
+                attr,
+                v,
+                range::Bound::Gt,
+            )?),
+            Bound::Unbounded => None,
+        };
+        let high_hits = match high {
+            Bound::Included(v) => Some(interpret::range_bitmap(
+                &mut self.backend,
+                attr,
+                v,
+                range::Bound::Lte,
+            )?),
+            Bound::Excluded(v) => Some(interpret::range_bitmap(
+                &mut self.backend,
+                attr,
+                v,
+                range::Bound::Lt,
+            )?),
+            Bound::Unbounded => None,
+        };
+        // Mixed-type bounds intersect two disjoint typed bucket sets — empty.
+        let hits = match (low_hits, high_hits) {
+            (Some(mut l), Some(h)) => {
+                l.intersect_with(&h);
+                l
+            }
+            (Some(l), None) => l,
+            (None, Some(h)) => h,
+            (None, None) => return Err(AuxError::UnboundedRange),
+        };
+        self.keys_of(&hits)
+    }
+
+    fn keys_of(&mut self, hits: &Bitmap) -> Result<Vec<EntityAddress>, AuxError<E>> {
+        let mut keys = Vec::with_capacity(hits.len() as usize);
+        for entity_id in hits.iter() {
+            if let Some(key) = self.id_key(entity_id)? {
+                keys.push(key);
+            }
+        }
+        keys.sort_unstable();
+        Ok(keys)
     }
 }
 
@@ -239,7 +318,8 @@ mod tests {
         ALL, CONTENT_TYPE, CREATED_AT_BLOCK, CREATOR, EXPIRATION, KEY, OWNER,
     };
     use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn};
-    use arkiv_interfaces::state::{AttrEntry, AuxiliaryEntityDelta};
+
+    use crate::indices::delta::AttrEntry;
 
     /// A backend that is both an [`AccountCode`] and an [`IndexStorage`] — the shape
     /// the reth bridge has. In-memory maps; enough to exercise the whole index.
@@ -330,9 +410,7 @@ mod tests {
     }
 
     fn apply(store: &mut RethAuxStore<MemBackend>, deltas: Vec<AuxiliaryEntityDelta>) {
-        store
-            .apply_delta(&BlockAuxiliaryStoreDelta { entities: deltas })
-            .unwrap();
+        store.apply_delta(&deltas).unwrap();
     }
 
     /// Evaluate `query` and return the matching keys, sorted for stable assertions.

@@ -17,7 +17,7 @@ use roaring::RoaringTreemap;
 /// A roaring64 bitmap of entity ids.
 ///
 /// Entity ids are `u64` (matching
-/// [`AuxiliaryEntityDelta::entity_id`](arkiv_interfaces::state::AuxiliaryEntityDelta::entity_id)),
+/// [`AuxiliaryEntityDelta`](crate::indices::delta::AuxiliaryEntityDelta)),
 /// so this wraps the 64-bit [`RoaringTreemap`] rather than the 32-bit
 /// `RoaringBitmap`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

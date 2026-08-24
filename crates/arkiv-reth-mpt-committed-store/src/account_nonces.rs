@@ -1,4 +1,5 @@
-//! [`RethAccountNoncesStore`] — the [`AccountNoncesStore`] implementation.
+//! [`RethAccountNoncesStore`] — raw transaction-nonce reads and
+//! writes.
 //!
 //! The **transaction** nonce (replay protection), not the entity-minting one —
 //! that is [`RethEntityCreationNoncesStore`](crate::RethEntityCreationNoncesStore),
@@ -8,7 +9,6 @@
 
 use alloy_primitives::Address;
 
-use arkiv_interfaces::manager::AccountNoncesStore;
 use arkiv_interfaces::primitives::{UserAddress, UserNonce};
 
 /// This store's raw seam: an Ethereum account's **nonce** field.
@@ -38,7 +38,7 @@ impl<T: NonceAccess + ?Sized> NonceAccess for &mut T {
     }
 }
 
-/// The reth-host [`AccountNoncesStore`]: transaction nonces are the accounts'
+/// The reth-host transaction-nonce store: transaction nonces are the accounts'
 /// own nonce fields, reached through a [`NonceAccess`].
 #[derive(Debug, Default, Clone)]
 pub struct RethAccountNoncesStore<B> {
@@ -62,20 +62,18 @@ impl<B> RethAccountNoncesStore<B> {
     }
 }
 
-impl<B: NonceAccess> AccountNoncesStore for RethAccountNoncesStore<B> {
-    type Error = B::Error;
-
-    fn get_account_nonce(&mut self, account: UserAddress) -> Result<UserNonce, Self::Error> {
+impl<B: NonceAccess> RethAccountNoncesStore<B> {
+    pub fn get_account_nonce(&mut self, account: UserAddress) -> Result<UserNonce, B::Error> {
         self.backend
             .get_nonce(Address::from(account))
             .map(UserNonce::new)
     }
 
-    fn set_account_nonce(
+    pub fn set_account_nonce(
         &mut self,
         account: UserAddress,
         nonce: UserNonce,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), B::Error> {
         self.backend.set_nonce(Address::from(account), nonce.get())
     }
 }

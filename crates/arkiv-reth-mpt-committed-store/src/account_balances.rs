@@ -1,4 +1,4 @@
-//! [`RethAccountBalancesStore`] — the [`AccountBalancesStore`] implementation.
+//! [`RethAccountBalancesStore`] — raw balance reads and writes.
 //!
 //! The store's own job is one conversion: the spec speaks in [`UserBalance`]
 //! big-endian bytes, the host in alloy [`U256`]s. Where a balance physically
@@ -9,7 +9,6 @@
 
 use alloy_primitives::{Address, U256};
 
-use arkiv_interfaces::manager::AccountBalancesStore;
 use arkiv_interfaces::primitives::{UserAddress, UserBalance};
 
 /// This store's raw seam: an Ethereum account's **balance** field.
@@ -39,8 +38,8 @@ impl<T: BalanceAccess + ?Sized> BalanceAccess for &mut T {
     }
 }
 
-/// The reth-host [`AccountBalancesStore`]: balances live in the accounts,
-/// reached through a [`BalanceAccess`].
+/// The reth-host balance store: balances live in the accounts, reached through
+/// a [`BalanceAccess`].
 #[derive(Debug, Default, Clone)]
 pub struct RethAccountBalancesStore<B> {
     backend: B,
@@ -63,19 +62,17 @@ impl<B> RethAccountBalancesStore<B> {
     }
 }
 
-impl<B: BalanceAccess> AccountBalancesStore for RethAccountBalancesStore<B> {
-    type Error = B::Error;
-
-    fn get_balance(&mut self, account: UserAddress) -> Result<UserBalance, Self::Error> {
+impl<B: BalanceAccess> RethAccountBalancesStore<B> {
+    pub fn get_balance(&mut self, account: UserAddress) -> Result<UserBalance, B::Error> {
         let balance = self.backend.get_balance(Address::from(account))?;
         Ok(UserBalance::from_be_bytes(balance.to_be_bytes()))
     }
 
-    fn set_balance(
+    pub fn set_balance(
         &mut self,
         account: UserAddress,
         balance: UserBalance,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), B::Error> {
         self.backend.set_balance(
             Address::from(account),
             U256::from_be_bytes(balance.to_be_bytes()),

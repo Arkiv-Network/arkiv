@@ -1,13 +1,11 @@
 //! The reth-host implementation of Arkiv's **committed state** — every
-//! consensus store, one module per lane, all multiplexed onto Ethereum's one
+//! consensus store, one module each, all multiplexed onto Ethereum's one
 //! keccak-MPT account state.
 //!
-//! This crate is the physical side of the
-//! [`CommittedState`](arkiv_interfaces::manager) picture: for each store the
-//! `arkiv_interfaces` traits name, one module holds the reth layout that
-//! realizes it —
+//! For each committed store the spec's `StateView` presents, one module holds
+//! the reth layout that realizes it —
 //!
-//! | lane                  | store                             | module                     | where it lives                     |
+//! | store                 | type                              | module                     | where it lives                     |
 //! |-----------------------|-----------------------------------|----------------------------|------------------------------------|
 //! | the entities          | [`RethEntityStore`]               | [`entities`]               | per-entity account code            |
 //! | the query index       | [`RethAuxStore`]                  | [`indices`]                | bitmap code + storage-slot B-trees |
@@ -21,12 +19,12 @@
 //! and the nonce store's [`NonceAccess`] (the account's two remaining fields).
 //! Together the seams cover everything of an Ethereum account Arkiv touches,
 //! so one backend implementing all of them — the write overlay, a provider
-//! snapshot, an in-memory mock — can carry every lane at once. That is what
-//! `arkiv-reth-statemanager`'s `MptStateManager` does: compose these stores
-//! over one base into the single `StateManager` seam.
+//! snapshot, an in-memory mock — can carry every store at once. That is what
+//! `arkiv-reth-statemanager`'s `MptStateView` does: compose these stores over
+//! one base into the spec's single `StateView` seam.
 //!
-//! The **uncommitted** state (the pruning map) is deliberately absent: it
-//! carries no commitment, so it lives with the manager, not here.
+//! The **uncommitted** state (the pruning set) is deliberately absent: it
+//! carries no commitment, so it lives with the view, not here.
 //!
 //! Consensus warning: the address derivations ([`entities::layout`],
 //! [`indices::address`]) and every stored byte format in this crate feed the
@@ -50,7 +48,8 @@ pub use entities::{
     decode, encode,
 };
 pub use entity_creation_nonces::RethEntityCreationNoncesStore;
+pub use indices::annotation::{annotation_delta, entity_annotations};
 pub use indices::{
-    AuxError, Bitmap, BitmapError, Bound, IndexStorage, QueryCapabilities, RethAuxStore,
-    all_entities_bucket, pair_address,
+    AttrEntry, AuxError, AuxiliaryEntityDelta, Bitmap, BitmapError, Bound, IndexStorage,
+    QueryCapabilities, RethAuxStore, all_entities_bucket, pair_address,
 };

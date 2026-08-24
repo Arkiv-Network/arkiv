@@ -1,5 +1,5 @@
 //! [`WriteOverlay`] — the reth **write-path** bridge, and the base a
-//! [`MptStateManager`](crate::MptStateManager) wraps on that path.
+//! [`MptStateView`](crate::MptStateView) wraps on that path.
 //!
 //! The no-EVM executor has no revm `Journal`: it reads accounts through the
 //! revm [`Database`] trait and *returns* an [`EvmState`] diff that reth's block

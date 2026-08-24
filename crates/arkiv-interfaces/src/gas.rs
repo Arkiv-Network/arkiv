@@ -15,7 +15,7 @@ use crate::query::QueryStats;
 ///
 /// This is the **schedule** building block — a pure price list. The question
 /// "how much for operation `o`?" is asked of the
-/// [`StateManager`](crate::manager::StateManager) (its `get_operation_cost`),
+/// [`StateManager`](crate::statemanager::StateManager) (its `get_operation_cost`),
 /// which may consult committed state on the way to an answer; a schedule like
 /// this is what it answers with.
 pub trait CostModel {

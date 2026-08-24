@@ -6,9 +6,9 @@
 //! | `arkiv_query` | `[q]` or `[q, `[`QueryOptions`]`]` | [`QueryResponse`] |
 //! | `arkiv_getEntityCount` | `[`[`CountRequest`]`]` (optional) | a hex quantity |
 //! | `arkiv_getBlockTiming` | `[]` | [`BlockTimingView`] |
-//! 
+//!
 //! ## Errors
-//! 
+//!
 //! | code | `data` |
 //! |---|---|
 //! | [`MALFORMED_INPUT`] | `position`, `message` |
