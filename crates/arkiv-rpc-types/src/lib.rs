@@ -7,16 +7,23 @@
 //! | `arkiv_getEntityCount` | `[`[`CountRequest`]`]` (optional) | a hex quantity |
 //! | `arkiv_getBlockTiming` | `[]` | [`BlockTimingView`] |
 //!
-//! Its own crate because both sides need it: the node serves these shapes
-//! (`arkiv-reth-rpc`), and `arkiv-cli`, `arkiv-harness` and any Rust SDK read
-//! them. So it names no transport — no jsonrpsee, no reth, no HTTP.
+//! ## Errors
+//!
+//! | code | `data` |
+//! |---|---|
+//! | [`MALFORMED_INPUT`] | `position`, `message` |
+//! | [`TYPE_ERROR`] | `position`, `message` |
+//! | [`LITERAL_ERROR`] | `position`, `message` |
+//! | [`QUERY_LIMIT`] | `message` |
+//! | [`CURSOR_ERROR`] | `message` |
+//! | [`BLOCK_UNAVAILABLE`] | `requested`, `latest`, `message` |
+//!
+//! `position` is a byte offset into the query text.
 
 #![forbid(unsafe_code)]
 
 pub mod entity;
-pub mod error;
 pub mod method;
 
 pub use entity::*;
-pub use error::*;
 pub use method::*;

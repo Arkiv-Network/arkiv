@@ -52,10 +52,12 @@
 //! This file is the **exact executor** — the reth-specific wiring (the [`Evm`],
 //! [`EvmFactory`] and [`ExecutorBuilder`] reth injects). The **entity business
 //! logic** is not here: it lives in [`arkiv`], written against the host-agnostic
-//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. [`arkiv_transact`]
-//! drives [`arkiv::ArkivExecutor`] over a reth-backed
-//! [`arkiv_interfaces::state::EntityStore`] (`RethEntityStore` → `CodeBackend` →
-//! [`ExecutorState`]) and returns the diff for reth to commit.
+//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. And the
+//! **state machinery** is not here either: all state — entities, the query
+//! index, minting nonces, sender balances and EOA nonces — is reached through
+//! one [`write_manager`] view (arkiv-reth-statemanager's `MptStateView` over
+//! its `WriteOverlay`), so a transaction's every effect lands in a single
+//! `EvmState` diff for reth to commit.
 
 /// Entity business logic, implementing the `arkiv-interfaces` executor interface.
 pub mod arkiv;
@@ -63,12 +65,9 @@ pub mod arkiv;
 pub mod decode;
 /// Revert-payload encoding: `RevertReason` / `DecodeError` → Solidity error data.
 pub mod revert;
-/// The reth write-path bridge: `AccountCode` over the `Database` + `EvmState` diff.
-pub mod state;
 
 pub use arkiv::{ArkivExecutor, OpEffect};
-pub use decode::{DecodeError, decode_ops, derive_entity_key};
-pub use state::ExecutorState;
+pub use decode::{DecodeError, decode_ops, derive_entity_address};
 
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
@@ -92,7 +91,7 @@ use reth_ethereum::{
             interpreter::interpreter::EthInterpreter,
             precompile::Precompiles,
             primitives::hardfork::SpecId,
-            state::{Account, EvmState},
+            state::EvmState,
         },
     },
     node::{
@@ -103,19 +102,23 @@ use reth_ethereum::{
 
 use core::cmp::Ordering;
 
-use arkiv_interfaces::execution::{BlockDraft, ExecEnv, ExecStatus, Op, OpKind};
-use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
-use arkiv_reth_auxstore::RethAuxStore;
-use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
+use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
+use arkiv_interfaces::primitives::{Hash, UserBalance};
+use arkiv_interfaces::statemanager::{
+    AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
+    EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
+};
+use arkiv_reth_statemanager::{WriteManager, write_manager};
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
 /// EOAs `CALL` here with entity `execute(Operation[])` calldata. There is no
 /// precompile object and no bytecode — calls to this address are routed directly
 /// in [`arkiv_transact`]. The bytes come from
-/// [`arkiv_interfaces::constants::ARKIV_ADDRESS`], which is also what
+/// [`arkiv_interfaces::constants::ethereum::ARKIV_RETH_ADDRESS`], which is also what
 /// `arkiv-genesis` asserts against; this is the reth-typed view of that one value.
-pub const ARKIV_ADDRESS: Address = Address::new(arkiv_interfaces::constants::ARKIV_ADDRESS);
+pub const ARKIV_ADDRESS: Address =
+    Address::new(arkiv_interfaces::constants::ethereum::ARKIV_RETH_ADDRESS);
 
 /// Flat gas charged per transaction by the fixed-function executor.
 const ARKIV_TX_GAS: u64 = 21_000;
@@ -137,6 +140,43 @@ fn intrinsic_gas(data: &[u8]) -> u64 {
     let initial = 21_000 + 4 * tokens;
     let floor = 21_000 + 10 * tokens;
     initial.max(floor)
+}
+
+/// An alloy `U256` as the spec's [`UserBalance`] bytes.
+fn as_balance(value: U256) -> UserBalance {
+    UserBalance::from_be_bytes(value.to_be_bytes())
+}
+
+/// Map a state-manager fault into the executor's fatal error channel. Faults
+/// here are host/store failures — business-rule reverts never travel this path.
+fn state_fault<T: core::fmt::Debug, DBError>(
+    context: &'static str,
+) -> impl FnOnce(T) -> EVMError<DBError> {
+    move |e| EVMError::Custom(format!("{context}: {e:?}"))
+}
+
+/// The parent-height ref a write view is opened at. reth owns canonicality on
+/// this host, so the hash is not threaded through and stays zero.
+fn parent_ref(block_number: u64) -> BlockRef {
+    BlockRef::new(block_number.saturating_sub(1), Hash::default())
+}
+
+/// Charge `sender` for `gas_cost` (plus `value_out`, for transfers) and bump its
+/// EOA nonce — the sender-side accounting every transaction shape shares.
+fn charge_sender<DB: Database>(
+    view: &mut WriteManager<'_, DB>,
+    sender: Address,
+    value_out: U256,
+    gas_cost: U256,
+) -> Result<(), EVMError<DB::Error>> {
+    let sender = sender.into_array();
+    view.fetch_sub_balance(sender, as_balance(value_out))
+        .map_err(state_fault("debit sender value"))?;
+    view.fetch_sub_balance(sender, as_balance(gas_cost))
+        .map_err(state_fault("debit sender gas"))?;
+    view.fetch_increment_acc_nonce(sender)
+        .map_err(state_fault("bump sender nonce"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +337,7 @@ fn arkiv_transact<DB: Database>(
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
-            return arkiv_entity_nonce_call(db, &tx);
+            return arkiv_entity_nonce_call(db, &tx, block_number);
         }
         if selector == IEntityRegistry::customAttributeNamesCall::SELECTOR {
             return arkiv_custom_attribute_names_call(db, &tx, block_number);
@@ -318,33 +358,16 @@ fn arkiv_transact<DB: Database>(
         tx.value
     };
 
-    // Sender: debit value + gas, bump nonce, mark touched.
-    let mut sender = db
-        .basic(tx.caller)
-        .map_err(EVMError::Database)?
-        .unwrap_or_default();
-    sender.balance = sender
-        .balance
-        .saturating_sub(value_out)
-        .saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-
-    let mut state = EvmState::default();
-    state.insert(tx.caller, sender_acc);
-
-    // Recipient: credit value.
+    // Sender debit + nonce bump and recipient credit, through one view — a
+    // transfer stages the same way every other state change does.
+    let mut view = write_manager(db, parent_ref(block_number));
+    charge_sender(&mut view, tx.caller, value_out, gas_cost)?;
     if to != tx.caller {
-        let mut recipient = db
-            .basic(to)
-            .map_err(EVMError::Database)?
-            .unwrap_or_default();
-        recipient.balance = recipient.balance.saturating_add(tx.value);
-        let mut recipient_acc = Account::from(recipient);
-        recipient_acc.mark_touch();
-        state.insert(to, recipient_acc);
+        view.fetch_add_balance(to.into_array(), as_balance(tx.value))
+            .map_err(state_fault("credit recipient"))?;
     }
+    StateView::commit(&mut view).map_err(state_fault("commit transfer"))?;
+    let state = view.into_base().into_state();
 
     let result = ExecutionResult::Success {
         reason: SuccessReason::Stop,
@@ -392,37 +415,30 @@ fn arkiv_entity_transact<DB: Database>(
         chain_id: tx.chain_id.unwrap_or(1),
     };
 
-    // Entity phase — borrows `db` until `into_state` releases it.
-    let mut state = ExecutorState::new(db);
-    let start_nonce = state
-        .read_nonce(caller)
-        .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
+    // One view for the whole transaction: the entity phase and the sender
+    // phase stage into the same overlay; a revert stages no entity changes, so
+    // the one commit at the end flushes exactly what should land.
+    let mut view = write_manager(db, parent_ref(block_number));
+    let start_nonce = view
+        .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
+        .map_err(state_fault("read minting nonce"))?;
     let outcome = match decode_ops(&env, &tx.data, start_nonce) {
-        Ok(ops) => run_ops(state, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
+        Ok(ops) => run_ops(&mut view, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
         Err(e) => Outcome {
             gas_used: 0,
             revert: Some(revert::decode_revert_data(&e)),
-            entity_state: state.into_state(),
             logs: Vec::new(),
         },
     };
 
-    // Sender phase — `db` is free again: charge gas, bump the EOA nonce. The
-    // charged/reported figure is floored at the pool's intrinsic minimum so a
-    // cheap batch still estimates to a pool-acceptable gas limit.
+    // Sender phase: charge gas, bump the EOA nonce. The charged/reported figure
+    // is floored at the pool's intrinsic minimum so a cheap batch still
+    // estimates to a pool-acceptable gas limit.
     let gas_used = outcome.gas_used.max(floor);
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
-    let mut sender = db
-        .basic(caller)
-        .map_err(EVMError::Database)?
-        .unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-
-    let mut evm_state = outcome.entity_state;
-    evm_state.insert(caller, sender_acc);
+    charge_sender(&mut view, caller, U256::ZERO, gas_cost)?;
+    StateView::commit(&mut view).map_err(state_fault("commit transaction"))?;
+    let evm_state = view.into_base().into_state();
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
@@ -453,22 +469,17 @@ fn arkiv_entity_transact<DB: Database>(
 fn arkiv_view_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
+    block_number: u64,
     answer: impl FnOnce(&mut DB) -> Result<Result<Vec<u8>, Vec<u8>>, EVMError<DB::Error>>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     let output = answer(db)?;
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
-    let mut sender = db
-        .basic(tx.caller)
-        .map_err(EVMError::Database)?
-        .unwrap_or_default();
-    sender.balance = sender.balance.saturating_sub(gas_cost);
-    sender.nonce = sender.nonce.saturating_add(1);
-    let mut sender_acc = Account::from(sender);
-    sender_acc.mark_touch();
-    let mut state = EvmState::default();
-    state.insert(tx.caller, sender_acc);
+    let mut view = write_manager(db, parent_ref(block_number));
+    charge_sender(&mut view, tx.caller, U256::ZERO, gas_cost)?;
+    StateView::commit(&mut view).map_err(state_fault("commit view call"))?;
+    let state = view.into_base().into_state();
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match output {
@@ -496,30 +507,31 @@ fn bad_view_args(view: &str, e: impl core::fmt::Display) -> Vec<u8> {
 fn view_entity<DB: Database>(
     db: &mut DB,
     key: B256,
+    block_number: u64,
 ) -> Result<Option<arkiv_interfaces::entity::Entity>, EVMError<DB::Error>> {
-    let mut store = RethEntityStore::new(CodeBackend::new(ExecutorState::new(db)));
-    store
-        .get(key.0)
-        .map_err(|e| EVMError::Custom(format!("read entity: {e:?}")))
+    write_manager(db, parent_ref(block_number))
+        .get_entity(key.0, ReadMode::ViewOnBase)
+        .map_err(state_fault("read entity"))
 }
 
 /// `entityNonce(owner)`: the owner's entity-key minting nonce, as a `uint64`.
 ///
 /// SDKs `eth_call` this before sending creates to predict the keys the batch
-/// will mint (`derive_entity_key(chain_id, owner, nonce + i, salt)`), so it
+/// will mint (`derive_entity_address(chain_id, owner, nonce + i, salt)`), so it
 /// reads the same system-account slot the execute path mints from.
 fn arkiv_entity_nonce_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
+    block_number: u64,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, |db| {
+    arkiv_view_call(db, tx, block_number, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
         };
-        let nonce = ExecutorState::new(db)
-            .read_nonce(call.owner)
-            .map_err(|e| EVMError::Custom(format!("read nonce: {e}")))?;
+        let nonce = write_manager(db, parent_ref(block_number))
+            .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
+            .map_err(state_fault("read minting nonce"))?;
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
             &nonce.get(),
         )))
@@ -538,12 +550,13 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
     tx: &TxEnv,
     block_number: u64,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, |db| {
+    arkiv_view_call(db, tx, block_number, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
         };
-        let names = match live_entity(view_entity(db, call.entityKey)?, block_number) {
+        let names = match live_entity(view_entity(db, call.entityKey, block_number)?, block_number)
+        {
             Some(e) => e.attributes.iter().map(|a| ident32_of(&a.key)).collect(),
             None => Vec::new(),
         };
@@ -564,13 +577,13 @@ fn arkiv_attribute_type_id_call<DB: Database>(
     tx: &TxEnv,
     block_number: u64,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, |db| {
+    arkiv_view_call(db, tx, block_number, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
         };
         let wanted = strip_trailing_zeros(call.name.0.to_vec());
-        let type_id = live_entity(view_entity(db, call.entityKey)?, block_number)
+        let type_id = live_entity(view_entity(db, call.entityKey, block_number)?, block_number)
             .and_then(|e| {
                 e.attributes
                     .iter()
@@ -610,20 +623,20 @@ fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
 }
 
 /// What running an op batch produced: the gas metered, the ABI-encoded revert
-/// payload if the batch failed a business rule, the entity `EvmState` diff
-/// (empty on revert), and the `EntityOperation` logs to emit (empty on revert).
+/// payload if the batch failed a business rule, and the `EntityOperation` logs
+/// to emit (empty on revert). The state itself needs no field here — it is
+/// staged in the [`WriteManager`] the batch ran over.
 struct Outcome {
     gas_used: u64,
     revert: Option<Bytes>,
-    entity_state: EvmState,
     logs: Vec<Log>,
 }
 
-/// Run a decoded batch over the reth-backed stores. On success it commits the draft
-/// and advances the minting nonce by the number of entities created; on a revert it
-/// stages nothing.
+/// Run a decoded batch through the write view: on success, fold the staged
+/// deltas into the index stores and advance the minting nonce per create; on a
+/// revert nothing is staged.
 fn run_ops<DB: Database>(
-    state: ExecutorState<'_, DB>,
+    view: &mut WriteManager<'_, DB>,
     env: &ExecEnv,
     ops: Vec<Op>,
 ) -> Result<Outcome, eyre::Report> {
@@ -631,43 +644,37 @@ fn run_ops<DB: Database>(
         .iter()
         .filter(|o| matches!(o, Op::Create { .. }))
         .count() as u64;
-    let caller = Address::from(env.caller);
 
-    let mut store = RethEntityStore::new(CodeBackend::new(state));
-    let mut draft = BlockDraft::default();
     let mut effects = Vec::new();
-    let out = ArkivExecutor::new()
-        .apply_with_effects(env, &mut store, &mut draft, &ops, &mut effects)
+    let out = ArkivExecutor::with_cost(*view.cost_model())
+        .apply_with_effects(env, view, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
     match out.status {
         ExecStatus::Ok => {
-            store
-                .apply_delta(&draft.entities)
-                .map_err(|e| eyre::eyre!("entity apply_delta: {e:?}"))?;
-            let state = store.into_backend().into_inner();
-
-            // Commit the query-index changes over the same state overlay, so the
-            // index accounts land in the one `EvmState` diff alongside the entities.
-            let mut index = RethAuxStore::new(state);
-            index
-                .apply_delta(&draft.auxiliary)
-                .map_err(|e| eyre::eyre!("index apply_delta: {e:?}"))?;
-            let mut state = index.into_backend();
-
-            state.bump_nonce(caller, create_count)?;
+            let deltas = view
+                .get_uncommitted_deltas()
+                .map_err(|e| eyre::eyre!("uncommitted deltas: {e:?}"))?;
+            view.equality_index_mut()
+                .apply_deltas(&deltas)
+                .map_err(|e| eyre::eyre!("equality index apply_deltas: {e:?}"))?;
+            view.range_index_mut()
+                .apply_deltas(&deltas)
+                .map_err(|e| eyre::eyre!("range index apply_deltas: {e:?}"))?;
+            for _ in 0..create_count {
+                view.fetch_increment_entity_creation_nonce(env.caller)
+                    .map_err(|e| eyre::eyre!("advance minting nonce: {e:?}"))?;
+            }
             let logs = effects.iter().map(entity_operation_log).collect();
             Ok(Outcome {
                 gas_used: out.gas_used,
                 revert: None,
-                entity_state: state.into_state(),
                 logs,
             })
         }
         ExecStatus::Reverted => Ok(Outcome {
             gas_used: out.gas_used,
             revert: out.revert.as_ref().map(revert::revert_data),
-            entity_state: store.into_backend().into_inner().into_state(),
             logs: Vec::new(),
         }),
     }
@@ -803,9 +810,11 @@ mod tests {
     use alloy_primitives::Bytes;
     use alloy_sol_types::SolCall;
     use arkiv_bindings::{IEntityRegistry, Operation};
-    use arkiv_interfaces::primitives::EntityNonce;
-    use arkiv_reth_entitystore::decode;
-    use arkiv_reth_entitystore::layout::{SYSTEM_ACCOUNT_ADDRESS, entity_address, nonce_slot};
+    use arkiv_interfaces::primitives::EntityCreationNonce;
+    use arkiv_reth_mpt_committed_store::decode;
+    use arkiv_reth_mpt_committed_store::entities::layout::{
+        SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address, nonce_slot,
+    };
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
     /// A create with a purely relative lifetime of `min_lifetime` blocks,
@@ -848,10 +857,10 @@ mod tests {
         assert!(rs.result.is_success());
 
         // The entity landed at the derived key, decodable, with env-resolved fields.
-        let key = derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0);
+        let key = derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(0), 0);
         let acc = rs
             .state
-            .get(&entity_address(key))
+            .get(&entity_leaf_address(key))
             .expect("entity account in the diff");
         let entity = decode(&acc.info.code.as_ref().unwrap().original_bytes()).unwrap();
         assert_eq!(entity.owner, [0xAA; 20]);
@@ -1007,7 +1016,7 @@ mod tests {
     #[test]
     fn entity_create_commits_index_accounts() {
         use arkiv_interfaces::entity::{AttributeType, annotations};
-        use arkiv_reth_auxstore::{Bitmap, all_entities_bucket, pair_address};
+        use arkiv_reth_mpt_committed_store::{Bitmap, all_entities_bucket, pair_address};
 
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
@@ -1140,7 +1149,12 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
         let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, names_calldata(key))).unwrap();
         assert_eq!(names_from(&rs), vec!["color", "rank"]);
     }
@@ -1160,7 +1174,12 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
 
         let rs =
             arkiv_transact(&mut db, 11, arkiv_tx(alice, type_id_calldata(key, "rank"))).unwrap();
@@ -1213,7 +1232,12 @@ mod tests {
             arkiv_transact(&mut db, 10, arkiv_tx(alice, create_with_attrs_calldata(50))).unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
 
         // Last live block is 59.
         let rs = arkiv_transact(&mut db, 59, arkiv_tx(alice, names_calldata(key))).unwrap();
@@ -1274,7 +1298,12 @@ mod tests {
 
         // A patch batch: cheap in the cost model (40k base) but with calldata
         // whose intrinsic floor exceeds it.
-        let key = B256::from(derive_entity_key(1, &[0xAA; 20], EntityNonce::new(0), 0));
+        let key = B256::from(derive_entity_address(
+            1,
+            &[0xAA; 20],
+            EntityCreationNonce::new(0),
+            0,
+        ));
         let big_payload = arkiv_bindings::Attribute::from_value(
             arkiv_bindings::Ident32::system("$payload").unwrap(),
             // 4k nonzero bytes → floor ≈ 181k

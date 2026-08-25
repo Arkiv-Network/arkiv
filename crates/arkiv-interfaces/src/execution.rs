@@ -4,15 +4,15 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::entity::{Attribute, AttributeValue, CreationFlags};
-use crate::primitives::{Address, BlockNumber, EntityKey, Gas, Hash};
-use crate::state::{BlockAuxiliaryStoreDelta, BlockEntityStoreDelta, EntityStore};
+use crate::primitives::{BlockNumber, EntityAddress, Gas, UserAddress};
+use crate::statemanager::{BlockRef, StateCommit, StateView};
 
 /// What a transaction executor needs to know about its context. No EVM call
 /// types — just these fields.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExecEnv {
     /// Who signed the transaction.
-    pub caller: Address,
+    pub caller: UserAddress,
     /// The block being executed.
     pub block_number: BlockNumber,
     /// Gas available to this transaction.
@@ -49,30 +49,30 @@ pub struct ExecOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevertReason {
     /// A `Create` targeted a key that already exists.
-    AlreadyExists { key: EntityKey },
+    AlreadyExists { key: EntityAddress },
     /// The op targeted a key with no live entity.
-    NotFound { key: EntityKey },
+    NotFound { key: EntityAddress },
     /// The caller isn't the entity's owner.
     NotOwner {
-        key: EntityKey,
-        caller: Address,
-        owner: Address,
+        key: EntityAddress,
+        caller: UserAddress,
+        owner: UserAddress,
     },
     /// A mutation targeted an entity past its expiry.
     Expired {
-        key: EntityKey,
+        key: EntityAddress,
         expires_at: BlockNumber,
     },
     /// A `Patch` targeted an entity created with the `readonly` flag.
-    ReadOnly { key: EntityKey },
+    ReadOnly { key: EntityAddress },
     /// An `ExtendExpiry` would have moved the expiry backwards.
     ExpiryNotExtended {
-        key: EntityKey,
+        key: EntityAddress,
         new_expires_at: BlockNumber,
         current_expires_at: BlockNumber,
     },
     /// A `Transfer` named the current owner as the new owner.
-    TransferToSelf { key: EntityKey },
+    TransferToSelf { key: EntityAddress },
     /// The batch's cost exceeded the gas supplied.
     OutOfGas,
 }
@@ -143,7 +143,7 @@ impl fmt::Display for RevertReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Create {
-        key: EntityKey,
+        key: EntityAddress,
         expires_at: BlockNumber,
         /// Entity properties fixed at creation. Immutable thereafter.
         creation_flags: CreationFlags,
@@ -158,19 +158,19 @@ pub enum Op {
     /// attributes compose instead of clobbering one another, and the cost is
     /// proportional to the mutation count rather than the entity size.
     Patch {
-        key: EntityKey,
+        key: EntityAddress,
         mutations: Vec<AttributeMutation>,
     },
     ExtendExpiry {
-        key: EntityKey,
+        key: EntityAddress,
         new_expires_at: BlockNumber,
     },
     Transfer {
-        key: EntityKey,
-        new_owner: Address,
+        key: EntityAddress,
+        new_owner: UserAddress,
     },
     Delete {
-        key: EntityKey,
+        key: EntityAddress,
     },
 }
 
@@ -209,7 +209,7 @@ impl AttributeMutation {
 
 impl Op {
     /// The entity this operation targets (the key being created, for `Create`).
-    pub fn key(&self) -> &EntityKey {
+    pub fn key(&self) -> &EntityAddress {
         match self {
             Op::Create { key, .. }
             | Op::Patch { key, .. }
@@ -244,71 +244,53 @@ pub enum OpKind {
     Delete,
 }
 
-/// A block's changes-in-progress: what execution has staged so far, to be applied
-/// to the stores when the block commits.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlockDraft {
-    /// Entity changes staged so far.
-    pub entities: BlockEntityStoreDelta,
-    /// Index changes staged so far.
-    pub auxiliary: BlockAuxiliaryStoreDelta,
-}
-
 /// Runs one transaction: decode its operations, check them, and stage the
-/// resulting changes into the block's [`BlockDraft`].
+/// resulting changes into the block's [`StateView`].
 ///
-/// Reads see the committed [`EntityStore`] plus whatever earlier transactions in
-/// the same block already staged in `draft`. Nothing touches the stores until the
-/// block commits.
+/// There is no separate draft: the view's overlay **is** the block's
+/// changes-in-progress. Reads through the view
+/// ([`ViewWithOverlay`](crate::statemanager::ReadMode::ViewWithOverlay)) see the
+/// committed base plus whatever earlier transactions in the same block already
+/// staged; nothing reaches the base until the block commits the view.
 ///
-/// A transaction is all-or-nothing: if any operation fails, `draft` is left
-/// exactly as it was.
+/// A transaction is all-or-nothing: if any operation fails, the overlay must be
+/// left exactly as it was. How — validating every operation before staging any
+/// write, or working a scratch view and folding it in on success — is the
+/// implementor's choice.
 pub trait TransactionExecutor {
-    /// The entity store this executor reads from.
-    type Entities: EntityStore;
+    /// The view this executor reads and stages through.
+    type State: StateView;
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// Run `op_bytes` under `env`, reading `entities` and `draft` and staging this
-    /// transaction's changes into `draft`.
+    /// Run `op_bytes` under `env`, reading `state` and staging this
+    /// transaction's changes into its overlay.
     fn execute(
         &self,
         env: &ExecEnv,
-        entities: &mut Self::Entities,
-        draft: &mut BlockDraft,
+        state: &mut Self::State,
         op_bytes: &[u8],
     ) -> Result<ExecOutput, Self::Error>;
 }
 
-/// Runs a block of transactions and, on commit, produces its commitments. Also
-/// undoes blocks on a reorg.
+/// Runs a block of transactions and, on commit, produces its commitments.
+///
+/// One block, one view: `begin_block` opens a [`StateView`] at the parent,
+/// every transaction stages into it, and `commit_block` commits the view and
+/// graduates it into the block's [`StateCommit`]. There is no rollback — a
+/// reorg is served by opening a view at the surviving block, never by undoing
+/// this one.
 pub trait BlockExecutor {
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
-    /// Start a new block.
-    fn begin_block(&mut self, block: BlockNumber) -> Result<(), Self::Error>;
+    /// Start a new block on top of `parent`.
+    fn begin_block(&mut self, parent: BlockRef) -> Result<(), Self::Error>;
 
     /// Run one transaction in the current block.
     fn execute_tx(&mut self, env: &ExecEnv, op_bytes: &[u8]) -> Result<ExecOutput, Self::Error>;
 
-    /// Finish the block: apply its staged changes and return its commitments.
-    fn commit_block(&mut self) -> Result<BlockCommit, Self::Error>;
-
-    /// Undo every block from `block` onward (a reorg).
-    fn rollback_to(&mut self, block: BlockNumber) -> Result<(), Self::Error>;
-}
-
-/// What committing a block produces. The entities and the index commit to
-/// **separate** roots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BlockCommit {
-    /// The block just committed.
-    pub block: BlockNumber,
-    /// Root of the entities after this block.
-    pub committed_root: Hash,
-    /// Root of the index after this block.
-    pub auxiliary_root: Hash,
-    /// Running hash of all changes through this block.
-    pub change_set_hash: Hash,
+    /// Finish the block: commit the view, seal the block, and graduate the
+    /// view into its [`StateCommit`].
+    fn commit_block(&mut self) -> Result<StateCommit, Self::Error>;
 }

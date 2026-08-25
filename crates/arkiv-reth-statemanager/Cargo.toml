@@ -1,0 +1,25 @@
+[package]
+name = "arkiv-reth-statemanager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The reth-host StateManager. MptStateManager composes the committed-store
+# lanes (arkiv-reth-mpt-committed-store) with the uncommitted pruning map into
+# the one arkiv_interfaces::manager::StateManager seam; WriteOverlay is the
+# write-path base bridging revm's Database to the raw seams and accumulating
+# the EvmState diff reth commits.
+
+[dependencies]
+# The StateManager trait family this crate implements.
+arkiv-interfaces.workspace = true
+# The committed lanes: entities, index, balances, nonces, minting nonces.
+arkiv-reth-mpt-committed-store.workspace = true
+# The uncommitted lane(s): the pruning map.
+arkiv-reth-uncommitted-store.workspace = true
+
+alloy-primitives.workspace = true
+# WriteOverlay reads through revm's Database and stages an EvmState diff.
+reth-ethereum = { workspace = true, features = ["evm"] }
+eyre.workspace = true

@@ -28,7 +28,7 @@ use core::fmt;
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
-use arkiv_interfaces::constants::{ETH_ADDRESS_LEN, WORD_LEN};
+use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_interfaces::entity::{AttributeType, AttributeValue, TOMBSTONE_TYPE_ID};
 
 use crate::{
@@ -223,8 +223,8 @@ impl Attribute {
 /// types, raw bytes for `string`/`bytes`.
 fn encode_value(value: &AttributeValue) -> Result<Vec<u8>, AttrAbiError> {
     let word = |fill: u8, tail: &[u8]| {
-        let mut w = [fill; WORD_LEN];
-        w[WORD_LEN - tail.len()..].copy_from_slice(tail);
+        let mut w = [fill; EVM_WORD_LENGTH];
+        w[EVM_WORD_LENGTH - tail.len()..].copy_from_slice(tail);
         Vec::from(w)
     };
     Ok(match value {
@@ -273,41 +273,41 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
         _ => {}
     }
 
-    let w: [u8; WORD_LEN] = bytes
+    let w: [u8; EVM_WORD_LENGTH] = bytes
         .try_into()
         .map_err(|_| AttrAbiError::BadWordLength(bytes.len()))?;
     match ty {
         AttributeType::Bool => {
-            zero_prefix(&w, WORD_LEN - 1)?;
-            match w[WORD_LEN - 1] {
+            zero_prefix(&w, EVM_WORD_LENGTH - 1)?;
+            match w[EVM_WORD_LENGTH - 1] {
                 0 => Ok(AttributeValue::Bool(false)),
                 1 => Ok(AttributeValue::Bool(true)),
                 other => Err(AttrAbiError::BadBool(other)),
             }
         }
         AttributeType::Int => {
-            let fill = if w[WORD_LEN - 4] & 0x80 == 0 {
+            let fill = if w[EVM_WORD_LENGTH - 4] & 0x80 == 0 {
                 0x00
             } else {
                 0xFF
             };
-            if w[..WORD_LEN - 4].iter().any(|b| *b != fill) {
+            if w[..EVM_WORD_LENGTH - 4].iter().any(|b| *b != fill) {
                 return Err(AttrAbiError::BadSignExtension);
             }
             Ok(AttributeValue::Int(i32::from_be_bytes(
-                w[WORD_LEN - 4..].try_into().unwrap(),
+                w[EVM_WORD_LENGTH - 4..].try_into().unwrap(),
             )))
         }
         AttributeType::U64 => {
-            zero_prefix(&w, WORD_LEN - 8)?;
+            zero_prefix(&w, EVM_WORD_LENGTH - 8)?;
             Ok(AttributeValue::U64(u64::from_be_bytes(
-                w[WORD_LEN - 8..].try_into().unwrap(),
+                w[EVM_WORD_LENGTH - 8..].try_into().unwrap(),
             )))
         }
         AttributeType::EthereumAddress => {
-            zero_prefix(&w, WORD_LEN - ETH_ADDRESS_LEN)?;
+            zero_prefix(&w, EVM_WORD_LENGTH - ETH_ADDRESS_LEN)?;
             Ok(AttributeValue::EthereumAddress(
-                w[WORD_LEN - ETH_ADDRESS_LEN..].try_into().unwrap(),
+                w[EVM_WORD_LENGTH - ETH_ADDRESS_LEN..].try_into().unwrap(),
             ))
         }
         AttributeType::U256 => Ok(AttributeValue::U256(w)),
@@ -320,7 +320,7 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
 }
 
 /// Check that a right-aligned value's leading `len` bytes are zero padding.
-fn zero_prefix(word: &[u8; WORD_LEN], len: usize) -> Result<(), AttrAbiError> {
+fn zero_prefix(word: &[u8; EVM_WORD_LENGTH], len: usize) -> Result<(), AttrAbiError> {
     if word[..len].iter().any(|b| *b != 0) {
         Err(AttrAbiError::NonZeroValuePadding)
     } else {
@@ -615,8 +615,8 @@ mod tests {
             value: Bytes::from(bytes),
         };
         let word = |tail: &[u8]| {
-            let mut w = vec![0u8; WORD_LEN];
-            w[WORD_LEN - tail.len()..].copy_from_slice(tail);
+            let mut w = vec![0u8; EVM_WORD_LENGTH];
+            w[EVM_WORD_LENGTH - tail.len()..].copy_from_slice(tail);
             w
         };
 
@@ -635,13 +635,17 @@ mod tests {
 
         // An address with junk in its leading padding.
         assert_eq!(
-            with(AttributeType::EthereumAddress.id(), vec![0xAB; WORD_LEN]).to_value(),
+            with(
+                AttributeType::EthereumAddress.id(),
+                vec![0xAB; EVM_WORD_LENGTH]
+            )
+            .to_value(),
             Err(AttrAbiError::NonZeroValuePadding)
         );
 
         // A u64 with junk above its eight bytes.
         assert_eq!(
-            with(AttributeType::U64.id(), vec![0xAB; WORD_LEN]).to_value(),
+            with(AttributeType::U64.id(), vec![0xAB; EVM_WORD_LENGTH]).to_value(),
             Err(AttrAbiError::NonZeroValuePadding)
         );
 

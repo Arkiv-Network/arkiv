@@ -23,9 +23,8 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, hex};
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
-use arkiv_interfaces::state::{AuxiliaryStore, EntityStore};
-use arkiv_reth_auxstore::RethAuxStore;
-use arkiv_reth_entitystore::{CodeBackend, RethEntityStore};
+use arkiv_reth_mpt_committed_store::RethAuxStore;
+use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
 use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
 use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
 use jsonrpsee::RpcModule;
@@ -223,10 +222,10 @@ where
 /// Parse `q`, evaluate it against the index (at the tip or as of
 /// `options.atBlock`), and read the matched entities back.
 ///
-/// One snapshot backs both stores: the index [`evaluate`](AuxiliaryStore::evaluate)
-/// resolves the query to a page of keys, then the same snapshot is recovered
-/// (`into_backend`) and reused to read those entities' full bytes — so the keys and
-/// the entities are read from a single consistent state.
+/// One snapshot backs both stores: the index's `evaluate` resolves the query to
+/// a page of keys, then the same snapshot is recovered (`into_backend`) and
+/// reused to read those entities' full bytes — so the keys and the entities are
+/// read from a single consistent state.
 ///
 /// The query is bounded to entities still live at that block — see [`live_at`].
 fn run_query<Provider>(

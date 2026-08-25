@@ -5,8 +5,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::entity::{AttributeValue, Entity};
-use crate::primitives::{BlockNumber, EntityKey, Gas};
-use crate::state::{AuxiliaryStore, EntityStore, HistoricalAuxiliaryStore, HistoricalEntityStore};
+use crate::primitives::{EntityAddress, Gas};
+use crate::statemanager::{BlockRef, StateView};
 
 /// A query — a tree of predicates over an entity's attributes.
 ///
@@ -94,13 +94,13 @@ pub struct PageParams {
     pub cursor: Option<u64>,
 }
 
-/// The [`AuxiliaryStore`]'s answer to a query: the matching entity **keys** and
-/// the work it took. The [`QueryProcessor`] turns the keys into full [`Entity`]
-/// values.
+/// The key half of an answer: the matching entity **keys** and the work it
+/// took. The [`QueryProcessor`] builds one of these from the index lanes, then
+/// turns the keys into full [`Entity`] values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueryMatches {
     /// The matching entity keys for this page.
-    pub keys: Vec<EntityKey>,
+    pub keys: Vec<EntityAddress>,
     /// A cursor for the next page, if more remain.
     pub next_cursor: Option<u64>,
     /// The statistics of the work done.
@@ -136,14 +136,18 @@ pub struct QueryStats {
 
 /// Answers a query with a page of entities.
 ///
-/// It asks the [`AuxiliaryStore`] which entity keys match, then reads those
-/// entities' bytes from the [`EntityStore`] and decodes them — adding paging and
-/// statistics along the way.
+/// It decomposes the query tree into the index lanes' primitives —
+/// [`get_equal_entities`](crate::statemanager::EqualityIndexStore::get_equal_entities),
+/// [`get_within_range`](crate::statemanager::RangeIndexStore::get_within_range),
+/// [`get_prefixed_entities`](crate::statemanager::EqualityIndexStore::get_prefixed_entities)
+/// — combines the matches (`AND`/`OR`/`NOT`), then reads the matching entities
+/// back — adding paging and statistics along the way. One [`StateView`] for all
+/// of it: the indexes and the entities are lanes of the same view, so a
+/// processor never holds two stores that could disagree about which block they
+/// are at.
 pub trait QueryProcessor {
-    /// The entity store it reads matched entities from.
-    type Entities: EntityStore;
-    /// The index it evaluates queries against.
-    type Auxiliary: AuxiliaryStore;
+    /// The view this processor reads the indexes and the entities through.
+    type State: StateView;
     /// Error type — your choice; it only has to be `Debug`.
     type Error: core::fmt::Debug;
 
@@ -154,24 +158,18 @@ pub trait QueryProcessor {
 
 /// Optional: answer queries against a **past block**, not just the current tip.
 ///
-/// A host implements this on top of [`QueryProcessor`] only if it can serve
-/// history. That requires history from both stores, so its [`Entities`] and
-/// [`Auxiliary`] must be a [`HistoricalEntityStore`] and a
-/// [`HistoricalAuxiliaryStore`]. The query runs exactly as
-/// [`QueryProcessor::query`], but as of the state committed through block `at`.
-///
-/// [`Entities`]: QueryProcessor::Entities
-/// [`Auxiliary`]: QueryProcessor::Auxiliary
-pub trait HistoricalQuery: QueryProcessor
-where
-    Self::Entities: HistoricalEntityStore,
-    Self::Auxiliary: HistoricalAuxiliaryStore,
-{
+/// History is served by opening a [`StateView`] at the older block, so this is
+/// implementable exactly as far back as the backend retains the index and
+/// entity lanes ([`has_store`](StateView::has_store)) — a block outside that
+/// window is an error, never a silently-wrong answer from the tip. The query
+/// runs exactly as [`QueryProcessor::query`], but as of the state committed
+/// through `at`.
+pub trait HistoricalQuery: QueryProcessor {
     /// Answer `query` as of block `at`.
     fn query_at(
         &self,
         query: &Query,
         page: PageParams,
-        at: BlockNumber,
+        at: BlockRef,
     ) -> Result<QueryResult, Self::Error>;
 }

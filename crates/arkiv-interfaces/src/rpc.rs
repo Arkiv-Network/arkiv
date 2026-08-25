@@ -7,7 +7,7 @@
 //! serialization (JSON-RPC, HTTP) are the host's concern and live in its crate.
 
 use crate::entity::Entity;
-use crate::primitives::{BlockNumber, EntityKey};
+use crate::primitives::{BlockNumber, EntityAddress};
 use crate::query::{PageParams, QueryResult};
 
 /// The `arkiv_*` methods every node serves, at the current tip.
@@ -19,7 +19,7 @@ pub trait ArkivRpc {
     fn query(&self, query: &str, page: PageParams) -> Result<QueryResult, Self::Error>;
 
     /// `arkiv_getEntity`: fetch one entity by key, or `None` if there is none.
-    fn get_entity(&self, key: EntityKey) -> Result<Option<Entity>, Self::Error>;
+    fn get_entity(&self, key: EntityAddress) -> Result<Option<Entity>, Self::Error>;
 }
 
 /// Optional: the same methods against a **past block**, for nodes that serve
@@ -34,6 +34,9 @@ pub trait ArkivHistoricalRpc: ArkivRpc {
     ) -> Result<QueryResult, Self::Error>;
 
     /// `arkiv_getEntity` as of block `at`.
-    fn get_entity_at(&self, key: EntityKey, at: BlockNumber)
-    -> Result<Option<Entity>, Self::Error>;
+    fn get_entity_at(
+        &self,
+        key: EntityAddress,
+        at: BlockNumber,
+    ) -> Result<Option<Entity>, Self::Error>;
 }

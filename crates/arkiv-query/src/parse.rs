@@ -35,7 +35,7 @@ use crate::literal;
 pub fn parse(input: &str) -> Result<Query, ParseError> {
     if input.len() > limits::MAX_QUERY_BYTES {
         return Err(ParseError::whole(
-            ParseErrorKind::Limit,
+            ParseErrorKind::QueryLimitError,
             "query is too long",
         ));
     }
@@ -176,7 +176,7 @@ impl Parser {
         if self.depth > limits::MAX_NESTING_DEPTH {
             return Err(ParseError::at(
                 position,
-                ParseErrorKind::Limit,
+                ParseErrorKind::QueryLimitError,
                 "query is nested too deeply",
             ));
         }
@@ -188,7 +188,7 @@ impl Parser {
         if self.predicates > limits::MAX_PREDICATES {
             return Err(ParseError::at(
                 self.next_position(),
-                ParseErrorKind::Limit,
+                ParseErrorKind::QueryLimitError,
                 "query has too many predicates",
             ));
         }
@@ -644,20 +644,26 @@ mod tests {
             parse("level = i32(10)").unwrap()
         );
         // A bare number never widens to reach a value i32 cannot hold.
-        assert_eq!(kind_of("level = 2147483648"), ParseErrorKind::Literal);
+        assert_eq!(kind_of("level = 2147483648"), ParseErrorKind::LiteralError);
         // Bare strings still have no default.
-        assert_eq!(kind_of("name = 'Bob'"), ParseErrorKind::Type);
+        assert_eq!(kind_of("name = 'Bob'"), ParseErrorKind::TypeError);
     }
 
     #[test]
     fn literal_validation_errors_are_their_own_kind() {
-        assert_eq!(kind_of("level = i32(2147483648)"), ParseErrorKind::Literal);
+        assert_eq!(
+            kind_of("level = i32(2147483648)"),
+            ParseErrorKind::LiteralError
+        );
         assert_eq!(
             kind_of("score = dec(0.1234567890123456789)"),
-            ParseErrorKind::Literal
+            ParseErrorKind::LiteralError
         );
-        assert_eq!(kind_of("who = addr(0xdead)"), ParseErrorKind::Literal);
-        assert_eq!(kind_of("parent = key(0xdead)"), ParseErrorKind::Literal);
+        assert_eq!(kind_of("who = addr(0xdead)"), ParseErrorKind::LiteralError);
+        assert_eq!(
+            kind_of("parent = key(0xdead)"),
+            ParseErrorKind::LiteralError
+        );
     }
 
     // ── the operator × type matrix ──────────────────────────────────────
@@ -687,7 +693,7 @@ mod tests {
         ];
         for query in unordered {
             let err = parse(&query).unwrap_err();
-            assert_eq!(err.kind, ParseErrorKind::Type, "{query}");
+            assert_eq!(err.kind, ParseErrorKind::TypeError, "{query}");
             assert!(err.message.contains("no ordering"), "{query}: {err}");
         }
     }
@@ -703,8 +709,14 @@ mod tests {
         );
         // Case-insensitive, like every keyword.
         assert!(parse("desc startswith str('ab')").is_ok());
-        assert_eq!(kind_of("level STARTSWITH i32(1)"), ParseErrorKind::Type);
-        assert_eq!(kind_of("flagged STARTSWITH true"), ParseErrorKind::Type);
+        assert_eq!(
+            kind_of("level STARTSWITH i32(1)"),
+            ParseErrorKind::TypeError
+        );
+        assert_eq!(
+            kind_of("flagged STARTSWITH true"),
+            ParseErrorKind::TypeError
+        );
     }
 
     // ── system attributes ───────────────────────────────────────────────
@@ -766,7 +778,7 @@ mod tests {
         // Untagged is a type error that names the fix, rather than silently
         // comparing an i32 against a u64 attribute and matching nothing.
         let err = parse("$expiresAt < 1200000").unwrap_err();
-        assert_eq!(err.kind, ParseErrorKind::Type);
+        assert_eq!(err.kind, ParseErrorKind::TypeError);
         assert!(err.message.contains("u64(1200000)"), "{err}");
     }
 
@@ -804,10 +816,13 @@ mod tests {
 
     #[test]
     fn a_system_attribute_rejects_the_wrong_type() {
-        assert_eq!(kind_of("$owner = i32(5)"), ParseErrorKind::Type);
-        assert_eq!(kind_of("$expiresAt = str('soon')"), ParseErrorKind::Type);
-        assert_eq!(kind_of("$contentType = i32(1)"), ParseErrorKind::Type);
-        assert_eq!(kind_of("$key = true"), ParseErrorKind::Type);
+        assert_eq!(kind_of("$owner = i32(5)"), ParseErrorKind::TypeError);
+        assert_eq!(
+            kind_of("$expiresAt = str('soon')"),
+            ParseErrorKind::TypeError
+        );
+        assert_eq!(kind_of("$contentType = i32(1)"), ParseErrorKind::TypeError);
+        assert_eq!(kind_of("$key = true"), ParseErrorKind::TypeError);
     }
 
     #[test]
@@ -821,7 +836,7 @@ mod tests {
             ("$nope = true", "unknown system attribute"),
         ] {
             let err = parse(query).unwrap_err();
-            assert_eq!(err.kind, ParseErrorKind::Type, "{query}");
+            assert_eq!(err.kind, ParseErrorKind::TypeError, "{query}");
             assert!(err.message.contains(hint), "{query}: {err}");
         }
     }
@@ -831,7 +846,7 @@ mod tests {
     #[test]
     fn cut_operators_name_their_replacement() {
         let err = parse("level != i32(10)").unwrap_err();
-        assert_eq!(err.kind, ParseErrorKind::Type);
+        assert_eq!(err.kind, ParseErrorKind::TypeError);
         assert!(err.message.contains("NOT (attr = value)"), "{err}");
 
         let err = parse("exists(reviewedBy)").unwrap_err();
@@ -931,8 +946,8 @@ mod tests {
     #[test]
     fn reserved_and_type_names_cannot_be_attributes() {
         // Keywords lex as keywords, so they never reach an attribute position.
-        assert_eq!(kind_of("and = true"), ParseErrorKind::Syntax);
-        assert_eq!(kind_of("not = true"), ParseErrorKind::Syntax);
+        assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");
@@ -959,8 +974,15 @@ mod tests {
             "level = i32(1) name = str('x')",
         ] {
             let err = parse(query).unwrap_err();
-            assert_eq!(err.kind, ParseErrorKind::Syntax, "{query}: {err}");
-            assert!(err.position.is_some(), "{query} should carry a position");
+            assert_eq!(
+                err.kind,
+                ParseErrorKind::MalformedInputError,
+                "{query}: {err}"
+            );
+            assert!(
+                err.failure_position.is_some(),
+                "{query} should carry a position"
+            );
         }
     }
 
@@ -969,29 +991,33 @@ mod tests {
     #[test]
     fn oversized_queries_are_limit_errors() {
         let long = format!("name = str('{}')", "a".repeat(limits::MAX_QUERY_BYTES));
-        assert_eq!(parse(&long).unwrap_err().kind, ParseErrorKind::Limit);
+        assert_eq!(
+            parse(&long).unwrap_err().kind,
+            ParseErrorKind::QueryLimitError
+        );
 
         let many = (0..=limits::MAX_PREDICATES)
             .map(|index| format!("a{index} = true"))
             .collect::<alloc::vec::Vec<_>>()
             .join(" AND ");
-        assert_eq!(parse(&many).unwrap_err().kind, ParseErrorKind::Limit);
+        assert_eq!(
+            parse(&many).unwrap_err().kind,
+            ParseErrorKind::QueryLimitError
+        );
 
         // Deep nesting is bounded, so neither the parser nor the evaluator can
         // be driven into unbounded recursion from an RPC call.
         let depth = limits::MAX_NESTING_DEPTH + 1;
         let deep = format!("{}a = true{}", "(".repeat(depth), ")".repeat(depth));
-        assert_eq!(parse(&deep).unwrap_err().kind, ParseErrorKind::Limit);
+        assert_eq!(
+            parse(&deep).unwrap_err().kind,
+            ParseErrorKind::QueryLimitError
+        );
         let nots = format!("{}a = true", "NOT ".repeat(depth));
-        assert_eq!(parse(&nots).unwrap_err().kind, ParseErrorKind::Limit);
-    }
-
-    #[test]
-    fn error_kinds_map_to_the_spec_codes() {
-        assert_eq!(ParseErrorKind::Syntax.rpc_code(), -32001);
-        assert_eq!(ParseErrorKind::Type.rpc_code(), -32002);
-        assert_eq!(ParseErrorKind::Literal.rpc_code(), -32003);
-        assert_eq!(ParseErrorKind::Limit.rpc_code(), -32004);
+        assert_eq!(
+            parse(&nots).unwrap_err().kind,
+            ParseErrorKind::QueryLimitError
+        );
     }
 
     /// The spec's worked example, minus the predicates this version cuts.

@@ -562,7 +562,7 @@ mod tests {
     fn bare_hex_literals_are_rejected_with_the_tagged_forms() {
         let err = tokenize("$owner = 0xabcdef").unwrap_err();
         assert!(err.message.contains("addr(0x…)"), "{err}");
-        assert_eq!(err.position, Some(9));
+        assert_eq!(err.failure_position, Some(9));
         assert!(tokenize("h = 0Xdead").is_err());
         // A plain zero is still a number.
         assert_eq!(kinds("0"), vec![Token::Int("0".into())]);
@@ -596,8 +596,8 @@ mod tests {
     #[test]
     fn unterminated_literals_report_their_opening_position() {
         let err = tokenize("name = str('oops").unwrap_err();
-        assert_eq!(err.kind, ParseErrorKind::Syntax);
-        assert!(err.position.is_some());
+        assert_eq!(err.kind, ParseErrorKind::MalformedInputError);
+        assert!(err.failure_position.is_some());
         let err = tokenize("name = str('ok'").unwrap_err();
         assert!(err.message.contains("closing ')'"), "{err}");
     }

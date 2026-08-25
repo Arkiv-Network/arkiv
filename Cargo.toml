@@ -86,6 +86,7 @@ arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
-arkiv-reth-entitystore = { path = "crates/arkiv-reth-entitystore" }
-arkiv-reth-auxstore = { path = "crates/arkiv-reth-auxstore" }
+arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store" }
+arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
+arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }

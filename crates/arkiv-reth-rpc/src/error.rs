@@ -1,18 +1,20 @@
-//! Failures, as jsonrpsee error objects. The codes and their meanings live in
-//! [`arkiv_rpc_types::error`]; this is the server half that builds the wire object
-//! and its machine-readable `data`.
+//! Failures, as jsonrpsee error objects. The codes live in
+//! [`rpc_error_codes`] and the `data` each one carries is tabulated in
+//! [`arkiv_rpc_types`]; this is the server half that builds the wire object.
 
 use arkiv_query::ParseError;
 use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE};
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 
-pub use arkiv_rpc_types::error::{BLOCK_UNAVAILABLE_CODE, CURSOR_ERROR_CODE};
+pub use arkiv_interfaces::constants::rpc_error_codes;
 
 /// Turn a query-language failure into its RPC error, preserving the position.
 pub fn query_error(error: &ParseError) -> ErrorObjectOwned {
-    let data = match error.position {
-        Some(position) => serde_json::json!({
-            "position": position,
+    let data = match error.failure_position {
+        // `position` on the wire: the key is part of the frozen contract, so it
+        // does not follow the Rust field's name.
+        Some(failure_position) => serde_json::json!({
+            "position": failure_position,
             "message": error.message,
         }),
         None => serde_json::json!({ "message": error.message }),
@@ -23,7 +25,7 @@ pub fn query_error(error: &ParseError) -> ErrorObjectOwned {
 /// A cursor this node will not resume from.
 pub fn cursor_error(message: &str) -> ErrorObjectOwned {
     ErrorObject::owned(
-        CURSOR_ERROR_CODE,
+        rpc_error_codes::CURSOR_ERROR,
         message,
         Some(serde_json::json!({ "message": message })),
     )
@@ -33,7 +35,7 @@ pub fn cursor_error(message: &str) -> ErrorObjectOwned {
 pub fn block_unavailable(requested: u64, retained_tip: u64, reason: &str) -> ErrorObjectOwned {
     let message = format!("block {requested} is unavailable: {reason}");
     ErrorObject::owned(
-        BLOCK_UNAVAILABLE_CODE,
+        rpc_error_codes::BLOCK_UNAVAILABLE,
         message.clone(),
         Some(serde_json::json!({
             "requested": requested,
@@ -65,10 +67,16 @@ mod tests {
     /// Each class of query failure reaches the client under its own code.
     #[test]
     fn query_failures_map_to_the_spec_codes() {
-        assert_eq!(code_for("rank = = u256(1)"), -32001); // syntax
-        assert_eq!(code_for("rank != u256(1)"), -32002); // type
-        assert_eq!(code_for("rank = i32(2147483648)"), -32003); // literal
-        assert_eq!(code_for(&"(".repeat(200)), -32004); // limits
+        assert_eq!(
+            code_for("rank = = u256(1)"),
+            rpc_error_codes::MALFORMED_INPUT
+        );
+        assert_eq!(code_for("rank != u256(1)"), rpc_error_codes::TYPE_ERROR);
+        assert_eq!(
+            code_for("rank = i32(2147483648)"),
+            rpc_error_codes::LITERAL_ERROR
+        );
+        assert_eq!(code_for(&"(".repeat(200)), rpc_error_codes::QUERY_LIMIT);
     }
 
     #[test]
@@ -84,9 +92,9 @@ mod tests {
 
     #[test]
     fn cursor_and_block_errors_have_their_own_codes() {
-        assert_eq!(cursor_error("nope").code(), -32005);
+        assert_eq!(cursor_error("nope").code(), rpc_error_codes::CURSOR_ERROR);
         let block = block_unavailable(99, 10, "ahead of the chain tip");
-        assert_eq!(block.code(), -32006);
+        assert_eq!(block.code(), rpc_error_codes::BLOCK_UNAVAILABLE);
         let data: serde_json::Value =
             serde_json::from_str(block.data().unwrap().get()).expect("data is json");
         assert_eq!(data["requested"], 99);

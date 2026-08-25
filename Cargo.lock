@@ -1464,25 +1464,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arkiv-reth-auxstore"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "arkiv-interfaces",
- "arkiv-reth-entitystore",
- "roaring",
-]
-
-[[package]]
-name = "arkiv-reth-entitystore"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "arkiv-interfaces",
-]
-
-[[package]]
 name = "arkiv-reth-executor"
 version = "0.1.0"
 dependencies = [
@@ -1491,11 +1472,21 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-interfaces",
- "arkiv-reth-auxstore",
- "arkiv-reth-entitystore",
+ "arkiv-reth-mpt-committed-store",
+ "arkiv-reth-statemanager",
  "eyre",
  "reth-ethereum",
  "tracing",
+]
+
+[[package]]
+name = "arkiv-reth-mpt-committed-store"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "arkiv-interfaces",
+ "roaring",
 ]
 
 [[package]]
@@ -1507,8 +1498,7 @@ dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
  "arkiv-query",
- "arkiv-reth-auxstore",
- "arkiv-reth-entitystore",
+ "arkiv-reth-mpt-committed-store",
  "arkiv-rpc-types",
  "base64 0.22.1",
  "eyre",
@@ -1516,6 +1506,25 @@ dependencies = [
  "reth-storage-api",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "arkiv-reth-statemanager"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "arkiv-interfaces",
+ "arkiv-reth-mpt-committed-store",
+ "arkiv-reth-uncommitted-store",
+ "eyre",
+ "reth-ethereum",
+]
+
+[[package]]
+name = "arkiv-reth-uncommitted-store"
+version = "0.1.0"
+dependencies = [
+ "arkiv-interfaces",
 ]
 
 [[package]]
