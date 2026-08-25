@@ -359,6 +359,117 @@ pub trait StateView:
     /// view may lack some.
     fn has_store(&self, store: StoreKind) -> bool;
 
+    // Each store, narrowed to its own trait — `_mut` for the write half. The
+    // view *is* every store; these just present one at a time.
+
+    fn entities(&self) -> &impl EntityStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn entities_mut(&mut self) -> &mut impl EntityStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn equality_index(&self) -> &impl EqualityIndexStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn equality_index_mut(
+        &mut self,
+    ) -> &mut impl EqualityIndexStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn range_index(&self) -> &impl RangeIndexStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn range_index_mut(&mut self) -> &mut impl RangeIndexStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn account_balances(&self) -> &impl AccountBalancesStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn account_balances_mut(
+        &mut self,
+    ) -> &mut impl AccountBalancesStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn account_nonces(&self) -> &impl AccountNoncesStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn account_nonces_mut(
+        &mut self,
+    ) -> &mut impl AccountNoncesStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn entity_creation_nonces(
+        &self,
+    ) -> &impl EntityCreationNoncesStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn entity_creation_nonces_mut(
+        &mut self,
+    ) -> &mut impl EntityCreationNoncesStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn pruning(&self) -> &impl PruningStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    fn pruning_mut(&mut self) -> &mut impl PruningStore<Error = <Self as StateView>::Error>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
     /// Commit every store, entities before the indexes.
     fn commit(&mut self) -> Result<(), <Self as StateView>::Error> {
         EntityStore::commit_store(self)?;

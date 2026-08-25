@@ -736,17 +736,19 @@ mod tests {
         }
     }
 
-    /// Create + index an entity through the view and return the staged deltas.
+    /// Create + index an entity through the view's store accessors.
     fn stage_create(view: &mut View, byte: u8, owner: u8) {
-        view.update_entity(EntityUpdates::create(entity_of(byte, owner)))
+        view.entities_mut()
+            .update_entity(EntityUpdates::create(entity_of(byte, owner)))
             .unwrap();
-        let deltas = view.get_uncommitted_deltas().unwrap();
-        EqualityIndexStore::apply_deltas(view, &deltas).unwrap();
-        RangeIndexStore::apply_deltas(view, &deltas).unwrap();
+        let deltas = view.entities().get_uncommitted_deltas().unwrap();
+        view.equality_index_mut().apply_deltas(&deltas).unwrap();
+        view.range_index_mut().apply_deltas(&deltas).unwrap();
     }
 
     fn owned_by(view: &View, owner: u8, read: ReadMode) -> Vec<EntityAddress> {
-        view.get_equal_entities(OWNER, &AttributeValue::EthereumAddress([owner; 20]), read)
+        view.equality_index()
+            .get_equal_entities(OWNER, &AttributeValue::EthereumAddress([owner; 20]), read)
             .unwrap()
     }
 

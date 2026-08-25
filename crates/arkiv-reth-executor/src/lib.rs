@@ -655,9 +655,11 @@ fn run_ops<DB: Database>(
             let deltas = view
                 .get_uncommitted_deltas()
                 .map_err(|e| eyre::eyre!("uncommitted deltas: {e:?}"))?;
-            EqualityIndexStore::apply_deltas(view, &deltas)
+            view.equality_index_mut()
+                .apply_deltas(&deltas)
                 .map_err(|e| eyre::eyre!("equality index apply_deltas: {e:?}"))?;
-            RangeIndexStore::apply_deltas(view, &deltas)
+            view.range_index_mut()
+                .apply_deltas(&deltas)
                 .map_err(|e| eyre::eyre!("range index apply_deltas: {e:?}"))?;
             for _ in 0..create_count {
                 view.fetch_increment_entity_creation_nonce(env.caller)

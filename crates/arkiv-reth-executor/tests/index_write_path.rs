@@ -103,28 +103,30 @@ fn run(exec: &ArkivExecutor<Mgr>, mgr: &mut Mgr, caller: [u8; 20], block: u64, o
     let out = exec.apply(&env(caller, block), mgr, ops).unwrap();
     assert_eq!(out.status, ExecStatus::Ok);
     let deltas = mgr.get_uncommitted_deltas().unwrap();
-    EqualityIndexStore::apply_deltas(mgr, &deltas).unwrap();
-    RangeIndexStore::apply_deltas(mgr, &deltas).unwrap();
+    mgr.equality_index_mut().apply_deltas(&deltas).unwrap();
+    mgr.range_index_mut().apply_deltas(&deltas).unwrap();
     StateView::commit(mgr).unwrap();
 }
 
 fn owned_by(mgr: &Mgr, owner: [u8; 20]) -> Vec<EntityAddress> {
-    mgr.get_equal_entities(
-        OWNER,
-        &AttributeValue::EthereumAddress(owner),
-        ReadMode::ViewOnBase,
-    )
-    .unwrap()
+    mgr.equality_index()
+        .get_equal_entities(
+            OWNER,
+            &AttributeValue::EthereumAddress(owner),
+            ReadMode::ViewOnBase,
+        )
+        .unwrap()
 }
 
 /// Every live entity — the `$all` marker's bucket.
 fn all_entities(mgr: &Mgr) -> Vec<EntityAddress> {
-    mgr.get_equal_entities(
-        ALL,
-        &AttributeValue::Str(String::new()),
-        ReadMode::ViewOnBase,
-    )
-    .unwrap()
+    mgr.equality_index()
+        .get_equal_entities(
+            ALL,
+            &AttributeValue::Str(String::new()),
+            ReadMode::ViewOnBase,
+        )
+        .unwrap()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
