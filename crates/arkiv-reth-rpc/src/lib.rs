@@ -65,6 +65,20 @@ where
     })?;
 
     let p = provider.clone();
+    module.register_async_method("arkiv_debugEntityExists", move |params, _ctx, _ext| {
+        let provider = p.clone();
+        async move {
+            let mut seq = params.sequence();
+            let key: B256 = seq
+                .next()
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            tokio::task::spawn_blocking(move || entity_exists_unfiltered(&provider, key))
+                .await
+                .map_err(|e| internal_error(format!("task join: {e}")))?
+        }
+    })?;
+
+    let p = provider.clone();
     module.register_async_method("arkiv_query", move |params, _ctx, _ext| {
         let provider = p.clone();
         async move {
@@ -179,6 +193,22 @@ where
     Ok(entity
         .filter(|e| is_live(e.expires_at, block_number))
         .map(|e| entity_data_from(e, &Projection::all())))
+}
+
+/// Testing/debugging read that deliberately bypasses the logical expiry filter.
+fn entity_exists_unfiltered<Provider>(
+    provider: &Provider,
+    key: B256,
+) -> Result<bool, ErrorObjectOwned>
+where
+    Provider: StateProviderFactory + BlockNumReader,
+{
+    let (state, _) = resolve_state(provider, None)?;
+    let mut store = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
+    Ok(store
+        .get(key.0)
+        .map_err(|e| internal_error(format!("get entity: {e:?}")))?
+        .is_some())
 }
 
 /// A state snapshot for `atBlock` plus the block number it answers for:

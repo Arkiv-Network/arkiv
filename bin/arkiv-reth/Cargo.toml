@@ -18,8 +18,10 @@ reth.workspace = true
 reth-cli-util.workspace = true
 reth-ethereum-cli.workspace = true
 reth-node-ethereum.workspace = true
+reth-ethereum.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
+arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true
 eyre.workspace = true

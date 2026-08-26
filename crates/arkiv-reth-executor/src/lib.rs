@@ -63,6 +63,7 @@
 pub mod arkiv;
 /// ABI op decoding: `execute(Operation[])` calldata → the spec's `Op`s.
 pub mod decode;
+pub mod expiry_queue;
 /// Revert-payload encoding: `RevertReason` / `DecodeError` → Solidity error data.
 pub mod revert;
 
@@ -234,7 +235,11 @@ where
         // both of which execute against state that need not match the tx's nonce.
         let nonce_check = !self.cfg_env().disable_nonce_check;
         let db = self.inner.db_mut();
-        if nonce_check {
+        let is_purge = tx.kind == TxKind::Call(ARKIV_ADDRESS)
+            && tx
+                .data
+                .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR);
+        if nonce_check && !is_purge {
             validate_nonce(db, &tx)?;
         }
         arkiv_transact(db, block_number, tx)
@@ -345,6 +350,9 @@ fn arkiv_transact<DB: Database>(
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
             return arkiv_attribute_type_id_call(db, &tx, block_number);
         }
+        if selector == IEntityRegistry::purgeExpiredCall::SELECTOR {
+            return arkiv_purge_expired(db, block_number, &tx);
+        }
         return arkiv_entity_transact(db, block_number, &tx);
     }
 
@@ -377,6 +385,70 @@ fn arkiv_transact<DB: Database>(
     };
 
     Ok(ResultAndState::new(result, state))
+}
+
+fn arkiv_purge_expired<DB: Database>(
+    db: &mut DB,
+    block_number: u64,
+    tx: &TxEnv,
+) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+    use arkiv_bindings::MAX_PURGE_KEYS;
+    use arkiv_interfaces::statemanager::EntityUpdates;
+
+    let call = IEntityRegistry::purgeExpiredCall::abi_decode_raw(&tx.data[4..])
+        .map_err(|e| EVMError::Custom(format!("decode purgeExpired: {e}")))?;
+    if call.entityKeys.len() > MAX_PURGE_KEYS {
+        return Err(EVMError::Custom(format!(
+            "purge contains more than {MAX_PURGE_KEYS} keys"
+        )));
+    }
+    let purge_keys = call.entityKeys;
+    let mut view = write_manager(db, parent_ref(block_number));
+    let mut modeled_gas = 0u64;
+    for key in &purge_keys {
+        let key_bytes = key.0;
+        let Some(entity) = view
+            .get_entity(key_bytes, ReadMode::ViewWithOverlay)
+            .map_err(state_fault("read purge entity"))?
+        else {
+            continue;
+        };
+        if entity.expires_at > block_number {
+            return Err(EVMError::Custom(format!(
+                "purge entity {key} has not expired"
+            )));
+        }
+        modeled_gas =
+            modeled_gas.saturating_add(arkiv_interfaces::gas::purge_cost(entity.attributes.len()));
+        view.update_entity(EntityUpdates::deletion(key_bytes))
+            .map_err(state_fault("stage purge deletion"))?;
+    }
+    let deltas = view
+        .get_uncommitted_deltas()
+        .map_err(state_fault("purge deltas"))?;
+    view.equality_index_mut()
+        .apply_deltas(&deltas)
+        .map_err(state_fault("purge equality index"))?;
+    view.range_index_mut()
+        .apply_deltas(&deltas)
+        .map_err(state_fault("purge range index"))?;
+    StateView::commit(&mut view).map_err(state_fault("commit purge"))?;
+    if let Ok(mut queue) = expiry_queue::expiry_queue().write() {
+        for key in purge_keys {
+            queue.remove(key);
+        }
+    }
+    let state = view.into_base().into_state();
+    let gas_used = modeled_gas.max(intrinsic_gas(&tx.data));
+    Ok(ResultAndState::new(
+        ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas: ResultGas::default().with_total_gas_spent(gas_used),
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        },
+        state,
+    ))
 }
 
 /// The entity state transition for a call to [`ARKIV_ADDRESS`].
@@ -666,6 +738,24 @@ fn run_ops<DB: Database>(
                     .map_err(|e| eyre::eyre!("advance minting nonce: {e:?}"))?;
             }
             let logs = effects.iter().map(entity_operation_log).collect();
+            // The blessed builder's schedule is deliberately process-local. Payload
+            // execution is its source of updates; losing it on restart is acceptable.
+            if let Ok(mut queue) = expiry_queue::expiry_queue().write() {
+                for effect in &effects {
+                    let key = B256::from(effect.key);
+                    match effect.kind {
+                        OpKind::Create | OpKind::ExtendExpiry => {
+                            let entity = view
+                                .get_entity(effect.key, ReadMode::ViewWithOverlay)
+                                .map_err(|e| eyre::eyre!("read scheduled entity: {e:?}"))?
+                                .ok_or_else(|| eyre::eyre!("scheduled entity missing"))?;
+                            queue.insert(key, effect.expires_at, entity.attributes.len())
+                        }
+                        OpKind::Delete => queue.remove(key),
+                        OpKind::Patch | OpKind::Transfer => {}
+                    }
+                }
+            }
             Ok(Outcome {
                 gas_used: out.gas_used,
                 revert: None,

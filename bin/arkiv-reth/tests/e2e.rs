@@ -41,6 +41,24 @@ async fn spawn_dev(
     (node, client, caller)
 }
 
+/// A slower producer for assertions about the exact intermediate purge block.
+async fn spawn_slow_dev(
+    key: &str,
+) -> (
+    arkiv_harness::Node,
+    ArkivClient<impl Provider + Clone>,
+    Address,
+) {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .block_time("1s")
+        .spawn();
+    let signer: PrivateKeySigner = key.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    (node, client, caller)
+}
+
 /// A create carrying `payload` under `text/plain`, with a purely relative
 /// lifetime — `$contentType` / `$payload` ride in the attribute list now.
 fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
@@ -963,6 +981,151 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
         !client.get_entity_at(key, expires_at - 1).await.is_null(),
         "a historical read before the expiry block still sees it",
     );
+}
+
+/// The producer's protocol transaction physically removes a short-lived entity;
+/// this uses the debug read because the public read hides expiry even without a purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_entity_is_physically_purged() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    client
+        .execute(vec![create_op(8, Bytes::from_static(b"purge-me"), vec![])])
+        .await;
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    let expires_at = hex_quantity(&client.get_entity(key).await["expiresAt"]);
+    assert!(
+        client.debug_entity_exists(key).await,
+        "record exists before expiry"
+    );
+
+    client
+        .wait_for_block(expires_at + 1, Duration::from_secs(15))
+        .await;
+    assert!(
+        client.get_entity(key).await.is_null(),
+        "expired entity is logically absent"
+    );
+    assert!(
+        !client.debug_entity_exists(key).await,
+        "expired entity record was physically purged"
+    );
+}
+
+/// The count cap drains one common-expiry cohort over successive blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn purge_is_limited_to_ten_entities_per_block() {
+    let (_node, client, caller) = spawn_slow_dev(DEV_KEY_0).await;
+    client
+        .execute(
+            (0..15)
+                .map(|i| create_op(8, Bytes::from(vec![i]), vec![]))
+                .collect(),
+        )
+        .await;
+    let keys: Vec<_> = (0..15)
+        .map(|nonce| {
+            B256::from(derive_entity_address(
+                DEV_CHAIN_ID,
+                &caller.into_array(),
+                EntityCreationNonce::new(nonce),
+                0,
+            ))
+        })
+        .collect();
+    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
+
+    client
+        .wait_for_block(expires_at + 1, Duration::from_secs(20))
+        .await;
+    let mut remaining = 0;
+    for key in &keys {
+        remaining += usize::from(client.debug_entity_exists(*key).await);
+    }
+    assert_eq!(remaining, 5, "exactly ten records are purged first");
+
+    client
+        .wait_for_block(expires_at + 2, Duration::from_secs(5))
+        .await;
+    for key in keys {
+        assert!(
+            !client.debug_entity_exists(key).await,
+            "remainder purged next"
+        );
+    }
+}
+
+/// Two individually over-threshold entities still make progress, one per block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn purge_soft_gas_threshold_allows_one_oversized_entity_per_block() {
+    let (_node, client, caller) = spawn_slow_dev(DEV_KEY_0).await;
+    let keys: Vec<_> = (0..2)
+        .map(|nonce| {
+            B256::from(derive_entity_address(
+                DEV_CHAIN_ID,
+                &caller.into_array(),
+                EntityCreationNonce::new(nonce),
+                0,
+            ))
+        })
+        .collect();
+
+    let mut ops = vec![
+        create_op(8, Bytes::from_static(b"large-0"), vec![]),
+        create_op(8, Bytes::from_static(b"large-1"), vec![]),
+    ];
+    // MAX_ATTRIBUTES applies per operation, so eight disjoint patches build an
+    // entity with 256 stored attributes without relaxing the protocol limit.
+    for (entity, key) in keys.iter().enumerate() {
+        for chunk in 0..8 {
+            let attributes = (0..32)
+                .map(|offset| {
+                    let name = format!("a{entity}_{:03}", chunk * 32 + offset);
+                    Attribute::from_value(
+                        Ident32::encode(&name).unwrap(),
+                        &AttributeValue::u256_from_u64(offset),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            ops.push(Operation::patch(*key, attributes));
+        }
+    }
+    client.execute(ops).await;
+    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
+    assert_eq!(
+        client.get_entity(keys[0]).await["attributes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        256
+    );
+    assert_eq!(
+        client.get_entity(keys[1]).await["attributes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        256
+    );
+
+    client
+        .wait_for_block(expires_at + 1, Duration::from_secs(20))
+        .await;
+    let exists = [
+        client.debug_entity_exists(keys[0]).await,
+        client.debug_entity_exists(keys[1]).await,
+    ];
+    assert_eq!(exists.into_iter().filter(|exists| *exists).count(), 1);
+
+    client
+        .wait_for_block(expires_at + 2, Duration::from_secs(5))
+        .await;
+    assert!(!client.debug_entity_exists(keys[0]).await);
+    assert!(!client.debug_entity_exists(keys[1]).await);
 }
 
 /// How many creates [`no_transaction_is_included_twice_over_a_live_node`] fires.

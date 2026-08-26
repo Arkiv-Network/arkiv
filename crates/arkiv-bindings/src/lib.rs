@@ -88,6 +88,7 @@ alloy_sol_types::sol! {
     #[sol(rpc)]
     interface IEntityRegistry {
         function execute(Operation[] ops) external returns (bytes32[] keys);
+        function purgeExpired(bytes32[] entityKeys) external;
         function entityNonce(address owner) external view returns (uint64);
         function customAttributeNames(bytes32 entityKey) external view returns (Ident32[] names);
         function attributeTypeId(bytes32 entityKey, Ident32 name) external view returns (uint8 typeId);
@@ -131,6 +132,11 @@ pub const OP_PATCH: u8 = 2;
 pub const OP_EXTEND_EXPIRY: u8 = 3;
 pub const OP_TRANSFER_OWNERSHIP: u8 = 4;
 pub const OP_DELETE: u8 = 5;
+
+/// Maximum number of expired entities carried by one protocol purge transaction.
+pub const MAX_PURGE_KEYS: usize = 10;
+/// Soft cumulative gas threshold for one block's purge selection.
+pub const PURGE_GAS_THRESHOLD: u64 = 1_000_000;
 
 /// Creation flags. Like the `typeId`s they belong to the protocol rather than
 /// the ABI, so the type lives in the spec crate and is re-exported here.

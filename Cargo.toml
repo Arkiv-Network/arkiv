@@ -34,6 +34,10 @@ reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
 reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 
 # JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
 # reth v2.5.0 uses so the RpcModule we register merges into reth's rpc modules.
@@ -65,6 +69,8 @@ alloy-eips = "2.3"
 alloy-sol-types = "1.6.1"
 alloy-provider = "2.3"
 alloy-signer-local = { version = "2.3", features = ["mnemonic"] }
+alloy-signer = "2.3"
+alloy-rpc-types-engine = "2.3"
 alloy-network = "2.3"
 alloy-contract = "2.3"
 alloy-rpc-types = "2.3"
@@ -90,3 +96,4 @@ arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
+arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }

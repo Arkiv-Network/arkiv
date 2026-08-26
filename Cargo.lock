@@ -1451,11 +1451,13 @@ dependencies = [
  "arkiv-bindings",
  "arkiv-harness",
  "arkiv-reth-executor",
+ "arkiv-reth-payload-builder",
  "arkiv-reth-rpc",
  "clap",
  "eyre",
  "reth",
  "reth-cli-util",
+ "reth-ethereum",
  "reth-ethereum-cli",
  "reth-node-ethereum",
  "serde_json",
@@ -1487,6 +1489,31 @@ dependencies = [
  "alloy-rlp",
  "arkiv-interfaces",
  "roaring",
+]
+
+[[package]]
+name = "arkiv-reth-payload-builder"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "arkiv-bindings",
+ "arkiv-interfaces",
+ "arkiv-reth-executor",
+ "eyre",
+ "reth-basic-payload-builder",
+ "reth-ethereum",
+ "reth-ethereum-payload-builder",
+ "reth-node-ethereum",
+ "reth-payload-builder",
+ "reth-payload-builder-primitives",
+ "reth-storage-api",
 ]
 
 [[package]]

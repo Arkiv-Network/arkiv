@@ -38,11 +38,16 @@ const G_EXTEND_EXPIRY: Gas = 10_000;
 /// Base cost to transfer ownership.
 const G_TRANSFER: Gas = 20_000;
 /// Base cost to delete an entity.
-const G_DELETE: Gas = 10_000;
+pub const G_DELETE: Gas = 10_000;
 /// Per byte of `content_type` + `payload` a write carries.
 const G_BYTE: Gas = 16;
 /// Per attribute a write carries (index maintenance).
-const G_ATTRIBUTE: Gas = 5_000;
+pub const G_ATTRIBUTE: Gas = 5_000;
+
+/// Protocol cost of physically purging one expired entity.
+pub const fn purge_cost(attribute_count: usize) -> Gas {
+    G_DELETE.saturating_add(G_ATTRIBUTE.saturating_mul(attribute_count as Gas))
+}
 /// Per entity a query scans.
 const G_SCANNED: Gas = 100;
 /// Per index lookup a query makes.
@@ -127,6 +132,12 @@ mod tests {
         });
         // base + 5 bytes * G_BYTE + 1 attr * G_ATTRIBUTE
         assert_eq!(cost, G_CREATE + 5 * G_BYTE + G_ATTRIBUTE);
+    }
+
+    #[test]
+    fn purge_cost_is_delete_plus_attributes() {
+        assert_eq!(purge_cost(0), G_DELETE);
+        assert_eq!(purge_cost(7), G_DELETE + 7 * G_ATTRIBUTE);
     }
 
     /// A patch is priced on what it changes, not on the entity it changes —
