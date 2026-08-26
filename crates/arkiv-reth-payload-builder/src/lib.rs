@@ -9,7 +9,7 @@ use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
-use arkiv_bindings::{IEntityRegistry, MAX_PURGE_KEYS, PURGE_GAS_LIMIT};
+use arkiv_bindings::{IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT};
 use arkiv_reth_executor::{ARKIV_ADDRESS, expiry_queue::expiry_queue};
 use arkiv_reth_mpt_committed_store::{AccountCode, CodeBackend, RethEntityStore};
 use futures_core::Stream;
@@ -356,6 +356,7 @@ fn protocol_transaction(
         ..Default::default()
     };
     let signer: PrivateKeySigner = PURGE_ENVELOPE_KEY.parse().expect("valid protocol key");
+    debug_assert_eq!(signer.address(), PURGE_CALLER);
     let signature = signer
         .sign_transaction_sync(&mut tx)
         .expect("sign protocol transaction");

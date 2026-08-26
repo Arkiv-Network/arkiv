@@ -234,12 +234,17 @@ where
         // `eth_simulateV1` without `validation` and for engine-tree payload prewarming,
         // both of which execute against state that need not match the tx's nonce.
         let nonce_check = !self.cfg_env().disable_nonce_check;
+        let chain_id = self.inner.chain_id();
         let db = self.inner.db_mut();
-        let is_purge = tx.kind == TxKind::Call(ARKIV_ADDRESS)
+        let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
             && tx
                 .data
                 .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR);
-        if nonce_check && !is_purge {
+        let is_protocol_purge = is_protocol_purge(&tx, block_number, chain_id);
+        if has_purge_selector && !is_protocol_purge {
+            return Err(invalid_transaction("purgeExpired is protocol-only"));
+        }
+        if nonce_check && !is_protocol_purge {
             validate_nonce(db, &tx)?;
         }
         arkiv_transact(db, block_number, tx)
@@ -271,6 +276,30 @@ where
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         self.inner.finish()
     }
+}
+
+fn is_protocol_purge(tx: &TxEnv, block_number: u64, chain_id: u64) -> bool {
+    use arkiv_bindings::{PURGE_CALLER, PURGE_GAS_LIMIT};
+
+    tx.tx_type == 2
+        && tx.caller == PURGE_CALLER
+        && tx.kind == TxKind::Call(ARKIV_ADDRESS)
+        && tx
+            .data
+            .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR)
+        && tx.nonce == block_number
+        && tx.chain_id == Some(chain_id)
+        && tx.gas_limit == PURGE_GAS_LIMIT
+        && tx.gas_price == u128::MAX
+        && tx.gas_priority_fee == Some(0)
+        && tx.value == U256::ZERO
+        && tx.access_list.is_empty()
+        && tx.blob_hashes.is_empty()
+        && tx.authorization_list.is_empty()
+}
+
+fn invalid_transaction<DBError>(message: impl Into<String>) -> EVMError<DBError> {
+    EVMError::Transaction(InvalidTransaction::Str(message.into().into()))
 }
 
 /// revm's pre-execution nonce check, which the no-EVM path would otherwise skip.
@@ -399,9 +428,9 @@ fn arkiv_purge_expired<DB: Database>(
         return Ok(out_of_gas());
     }
     let call = IEntityRegistry::purgeExpiredCall::abi_decode_raw(&tx.data[4..])
-        .map_err(|e| EVMError::Custom(format!("decode purgeExpired: {e}")))?;
+        .map_err(|e| invalid_transaction(format!("invalid purgeExpired calldata: {e}")))?;
     if call.entityKeys.len() > MAX_PURGE_KEYS {
-        return Err(EVMError::Custom(format!(
+        return Err(invalid_transaction(format!(
             "purge contains more than {MAX_PURGE_KEYS} keys"
         )));
     }
@@ -417,9 +446,7 @@ fn arkiv_purge_expired<DB: Database>(
             continue;
         };
         if entity.expires_at > block_number {
-            return Err(EVMError::Custom(format!(
-                "purge entity {key} has not expired"
-            )));
+            continue;
         }
         modeled_gas =
             modeled_gas.saturating_add(arkiv_interfaces::gas::purge_cost(entity.attributes.len()));
@@ -926,6 +953,87 @@ mod tests {
             chain_id: Some(1),
             ..Default::default()
         }
+    }
+
+    fn protocol_purge_tx(block: u64, keys: Vec<B256>) -> TxEnv {
+        use arkiv_bindings::{PURGE_CALLER, PURGE_GAS_LIMIT};
+
+        TxEnv {
+            tx_type: 2,
+            caller: PURGE_CALLER,
+            gas_limit: PURGE_GAS_LIMIT,
+            gas_price: u128::MAX,
+            kind: TxKind::Call(ARKIV_ADDRESS),
+            data: IEntityRegistry::purgeExpiredCall { entityKeys: keys }
+                .abi_encode()
+                .into(),
+            nonce: block,
+            chain_id: Some(1),
+            gas_priority_fee: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn protocol_purge_requires_the_exact_envelope() {
+        let tx = protocol_purge_tx(10, Vec::new());
+        assert!(is_protocol_purge(&tx, 10, 1));
+
+        let mut user = tx.clone();
+        user.caller = Address::repeat_byte(0xAA);
+        assert!(!is_protocol_purge(&user, 10, 1));
+
+        let mut wrong_nonce = tx.clone();
+        wrong_nonce.nonce += 1;
+        assert!(!is_protocol_purge(&wrong_nonce, 10, 1));
+
+        let mut wrong_gas = tx;
+        wrong_gas.gas_limit -= 1;
+        assert!(!is_protocol_purge(&wrong_gas, 10, 1));
+    }
+
+    #[test]
+    fn malformed_and_oversized_purges_are_invalid_transactions() {
+        use alloy_evm::EvmError;
+
+        let mut db = EmptyDB::default();
+        let mut malformed = protocol_purge_tx(10, Vec::new());
+        malformed.data = IEntityRegistry::purgeExpiredCall::SELECTOR.into();
+        let error = arkiv_purge_expired(&mut db, 10, &malformed).unwrap_err();
+        assert!(error.try_into_invalid_tx_err().is_ok());
+
+        let oversized = protocol_purge_tx(
+            10,
+            (0..=arkiv_bindings::MAX_PURGE_KEYS)
+                .map(|i| B256::repeat_byte(i as u8))
+                .collect(),
+        );
+        let error = arkiv_purge_expired(&mut db, 10, &oversized).unwrap_err();
+        assert!(error.try_into_invalid_tx_err().is_ok());
+    }
+
+    #[test]
+    fn protocol_purge_skips_a_live_entity() {
+        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let alice = Address::repeat_byte(0xAA);
+        let created =
+            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"live"))).unwrap();
+        db.commit(created.state);
+        let key = B256::from(derive_entity_address(
+            1,
+            &alice.into_array(),
+            EntityCreationNonce::new(0),
+            0,
+        ));
+
+        let purged = arkiv_purge_expired(&mut db, 11, &protocol_purge_tx(11, vec![key])).unwrap();
+        assert!(purged.result.is_success());
+        assert!(
+            purged.state.get(&entity_leaf_address(key.0)).is_none(),
+            "a live entity must not be staged for deletion"
+        );
     }
 
     /// A create call through `arkiv_transact`: the entity is committed at its minted

@@ -1373,3 +1373,61 @@ async fn a_pooled_create_transaction_does_not_stall_block_production() {
         "a contract deployment must never be mined",
     );
 }
+
+/// A user can submit `purgeExpired` to the stock pool, but the executor must
+/// reject it as a skippable invalid transaction instead of aborting payloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pooled_user_purge_does_not_stall_block_production() {
+    let (node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let nonce = client
+        .provider()
+        .get_transaction_count(caller)
+        .await
+        .expect("transaction count");
+    let purge = TransactionRequest::default()
+        .with_to(ARKIV_ADDRESS)
+        // Selector only: deliberately malformed ABI for purgeExpired(bytes32[]).
+        .with_input(Bytes::copy_from_slice(
+            &IEntityRegistry::purgeExpiredCall::SELECTOR,
+        ))
+        .with_nonce(nonce)
+        .with_gas_limit(1_000_000)
+        .with_gas_price(1_000_000_000)
+        .with_chain_id(DEV_CHAIN_ID);
+    let purge_hash = *client
+        .provider()
+        .send_transaction(purge)
+        .await
+        .expect("the pool accepts purge calldata at ingress")
+        .tx_hash();
+
+    let bystander_signer: PrivateKeySigner = DEV_KEY_1.parse().unwrap();
+    let bystander_addr = bystander_signer.address();
+    let bystander = connect(&node.http_url(), bystander_signer);
+    bystander
+        .execute(vec![create_op(
+            1000,
+            Bytes::from_static(b"still-building"),
+            vec![],
+        )])
+        .await;
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &bystander_addr.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    assert_eq!(
+        bystander.get_entity(key).await["payload"],
+        "0x7374696c6c2d6275696c64696e67"
+    );
+    assert!(
+        client
+            .provider()
+            .get_transaction_receipt(purge_hash)
+            .await
+            .expect("eth_getTransactionReceipt")
+            .is_none(),
+        "the user purge must be skipped, not mined"
+    );
+}
