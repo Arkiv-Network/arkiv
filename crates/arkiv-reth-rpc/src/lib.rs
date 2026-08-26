@@ -72,7 +72,10 @@ where
             let key: B256 = seq
                 .next()
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            tokio::task::spawn_blocking(move || entity_exists_unfiltered(&provider, key))
+            let block: Option<u64> = seq
+                .optional_next()
+                .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
+            tokio::task::spawn_blocking(move || entity_exists_unfiltered(&provider, key, block))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
         }
@@ -199,11 +202,12 @@ where
 fn entity_exists_unfiltered<Provider>(
     provider: &Provider,
     key: B256,
+    block: Option<u64>,
 ) -> Result<bool, ErrorObjectOwned>
 where
     Provider: StateProviderFactory + BlockNumReader,
 {
-    let (state, _) = resolve_state(provider, None)?;
+    let (state, _) = resolve_state(provider, block)?;
     let mut store = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
     Ok(store
         .get(key.0)

@@ -21,7 +21,6 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
-use futures_util::future::join_all;
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -1030,15 +1029,19 @@ async fn expired_entity_is_physically_purged() {
     );
 
     client
-        .wait_for_block(expires_at, Duration::from_secs(15))
+        .wait_for_block(expires_at + 1, Duration::from_secs(15))
         .await;
     assert!(
         client.get_entity(key).await.is_null(),
         "expired entity is logically absent"
     );
     assert!(
-        !client.debug_entity_exists(key).await,
+        !client.debug_entity_exists_at(key, expires_at).await,
         "expired entity record was physically purged"
+    );
+    assert!(
+        client.debug_entity_exists_at(key, expires_at - 1).await,
+        "record existed in the preceding block"
     );
 }
 
@@ -1066,21 +1069,17 @@ async fn purge_is_limited_to_ten_entities_per_block() {
     let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
 
     client
-        .wait_for_block(expires_at, Duration::from_secs(20))
+        .wait_for_block(expires_at + 1, Duration::from_secs(20))
         .await;
-    let remaining = join_all(keys.iter().map(|key| client.debug_entity_exists(*key)))
-        .await
-        .into_iter()
-        .filter(|exists| *exists)
-        .count();
+    let mut remaining = 0;
+    for key in &keys {
+        remaining += usize::from(client.debug_entity_exists_at(*key, expires_at).await);
+    }
     assert_eq!(remaining, 5, "exactly ten records are purged first");
 
-    client
-        .wait_for_block(expires_at + 1, Duration::from_secs(5))
-        .await;
     for key in keys {
         assert!(
-            !client.debug_entity_exists(key).await,
+            !client.debug_entity_exists_at(key, expires_at + 1).await,
             "remainder purged next"
         );
     }
@@ -1132,23 +1131,19 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
     }
 
     client
-        .wait_for_block(expires_at, Duration::from_secs(20))
+        .wait_for_block(expires_at + 1, Duration::from_secs(20))
         .await;
-    let remaining = join_all(keys.iter().map(|key| client.debug_entity_exists(*key)))
-        .await
-        .into_iter()
-        .filter(|exists| *exists)
-        .count();
+    let mut remaining = 0;
+    for key in &keys {
+        remaining += usize::from(client.debug_entity_exists_at(*key, expires_at).await);
+    }
     assert_eq!(
         remaining, 1,
         "the sixth purge does not exceed the gas limit"
     );
 
-    client
-        .wait_for_block(expires_at + 1, Duration::from_secs(5))
-        .await;
     for key in keys {
-        assert!(!client.debug_entity_exists(key).await);
+        assert!(!client.debug_entity_exists_at(key, expires_at + 1).await);
     }
 }
 

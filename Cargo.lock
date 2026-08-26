@@ -1455,7 +1455,6 @@ dependencies = [
  "arkiv-reth-rpc",
  "clap",
  "eyre",
- "futures-util",
  "reth",
  "reth-cli-util",
  "reth-ethereum",

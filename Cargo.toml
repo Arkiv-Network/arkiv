@@ -72,7 +72,6 @@ alloy-signer-local = { version = "2.3", features = ["mnemonic"] }
 alloy-signer = "2.3"
 alloy-rpc-types-engine = "2.3"
 futures-core = "0.3"
-futures-util = "0.3"
 alloy-network = "2.3"
 alloy-contract = "2.3"
 alloy-rpc-types = "2.3"
