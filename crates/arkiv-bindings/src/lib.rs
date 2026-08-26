@@ -177,6 +177,7 @@ mod tests {
     ///
     /// ```text
     /// cast sig 'execute((uint8,bytes)[])'          # 0x49650044
+    /// cast sig 'purgeExpired(bytes32[])'           # 0xad9e3f1c
     /// cast sig 'entityNonce(address)'              # 0x36917bfd
     /// cast sig 'customAttributeNames(bytes32)'     # 0x58d5418a
     /// cast sig 'attributeTypeId(bytes32,bytes32)'  # 0x434fb6f3
@@ -186,6 +187,7 @@ mod tests {
     /// signature, not its UDVT name — which is why the last one reads
     /// `(bytes32,bytes32)`.
     const EXECUTE_SELECTOR: [u8; 4] = [0x49, 0x65, 0x00, 0x44];
+    const PURGE_EXPIRED_SELECTOR: [u8; 4] = [0xad, 0x9e, 0x3f, 0x1c];
     const ENTITY_NONCE_SELECTOR: [u8; 4] = [0x36, 0x91, 0x7b, 0xfd];
     const CUSTOM_ATTRIBUTE_NAMES_SELECTOR: [u8; 4] = [0x58, 0xd5, 0x41, 0x8a];
     const ATTRIBUTE_TYPE_ID_SELECTOR: [u8; 4] = [0x43, 0x4f, 0xb6, 0xf3];
@@ -200,6 +202,10 @@ mod tests {
     #[test]
     fn selectors_are_pinned() {
         assert_eq!(IEntityRegistry::executeCall::SELECTOR, EXECUTE_SELECTOR);
+        assert_eq!(
+            IEntityRegistry::purgeExpiredCall::SELECTOR,
+            PURGE_EXPIRED_SELECTOR
+        );
         assert_eq!(
             IEntityRegistry::entityNonceCall::SELECTOR,
             ENTITY_NONCE_SELECTOR
@@ -226,6 +232,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(selector_of("execute((uint8,bytes)[])"), EXECUTE_SELECTOR);
+        assert_eq!(
+            selector_of("purgeExpired(bytes32[])"),
+            PURGE_EXPIRED_SELECTOR
+        );
         assert_eq!(selector_of("entityNonce(address)"), ENTITY_NONCE_SELECTOR);
         assert_eq!(
             selector_of("customAttributeNames(bytes32)"),

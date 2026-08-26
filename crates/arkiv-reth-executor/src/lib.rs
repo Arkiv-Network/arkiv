@@ -365,9 +365,8 @@ fn arkiv_transact<DB: Database>(
         }
     };
 
-    // A call to ARKIV_ADDRESS is either one of the read-only views or the entity
-    // state transition (`execute(Operation[])` — the only other selector
-    // `decode_ops` accepts).
+    // A call to ARKIV_ADDRESS is a read-only view, the user entity transition
+    // `execute(Operation[])`, or the protocol-only `purgeExpired(bytes32[])`.
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
