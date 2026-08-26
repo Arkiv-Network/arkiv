@@ -1,10 +1,7 @@
 # Arkiv harness
 
-[![rust-docker-build status](https://github.com/Arkiv-Network/arkiv/actions/workflows/rust.yml/badge.svg)][rust-docker-build-ci]
-[![python-lint status](https://github.com/Arkiv-Network/arkiv/actions/workflows/lint.yml/badge.svg)][gh-python-lint]
-
-[rust-docker-build-ci]: https://github.com/Arkiv-Network/arkiv/actions/workflows/rust.yml
-[gh-python-lint]: https://github.com/Arkiv-Network/arkiv/actions/workflows/lint.yml
+![rust-docker-build status](https://github.com/Arkiv-Network/arkiv/actions/workflows/rust.yml/badge.svg)
+![python-lint status](https://github.com/Arkiv-Network/arkiv/actions/workflows/lint.yml/badge.svg)
 
 Black-box test harness for the Arkiv database-chain. Stands up a devnet with kurtosis and drives it from the outside.
 
@@ -17,23 +14,27 @@ arkiv/
 ├── bin/
 │   ├── arkiv-reth/                     # dummy EL — vanilla reth wrapper
 │   └── arkiv-cli/                      # black-box driver (skeleton)
+│
 ├── crates/
-│   ├── arkiv-bindings
-│   ├── arkiv-genesis
-│   ├── arkiv-harness                   # shared config types
+│   ├── arkiv-bindings                  # Encoding helpers (entities, operations, attributes)
+│   ├── arkiv-genesis                   # Genesis Chain Initialization params
+│   ├── arkiv-harness                   # node client with shared config types
 │   ├── arkiv-interfaces
-│   ├── arkiv-query
-│   ├── arkiv-reth-executor
-│   ├── arkiv-reth-mpt-committed-store
-│   ├── arkiv-reth-rpc
+│   ├── arkiv-query                     # Parser for Arkiv DB query language
+│   ├── arkiv-reth-executor             # Main EVM integration with modifications (e.g: smart contracts not supported)
+│   ├── arkiv-reth-mpt-committed-store  # Implement storage
+│   ├── arkiv-reth-rpc                  # available JSON RPC endpoints (read-only)
 │   ├── arkiv-reth-statemanager
 │   ├── arkiv-reth-uncommitted-store
-│   └── arkiv-rpc-types
+│   └── arkiv-rpc-types                 # Shared request and response types for the JSON-RPC API
+│
 ├── docker/                             # Dockerfiles for debian-slim
 │   ├── arkiv-reth-dev.Dockerfile
 │   └── arkiv-reth.Dockerfile
+│
 ├── kurtosis/  
 │   └── arkiv-chain.yaml                # ethereum-package args
+│
 ├── scripts/
 │   └── kurtosis/                       # up / down helpers
 │       ├── check.py
@@ -41,9 +42,12 @@ arkiv/
 │       └── up.py
 ```
 
+
+
 ## Usage
 
 > **Prerequisites:**
+>
 > - [Rust](https://rust-lang.org/tools/install/) installed
 > - [Docker](https://www.docker.com/)
 > - [Kurtosis](https://docs.kurtosis.com/install)  CLI
@@ -64,10 +68,11 @@ Scaffold only — the workspace builds and the devnet is wired; real harness log
 ## Development
 
 CI runs three workflows: 
-- `rust.yml`: 🦀 Rust checks and 🐳 Docker publishing for
+
+- `[rust.yml](./.github/workflows/rust.yml)`: 🦀 Rust checks and 🐳 Docker publishing for
 `arkiv-reth` and `arkiv-reth-dev`.
-- `lint.yml`: 🐍 Linting and formatting with [Black]((https://black.readthedocs.io)) over the Python scripts, using configs from [`pyproject.toml`](./pyproject.toml).
-- `kurtosis.yml`: 🧪 the two-node sequencer/follower smoke test.
+- `[lint.yml](./.github/workflows/lint.yml)`: 🐍 Linting and formatting with [Black]((https://black.readthedocs.io)) over the Python scripts, using configs from `[pyproject.toml](./pyproject.toml)`.
+- `[kurtosis.yml](./.github/workflows/kurtosis.yml)`: 🧪 the two-node sequencer/follower smoke test.
 
 Enable the local pre-commit hook with `pip install pre-commit && pre-commit install` — black then runs on staged Python before each commit.
 
