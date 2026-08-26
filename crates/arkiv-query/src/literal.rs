@@ -4,22 +4,15 @@
 //! The lexer captures a literal's body verbatim; every rule about what may be in
 //! there lives here, so the spec's literal table has exactly one implementation:
 //!
-//! | tag | accepted |
-//! |---|---|
-//! | `i32` | sign + digits, within [−2³¹, 2³¹−1] |
-//! | `u256` | decimal digits or `0x` hex, ≤ 2²⁵⁶−1 |
-//! | `dec` | sign, digits, `.` + ≤ 18 fractional digits — no exponent |
-//! | `str` | `'…'` with `''` escapes, ≤ 128 bytes of UTF-8 |
-//! | `addr` | `0x` + 40 hex, all-lower / all-upper / valid EIP-55 |
-//! | `key`, `bytes32` | `0x` + 64 hex |
-//! | `bool` | nothing — `true` / `false` are written bare |
-//!
-//! Excess precision on a `dec` is an **error, never a rounding**: silently
-//! dropping a digit would make a query quietly match the wrong rows.
-//!
-//! The 256-bit arithmetic is done by hand on big-endian bytes. It only ever needs
-//! "multiply by a small factor and add a digit", which is a dozen lines and keeps
-//! the crate's arithmetic dependency-free.
+//! | tag              | accepted                                                 |
+//! |------------------|----------------------------------------------------------|
+//! | `i32`            | sign + digits, within [−2³¹, 2³¹−1]                      |
+//! | `u256`           | decimal digits or `0x` hex, ≤ 2²⁵⁶−1                     |
+//! | `dec`            | sign, digits, `.` + ≤ 18 fractional digits — no exponent |
+//! | `str`            | `'…'` with `''` escapes, ≤ 128 bytes of UTF-8            |
+//! | `addr`           | `0x` + 40 hex, all-lower / all-upper / valid EIP-55      |
+//! | `key`, `bytes32` | `0x` + 64 hex                                            |
+//! | `bool`           | nothing — `true` / `false` are written bare              |
 
 use alloc::string::String;
 
