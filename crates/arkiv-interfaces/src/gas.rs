@@ -38,11 +38,11 @@ const G_EXTEND_EXPIRY: Gas = 10_000;
 /// Base cost to transfer ownership.
 const G_TRANSFER: Gas = 20_000;
 /// Base cost to delete an entity.
-pub const G_DELETE: Gas = 10_000;
+const G_DELETE: Gas = 10_000;
 /// Per byte of `content_type` + `payload` a write carries.
 const G_BYTE: Gas = 16;
 /// Per attribute a write carries (index maintenance).
-pub const G_ATTRIBUTE: Gas = 5_000;
+const G_ATTRIBUTE: Gas = 5_000;
 
 /// Protocol cost of physically purging one expired entity.
 pub const fn purge_cost(attribute_count: usize) -> Gas {
