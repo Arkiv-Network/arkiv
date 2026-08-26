@@ -395,6 +395,9 @@ fn arkiv_purge_expired<DB: Database>(
     use arkiv_bindings::MAX_PURGE_KEYS;
     use arkiv_interfaces::statemanager::EntityUpdates;
 
+    if tx.gas_limit < intrinsic_gas(&tx.data) {
+        return Ok(out_of_gas());
+    }
     let call = IEntityRegistry::purgeExpiredCall::abi_decode_raw(&tx.data[4..])
         .map_err(|e| EVMError::Custom(format!("decode purgeExpired: {e}")))?;
     if call.entityKeys.len() > MAX_PURGE_KEYS {
@@ -420,6 +423,9 @@ fn arkiv_purge_expired<DB: Database>(
         }
         modeled_gas =
             modeled_gas.saturating_add(arkiv_interfaces::gas::purge_cost(entity.attributes.len()));
+        if modeled_gas > tx.gas_limit {
+            return Ok(out_of_gas());
+        }
         view.update_entity(EntityUpdates::deletion(key_bytes))
             .map_err(state_fault("stage purge deletion"))?;
     }
@@ -433,11 +439,6 @@ fn arkiv_purge_expired<DB: Database>(
         .apply_deltas(&deltas)
         .map_err(state_fault("purge range index"))?;
     StateView::commit(&mut view).map_err(state_fault("commit purge"))?;
-    if let Ok(mut queue) = expiry_queue::expiry_queue().write() {
-        for key in purge_keys {
-            queue.remove(key);
-        }
-    }
     let state = view.into_base().into_state();
     let gas_used = modeled_gas.max(intrinsic_gas(&tx.data));
     Ok(ResultAndState::new(
@@ -449,6 +450,17 @@ fn arkiv_purge_expired<DB: Database>(
         },
         state,
     ))
+}
+
+fn out_of_gas() -> ResultAndState<HaltReason> {
+    ResultAndState::new(
+        ExecutionResult::Halt {
+            reason: HaltReason::OutOfGas(OutOfGasError::Basic),
+            gas: ResultGas::default(),
+            logs: Vec::new(),
+        },
+        EvmState::default(),
+    )
 }
 
 /// The entity state transition for a call to [`ARKIV_ADDRESS`].
@@ -738,24 +750,6 @@ fn run_ops<DB: Database>(
                     .map_err(|e| eyre::eyre!("advance minting nonce: {e:?}"))?;
             }
             let logs = effects.iter().map(entity_operation_log).collect();
-            // The blessed builder's schedule is deliberately process-local. Payload
-            // execution is its source of updates; losing it on restart is acceptable.
-            if let Ok(mut queue) = expiry_queue::expiry_queue().write() {
-                for effect in &effects {
-                    let key = B256::from(effect.key);
-                    match effect.kind {
-                        OpKind::Create | OpKind::ExtendExpiry => {
-                            let entity = view
-                                .get_entity(effect.key, ReadMode::ViewWithOverlay)
-                                .map_err(|e| eyre::eyre!("read scheduled entity: {e:?}"))?
-                                .ok_or_else(|| eyre::eyre!("scheduled entity missing"))?;
-                            queue.insert(key, effect.expires_at, entity.attributes.len())
-                        }
-                        OpKind::Delete => queue.remove(key),
-                        OpKind::Patch | OpKind::Transfer => {}
-                    }
-                }
-            }
             Ok(Outcome {
                 gas_used: out.gas_used,
                 revert: None,

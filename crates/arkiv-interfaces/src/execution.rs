@@ -75,6 +75,8 @@ pub enum RevertReason {
     },
     /// A `Transfer` named the current owner as the new owner.
     TransferToSelf { key: EntityAddress },
+    /// A `Patch` would grow the entity beyond the protocol attribute limit.
+    TooManyAttributes { count: usize, max: usize },
     /// The batch's cost exceeded the gas supplied.
     OutOfGas,
 }
@@ -132,6 +134,9 @@ impl fmt::Display for RevertReason {
                 write!(f, "transfer of entity ")?;
                 hex(f, key)?;
                 write!(f, " to its current owner")
+            }
+            Self::TooManyAttributes { count, max } => {
+                write!(f, "entity has {count} attributes; maximum is {max}")
             }
             Self::OutOfGas => write!(f, "out of gas"),
         }

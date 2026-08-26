@@ -44,26 +44,8 @@ impl ExpiryQueue {
         }
     }
 
-    pub fn take_expired(&mut self, block: u64, limit: usize) -> Vec<B256> {
-        let keys = self.expired(block, limit);
-        for key in &keys {
-            self.remove(*key);
-        }
-        keys
-    }
-
-    pub fn expired(&self, block: u64, limit: usize) -> Vec<B256> {
-        self.by_expiry
-            .range(..=block)
-            .flat_map(|(_, keys)| keys.iter().copied())
-            .take(limit)
-            .collect()
-    }
-
-    /// Chronological selection with a soft gas threshold: the entity that crosses
-    /// the threshold is included, then selection stops. This lets one unusually
-    /// expensive entity make progress even when it exceeds the threshold alone.
-    pub fn select_expired(&self, block: u64, limit: usize, gas_threshold: u64) -> Vec<B256> {
+    /// Select expired entities in chronological order without exceeding `gas_limit`.
+    pub fn select_expired(&self, block: u64, limit: usize, gas_limit: u64) -> Vec<B256> {
         let mut selected = Vec::with_capacity(limit);
         let mut gas = 0u64;
         for key in self.by_expiry.range(..=block).flat_map(|(_, keys)| keys) {
@@ -74,11 +56,12 @@ impl ExpiryQueue {
                 .by_key
                 .get(key)
                 .expect("expiry index and metadata agree");
-            gas = gas.saturating_add(purge_cost(scheduled.attribute_count));
-            selected.push(*key);
-            if gas > gas_threshold {
+            let next_gas = gas.saturating_add(purge_cost(scheduled.attribute_count));
+            if next_gas > gas_limit {
                 break;
             }
+            gas = next_gas;
+            selected.push(*key);
         }
         selected
     }
@@ -102,30 +85,31 @@ mod tests {
         q.insert(B256::repeat_byte(1), 7, 0);
         q.insert(B256::repeat_byte(3), 6, 0);
         assert_eq!(
-            q.take_expired(7, 2),
+            q.select_expired(7, 2, u64::MAX),
             vec![B256::repeat_byte(3), B256::repeat_byte(1)]
         );
-        assert_eq!(q.take_expired(8, 10), vec![B256::repeat_byte(2)]);
+        q.remove(B256::repeat_byte(3));
+        q.remove(B256::repeat_byte(1));
+        assert_eq!(
+            q.select_expired(8, 10, u64::MAX),
+            vec![B256::repeat_byte(2)]
+        );
     }
 
     #[test]
-    fn threshold_includes_the_crossing_entity_then_stops() {
+    fn gas_limit_excludes_the_crossing_entity() {
         let mut q = ExpiryQueue::default();
         for byte in 0..10 {
             q.insert(B256::repeat_byte(byte), 7, 32); // 170k each
         }
         let selected = q.select_expired(7, 10, 1_000_000);
-        assert_eq!(selected.len(), 6); // 1.02m: the sixth crosses the threshold
+        assert_eq!(selected.len(), 5); // the sixth would raise the total to 1.02m
     }
 
     #[test]
-    fn one_entity_can_exceed_the_threshold() {
-        let mut q = ExpiryQueue::default();
-        q.insert(B256::repeat_byte(1), 7, 300);
-        q.insert(B256::repeat_byte(2), 7, 0);
-        assert_eq!(
-            q.select_expired(7, 10, 1_000_000),
-            vec![B256::repeat_byte(1)]
-        );
+    fn maximum_entity_purge_fits_the_gas_limit() {
+        use arkiv_bindings::{MAX_ATTRIBUTES, PURGE_GAS_LIMIT};
+
+        assert!(purge_cost(MAX_ATTRIBUTES) < PURGE_GAS_LIMIT);
     }
 }

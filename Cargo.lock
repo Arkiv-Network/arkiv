@@ -1455,6 +1455,7 @@ dependencies = [
  "arkiv-reth-rpc",
  "clap",
  "eyre",
+ "futures-util",
  "reth",
  "reth-cli-util",
  "reth-ethereum",
@@ -1506,7 +1507,9 @@ dependencies = [
  "arkiv-bindings",
  "arkiv-interfaces",
  "arkiv-reth-executor",
+ "arkiv-reth-mpt-committed-store",
  "eyre",
+ "futures-core",
  "reth-basic-payload-builder",
  "reth-ethereum",
  "reth-ethereum-payload-builder",
@@ -1514,6 +1517,7 @@ dependencies = [
  "reth-payload-builder",
  "reth-payload-builder-primitives",
  "reth-storage-api",
+ "tracing",
 ]
 
 [[package]]

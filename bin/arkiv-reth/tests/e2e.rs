@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::SolEvent;
+use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Operation,
 };
@@ -21,6 +21,7 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
+use futures_util::future::join_all;
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -210,7 +211,7 @@ async fn nonces_view_tracks_creates_over_a_live_node() {
 /// the revert data — decodable by the SDK — not as plain strings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_revert_errors_over_a_live_node() {
-    use alloy_sol_types::{SolCall, SolError};
+    use alloy_sol_types::SolError;
 
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
@@ -1003,6 +1004,31 @@ async fn expired_entity_is_physically_purged() {
         "record exists before expiry"
     );
 
+    // A successful simulation must not remove the canonical schedule entry.
+    let calldata = IEntityRegistry::executeCall {
+        ops: vec![Operation::delete(key)],
+    }
+    .abi_encode();
+    client
+        .provider()
+        .raw_request::<_, Bytes>(
+            "eth_call".into(),
+            (
+                serde_json::json!({
+                    "from": caller,
+                    "to": ARKIV_ADDRESS,
+                    "data": format!("0x{}", alloy_primitives::hex::encode(calldata)),
+                }),
+                "latest",
+            ),
+        )
+        .await
+        .expect("simulated delete succeeds");
+    assert!(
+        client.debug_entity_exists(key).await,
+        "simulation does not delete canonical state"
+    );
+
     client
         .wait_for_block(expires_at + 1, Duration::from_secs(15))
         .await;
@@ -1042,10 +1068,11 @@ async fn purge_is_limited_to_ten_entities_per_block() {
     client
         .wait_for_block(expires_at + 1, Duration::from_secs(20))
         .await;
-    let mut remaining = 0;
-    for key in &keys {
-        remaining += usize::from(client.debug_entity_exists(*key).await);
-    }
+    let remaining = join_all(keys.iter().map(|key| client.debug_entity_exists(*key)))
+        .await
+        .into_iter()
+        .filter(|exists| *exists)
+        .count();
     assert_eq!(remaining, 5, "exactly ten records are purged first");
 
     client
@@ -1059,11 +1086,11 @@ async fn purge_is_limited_to_ten_entities_per_block() {
     }
 }
 
-/// Two individually over-threshold entities still make progress, one per block.
+/// Patch-expanded entities obey the strict purge transaction gas limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn purge_soft_gas_threshold_allows_one_oversized_entity_per_block() {
+async fn purge_respects_strict_gas_limit_after_attribute_patches() {
     let (_node, client, caller) = spawn_slow_dev(DEV_KEY_0).await;
-    let keys: Vec<_> = (0..2)
+    let keys: Vec<_> = (0..6)
         .map(|nonce| {
             B256::from(derive_entity_address(
                 DEV_CHAIN_ID,
@@ -1074,58 +1101,55 @@ async fn purge_soft_gas_threshold_allows_one_oversized_entity_per_block() {
         })
         .collect();
 
-    let mut ops = vec![
-        create_op(8, Bytes::from_static(b"large-0"), vec![]),
-        create_op(8, Bytes::from_static(b"large-1"), vec![]),
-    ];
-    // MAX_ATTRIBUTES applies per operation, so eight disjoint patches build an
-    // entity with 256 stored attributes without relaxing the protocol limit.
+    let mut ops: Vec<_> = (0..6)
+        .map(|i| create_op(8, Bytes::from(vec![i]), vec![]))
+        .collect();
+    // Each patch grows the stored entity to the per-operation maximum. Six
+    // purges would cost 1.02m gas, so only five fit in the 1m transaction.
     for (entity, key) in keys.iter().enumerate() {
-        for chunk in 0..8 {
-            let attributes = (0..32)
-                .map(|offset| {
-                    let name = format!("a{entity}_{:03}", chunk * 32 + offset);
-                    Attribute::from_value(
-                        Ident32::encode(&name).unwrap(),
-                        &AttributeValue::u256_from_u64(offset),
-                    )
-                    .unwrap()
-                })
-                .collect();
-            ops.push(Operation::patch(*key, attributes));
-        }
+        let attributes = (0..32)
+            .map(|offset| {
+                let name = format!("a{entity}_{offset:02}");
+                Attribute::from_value(
+                    Ident32::encode(&name).unwrap(),
+                    &AttributeValue::u256_from_u64(offset),
+                )
+                .unwrap()
+            })
+            .collect();
+        ops.push(Operation::patch(*key, attributes));
     }
     client.execute(ops).await;
     let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
-    assert_eq!(
-        client.get_entity(keys[0]).await["attributes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        256
-    );
-    assert_eq!(
-        client.get_entity(keys[1]).await["attributes"]
-            .as_array()
-            .unwrap()
-            .len(),
-        256
-    );
+    for key in &keys {
+        assert_eq!(
+            client.get_entity(*key).await["attributes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+    }
 
     client
         .wait_for_block(expires_at + 1, Duration::from_secs(20))
         .await;
-    let exists = [
-        client.debug_entity_exists(keys[0]).await,
-        client.debug_entity_exists(keys[1]).await,
-    ];
-    assert_eq!(exists.into_iter().filter(|exists| *exists).count(), 1);
+    let remaining = join_all(keys.iter().map(|key| client.debug_entity_exists(*key)))
+        .await
+        .into_iter()
+        .filter(|exists| *exists)
+        .count();
+    assert_eq!(
+        remaining, 1,
+        "the sixth purge does not exceed the gas limit"
+    );
 
     client
         .wait_for_block(expires_at + 2, Duration::from_secs(5))
         .await;
-    assert!(!client.debug_entity_exists(keys[0]).await);
-    assert!(!client.debug_entity_exists(keys[1]).await);
+    for key in keys {
+        assert!(!client.debug_entity_exists(key).await);
+    }
 }
 
 /// How many creates [`no_transaction_is_included_twice_over_a_live_node`] fires.

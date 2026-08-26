@@ -25,10 +25,9 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
 use arkiv_reth_executor::ArkivExecutorBuilder;
-use arkiv_reth_payload_builder::ArkivPayloadBuilderBuilder;
+use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
 use clap::Parser;
 use reth::cli::Cli;
-use reth_ethereum::node::builder::components::BasicPayloadServiceBuilder;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
 use tracing::info;
@@ -48,7 +47,7 @@ fn main() {
             .with_components(
                 EthereumNode::components()
                     .executor(ArkivExecutorBuilder::default())
-                    .payload(BasicPayloadServiceBuilder::new(ArkivPayloadBuilderBuilder)),
+                    .payload(ArkivPayloadServiceBuilder),
             )
             // Standard Ethereum add-ons (RPC, engine API, validator).
             .with_add_ons(EthereumAddOns::default())

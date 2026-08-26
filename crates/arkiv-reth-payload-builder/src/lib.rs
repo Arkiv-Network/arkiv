@@ -1,36 +1,236 @@
 //! Arkiv payload builder: prepend a bounded, protocol-generated purge transaction.
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, transaction::SignerRecoverable};
+use alloy_consensus::{
+    BlockHeader, SignableTransaction, Transaction, TxEip1559, TxEnvelope,
+    transaction::SignerRecoverable,
+};
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Bytes, TxKind, U256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::SolCall;
-use arkiv_bindings::{IEntityRegistry, MAX_ATTRIBUTES, MAX_PURGE_KEYS, PURGE_GAS_THRESHOLD};
+use alloy_sol_types::{SolCall, SolEvent};
+use arkiv_bindings::{IEntityRegistry, MAX_PURGE_KEYS, PURGE_GAS_LIMIT};
 use arkiv_reth_executor::{ARKIV_ADDRESS, expiry_queue::expiry_queue};
-use reth_basic_payload_builder::{BuildArguments, BuildOutcome, PayloadBuilder};
+use arkiv_reth_mpt_committed_store::{AccountCode, CodeBackend, RethEntityStore};
+use futures_core::Stream;
+use reth_basic_payload_builder::{
+    BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
+    PayloadBuilder,
+};
 use reth_ethereum::{
     EthPrimitives, TransactionSigned,
     chainspec::ChainSpec,
     evm::primitives::{ConfigureEvm, NextBlockEnvAttributes},
     node::{
         api::{FullNodeTypes, NodeTypes},
-        builder::{BuilderContext, PayloadBuilderConfig, components::PayloadBuilderBuilder},
+        builder::{
+            BuilderContext, PayloadBuilderConfig,
+            components::{PayloadBuilderBuilder, PayloadServiceBuilder},
+        },
     },
     pool::{
         BestTransactions, EthPooledTransaction, TransactionOrigin, TransactionPool,
         ValidPoolTransaction, error::InvalidPoolTransactionError,
     },
+    provider::{
+        CanonStateNotification, CanonStateNotificationStream, CanonStateSubscriptions, Chain,
+    },
 };
 use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_node_ethereum::EthEngineTypes;
-use reth_payload_builder::EthBuiltPayload;
-use std::{sync::Arc, time::Instant};
+use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
+use reth_storage_api::{StateProviderBox, StateProviderFactory};
+use std::{
+    collections::BTreeSet,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
+use tracing::warn;
 
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
-const PURGE_GAS_LIMIT: u64 =
-    PURGE_GAS_THRESHOLD + arkiv_interfaces::gas::purge_cost(MAX_ATTRIBUTES);
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArkivPayloadServiceBuilder;
+
+impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for ArkivPayloadServiceBuilder
+where
+    Node: FullNodeTypes<
+        Types: NodeTypes<
+            ChainSpec = ChainSpec,
+            Primitives = EthPrimitives,
+            Payload = EthEngineTypes,
+        >,
+    >,
+    Node::Provider: StateProviderFactory + Unpin,
+    Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + 'static,
+    Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>
+        + Send
+        + 'static,
+{
+    async fn spawn_payload_builder_service(
+        self,
+        ctx: &BuilderContext<Node>,
+        pool: Pool,
+        evm: Evm,
+    ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
+        let payload_builder = ArkivPayloadBuilderBuilder
+            .build_payload_builder(ctx, pool, evm)
+            .await?;
+        let conf = ctx.config().builder.clone();
+        let generator = BasicPayloadJobGenerator::with_builder(
+            ctx.provider().clone(),
+            ctx.task_executor().clone(),
+            BasicPayloadJobGeneratorConfig::default()
+                .interval(conf.interval)
+                .deadline(conf.deadline)
+                .max_payload_tasks(conf.max_payload_tasks),
+            payload_builder,
+        );
+        let notifications = CanonicalQueueStream {
+            inner: ctx.provider().canonical_state_stream(),
+            provider: ctx.provider().clone(),
+        };
+        let (service, handle) = PayloadBuilderService::new(generator, notifications);
+        ctx.task_executor().spawn_critical_os_thread(
+            "payload-service",
+            "arkiv payload builder service",
+            service,
+        );
+        Ok(handle)
+    }
+}
+
+/// Canonical notifications update the process-local queue before the payload
+/// generator sees the new head. Speculative execution never reaches this stream.
+struct CanonicalQueueStream<P> {
+    inner: CanonStateNotificationStream<EthPrimitives>,
+    provider: P,
+}
+
+impl<P> Stream for CanonicalQueueStream<P>
+where
+    P: StateProviderFactory + Unpin,
+{
+    type Item = CanonStateNotification<EthPrimitives>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(notification)) => {
+                if let Err(error) = apply_canonical_update(&self.provider, &notification) {
+                    warn!(target: "arkiv-reth", %error, "failed to update expiry queue");
+                }
+                Poll::Ready(Some(notification))
+            }
+            other => other,
+        }
+    }
+}
+
+fn apply_canonical_update<P>(
+    provider: &P,
+    notification: &CanonStateNotification<EthPrimitives>,
+) -> eyre::Result<()>
+where
+    P: StateProviderFactory,
+{
+    let committed = notification.committed();
+    let reverted = notification.reverted();
+    let mut touched = BTreeSet::new();
+    collect_touched_keys(&committed, &mut touched);
+    if let Some(reverted) = &reverted {
+        collect_touched_keys(reverted, &mut touched);
+    }
+    if touched.is_empty() {
+        return Ok(());
+    }
+
+    let state_hash = (!committed.is_empty())
+        .then(|| committed.tip().hash())
+        .or_else(|| {
+            reverted
+                .as_ref()
+                .map(|chain| chain.first().header().parent_hash())
+        });
+    let Some(state_hash) = state_hash else {
+        return Ok(());
+    };
+    let state = provider
+        .state_by_block_hash(state_hash)
+        .map_err(|error| eyre::eyre!("canonical state {state_hash}: {error:?}"))?;
+    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode(state)));
+    let mut queue = expiry_queue()
+        .write()
+        .map_err(|_| eyre::eyre!("expiry queue poisoned"))?;
+    for key in touched {
+        match entities
+            .get(key.0)
+            .map_err(|error| eyre::eyre!("read canonical entity {key}: {error:?}"))?
+        {
+            Some(entity) => queue.insert(key, entity.expires_at, entity.attributes.len()),
+            None => queue.remove(key),
+        }
+    }
+    Ok(())
+}
+
+fn collect_touched_keys(chain: &Chain<EthPrimitives>, keys: &mut BTreeSet<B256>) {
+    for log in chain.logs_iter() {
+        if log.address != ARKIV_ADDRESS {
+            continue;
+        }
+        let topics = log.topics();
+        if topics.len() > 1
+            && matches!(
+                topics[0],
+                IEntityRegistry::EntityCreated::SIGNATURE_HASH
+                    | IEntityRegistry::EntityPatched::SIGNATURE_HASH
+                    | IEntityRegistry::ExpiryExtended::SIGNATURE_HASH
+                    | IEntityRegistry::OwnershipTransferred::SIGNATURE_HASH
+                    | IEntityRegistry::EntityDeleted::SIGNATURE_HASH
+            )
+        {
+            keys.insert(topics[1]);
+        }
+    }
+    for transaction in chain.transactions_iter() {
+        if transaction.to() != Some(ARKIV_ADDRESS)
+            || !transaction
+                .input()
+                .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR)
+        {
+            continue;
+        }
+        if let Ok(call) = IEntityRegistry::purgeExpiredCall::abi_decode(transaction.input()) {
+            keys.extend(call.entityKeys);
+        }
+    }
+}
+
+struct SnapshotAccountCode(StateProviderBox);
+
+impl AccountCode for SnapshotAccountCode {
+    type Error = eyre::Report;
+
+    fn code(&mut self, address: Address) -> Result<Vec<u8>, Self::Error> {
+        Ok(self
+            .0
+            .account_code(&address)
+            .map_err(|error| eyre::eyre!("account_code({address}): {error:?}"))?
+            .map(|code| code.original_bytes().to_vec())
+            .unwrap_or_default())
+    }
+
+    fn set_code(&mut self, _address: Address, _code: Vec<u8>) -> Result<(), Self::Error> {
+        eyre::bail!("canonical snapshot is read-only")
+    }
+
+    fn clear_code(&mut self, _address: Address) -> Result<(), Self::Error> {
+        eyre::bail!("canonical snapshot is read-only")
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArkivPayloadBuilderBuilder;
@@ -101,7 +301,7 @@ where
             // `expires_at` is the entity's first non-live block. Purging starts
             // in the following block so expiry and physical cleanup remain
             // distinct lifecycle steps.
-            .select_expired(block.saturating_sub(1), MAX_PURGE_KEYS, PURGE_GAS_THRESHOLD);
+            .select_expired(block.saturating_sub(1), MAX_PURGE_KEYS, PURGE_GAS_LIMIT);
         let purge = protocol_transaction(self.chain_id, block, keys);
         default_ethereum_payload(
             self.evm.clone(),

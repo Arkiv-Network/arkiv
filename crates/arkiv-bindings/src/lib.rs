@@ -135,8 +135,8 @@ pub const OP_DELETE: u8 = 5;
 
 /// Maximum number of expired entities carried by one protocol purge transaction.
 pub const MAX_PURGE_KEYS: usize = 10;
-/// Soft cumulative gas threshold for one block's purge selection.
-pub const PURGE_GAS_THRESHOLD: u64 = 1_000_000;
+/// Strict gas limit for one protocol purge transaction.
+pub const PURGE_GAS_LIMIT: u64 = 1_000_000;
 
 /// Creation flags. Like the `typeId`s they belong to the protocol rather than
 /// the ABI, so the type lives in the spec crate and is re-exported here.
