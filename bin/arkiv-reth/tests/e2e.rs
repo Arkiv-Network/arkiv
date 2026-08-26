@@ -1030,7 +1030,7 @@ async fn expired_entity_is_physically_purged() {
     );
 
     client
-        .wait_for_block(expires_at + 1, Duration::from_secs(15))
+        .wait_for_block(expires_at, Duration::from_secs(15))
         .await;
     assert!(
         client.get_entity(key).await.is_null(),
@@ -1066,7 +1066,7 @@ async fn purge_is_limited_to_ten_entities_per_block() {
     let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
 
     client
-        .wait_for_block(expires_at + 1, Duration::from_secs(20))
+        .wait_for_block(expires_at, Duration::from_secs(20))
         .await;
     let remaining = join_all(keys.iter().map(|key| client.debug_entity_exists(*key)))
         .await
@@ -1076,7 +1076,7 @@ async fn purge_is_limited_to_ten_entities_per_block() {
     assert_eq!(remaining, 5, "exactly ten records are purged first");
 
     client
-        .wait_for_block(expires_at + 2, Duration::from_secs(5))
+        .wait_for_block(expires_at + 1, Duration::from_secs(5))
         .await;
     for key in keys {
         assert!(
@@ -1132,7 +1132,7 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
     }
 
     client
-        .wait_for_block(expires_at + 1, Duration::from_secs(20))
+        .wait_for_block(expires_at, Duration::from_secs(20))
         .await;
     let remaining = join_all(keys.iter().map(|key| client.debug_entity_exists(*key)))
         .await
@@ -1145,7 +1145,7 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
     );
 
     client
-        .wait_for_block(expires_at + 2, Duration::from_secs(5))
+        .wait_for_block(expires_at + 1, Duration::from_secs(5))
         .await;
     for key in keys {
         assert!(!client.debug_entity_exists(key).await);

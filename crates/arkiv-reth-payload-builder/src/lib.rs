@@ -298,10 +298,10 @@ where
         let keys = expiry_queue()
             .read()
             .expect("expiry queue poisoned")
-            // `expires_at` is the entity's first non-live block. Purging starts
-            // in the following block so expiry and physical cleanup remain
-            // distinct lifecycle steps.
-            .select_expired(block.saturating_sub(1), MAX_PURGE_KEYS, PURGE_GAS_LIMIT);
+            // `expires_at` is the entity's first non-live block, so entities due
+            // at this height are eligible. Writes in this block must resolve to
+            // a later expiry and cannot enter this selection.
+            .select_expired(block, MAX_PURGE_KEYS, PURGE_GAS_LIMIT);
         let purge = protocol_transaction(self.chain_id, block, keys);
         default_ethereum_payload(
             self.evm.clone(),
