@@ -46,6 +46,11 @@ pub fn revert_data(reason: &RevertReason) -> Bytes {
             entityKey: B256::from(*key),
         }
         .abi_encode(),
+        RevertReason::TooManyAttributes { count, max } => E::TooManyAttributes {
+            count: alloy_primitives::U256::from(*count),
+            maxCount: alloy_primitives::U256::from(*max),
+        }
+        .abi_encode(),
         RevertReason::ExpiryNotExtended {
             key,
             new_expires_at,

@@ -67,7 +67,10 @@ pub const MAX_STR_BYTES: usize = 128;
 pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
 
 /// The most attributes one entity operation may carry.
-pub const MAX_ATTRIBUTES: usize = 32;
+pub const OP_MAX_ATTRIBUTES: usize = 32;
+
+/// The most attributes one entity may contain.
+pub const ENTITY_MAX_ATTRIBUTES: usize = 32;
 
 /// The longest attribute name — the width the ABI's `Ident32` carries.
 pub const MAX_ATTRIBUTE_NAME_BYTES: usize = 32;
