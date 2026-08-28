@@ -42,24 +42,6 @@ async fn spawn_dev(
     (node, client, caller)
 }
 
-/// A slower producer for assertions about the exact intermediate purge block.
-async fn spawn_slow_dev(
-    key: &str,
-) -> (
-    arkiv_harness::Node,
-    ArkivClient<impl Provider + Clone>,
-    Address,
-) {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
-        .block_time("1s")
-        .spawn();
-    let signer: PrivateKeySigner = key.parse().unwrap();
-    let caller = signer.address();
-    let client = connect(&node.http_url(), signer);
-    node.wait_ready(&client, READY).await;
-    (node, client, caller)
-}
-
 /// A create carrying `payload` under `text/plain`, with a purely relative
 /// lifetime — `$contentType` / `$payload` ride in the attribute list now.
 fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
@@ -1049,7 +1031,7 @@ async fn expired_entity_is_physically_purged() {
 /// The count cap drains one common-expiry cohort over successive blocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn purge_respects_max_keys_per_block() {
-    let (_node, client, caller) = spawn_slow_dev(DEV_KEY_0).await;
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
     let entity_count = u64::try_from(MAX_PURGE_KEYS).unwrap() + 1;
     client
         .execute(
@@ -1090,7 +1072,7 @@ async fn purge_respects_max_keys_per_block() {
 /// Patch-expanded entities obey the strict purge transaction gas limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn purge_respects_strict_gas_limit_after_attribute_patches() {
-    let (_node, client, caller) = spawn_slow_dev(DEV_KEY_0).await;
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
     let keys: Vec<_> = (0..6)
         .map(|nonce| {
             B256::from(derive_entity_address(
