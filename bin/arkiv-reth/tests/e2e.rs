@@ -15,7 +15,7 @@ use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
-    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Operation,
+    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, MAX_PURGE_KEYS, Operation,
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
@@ -1047,16 +1047,17 @@ async fn expired_entity_is_physically_purged() {
 
 /// The count cap drains one common-expiry cohort over successive blocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn purge_is_limited_to_ten_entities_per_block() {
+async fn purge_respects_max_keys_per_block() {
     let (_node, client, caller) = spawn_slow_dev(DEV_KEY_0).await;
+    let entity_count = u64::try_from(MAX_PURGE_KEYS).unwrap() + 1;
     client
         .execute(
-            (0..15)
-                .map(|i| create_op(8, Bytes::from(vec![i]), vec![]))
+            (0..entity_count)
+                .map(|_| create_op(8, Bytes::new(), vec![]))
                 .collect(),
         )
         .await;
-    let keys: Vec<_> = (0..15)
+    let keys: Vec<_> = (0..entity_count)
         .map(|nonce| {
             B256::from(derive_entity_address(
                 DEV_CHAIN_ID,
@@ -1075,7 +1076,7 @@ async fn purge_is_limited_to_ten_entities_per_block() {
     for key in &keys {
         remaining += usize::from(client.debug_entity_exists_at(*key, expires_at).await);
     }
-    assert_eq!(remaining, 5, "exactly ten records are purged first");
+    assert_eq!(remaining, 1, "the per-block key limit is enforced");
 
     for key in keys {
         assert!(
