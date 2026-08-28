@@ -450,10 +450,21 @@ fn check_operator(operator: &Token, value: &AnnotVal, position: usize) -> Result
 /// reserved names. Type tags are only tags in front of a `(`, so a bare `str`
 /// arrives here as an ordinary name and has to be rejected by hand.
 fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
+    const RESERVED_NAMES: [&str; 1] = ["set"];
+
     if name.len() > limits::MAX_ATTRIBUTE_NAME_BYTES {
         return Err(ParseError::syntax(
             position,
             "attribute names are limited to 32 bytes",
+        ));
+    }
+    if RESERVED_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(ParseError::syntax(
+            position,
+            alloc::format!("{name} is reserved and cannot be an attribute name"),
         ));
     }
     if let Some(tag) = TypeTag::from_name(name) {
@@ -948,6 +959,7 @@ mod tests {
         // Keywords lex as keywords, so they never reach an attribute position.
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("set = true"), ParseErrorKind::MalformedInputError);
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");
