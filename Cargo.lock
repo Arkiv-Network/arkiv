@@ -1508,7 +1508,7 @@ dependencies = [
  "arkiv-reth-executor",
  "arkiv-reth-mpt-committed-store",
  "eyre",
- "futures-core",
+ "futures-util",
  "reth-basic-payload-builder",
  "reth-ethereum",
  "reth-ethereum-payload-builder",

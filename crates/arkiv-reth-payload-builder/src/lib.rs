@@ -14,7 +14,7 @@ use arkiv_bindings::{
 };
 use arkiv_reth_executor::{ARKIV_ADDRESS, expiry_queue::expiry_queue};
 use arkiv_reth_mpt_committed_store::{AccountCode, CodeBackend, RethEntityStore};
-use futures_core::Stream;
+use futures_util::StreamExt;
 use reth_basic_payload_builder::{
     BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
     PayloadBuilder,
@@ -34,21 +34,13 @@ use reth_ethereum::{
         BestTransactions, EthPooledTransaction, TransactionOrigin, TransactionPool,
         ValidPoolTransaction, error::InvalidPoolTransactionError,
     },
-    provider::{
-        CanonStateNotification, CanonStateNotificationStream, CanonStateSubscriptions, Chain,
-    },
+    provider::{CanonStateNotification, CanonStateSubscriptions, Chain},
 };
 use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
 use reth_storage_api::{StateProviderBox, StateProviderFactory};
-use std::{
-    collections::BTreeSet,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Instant,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tracing::warn;
 
 /// Public protocol material, not an authentication secret.
@@ -91,10 +83,15 @@ where
                 .max_payload_tasks(conf.max_payload_tasks),
             payload_builder,
         );
-        let notifications = CanonicalQueueStream {
-            inner: ctx.provider().canonical_state_stream(),
-            provider: ctx.provider().clone(),
-        };
+        let provider = ctx.provider().clone();
+        let notifications = ctx
+            .provider()
+            .canonical_state_stream()
+            .inspect(move |notification| {
+                if let Err(error) = apply_canonical_update(&provider, notification) {
+                    warn!(target: "arkiv-reth", %error, "failed to update expiry queue");
+                }
+            });
         let (service, handle) = PayloadBuilderService::new(generator, notifications);
         ctx.task_executor().spawn_critical_os_thread(
             "payload-service",
@@ -102,32 +99,6 @@ where
             service,
         );
         Ok(handle)
-    }
-}
-
-/// Canonical notifications update the process-local queue before the payload
-/// generator sees the new head. Speculative execution never reaches this stream.
-struct CanonicalQueueStream<P> {
-    inner: CanonStateNotificationStream<EthPrimitives>,
-    provider: P,
-}
-
-impl<P> Stream for CanonicalQueueStream<P>
-where
-    P: StateProviderFactory + Unpin,
-{
-    type Item = CanonStateNotification<EthPrimitives>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(notification)) => {
-                if let Err(error) = apply_canonical_update(&self.provider, &notification) {
-                    warn!(target: "arkiv-reth", %error, "failed to update expiry queue");
-                }
-                Poll::Ready(Some(notification))
-            }
-            other => other,
-        }
     }
 }
 
