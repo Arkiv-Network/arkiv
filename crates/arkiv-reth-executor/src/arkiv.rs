@@ -7,6 +7,7 @@ use core::fmt;
 use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
+use arkiv_interfaces::constants::ENTITY_MAX_ATTRIBUTES;
 use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity, annotations};
 use arkiv_interfaces::execution::{
     AttributeMutation, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
@@ -213,7 +214,16 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                         }
                         Ok(())
                     },
-                    |e| apply_mutations(e, mutations),
+                    |e| {
+                        apply_mutations(e, mutations);
+                        if e.attributes.len() > ENTITY_MAX_ATTRIBUTES {
+                            return Err(RevertReason::TooManyAttributes {
+                                count: e.attributes.len(),
+                                max: ENTITY_MAX_ATTRIBUTES,
+                            });
+                        }
+                        Ok(())
+                    },
                 )
                 .map(|r| {
                     r.map(|(owner, expires_at)| self.effect(*key, OpKind::Patch, owner, expires_at))
@@ -243,6 +253,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     },
                     |e| {
                         e.expires_at = *new_expires_at;
+                        Ok(())
                     },
                 )
                 .map(|r| {
@@ -266,6 +277,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     },
                     |e| {
                         e.owner = *new_owner;
+                        Ok(())
                     },
                 )
                 .map(|r| {
@@ -325,7 +337,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         key: EntityAddress,
         auth: Auth,
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
-        edit: impl FnOnce(&mut Entity),
+        edit: impl FnOnce(&mut Entity) -> Result<(), RevertReason>,
     ) -> Result<Result<(UserAddress, BlockNumber), RevertReason>, ExecError> {
         let Some(mut entity) = self.current(state, overlay, key)? else {
             return Ok(Err(RevertReason::NotFound { key }));
@@ -346,7 +358,9 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         if let Err(reason) = check(&entity) {
             return Ok(Err(reason));
         }
-        edit(&mut entity);
+        if let Err(reason) = edit(&mut entity) {
+            return Ok(Err(reason));
+        }
         entity.last_modified_at_block = env.block_number;
         let post_op = (entity.owner, entity.expires_at);
         overlay.insert(key, Some(entity));
@@ -482,6 +496,7 @@ impl std::error::Error for ExecError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkiv_interfaces::constants::OP_MAX_ATTRIBUTES;
     use arkiv_interfaces::entity::AttributeValue;
     use arkiv_interfaces::statemanager::{BlockRef, EntityStore, StateView};
     use arkiv_reth_statemanager::MptStateView;
@@ -912,6 +927,71 @@ mod tests {
         let e = staged(&view, [7u8; 32]).unwrap();
         assert_eq!(e.attributes.len(), 1);
         assert_eq!(e.attributes[0].key, b"size");
+    }
+
+    #[test]
+    fn patches_cannot_exceed_the_entity_attribute_limit() {
+        let exec = ArkivExecutor::<View>::new();
+        let mut view = fresh_view();
+        let owner = [0xAA; 20];
+        let key = [8u8; 32];
+
+        let mutations = |start: usize, count: usize| {
+            (start..start + count)
+                .map(|i| {
+                    AttributeMutation::set(
+                        format!("attribute-{i:03}").into_bytes(),
+                        AttributeValue::u256_from_u64(i as u64),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut ops = vec![Op::Create {
+            key,
+            expires_at: 100,
+            creation_flags: CreationFlags::NONE,
+            content_type: Vec::new(),
+            payload: Vec::new(),
+            attributes: Vec::new(),
+        }];
+        for start in (0..ENTITY_MAX_ATTRIBUTES).step_by(OP_MAX_ATTRIBUTES) {
+            ops.push(Op::Patch {
+                key,
+                mutations: mutations(start, OP_MAX_ATTRIBUTES),
+            });
+        }
+
+        let out = exec.apply(&env(owner, 10), &mut view, &ops).unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(
+            staged(&view, key).unwrap().attributes.len(),
+            ENTITY_MAX_ATTRIBUTES
+        );
+
+        let out = exec
+            .apply(
+                &env(owner, 11),
+                &mut view,
+                &[Op::Patch {
+                    key,
+                    mutations: mutations(ENTITY_MAX_ATTRIBUTES, 1),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(out.status, ExecStatus::Reverted);
+        assert_eq!(
+            out.revert,
+            Some(RevertReason::TooManyAttributes {
+                count: ENTITY_MAX_ATTRIBUTES + 1,
+                max: ENTITY_MAX_ATTRIBUTES,
+            })
+        );
+        assert_eq!(
+            staged(&view, key).unwrap().attributes.len(),
+            ENTITY_MAX_ATTRIBUTES
+        );
     }
 
     /// Expiry is final: at `expires_at` the owner can no longer mutate — you

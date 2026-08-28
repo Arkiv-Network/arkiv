@@ -65,6 +65,8 @@ pub enum RevertReason {
     },
     /// A `Patch` targeted an entity created with the `readonly` flag.
     ReadOnly { key: EntityAddress },
+    /// A `Patch` would leave the entity with too many user attributes.
+    TooManyAttributes { count: usize, max: usize },
     /// An `ExtendExpiry` would have moved the expiry backwards.
     ExpiryNotExtended {
         key: EntityAddress,
@@ -110,6 +112,9 @@ impl fmt::Display for RevertReason {
                 write!(f, "entity ")?;
                 hex(f, key)?;
                 write!(f, " is read-only")
+            }
+            Self::TooManyAttributes { count, max } => {
+                write!(f, "too many attributes ({count} > {max})")
             }
             Self::ExpiryNotExtended {
                 key,

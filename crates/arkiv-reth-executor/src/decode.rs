@@ -37,8 +37,8 @@ use core::fmt;
 use alloy_primitives::{Address, U256, keccak256};
 use alloy_sol_types::SolCall;
 use arkiv_bindings::{
-    Attribute as AbiAttribute, Create, Delete, ExtendExpiry, IEntityRegistry, MAX_ATTRIBUTES,
-    OP_CREATE, OP_DELETE, OP_EXTEND_EXPIRY, OP_PATCH, OP_TRANSFER_OWNERSHIP, Operation, Patch,
+    Attribute as AbiAttribute, Create, Delete, ExtendExpiry, IEntityRegistry, OP_CREATE, OP_DELETE,
+    OP_EXTEND_EXPIRY, OP_MAX_ATTRIBUTES, OP_PATCH, OP_TRANSFER_OWNERSHIP, Operation, Patch,
     TransferOwnership,
     encode::{AttrAbiError, OpAbiError},
     types::{Ident32ByteError, validate_ident32_bytes, validate_system_ident32_bytes},
@@ -259,13 +259,13 @@ fn convert_mutations(attrs: &[AbiAttribute]) -> Result<Vec<AttributeMutation>, D
 }
 
 /// The structural rules every triple list obeys, whichever op carries it: at
-/// most [`MAX_ATTRIBUTES`], valid `Ident32` names, strictly ascending by name
+/// most [`OP_MAX_ATTRIBUTES`], valid `Ident32` names, strictly ascending by name
 /// (which also enforces uniqueness), and no engine-controlled `$` name.
 fn check_triple_list(attrs: &[AbiAttribute]) -> Result<(), DecodeError> {
-    if attrs.len() > MAX_ATTRIBUTES {
+    if attrs.len() > OP_MAX_ATTRIBUTES {
         return Err(DecodeError::TooManyAttributes {
             count: attrs.len(),
-            max: MAX_ATTRIBUTES,
+            max: OP_MAX_ATTRIBUTES,
         });
     }
     for a in attrs {
