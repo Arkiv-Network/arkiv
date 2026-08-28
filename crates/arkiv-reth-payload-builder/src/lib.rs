@@ -5,7 +5,7 @@ use alloy_consensus::{
     transaction::SignerRecoverable,
 };
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_primitives::{B256, Bytes, TxKind, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
@@ -13,7 +13,8 @@ use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
 use arkiv_reth_executor::{ARKIV_ADDRESS, expiry_queue::expiry_queue};
-use arkiv_reth_mpt_committed_store::{AccountCode, CodeBackend, RethEntityStore};
+use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
+use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
     BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
@@ -25,10 +26,7 @@ use reth_ethereum::{
     evm::primitives::{ConfigureEvm, NextBlockEnvAttributes},
     node::{
         api::{FullNodeTypes, NodeTypes},
-        builder::{
-            BuilderContext, PayloadBuilderConfig,
-            components::{PayloadBuilderBuilder, PayloadServiceBuilder},
-        },
+        builder::{BuilderContext, PayloadBuilderConfig, components::PayloadServiceBuilder},
     },
     pool::{
         BestTransactions, EthPooledTransaction, TransactionOrigin, TransactionPool,
@@ -39,7 +37,7 @@ use reth_ethereum::{
 use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
-use reth_storage_api::{StateProviderBox, StateProviderFactory};
+use reth_storage_api::StateProviderFactory;
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use tracing::warn;
 
@@ -70,9 +68,14 @@ where
         pool: Pool,
         evm: Evm,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let payload_builder = ArkivPayloadBuilderBuilder
-            .build_payload_builder(ctx, pool, evm)
-            .await?;
+        let payload_builder = ArkivPayloadBuilder {
+            client: ctx.provider().clone(),
+            pool,
+            evm,
+            chain_id: ctx.chain_spec().chain().id(),
+            config: EthereumBuilderConfig::new()
+                .with_extra_data(ctx.payload_builder_config().extra_data()),
+        };
         let conf = ctx.config().builder.clone();
         let generator = BasicPayloadJobGenerator::with_builder(
             ctx.provider().clone(),
@@ -133,7 +136,7 @@ where
     let state = provider
         .state_by_block_hash(state_hash)
         .map_err(|error| eyre::eyre!("canonical state {state_hash}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode(state)));
+    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
     let mut queue = expiry_queue()
         .write()
         .map_err(|_| eyre::eyre!("expiry queue poisoned"))?;
@@ -177,64 +180,6 @@ fn collect_touched_keys(chain: &Chain<EthPrimitives>, keys: &mut BTreeSet<B256>)
         if let Ok(call) = purgeExpiredCall::abi_decode(transaction.input()) {
             keys.extend(call.entityKeys);
         }
-    }
-}
-
-struct SnapshotAccountCode(StateProviderBox);
-
-impl AccountCode for SnapshotAccountCode {
-    type Error = eyre::Report;
-
-    fn code(&mut self, address: Address) -> Result<Vec<u8>, Self::Error> {
-        Ok(self
-            .0
-            .account_code(&address)
-            .map_err(|error| eyre::eyre!("account_code({address}): {error:?}"))?
-            .map(|code| code.original_bytes().to_vec())
-            .unwrap_or_default())
-    }
-
-    fn set_code(&mut self, _address: Address, _code: Vec<u8>) -> Result<(), Self::Error> {
-        eyre::bail!("canonical snapshot is read-only")
-    }
-
-    fn clear_code(&mut self, _address: Address) -> Result<(), Self::Error> {
-        eyre::bail!("canonical snapshot is read-only")
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ArkivPayloadBuilderBuilder;
-
-impl<Node, Pool, Evm> PayloadBuilderBuilder<Node, Pool, Evm> for ArkivPayloadBuilderBuilder
-where
-    Node: FullNodeTypes<
-        Types: NodeTypes<
-            ChainSpec = ChainSpec,
-            Primitives = EthPrimitives,
-            Payload = EthEngineTypes,
-        >,
-    >,
-    Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + 'static,
-    Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>
-        + 'static,
-{
-    type PayloadBuilder = ArkivPayloadBuilder<Pool, Node::Provider, Evm>;
-
-    async fn build_payload_builder(
-        self,
-        ctx: &BuilderContext<Node>,
-        pool: Pool,
-        evm: Evm,
-    ) -> eyre::Result<Self::PayloadBuilder> {
-        Ok(ArkivPayloadBuilder {
-            client: ctx.provider().clone(),
-            pool,
-            evm,
-            chain_id: ctx.chain_spec().chain().id(),
-            config: EthereumBuilderConfig::new()
-                .with_extra_data(ctx.payload_builder_config().extra_data()),
-        })
     }
 }
 

@@ -69,7 +69,6 @@ alloy-eips = "2.3"
 alloy-sol-types = "1.6.1"
 alloy-provider = "2.3"
 alloy-signer-local = { version = "2.3", features = ["mnemonic"] }
-alloy-signer = "2.3"
 alloy-rpc-types-engine = "2.3"
 futures-util = "0.3"
 alloy-network = "2.3"
