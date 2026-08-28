@@ -9,7 +9,9 @@ use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
-use arkiv_bindings::{IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT};
+use arkiv_bindings::{
+    IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
+};
 use arkiv_reth_executor::{ARKIV_ADDRESS, expiry_queue::expiry_queue};
 use arkiv_reth_mpt_committed_store::{AccountCode, CodeBackend, RethEntityStore};
 use futures_core::Stream;
@@ -197,13 +199,11 @@ fn collect_touched_keys(chain: &Chain<EthPrimitives>, keys: &mut BTreeSet<B256>)
     }
     for transaction in chain.transactions_iter() {
         if transaction.to() != Some(ARKIV_ADDRESS)
-            || !transaction
-                .input()
-                .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR)
+            || !transaction.input().starts_with(&purgeExpiredCall::SELECTOR)
         {
             continue;
         }
-        if let Ok(call) = IEntityRegistry::purgeExpiredCall::abi_decode(transaction.input()) {
+        if let Ok(call) = purgeExpiredCall::abi_decode(transaction.input()) {
             keys.extend(call.entityKeys);
         }
     }
@@ -341,9 +341,7 @@ fn protocol_transaction(
     block: u64,
     keys: Vec<alloy_primitives::B256>,
 ) -> Arc<ValidPoolTransaction<EthPooledTransaction>> {
-    let input: Bytes = IEntityRegistry::purgeExpiredCall { entityKeys: keys }
-        .abi_encode()
-        .into();
+    let input: Bytes = purgeExpiredCall { entityKeys: keys }.abi_encode().into();
     let mut tx = TxEip1559 {
         chain_id,
         nonce: block,

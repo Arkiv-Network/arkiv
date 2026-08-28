@@ -16,7 +16,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     Attribute, AttributeType, AttributeValue, ENTITY_MAX_ATTRIBUTES, IEntityRegistry, Ident32,
-    MAX_PURGE_KEYS, Operation,
+    MAX_PURGE_KEYS, Operation, protocol::purgeExpiredCall,
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
@@ -1366,9 +1366,7 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
     let purge = TransactionRequest::default()
         .with_to(ARKIV_ADDRESS)
         // Selector only: deliberately malformed ABI for purgeExpired(bytes32[]).
-        .with_input(Bytes::copy_from_slice(
-            &IEntityRegistry::purgeExpiredCall::SELECTOR,
-        ))
+        .with_input(Bytes::copy_from_slice(&purgeExpiredCall::SELECTOR))
         .with_nonce(nonce)
         .with_gas_limit(1_000_000)
         .with_gas_price(1_000_000_000)

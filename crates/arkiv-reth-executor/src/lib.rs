@@ -73,7 +73,7 @@ pub use decode::{DecodeError, decode_ops, derive_entity_address};
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_sol_types::{SolCall, SolError, SolEvent};
-use arkiv_bindings::IEntityRegistry;
+use arkiv_bindings::{IEntityRegistry, protocol::purgeExpiredCall};
 use reth_ethereum::{
     EthPrimitives,
     chainspec::ChainSpec,
@@ -237,9 +237,7 @@ where
         let chain_id = self.inner.chain_id();
         let db = self.inner.db_mut();
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
-            && tx
-                .data
-                .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR);
+            && tx.data.starts_with(&purgeExpiredCall::SELECTOR);
         let is_protocol_purge = is_protocol_purge(&tx, block_number, chain_id);
         if has_purge_selector && !is_protocol_purge {
             return Err(invalid_transaction("purgeExpired is protocol-only"));
@@ -284,9 +282,7 @@ fn is_protocol_purge(tx: &TxEnv, block_number: u64, chain_id: u64) -> bool {
     tx.tx_type == 2
         && tx.caller == PURGE_CALLER
         && tx.kind == TxKind::Call(ARKIV_ADDRESS)
-        && tx
-            .data
-            .starts_with(&IEntityRegistry::purgeExpiredCall::SELECTOR)
+        && tx.data.starts_with(&purgeExpiredCall::SELECTOR)
         && tx.nonce == block_number
         && tx.chain_id == Some(chain_id)
         && tx.gas_limit == PURGE_GAS_LIMIT
@@ -378,7 +374,7 @@ fn arkiv_transact<DB: Database>(
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
             return arkiv_attribute_type_id_call(db, &tx, block_number);
         }
-        if selector == IEntityRegistry::purgeExpiredCall::SELECTOR {
+        if selector == purgeExpiredCall::SELECTOR {
             return arkiv_purge_expired(db, block_number, &tx);
         }
         return arkiv_entity_transact(db, block_number, &tx);
@@ -426,7 +422,7 @@ fn arkiv_purge_expired<DB: Database>(
     if tx.gas_limit < intrinsic_gas(&tx.data) {
         return Ok(out_of_gas());
     }
-    let call = IEntityRegistry::purgeExpiredCall::abi_decode_raw(&tx.data[4..])
+    let call = purgeExpiredCall::abi_decode_raw(&tx.data[4..])
         .map_err(|e| invalid_transaction(format!("invalid purgeExpired calldata: {e}")))?;
     if call.entityKeys.len() > MAX_PURGE_KEYS {
         return Err(invalid_transaction(format!(
@@ -963,9 +959,7 @@ mod tests {
             gas_limit: PURGE_GAS_LIMIT,
             gas_price: u128::MAX,
             kind: TxKind::Call(ARKIV_ADDRESS),
-            data: IEntityRegistry::purgeExpiredCall { entityKeys: keys }
-                .abi_encode()
-                .into(),
+            data: purgeExpiredCall { entityKeys: keys }.abi_encode().into(),
             nonce: block,
             chain_id: Some(1),
             gas_priority_fee: Some(0),
@@ -997,7 +991,7 @@ mod tests {
 
         let mut db = EmptyDB::default();
         let mut malformed = protocol_purge_tx(10, Vec::new());
-        malformed.data = IEntityRegistry::purgeExpiredCall::SELECTOR.into();
+        malformed.data = purgeExpiredCall::SELECTOR.into();
         let error = arkiv_purge_expired(&mut db, 10, &malformed).unwrap_err();
         assert!(error.try_into_invalid_tx_err().is_ok());
 
