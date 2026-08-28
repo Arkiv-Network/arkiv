@@ -441,10 +441,7 @@ impl Auth {
 /// Set some attributes, unset others, leave the rest untouched. `$payload` and
 /// `$contentType` route to the entity's own fields; every other `$` name was
 /// rejected at decode.
-fn apply_mutations(
-    entity: &mut Entity,
-    mutations: &[AttributeMutation],
-) -> Result<(), RevertReason> {
+fn apply_mutations(entity: &mut Entity, mutations: &[AttributeMutation]) {
     for m in mutations {
         match m.key.as_slice() {
             annotations::PAYLOAD => {
@@ -469,13 +466,6 @@ fn apply_mutations(
     }
     // The stored order is canonical, and a push above may have broken it.
     entity.attributes.sort_by(|a, b| a.key.cmp(&b.key));
-    if entity.attributes.len() > arkiv_interfaces::constants::MAX_ATTRIBUTES {
-        return Err(RevertReason::TooManyAttributes {
-            count: entity.attributes.len(),
-            max: arkiv_interfaces::constants::MAX_ATTRIBUTES,
-        });
-    }
-    Ok(())
 }
 
 /// Errors that abort execution as a host/store fault (as opposed to a revert,

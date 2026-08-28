@@ -65,11 +65,6 @@ pub fn revert_data(reason: &RevertReason) -> Bytes {
             entityKey: B256::from(*key),
         }
         .abi_encode(),
-        RevertReason::TooManyAttributes { count, max } => E::TooManyAttributes {
-            count: alloy_primitives::U256::from(*count),
-            maxCount: alloy_primitives::U256::from(*max),
-        }
-        .abi_encode(),
         // No ABI counterpart — the standard `Error(string)` keeps them readable.
         RevertReason::AlreadyExists { .. } | RevertReason::OutOfGas => {
             Revert::from(reason.to_string()).abi_encode()

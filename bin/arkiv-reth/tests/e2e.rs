@@ -15,7 +15,8 @@ use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
-    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, MAX_PURGE_KEYS, Operation,
+    Attribute, AttributeType, AttributeValue, ENTITY_MAX_ATTRIBUTES, IEntityRegistry, Ident32,
+    MAX_PURGE_KEYS, Operation,
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
@@ -1107,12 +1108,12 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
     // Each patch grows the stored entity to the per-operation maximum. Six
     // purges would cost 1.02m gas, so only five fit in the 1m transaction.
     for (entity, key) in keys.iter().enumerate() {
-        let attributes = (0..32)
+        let attributes = (0..ENTITY_MAX_ATTRIBUTES)
             .map(|offset| {
                 let name = format!("a{entity}_{offset:02}");
                 Attribute::from_value(
                     Ident32::encode(&name).unwrap(),
-                    &AttributeValue::u256_from_u64(offset),
+                    &AttributeValue::u256_from_u64(offset as u64),
                 )
                 .unwrap()
             })
@@ -1127,7 +1128,7 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
                 .as_array()
                 .unwrap()
                 .len(),
-            32
+            ENTITY_MAX_ATTRIBUTES
         );
     }
 

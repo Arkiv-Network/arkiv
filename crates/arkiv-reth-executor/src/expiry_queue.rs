@@ -108,8 +108,8 @@ mod tests {
 
     #[test]
     fn maximum_entity_purge_fits_the_gas_limit() {
-        use arkiv_bindings::{MAX_ATTRIBUTES, PURGE_GAS_LIMIT};
+        use arkiv_bindings::{ENTITY_MAX_ATTRIBUTES, PURGE_GAS_LIMIT};
 
-        assert!(purge_cost(MAX_ATTRIBUTES) < PURGE_GAS_LIMIT);
+        assert!(purge_cost(ENTITY_MAX_ATTRIBUTES) < PURGE_GAS_LIMIT);
     }
 }
