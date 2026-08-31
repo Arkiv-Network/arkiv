@@ -962,6 +962,9 @@ mod tests {
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("set = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("Set = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("SET = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("seT = true"), ParseErrorKind::MalformedInputError);
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");
