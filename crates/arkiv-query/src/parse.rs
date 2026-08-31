@@ -31,6 +31,10 @@ use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
 use crate::limits;
 use crate::literal;
 
+/// Names reserved for possible future language features, so they cannot be
+/// used as attribute names.
+const RESERVED_NAMES: [&str; 1] = ["set"];
+
 /// Parse a query string into a [`Query`] AST. See the [module docs](self).
 pub fn parse(input: &str) -> Result<Query, ParseError> {
     if input.len() > limits::MAX_QUERY_BYTES {
@@ -450,8 +454,6 @@ fn check_operator(operator: &Token, value: &AnnotVal, position: usize) -> Result
 /// reserved names. Type tags are only tags in front of a `(`, so a bare `str`
 /// arrives here as an ordinary name and has to be rejected by hand.
 fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
-    const RESERVED_NAMES: [&str; 1] = ["set"];
-
     if name.len() > limits::MAX_ATTRIBUTE_NAME_BYTES {
         return Err(ParseError::syntax(
             position,
