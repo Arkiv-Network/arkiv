@@ -7,6 +7,7 @@
 //! RPC.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes};
@@ -47,6 +48,39 @@ fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
         attr("rank", AttributeValue::u256_from_u64(rank)),
         attr("team", AttributeValue::Str(team.into())),
     ]
+}
+
+fn pruning_map_files(root: &Path) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return matches;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            matches.extend(pruning_map_files(&path));
+        } else if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("arkiv-pruning.db"))
+        {
+            matches.push(path);
+        }
+    }
+    matches
+}
+
+async fn wait_for_physical_purge(
+    client: &arkiv_harness::ArkivClient<impl alloy_provider::Provider>,
+    key: B256,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while client.debug_entity_exists(key).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the entity was not physically purged within 30 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -128,4 +162,86 @@ async fn state_and_index_survive_kill_and_restart() {
         3,
         "new writes work after recovery"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pruning_schedule_survives_kill_and_restart() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+
+    client
+        .execute(vec![create_op(
+            30,
+            Bytes::from_static(b"persistent-pruning"),
+            vec![],
+        )])
+        .await;
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    let entity = client.get_entity(key).await;
+    let created_at = hex_quantity(&entity["createdAt"]);
+    let expires_at = hex_quantity(&entity["expiresAt"]);
+    client
+        .wait_for_block(created_at + 20, Duration::from_secs(30))
+        .await;
+
+    node.kill();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node.restart();
+    node.wait_ready(&client, READY).await;
+    client
+        .wait_for_block(expires_at + 5, Duration::from_secs(30))
+        .await;
+    wait_for_physical_purge(&client, key).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pruning_schedule_rebuilds_from_chain_history() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+
+    client
+        .execute(vec![create_op(
+            40,
+            Bytes::from_static(b"replayed-pruning"),
+            vec![],
+        )])
+        .await;
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    let entity = client.get_entity(key).await;
+    let created_at = hex_quantity(&entity["createdAt"]);
+    let expires_at = hex_quantity(&entity["expiresAt"]);
+    client
+        .wait_for_block(created_at + 20, Duration::from_secs(30))
+        .await;
+
+    node.kill();
+    let map_files = pruning_map_files(node.datadir());
+    assert!(!map_files.is_empty(), "the pruning map exists before loss");
+    for path in map_files {
+        std::fs::remove_file(&path)
+            .unwrap_or_else(|error| panic!("remove {}: {error}", path.display()));
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node.restart();
+    node.wait_ready(&client, READY).await;
+    client
+        .wait_for_block(expires_at + 5, Duration::from_secs(30))
+        .await;
+    wait_for_physical_purge(&client, key).await;
 }

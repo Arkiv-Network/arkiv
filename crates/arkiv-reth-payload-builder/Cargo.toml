@@ -13,6 +13,7 @@ alloy-signer-local.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-sol-types.workspace = true
 arkiv-bindings.workspace = true
+arkiv-interfaces.workspace = true
 arkiv-reth-executor.workspace = true
 arkiv-reth-mpt-committed-store.workspace = true
 arkiv-reth-rpc.workspace = true
@@ -26,3 +27,8 @@ reth-payload-builder-primitives.workspace = true
 reth-node-ethereum.workspace = true
 reth-storage-api.workspace = true
 tracing.workspace = true
+turso.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
