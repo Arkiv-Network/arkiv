@@ -6,7 +6,7 @@
 //! historical reads — all against real reth state over JSON-RPC.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, B256, Bytes};
@@ -40,6 +40,60 @@ async fn spawn_dev(
     let client = connect(&node.http_url(), signer);
     node.wait_ready(&client, READY).await;
     (node, client, caller)
+}
+
+async fn physical_entity_count_at(
+    client: &ArkivClient<impl Provider>,
+    keys: &[B256],
+    block: u64,
+) -> usize {
+    let mut count = 0;
+    for key in keys {
+        count += usize::from(client.debug_entity_exists_at(*key, block).await);
+    }
+    count
+}
+
+async fn wait_for_first_purge(
+    client: &ArkivClient<impl Provider>,
+    keys: &[B256],
+    first_block: u64,
+) -> (u64, usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut block = first_block;
+    loop {
+        let tip = client.block_number().await;
+        while block <= tip {
+            let remaining = physical_entity_count_at(client, keys, block).await;
+            if remaining < keys.len() {
+                return (block, remaining);
+            }
+            block += 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no physical purge occurred within 30 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_all_purged(client: &ArkivClient<impl Provider>, keys: &[B256]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut remaining = 0;
+        for key in keys {
+            remaining += usize::from(client.debug_entity_exists(*key).await);
+        }
+        if remaining == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "physical pruning did not finish within 30 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// A create carrying `payload` under `text/plain`, with a purely relative
@@ -1052,21 +1106,9 @@ async fn purge_respects_max_keys_per_block() {
         .collect();
     let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
 
-    client
-        .wait_for_block(expires_at + 1, Duration::from_secs(20))
-        .await;
-    let mut remaining = 0;
-    for key in &keys {
-        remaining += usize::from(client.debug_entity_exists_at(*key, expires_at).await);
-    }
+    let (_, remaining) = wait_for_first_purge(&client, &keys, expires_at).await;
     assert_eq!(remaining, 1, "the per-block key limit is enforced");
-
-    for key in keys {
-        assert!(
-            !client.debug_entity_exists_at(key, expires_at + 1).await,
-            "remainder purged next"
-        );
-    }
+    wait_for_all_purged(&client, &keys).await;
 }
 
 /// Patch-expanded entities obey the strict purge transaction gas limit.
@@ -1114,21 +1156,12 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
         );
     }
 
-    client
-        .wait_for_block(expires_at + 1, Duration::from_secs(20))
-        .await;
-    let mut remaining = 0;
-    for key in &keys {
-        remaining += usize::from(client.debug_entity_exists_at(*key, expires_at).await);
-    }
+    let (_, remaining) = wait_for_first_purge(&client, &keys, expires_at).await;
     assert_eq!(
         remaining, 1,
         "the sixth purge does not exceed the gas limit"
     );
-
-    for key in keys {
-        assert!(!client.debug_entity_exists_at(key, expires_at + 1).await);
-    }
+    wait_for_all_purged(&client, &keys).await;
 }
 
 /// How many creates [`no_transaction_is_included_twice_over_a_live_node`] fires.

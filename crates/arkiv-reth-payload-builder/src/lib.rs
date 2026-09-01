@@ -98,12 +98,24 @@ where
                 .max_payload_tasks(conf.max_payload_tasks),
             payload_builder,
         );
-        catch_up(ctx.provider().clone(), pruning_map.clone()).await?;
+        spawn_catch_up(
+            ctx.task_executor(),
+            ctx.provider().clone(),
+            pruning_map.clone(),
+        );
         let provider = ctx.provider().clone();
-        let executor = ctx.task_executor().clone();
-        let notifications = ctx.provider().canonical_state_stream().inspect(move |_| {
-            spawn_catch_up(&executor, provider.clone(), pruning_map.clone());
-        });
+        let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
+            move |notification| {
+                let provider = provider.clone();
+                let pruning_map = pruning_map.clone();
+                async move {
+                    if let Err(error) = catch_up(provider, pruning_map).await {
+                        warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
+                    }
+                    notification
+                }
+            },
+        ));
         let (service, handle) = PayloadBuilderService::new(generator, notifications);
         ctx.task_executor().spawn_critical_os_thread(
             "payload-service",
