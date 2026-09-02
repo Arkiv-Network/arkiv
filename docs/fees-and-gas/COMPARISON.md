@@ -1,7 +1,8 @@
 # Base fee: before and after the minimum-base-fee rule
 
-Quick reference for what changes when `scx1332/min-base-fee` lands. Details and
-source references are in [base-fee.md](base-fee.md).
+Quick reference for what changes when `scx1332/min-base-fee` and
+`scx1332/effective-gas-price` land. Details and source references are in
+[base-fee.md](base-fee.md).
 
 | | Before (`v0.1.0`, `main` today) | After merge |
 |---|---|---|
@@ -17,5 +18,7 @@ source references are in [base-fee.md](base-fee.md).
 | Tiramisu (1 gwei genesis) | Sits at 7 wei when below target | Would sit at 1 gwei; needs a new network, old nodes reject the blocks |
 | Consensus compatibility | — | Breaking: old and new nodes diverge once the fee would drop below the floor |
 | Tx pool minimum (`--txpool.minimal-protocol-fee`) | 7 wei default, unchanged | 7 wei default, unchanged; set it to the genesis base fee so under-priced txs fail at submission instead of parking |
-| What a sender pays (executor) | `gas_used × max_fee_per_gas`, burned | Unchanged; but the pool now only offers txs with fee cap ≥ floor, so every sender pays at least the floor per gas |
+| What a sender pays (executor) | `gas_used × max_fee_per_gas` (the fee cap), all burned | `gas_used × min(max_fee, base_fee + tip)`: base-fee share burned, tip to the block beneficiary |
+| Receipt `effectiveGasPrice` vs. balance change | Disagree whenever `max_fee > base_fee + tip` | Agree |
+| Fee validation in the executor | None: fee cap vs. base fee unchecked, balance debit saturates (underfunded senders still succeed) | Fee cap ≥ base fee, tip ≤ fee cap, balance ≥ `gas_limit × max_fee + value`; typed rejections the builder skips on |
 | Block gas limit | Drifts to 36 M unless `--builder.gaslimit` is set | Unchanged |
