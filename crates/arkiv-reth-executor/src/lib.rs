@@ -247,13 +247,19 @@ fn charge_sender<DB: Database>(
 }
 
 /// Which of revm's pre-execution fee checks to run. Each maps to a `CfgEnv`
-/// flag reth sets for a specific RPC path (`eth_call` / `eth_estimateGas`
-/// disable the base-fee check, `eth_simulateV1` the balance check, ...).
+/// flag reth sets for a specific path: `eth_call` / `eth_estimateGas` disable
+/// the base-fee check and fee charging; engine-tree payload prewarming disables
+/// the balance check (with the nonce and base-fee checks) because its results
+/// are cache-only.
 #[derive(Debug, Clone, Copy)]
 struct FeeChecks {
     base_fee: bool,
     priority_fee: bool,
     balance: bool,
+    /// Whether gas will be charged at all (`disable_fee_charge` off). When it
+    /// will not, the balance only has to cover the value: revm's
+    /// `calculate_caller_fee` returns before its balance check in that case.
+    charge: bool,
 }
 
 impl FeeChecks {
@@ -264,6 +270,7 @@ impl FeeChecks {
             base_fee: !cfg.is_base_fee_check_disabled(),
             priority_fee: !cfg.is_priority_fee_check_disabled(),
             balance: !cfg.is_balance_check_disabled(),
+            charge: !cfg.is_fee_charge_disabled(),
         }
     }
 }
@@ -325,7 +332,7 @@ where
         let nonce_check = !self.cfg_env().is_nonce_check_disabled();
         let fee_checks = FeeChecks::from_cfg(self.cfg_env());
         let fees = FeeEnv {
-            charge: !self.cfg_env().is_fee_charge_disabled(),
+            charge: fee_checks.charge,
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
@@ -435,7 +442,10 @@ fn validate_nonce<DB: Database>(db: &mut DB, tx: &TxEnv) -> Result<(), EVMError<
 ///   built block the pool guarantees this, for a block received over the Engine
 ///   API or P2P nothing else does;
 /// - the sender must be able to afford the maximum spend, `gas_limit × max_fee +
-///   value`, the same bound the pool admits on.
+///   value`, the same bound the pool admits on. With fee charging disabled
+///   (`eth_call`, `eth_estimateGas`) only the value has to be covered: revm skips
+///   the gas bound there, and the value bound keeps [`charge_sender`]'s saturating
+///   debit from moving value the sender does not have.
 ///
 /// All three are typed [`InvalidTransaction`]s, for the reason [`validate_nonce`]
 /// spells out: the payload builder skips a transaction on those and aborts the
@@ -458,9 +468,13 @@ fn validate_fees<DB: Database>(
         ));
     }
     if checks.balance {
-        let max_spend = U256::from(tx.gas_limit)
-            .saturating_mul(U256::from(max_fee))
-            .saturating_add(tx.value);
+        let max_spend = if checks.charge {
+            U256::from(tx.gas_limit)
+                .saturating_mul(U256::from(max_fee))
+                .saturating_add(tx.value)
+        } else {
+            tx.value
+        };
         let balance = db
             .basic(tx.caller)
             .map_err(EVMError::Database)?
@@ -1839,6 +1853,7 @@ mod tests {
         base_fee: true,
         priority_fee: true,
         balance: true,
+        charge: true,
     };
 
     /// The sender pays `gas_used × min(max_fee, base_fee + tip)`, not the fee
@@ -2038,13 +2053,43 @@ mod tests {
         let mut db = funded_db(&[(alice, gas * 10 + 100)]);
         validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect("can afford the max spend");
 
-        // And the check can be switched off (eth_simulateV1 without validation).
+        // And the check can be switched off (engine-tree payload prewarming).
         let mut db = funded_db(&[(alice, 0)]);
         let relaxed = FeeChecks {
             balance: false,
             ..ALL_CHECKS
         };
         validate_fees(&mut db, &tx, 5, relaxed).expect("balance check disabled");
+    }
+
+    /// With fee charging disabled (reth's `eth_call` / `eth_estimateGas`) the
+    /// sender need not afford the gas — revm skips that bound — but must still
+    /// cover the value, or the dry run would move value that does not exist.
+    #[test]
+    fn with_charging_disabled_only_the_value_must_be_covered() {
+        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
+        let dry_run = FeeChecks {
+            charge: false,
+            ..ALL_CHECKS
+        };
+        // Explicit gas and fee cap far beyond the sender's means, as a wallet's
+        // eth_call may carry; the value itself is covered exactly.
+        let tx = transfer_tx(alice, carol, 100, 1_000_000_000, Some(3));
+
+        let mut db = funded_db(&[(alice, 100)]);
+        validate_fees(&mut db, &tx, 5, dry_run).expect("gas is not charged, value is covered");
+        assert!(
+            validate_fees(&mut db, &tx, 5, ALL_CHECKS).is_err(),
+            "the same sender cannot afford the gas once it is charged",
+        );
+
+        let mut db = funded_db(&[(alice, 99)]);
+        let err = validate_fees(&mut db, &tx, 5, dry_run).expect_err("one wei short of the value");
+        assert!(matches!(
+            err,
+            EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance })
+                if *fee == U256::from(100) && *balance == U256::from(99)
+        ));
     }
 
     /// With charging disabled (reth's `eth_call` / `eth_estimateGas`) the value
