@@ -193,10 +193,11 @@ they match revm:
   invalid-transaction errors so the payload builder skips the transaction
   rather than aborting the block: the priority fee may not exceed the fee cap;
   the effective price may not fall below the block base fee; the sender must
-  cover `gas_limit × max_fee + value`. Each honours the revm `CfgEnv` flag reth
-  sets for the matching RPC path (`eth_call` and `eth_estimateGas` disable the
-  base-fee check and fee charging; `eth_simulateV1` without validation disables
-  the balance check).
+  cover `gas_limit × max_fee + value`, or just the value when gas is not going
+  to be charged. Each honours the revm `CfgEnv` flag reth sets for the matching
+  path (`eth_call` and `eth_estimateGas` disable the base-fee check and fee
+  charging; engine-tree payload prewarming, whose results are cache-only,
+  disables the balance check along with the nonce and base-fee checks).
 - **Settlement** (`charge_sender`): the sender pays `gas_used × effective`,
   where `effective = min(max_fee, base_fee + priority_fee)` for EIP-1559 and
   the `gasPrice` for legacy transactions. `gas_used × base_fee` is burned and
