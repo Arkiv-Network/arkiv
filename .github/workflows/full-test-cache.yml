@@ -1,19 +1,23 @@
 # Experiment: does packing the Cargo home alongside target/ beat packing
 # target/ alone?
 #
-# cold-build's caches carry only the build tree, so a warm run still hits
-# crates.io for the index and 729 .crate files and re-extracts them into
-# registry/src. That measured 22s of network — the open question is what the
-# extraction costs on top, which is what Swatinem/rust-cache also saves.
+# cold-build's caches carry only the build tree — verified by unpacking one:
+# 786 compiled dependency rlibs and not a single .crate archive. So a warm run
+# still fetches the index, 784 .crate files and the git dependencies, then
+# re-extracts them into registry/src.
+#
+# The extra layer here is 282 MB, of which 180 MB is the bare clones of reth
+# and discv5 — the part an earlier "downloads cost 22s" measurement missed
+# entirely, since that timed the sparse index and crates.io only.
+#
+# Unvalidated: nothing has restored this tag yet, so whether the layer pays for
+# its own transfer is still an open question. Dispatch only until it does.
 #
 # Scoped deliberately: one profile (dev-fast), the test binaries only, one tag.
 name: full-test-cache
 
 on:
   workflow_dispatch:
-  push:
-    branches: [scx1332/ci-optimizations]
-    paths: [".github/workflows/full-test-cache.yml"]
 
 concurrency:
   group: ${{ github.workflow }}

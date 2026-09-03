@@ -15,11 +15,6 @@ on:
         default: "dev-fast"
         type: choice
         options: [dev-fast]
-  # `workflow_dispatch` is not startable until this file reaches the default
-  # branch, so pushes to the working branch are how to measure it by hand.
-  # TEMPORARY: drop before merging.
-  push:
-    branches: [scx1332/ci-optimizations]
   pull_request:
 
 # Gates pull requests. Superseded runs are pointless once the head moves,
