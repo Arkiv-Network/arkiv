@@ -95,3 +95,23 @@ arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
+
+# Copied from yagna (.cargo/config). A dev build without debug info or
+# incremental state, with dependencies optimized — much faster to link and to
+# run than plain `dev`, at the cost of debuggability and rebuild speed.
+[profile.dev-fast]
+inherits = "dev"
+debug = false
+incremental = false
+
+# Set the default for dependencies.
+[profile.dev-fast.package."*"]
+opt-level = 2
+
+# Also from yagna: an optimized build that trades some runtime speed for much
+# shorter link times — no LTO, more codegen units, opt-level 2.
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16
