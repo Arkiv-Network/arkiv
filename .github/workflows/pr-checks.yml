@@ -69,18 +69,25 @@ jobs:
           cargo nextest run --workspace --locked --cargo-profile "$PROFILE"
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
-      # Not blocking yet: the workspace has never been linted in CI, so let
-      # this report what it finds before it gates anything. Drop
-      # continue-on-error (and keep -D warnings) to make it a gate.
+      # Blocking. It runs last and nothing depends on it, so a lint failure
+      # costs nothing already done: fmt and the tests have reported, and the
+      # binaries come out of pr-artifact regardless.
       - name: clippy
         id: clippy
-        continue-on-error: true
         run: |
+          # pipefail matters: without it `tee` would mask clippy's exit status.
           set -euo pipefail
           t0=$(date +%s)
-          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps 2>&1 | tee clippy.log
-          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
-          echo "warnings=$(grep -c '^warning' clippy.log || true)" >> "$GITHUB_OUTPUT"
+          # Clippy exits 0 on lint warnings, so `-D warnings` is what makes
+          # this a gate rather than a report.
+          status=0
+          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps \
+            -- -D warnings 2>&1 | tee clippy.log || status=$?
+          {
+            echo "seconds=$(( $(date +%s) - t0 ))"
+            echo "lints=$(grep -c '^error: ' clippy.log || true)"
+          } >> "$GITHUB_OUTPUT"
+          exit $status
 
       - if: always()
         run: |
@@ -93,5 +100,5 @@ jobs:
             echo "| tests | ${{ steps.tests.outputs.seconds }} |"
             echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
             echo
-            echo "clippy warnings: ${{ steps.clippy.outputs.warnings }} (non-blocking)"
+            echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
           } >> "$GITHUB_STEP_SUMMARY"
