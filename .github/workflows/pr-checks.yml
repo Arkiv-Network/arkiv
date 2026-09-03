@@ -13,10 +13,12 @@ name: pr-checks
 on:
   workflow_dispatch:
     inputs:
-      package:
-        description: "Build cache to restore; cold-build refreshes :latest nightly"
+      profile:
+        description: "Cargo profile, and the cache tag that mirrors it"
         required: false
-        default: "ghcr.io/arkiv-network/arkiv-build-cache:latest"
+        default: "release-fast"
+        type: choice
+        options: [release-fast, dev-fast]
   pull_request:
 
 # Gates pull requests. Superseded runs are pointless once the head moves,
@@ -33,8 +35,11 @@ jobs:
       contents: read
       packages: read
     env:
-      PROFILE: release-fast
-      PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:latest' }}
+      # The cache tag mirrors the profile: cold-build publishes one per profile
+      # from the same tree, so dispatching dev-fast measures the same lane
+      # against the cheaper optimisation level.
+      PROFILE: ${{ inputs.profile || 'release-fast' }}
+      PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache:${{ inputs.profile || 'release-fast' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97

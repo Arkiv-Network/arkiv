@@ -1,10 +1,14 @@
 # Rebuilds the shared build cache from scratch and republishes it under one
 # mutable tag.
 #
-# One package, one version. `pr-artifact` and `pr-checks` both restore
-# `:latest`, so this is the only thing that writes it — and every previous
-# version is deleted once the new one is in place, rather than accumulating a
-# 511 MB blob per commit.
+# One package, one version per profile, tagged by profile name. `pr-artifact`
+# and `pr-checks` restore whichever tag matches the profile they build with, so
+# this is the only thing that writes them — and the version a tag move leaves
+# behind is deleted, rather than accumulating a 511 MB blob per commit.
+#
+# release-fast and dev-fast are built as a matrix so the two are directly
+# comparable: same tree, same steps, same measurements, different optimisation
+# level.
 #
 # It builds both the workspace binaries and the test binaries: dev-dependencies
 # pull a larger graph, and a cache that covers them serves the binary lane just
@@ -18,21 +22,15 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
-    inputs:
-      profile:
-        description: "Cargo profile to build"
-        required: false
-        default: "release-fast"
-        type: choice
-        options: [release-fast, dev-fast, dev, release]
+  # `workflow_dispatch` is not startable until this file reaches the default
+  # branch, so until then touching the file itself is how to run it by hand.
+  push:
+    branches: [scx1332/ci-optimizations]
+    paths: [".github/workflows/cold-build.yml"]
 
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
 
 env:
   PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache
-  TAG: latest
   ARCHIVE: target-cache.tar.zst
 
 jobs:
@@ -41,10 +39,18 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # A schedule or push event carries no inputs, so the profile falls back to
-    # the same default the dispatch form offers.
+    # Per profile, so the two legs never queue behind each other.
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.profile }}
+      cancel-in-progress: false
+    strategy:
+      # One profile failing must not cancel the other: each publishes its own
+      # tag, and a half-refreshed pair is still usable.
+      fail-fast: false
+      matrix:
+        profile: [release-fast, dev-fast]
     env:
-      PROFILE: ${{ inputs.profile || 'release-fast' }}
+      PROFILE: ${{ matrix.profile }}
     # A cold build of the reth tree with no cache at all took ~25 minutes for
     # the binaries alone; the tests add to that. Leave generous headroom.
     timeout-minutes: 240
@@ -118,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
-          oras push "$PACKAGE:$TAG" \
+          oras push "$PACKAGE:$PROFILE" \
             --artifact-type "application/vnd.arkiv.build-cache.v1" \
             --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
             --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
@@ -126,8 +132,10 @@ jobs:
             --annotation "network.arkiv.built-at=$(date -u +%FT%TZ)" \
             "$ARCHIVE:application/vnd.arkiv.build-cache.v1.tar+zstd"
 
-      # Moving the tag leaves the version it pointed at behind, untagged but
-      # still occupying storage. Keep exactly the one just pushed.
+      # Moving a tag leaves the version it pointed at behind, untagged but still
+      # occupying storage. Deleting exactly the untagged ones keeps one live
+      # version per profile without either leg having to know about the other —
+      # a version count would delete the sibling profile's cache.
       #
       # Not fatal if it fails: an uncollected version wastes space, whereas
       # failing here would mask a cache that published fine.
@@ -138,7 +146,7 @@ jobs:
           owner: arkiv-network
           package-name: arkiv-build-cache
           package-type: container
-          min-versions-to-keep: 1
+          delete-only-untagged-versions: true
 
       - if: always()
         run: |
@@ -151,5 +159,5 @@ jobs:
             echo "| tests | ${{ steps.tests.outputs.seconds }} |"
             echo
             echo "- target: ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB (${{ steps.prune.outputs.removed }} object files pruned)"
-            echo "- package: \`$PACKAGE:$TAG\` (${{ steps.pack.outputs.mb }}MB)"
+            echo "- package: \`$PACKAGE:$PROFILE\` (${{ steps.pack.outputs.mb }}MB)"
           } >> "$GITHUB_STEP_SUMMARY"

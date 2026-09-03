@@ -1,0 +1,277 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - generic [ref=e5]: Arkiv-Network / arkiv
+      - generic [ref=e6]: branch scx1332/ci-optimizations
+      - generic [ref=e7]: 3 September 2026
+    - heading "The pull-request pipeline, rebuilt around a shared build cache" [level=1] [ref=e8]
+    - paragraph [ref=e9]: Every pull request used to wait sixteen minutes on four cold-ish Cargo jobs. It now waits ten, and gets a clippy gate and a live two-node devnet it never had before. Here is what changed, and where the time actually went.
+  - generic [ref=e10]:
+    - generic [ref=e11]:
+      - term [ref=e12]: Pull-request wall clock
+      - definition [ref=e13]:
+        - text: 634s
+        - generic [ref=e14]: 1004s
+      - paragraph [ref=e15]: 10m34s, down from 16m44s. Measured, not projected.
+    - generic [ref=e16]:
+      - term [ref=e17]: Checks on a pull request
+      - definition [ref=e18]:
+        - text: "6"
+        - generic [ref=e19]: "5"
+      - paragraph [ref=e20]: clippy and the Kurtosis smoke test are new; udeps moved to main.
+    - generic [ref=e21]:
+      - term [ref=e22]: Cache packages stored
+      - definition [ref=e23]:
+        - text: "1"
+        - generic [ref=e24]: "3"
+      - paragraph [ref=e25]: One mutable tag. Superseded versions are deleted on each push.
+  - generic [ref=e26]:
+    - heading "Where the ten minutes go" [level=2] [ref=e27]
+    - paragraph [ref=e29]:
+      - text: Both bars are real runs on the same scale. Before is a genuine pull request against
+      - code [ref=e30]: main
+      - text: with a warm
+      - code [ref=e31]: Swatinem/rust-cache
+      - text: ; after is this branch's two lanes, which run in parallel, so the wall clock is the longer of them.
+    - generic [ref=e32]:
+      - generic [ref=e33]:
+        - generic [ref=e34]:
+          - heading "Before — rust.yml on pull_request" [level=3] [ref=e35]
+          - generic [ref=e36]: wall clock 1004s
+        - generic [ref=e37]:
+          - generic [ref=e38]:
+            - generic [ref=e39]: fmt
+            - generic [ref=e40]: 31s
+          - generic [ref=e43]:
+            - generic [ref=e44]: build
+            - generic [ref=e45]: 266s
+          - generic [ref=e47]:
+            - generic [ref=e48]: test
+            - generic [ref=e49]: 419s
+          - generic [ref=e51]:
+            - generic [ref=e52]: udeps
+            - generic [ref=e53]: 998s
+      - generic [ref=e55]:
+        - generic [ref=e56]:
+          - heading "After — pr-checks, pr-artifact, lint" [level=3] [ref=e57]
+          - generic [ref=e58]: wall clock 634s
+        - generic [ref=e59]:
+          - generic [ref=e60]:
+            - generic [ref=e61]: black
+            - generic [ref=e62]: 13s
+          - generic [ref=e65]:
+            - generic [ref=e66]: pr-artifact→ kurtosis
+            - generic [ref=e68]:
+              - generic [ref=e69]: 433s build
+              - generic [ref=e70]: 116s devnet
+          - generic [ref=e71]:
+            - generic [ref=e72]: pr-checks
+            - generic [ref=e73]: 634s — fmt, tests, clippy
+      - generic [ref=e77]:
+        - generic [ref=e78]: 0s
+        - generic [ref=e79]: 300s
+        - generic [ref=e80]: 600s
+        - generic [ref=e81]: 900s
+        - generic [ref=e82]: 1050s
+      - generic [ref=e83]:
+        - generic [ref=e84]: previous pipeline
+        - generic [ref=e86]: current pipeline
+        - generic [ref=e88]: new coverage
+    - generic [ref=e90]:
+      - heading "The honest version" [level=3] [ref=e91]
+      - paragraph [ref=e92]:
+        - text: Compiling did not get faster. The binary build went
+        - emphasis [ref=e93]: up
+        - text: — 266s to 433s — because it now produces optimised, stripped, shippable binaries under
+        - code [ref=e94]: release-fast
+        - text: instead of an unoptimised
+        - code [ref=e95]: dev
+        - text: compile that was thrown away. Tests are a wash at 419s either way.
+      - paragraph [ref=e96]:
+        - text: "The entire saving is structural:"
+        - strong [ref=e97]: udeps, at 998s, was the critical path
+        - text: ", and it is not a pull-request concern. Moving it to"
+        - code [ref=e98]: main
+        - text: and tags, then running the two remaining lanes in parallel, is what turned 1004s into 634s.
+  - generic [ref=e99]:
+    - heading "What runs, and when" [level=2] [ref=e100]
+    - paragraph [ref=e102]: The work is now split by what each event actually needs. Nothing that ran before has been deleted — the heavyweight lane simply stopped gating pull requests.
+    - generic [ref=e103]:
+      - generic [ref=e104]:
+        - generic [ref=e105]:
+          - text: pull_request
+          - generic [ref=e106]: every push to a PR
+        - list [ref=e108]:
+          - listitem [ref=e109]:
+            - code [ref=e110]: pr-checks
+            - text: — fmt, then
+            - code [ref=e111]: nextest
+            - text: ", then clippy as a blocking gate"
+          - listitem [ref=e112]:
+            - code [ref=e113]: pr-artifact
+            - text: — binaries uploaded as an artifact, then the Kurtosis devnet smoke test against that exact binary
+          - listitem [ref=e114]:
+            - code [ref=e115]: lint
+            - text: — black over
+            - code [ref=e116]: scripts/
+      - generic [ref=e117]:
+        - generic [ref=e118]:
+          - text: "push: main, v*"
+          - generic [ref=e119]: merges and releases
+        - list [ref=e121]:
+          - listitem [ref=e122]:
+            - code [ref=e123]: rust
+            - text: "— unchanged: fmt, dev build, tests,"
+            - strong [ref=e124]: udeps
+            - text: ", and the two-architecture image publish that moves"
+            - code [ref=e125]: latest
+          - listitem [ref=e126]:
+            - code [ref=e127]: lint
+      - generic [ref=e128]:
+        - generic [ref=e129]:
+          - text: "schedule: 03:00 UTC"
+          - generic [ref=e130]: nightly, from main
+        - list [ref=e132]:
+          - listitem [ref=e133]:
+            - code [ref=e134]: cold-build
+            - text: — rebuilds the workspace and test binaries from nothing and republishes the cache
+      - generic [ref=e135]:
+        - generic [ref=e136]:
+          - text: workflow_dispatch
+          - generic [ref=e137]: by hand
+        - list [ref=e139]:
+          - listitem [ref=e140]:
+            - text: any of the above, plus
+            - code [ref=e141]: kurtosis
+            - text: standalone, which falls back to building the image from source
+  - generic [ref=e142]:
+    - heading "Check by check" [level=2] [ref=e143]
+    - table [ref=e145]:
+      - rowgroup [ref=e146]:
+        - row [ref=e147]:
+          - columnheader "Check" [ref=e148]
+          - columnheader "Before" [ref=e149]
+          - columnheader "After" [ref=e150]
+          - columnheader "Status" [ref=e151]
+      - rowgroup [ref=e152]:
+        - row [ref=e153]:
+          - rowheader "cargo fmt" [ref=e154]
+          - cell "31s · PR" [ref=e155]
+          - cell "11s · PR" [ref=e156]
+          - cell "kept" [ref=e157]
+        - row [ref=e159]:
+          - rowheader "nextest" [ref=e160]
+          - cell "419s · PR" [ref=e161]
+          - cell "419s · PR" [ref=e162]
+          - cell "kept" [ref=e163]
+        - row [ref=e165]:
+          - rowheader "workspace build" [ref=e166]
+          - cell "266s · dev, discarded" [ref=e167]
+          - cell "366s · release-fast, uploaded" [ref=e168]
+          - cell "kept" [ref=e169]
+        - row [ref=e171]:
+          - rowheader "black" [ref=e172]
+          - cell "PR" [ref=e173]
+          - cell "13s · PR" [ref=e174]
+          - cell "kept" [ref=e175]
+        - row [ref=e177]:
+          - rowheader "cargo clippy" [ref=e178]
+          - cell "never existed anywhere in this repo" [ref=e179]
+          - cell "159s · PR, blocking" [ref=e180]
+          - cell "new" [ref=e181]
+        - row [ref=e183]:
+          - rowheader "Kurtosis devnet" [ref=e184]
+          - cell "manual dispatch only" [ref=e185]
+          - cell "116s · PR" [ref=e186]
+          - cell "new" [ref=e187]
+        - row [ref=e189]:
+          - rowheader "cargo udeps" [ref=e190]
+          - cell "998s · PR" [ref=e191]
+          - cell "865s · main and tags" [ref=e192]
+          - cell "moved" [ref=e193]
+        - row [ref=e195]:
+          - rowheader "docker images" [ref=e196]
+          - cell "main and tags" [ref=e197]
+          - cell "main and tags" [ref=e198]
+          - cell "untouched" [ref=e199]
+  - generic [ref=e201]:
+    - heading "The cache is the whole trick" [level=2] [ref=e202]
+    - generic [ref=e203]:
+      - paragraph [ref=e204]:
+        - text: A from-scratch build of this workspace takes 30 minutes — 1751s for the binaries, then 52s more for the test binaries, which share almost everything. Restoring the finished
+        - code [ref=e205]: target/
+        - text: takes 26 seconds, after which roughly fourteen crates recompile. That gap is the budget everything else was bought with.
+      - paragraph [ref=e206]:
+        - text: The cache is a single OCI artifact on GHCR, pushed with
+        - code [ref=e207]: oras
+        - text: so the zstd tarball is stored byte-for-byte rather than being re-gzipped as a Docker layer.
+    - table [ref=e209]:
+      - rowgroup [ref=e210]:
+        - row [ref=e211]:
+          - columnheader "Property" [ref=e212]
+          - columnheader "First attempt" [ref=e213]
+          - columnheader "Now" [ref=e214]
+      - rowgroup [ref=e215]:
+        - row [ref=e216]:
+          - rowheader "tag" [ref=e217]
+          - cell "<profile>-<sha12>" [ref=e218]
+          - cell ":latest" [ref=e219]
+        - row [ref=e220]:
+          - rowheader "versions kept" [ref=e221]
+          - cell "all of them — 3 × 511 MB and climbing" [ref=e222]
+          - cell "1 — verified after the first nightly-shaped run" [ref=e223]
+        - row [ref=e224]:
+          - rowheader "packages" [ref=e225]
+          - cell "two — one for binaries, one for tests" [ref=e226]
+          - cell "one, covering both" [ref=e227]
+        - row [ref=e228]:
+          - rowheader "refreshed" [ref=e229]
+          - cell "by hand, then pinned in each workflow" [ref=e230]
+          - cell "nightly from main, nothing to pin" [ref=e231]
+        - row [ref=e232]:
+          - rowheader "size" [ref=e233]
+          - cell "651 MB" [ref=e234]
+          - cell "511 MB" [ref=e235]
+    - paragraph [ref=e237]:
+      - text: The 140 MB came from zstd level 10 with a 128 MB window (56 MB on its own) and deleting 1,199
+      - code [ref=e238]: "*.o"
+      - text: intermediates that jemalloc and rocksdb leave behind once their archives exist. The
+      - code [ref=e239]: .rmeta
+      - text: "files — 40% of what remains — stay: drop them and dependent crates can no longer typecheck without recompiling, which is the entire point of the cache."
+  - generic [ref=e240]:
+    - heading "Two things to know before merging" [level=2] [ref=e241]
+    - generic [ref=e242]:
+      - generic [ref=e243]:
+        - generic [ref=e244]: §1
+        - paragraph [ref=e245]:
+          - strong [ref=e246]:
+            - text: The nightly cannot fire until this is on
+            - code [ref=e247]: main
+            - text: .
+          - text: GitHub only runs
+          - code [ref=e248]: schedule
+          - text: and offers
+          - code [ref=e249]: workflow_dispatch
+          - text: from the default branch. Until the merge lands, the cache is whatever the last manual cold build published.
+      - generic [ref=e250]:
+        - generic [ref=e251]: §2
+        - paragraph [ref=e252]:
+          - strong [ref=e253]: Branch protection is not affected.
+          - text: The
+          - code [ref=e254]: main
+          - text: ruleset enforces no deletion, no force-push, and squash-only merges behind a pull request — but it declares no required status checks, so
+          - code [ref=e255]: rust
+          - text: dropping off the pull-request path blocks nothing. Checked, not assumed.
+      - generic [ref=e256]:
+        - generic [ref=e257]: §3
+        - paragraph [ref=e258]:
+          - strong [ref=e259]: The Kurtosis image is not the published image.
+          - text: The smoke test packages the
+          - code [ref=e260]: release-fast
+          - text: binary onto an Ubuntu base — single-architecture, matched to the runner's glibc. The multi-architecture Debian images that
+          - code [ref=e261]: rust
+          - text: publishes are untouched, and still built from source.
+  - contentinfo [ref=e262]:
+    - text: Timings from runs 33747580066 (before), 33772763843 and 33773413031 (after) on Arkiv-Network/arkiv · ubuntu-latest, 4 vCPU · profile
+    - code [ref=e263]: release-fast
+    - text: ", Rust 1.97"

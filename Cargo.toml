@@ -112,6 +112,9 @@ arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
 inherits = "dev"
 debug = false
 incremental = false
+# `debug = false` stops rustc emitting debug info; this drops the symbol table
+# the linker would still write, matching release-fast.
+strip = "symbols"
 
 # Set the default for dependencies.
 [profile.dev-fast.package."*"]
