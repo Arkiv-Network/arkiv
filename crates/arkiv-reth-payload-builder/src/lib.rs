@@ -22,7 +22,7 @@ use reth_basic_payload_builder::{
 };
 use reth_ethereum::{
     EthPrimitives, TransactionSigned,
-    chainspec::ChainSpec,
+    chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks},
     evm::primitives::{ConfigureEvm, NextBlockEnvAttributes},
     node::{
         api::{FullNodeTypes, NodeTypes},
@@ -49,13 +49,8 @@ pub struct ArkivPayloadServiceBuilder;
 
 impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for ArkivPayloadServiceBuilder
 where
-    Node: FullNodeTypes<
-        Types: NodeTypes<
-            ChainSpec = ChainSpec,
-            Primitives = EthPrimitives,
-            Payload = EthEngineTypes,
-        >,
-    >,
+    Node: FullNodeTypes<Types: NodeTypes<Primitives = EthPrimitives, Payload = EthEngineTypes>>,
+    <Node::Types as NodeTypes>::ChainSpec: EthChainSpec + EthereumHardforks,
     Node::Provider: StateProviderFactory + Unpin,
     Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + 'static,
     Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>
@@ -195,7 +190,7 @@ pub struct ArkivPayloadBuilder<Pool, Client, Evm> {
 impl<Pool, Client, Evm> PayloadBuilder for ArkivPayloadBuilder<Pool, Client, Evm>
 where
     Client: reth_storage_api::StateProviderFactory
-        + reth_ethereum::chainspec::ChainSpecProvider<ChainSpec = ChainSpec>
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + Clone,
     Pool: TransactionPool<Transaction = EthPooledTransaction>,
     Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,

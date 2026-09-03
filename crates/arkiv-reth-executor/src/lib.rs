@@ -17,8 +17,16 @@
 //! **whole handler pipeline**, and that includes its pre-execution *validation* stage.
 //! Every check revm would have made — nonce, balance, base fee, chain id, EIP-3607 — is
 //! therefore ours to make or to knowingly go without. Anything [`arkiv_transact`] is
-//! handed and does not explicitly reject *succeeds*. The nonce is checked, in
-//! [`validate_nonce`]; the rest are not yet, which is a real gap and not a design choice.
+//! handed and does not explicitly reject *succeeds*. The nonce is checked in
+//! [`validate_nonce`] and the fee preconditions (fee cap vs. base fee, priority fee
+//! vs. fee cap, balance vs. the maximum spend) in [`validate_fees`]; chain id and
+//! EIP-3607 are not yet, which is a real gap and not a design choice.
+//!
+//! Fees follow EIP-1559 exactly as revm applies it ([`charge_sender`]): the sender
+//! pays `gas_used × effective_gas_price`, where the effective price is
+//! `min(max_fee, base_fee + priority_fee)` (a legacy tx's `gasPrice`); the base-fee
+//! share is burned and the tip is credited to the block beneficiary. Unused gas is
+//! never charged.
 //!
 //! - **Plain transfer** — debit sender (value + flat 21k gas), bump nonce,
 //!   credit recipient. Computed in Rust, committed as a `BundleState`.
@@ -70,22 +78,26 @@ pub mod revert;
 pub use arkiv::{ArkivExecutor, OpEffect};
 pub use decode::{DecodeError, decode_ops, derive_entity_address};
 
+use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use arkiv_bindings::{IEntityRegistry, protocol::purgeExpiredCall};
 use reth_ethereum::{
     EthPrimitives,
-    chainspec::ChainSpec,
+    chainspec::{EthereumHardforks, Hardforks},
     evm::{
         EthEvm, EthEvmConfig,
         primitives::{Database, EvmEnv},
         revm::{
             MainBuilder, MainContext,
             context::{BlockEnv, CfgEnv, Context, TxEnv},
-            context_interface::result::{
-                EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError, Output,
-                ResultAndState, ResultGas, SuccessReason,
+            context_interface::{
+                Cfg, Transaction,
+                result::{
+                    EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError,
+                    Output, ResultAndState, ResultGas, SuccessReason,
+                },
             },
             database_interface::DBErrorMarker,
             inspector::{Inspector, NoOpInspector},
@@ -162,22 +174,99 @@ fn parent_ref(block_number: u64) -> BlockRef {
     BlockRef::new(block_number.saturating_sub(1), Hash::default())
 }
 
-/// Charge `sender` for `gas_cost` (plus `value_out`, for transfers) and bump its
-/// EOA nonce — the sender-side accounting every transaction shape shares.
+/// The block-level inputs of a transaction's fee accounting, read off the
+/// `BlockEnv` reth built for the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeEnv {
+    /// The block's EIP-1559 base fee: burned, and the floor of the effective price.
+    pub base_fee: u64,
+    /// The block's fee recipient (`coinbase`): receives the priority fee.
+    pub beneficiary: Address,
+    /// Whether gas is charged at all. reth turns this off (`disable_fee_charge`)
+    /// for `eth_call` and `eth_estimateGas`; a mined transaction always pays.
+    pub charge: bool,
+}
+
+impl FeeEnv {
+    /// The fee inputs of `block`, with charging on.
+    pub fn from_block(block: &BlockEnv) -> Self {
+        Self {
+            base_fee: block.basefee,
+            beneficiary: block.beneficiary,
+            charge: true,
+        }
+    }
+
+    /// What `tx` pays per gas in this block — revm's effective gas price:
+    /// `min(max_fee, base_fee + priority_fee)`, or a legacy tx's `gasPrice`.
+    fn effective_gas_price(&self, tx: &TxEnv) -> u128 {
+        tx.effective_gas_price(u128::from(self.base_fee))
+    }
+}
+
+/// Settle `gas_used` gas of `sender`'s transaction the way revm's post-execution
+/// does — the sender-side accounting every transaction shape shares:
+///
+/// - debit `value_out` (for transfers) and `gas_used × effective_gas_price`;
+/// - bump the sender's EOA nonce;
+/// - credit the beneficiary the tip, `gas_used × (effective_gas_price − base_fee)`.
+///   The base-fee share is burned. A zero tip credits nothing, so the beneficiary
+///   is not touched into existence as an empty account.
+///
+/// With [`FeeEnv::charge`] off only the value moves and the nonce bumps, as in
+/// revm with `disable_fee_charge`. Only gas actually used is charged; there is no
+/// up-front `gas_limit` debit and refund because nothing runs between the two.
 fn charge_sender<DB: Database>(
     view: &mut WriteManager<'_, DB>,
+    fees: &FeeEnv,
     sender: Address,
     value_out: U256,
-    gas_cost: U256,
+    gas_used: u64,
+    tx: &TxEnv,
 ) -> Result<(), EVMError<DB::Error>> {
     let sender = sender.into_array();
     view.fetch_sub_balance(sender, as_balance(value_out))
         .map_err(state_fault("debit sender value"))?;
-    view.fetch_sub_balance(sender, as_balance(gas_cost))
-        .map_err(state_fault("debit sender gas"))?;
     view.fetch_increment_acc_nonce(sender)
         .map_err(state_fault("bump sender nonce"))?;
+    if !fees.charge {
+        return Ok(());
+    }
+
+    let price = fees.effective_gas_price(tx);
+    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(price));
+    view.fetch_sub_balance(sender, as_balance(gas_cost))
+        .map_err(state_fault("debit sender gas"))?;
+
+    let tip = price.saturating_sub(u128::from(fees.base_fee));
+    if tip > 0 {
+        let reward = U256::from(gas_used).saturating_mul(U256::from(tip));
+        view.fetch_add_balance(fees.beneficiary.into_array(), as_balance(reward))
+            .map_err(state_fault("credit beneficiary tip"))?;
+    }
     Ok(())
+}
+
+/// Which of revm's pre-execution fee checks to run. Each maps to a `CfgEnv`
+/// flag reth sets for a specific RPC path (`eth_call` / `eth_estimateGas`
+/// disable the base-fee check, `eth_simulateV1` the balance check, ...).
+#[derive(Debug, Clone, Copy)]
+struct FeeChecks {
+    base_fee: bool,
+    priority_fee: bool,
+    balance: bool,
+}
+
+impl FeeChecks {
+    /// The `Cfg` accessors, not the fields: each field is behind a revm cargo
+    /// feature, and the accessor reads `false` when that feature is off.
+    fn from_cfg(cfg: &CfgEnv<SpecId>) -> Self {
+        Self {
+            base_fee: !cfg.is_base_fee_check_disabled(),
+            priority_fee: !cfg.is_priority_fee_check_disabled(),
+            balance: !cfg.is_balance_check_disabled(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +319,16 @@ where
         tx: TxEnv,
     ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
         let block_number = self.inner.block().number.saturating_to::<u64>();
-        // Read the flag before taking the mutable database borrow. reth sets it for
-        // `eth_simulateV1` without `validation` and for engine-tree payload prewarming,
-        // both of which execute against state that need not match the tx's nonce.
-        let nonce_check = !self.cfg_env().disable_nonce_check;
+        // Read the flags before taking the mutable database borrow. reth sets
+        // `disable_nonce_check` for `eth_simulateV1` without `validation` and for
+        // engine-tree payload prewarming, both of which execute against state that
+        // need not match the tx's nonce; the fee flags likewise per RPC path.
+        let nonce_check = !self.cfg_env().is_nonce_check_disabled();
+        let fee_checks = FeeChecks::from_cfg(self.cfg_env());
+        let fees = FeeEnv {
+            charge: !self.cfg_env().is_fee_charge_disabled(),
+            ..FeeEnv::from_block(self.inner.block())
+        };
         let chain_id = self.inner.chain_id();
         let db = self.inner.db_mut();
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
@@ -242,10 +337,13 @@ where
         if has_purge_selector && !is_protocol_purge {
             return Err(invalid_transaction("purgeExpired is protocol-only"));
         }
-        if nonce_check && !is_protocol_purge {
-            validate_nonce(db, &tx)?;
+        if !is_protocol_purge {
+            if nonce_check {
+                validate_nonce(db, &tx)?;
+            }
+            validate_fees(db, &tx, fees.base_fee, fee_checks)?;
         }
-        arkiv_transact(db, block_number, tx)
+        arkiv_transact(db, block_number, fees, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -331,10 +429,61 @@ fn validate_nonce<DB: Database>(db: &mut DB, tx: &TxEnv) -> Result<(), EVMError<
     }
 }
 
+/// revm's pre-execution fee checks, which the no-EVM path would otherwise skip:
+///
+/// - the priority fee may not exceed the fee cap;
+/// - the effective price may not fall below the block base fee — for a locally
+///   built block the pool guarantees this, for a block received over the Engine
+///   API or P2P nothing else does;
+/// - the sender must be able to afford the maximum spend, `gas_limit × max_fee +
+///   value`, the same bound the pool admits on.
+///
+/// All three are typed [`InvalidTransaction`]s, for the reason [`validate_nonce`]
+/// spells out: the payload builder skips a transaction on those and aborts the
+/// block on anything else.
+fn validate_fees<DB: Database>(
+    db: &mut DB,
+    tx: &TxEnv,
+    base_fee: u64,
+    checks: FeeChecks,
+) -> Result<(), EVMError<DB::Error>> {
+    let max_fee = tx.max_fee_per_gas();
+    if checks.priority_fee && tx.max_priority_fee_per_gas().unwrap_or_default() > max_fee {
+        return Err(EVMError::Transaction(
+            InvalidTransaction::PriorityFeeGreaterThanMaxFee,
+        ));
+    }
+    if checks.base_fee && tx.effective_gas_price(u128::from(base_fee)) < u128::from(base_fee) {
+        return Err(EVMError::Transaction(
+            InvalidTransaction::GasPriceLessThanBasefee,
+        ));
+    }
+    if checks.balance {
+        let max_spend = U256::from(tx.gas_limit)
+            .saturating_mul(U256::from(max_fee))
+            .saturating_add(tx.value);
+        let balance = db
+            .basic(tx.caller)
+            .map_err(EVMError::Database)?
+            .map(|acc| acc.balance)
+            .unwrap_or_default();
+        if balance < max_spend {
+            return Err(EVMError::Transaction(
+                InvalidTransaction::LackOfFundForMaxFee {
+                    fee: Box::new(max_spend),
+                    balance: Box::new(balance),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The fixed-function state-transition function — Rust, no EVM.
 ///
 /// Callers reach this through [`ArkivEvm::transact_raw`], which validates the nonce
-/// first; the sender's nonce bump below therefore lands on `tx.nonce + 1`.
+/// and the fee preconditions first; the sender's nonce bump below therefore lands
+/// on `tx.nonce + 1`, and the sender can afford the charge.
 ///
 /// Reads accounts through the `Database`, applies the transfer / entity-call
 /// accounting, and returns a `ResultAndState` (execution result + the account
@@ -343,6 +492,7 @@ fn validate_nonce<DB: Database>(db: &mut DB, tx: &TxEnv) -> Result<(), EVMError<
 fn arkiv_transact<DB: Database>(
     db: &mut DB,
     block_number: u64,
+    fees: FeeEnv,
     tx: TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     // Neuter: user programs never execute. The rejection must be a *typed*
@@ -366,24 +516,23 @@ fn arkiv_transact<DB: Database>(
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
-            return arkiv_entity_nonce_call(db, &tx, block_number);
+            return arkiv_entity_nonce_call(db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::customAttributeNamesCall::SELECTOR {
-            return arkiv_custom_attribute_names_call(db, &tx, block_number);
+            return arkiv_custom_attribute_names_call(db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
-            return arkiv_attribute_type_id_call(db, &tx, block_number);
+            return arkiv_attribute_type_id_call(db, &tx, block_number, &fees);
         }
         if selector == purgeExpiredCall::SELECTOR {
             return arkiv_purge_expired(db, block_number, &tx);
         }
-        return arkiv_entity_transact(db, block_number, &tx);
+        return arkiv_entity_transact(db, block_number, &fees, &tx);
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
     // intrinsics should the transfer carry data.
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
     let value_out = if to == tx.caller {
         U256::ZERO
     } else {
@@ -393,7 +542,7 @@ fn arkiv_transact<DB: Database>(
     // Sender debit + nonce bump and recipient credit, through one view — a
     // transfer stages the same way every other state change does.
     let mut view = write_manager(db, parent_ref(block_number));
-    charge_sender(&mut view, tx.caller, value_out, gas_cost)?;
+    charge_sender(&mut view, &fees, tx.caller, value_out, gas_used, &tx)?;
     if to != tx.caller {
         view.fetch_add_balance(to.into_array(), as_balance(tx.value))
             .map_err(state_fault("credit recipient"))?;
@@ -494,6 +643,7 @@ fn out_of_gas() -> ResultAndState<HaltReason> {
 fn arkiv_entity_transact<DB: Database>(
     db: &mut DB,
     block_number: u64,
+    fees: &FeeEnv,
     tx: &TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     // During eth_estimateGas the binary search probes gas limits below the
@@ -541,8 +691,7 @@ fn arkiv_entity_transact<DB: Database>(
     // is floored at the pool's intrinsic minimum so a cheap batch still
     // estimates to a pool-acceptable gas limit.
     let gas_used = outcome.gas_used.max(floor);
-    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
-    charge_sender(&mut view, caller, U256::ZERO, gas_cost)?;
+    charge_sender(&mut view, fees, caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit transaction"))?;
     let evm_state = view.into_base().into_state();
 
@@ -576,14 +725,14 @@ fn arkiv_view_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
+    fees: &FeeEnv,
     answer: impl FnOnce(&mut DB) -> Result<Result<Vec<u8>, Vec<u8>>, EVMError<DB::Error>>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     let output = answer(db)?;
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(tx.gas_price));
     let mut view = write_manager(db, parent_ref(block_number));
-    charge_sender(&mut view, tx.caller, U256::ZERO, gas_cost)?;
+    charge_sender(&mut view, fees, tx.caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit view call"))?;
     let state = view.into_base().into_state();
 
@@ -629,8 +778,9 @@ fn arkiv_entity_nonce_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
+    fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, |db| {
+    arkiv_view_call(db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
@@ -655,8 +805,9 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
+    fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, |db| {
+    arkiv_view_call(db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
@@ -682,8 +833,9 @@ fn arkiv_attribute_type_id_call<DB: Database>(
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
+    fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, |db| {
+    arkiv_view_call(db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
@@ -887,15 +1039,24 @@ impl EvmFactory for ArkivEvmFactory {
 /// Builds the Arkiv block executor: reth's stock Ethereum block executor driven
 /// by [`ArkivEvmFactory`]. This is the type arkiv-reth hands to
 /// `EthereumNode::components().executor(..)`.
+///
+/// Generic over the node's chain spec with the same bounds reth's own
+/// `EthereumExecutorBuilder` asks for, so the node can run on arkiv-reth-chainspec's
+/// `ArkivChainSpec` (the minimum-base-fee rule) as well as on reth's `ChainSpec`.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct ArkivExecutorBuilder;
 
 impl<Node> ExecutorBuilder<Node> for ArkivExecutorBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    Node: FullNodeTypes<
+        Types: NodeTypes<
+            ChainSpec: Hardforks + EthExecutorSpec + EthereumHardforks,
+            Primitives = EthPrimitives,
+        >,
+    >,
 {
-    type EVM = EthEvmConfig<ChainSpec, ArkivEvmFactory>;
+    type EVM = EthEvmConfig<<Node::Types as NodeTypes>::ChainSpec, ArkivEvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         tracing::info!(
@@ -937,6 +1098,14 @@ mod tests {
         .abi_encode()
         .into()
     }
+
+    /// No base fee, no beneficiary: the tests above are about entity semantics,
+    /// and `arkiv_tx` prices at zero, so nothing is charged or rewarded.
+    const NO_FEES: FeeEnv = FeeEnv {
+        base_fee: 0,
+        beneficiary: Address::ZERO,
+        charge: true,
+    };
 
     fn arkiv_tx(caller: Address, data: Bytes) -> TxEnv {
         TxEnv {
@@ -1011,8 +1180,13 @@ mod tests {
 
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
-        let created =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"live"))).unwrap();
+        let created = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_calldata(50, b"live")),
+        )
+        .unwrap();
         db.commit(created.state);
         let key = B256::from(derive_entity_address(
             1,
@@ -1024,7 +1198,7 @@ mod tests {
         let purged = arkiv_purge_expired(&mut db, 11, &protocol_purge_tx(11, vec![key])).unwrap();
         assert!(purged.result.is_success());
         assert!(
-            purged.state.get(&entity_leaf_address(key.0)).is_none(),
+            !purged.state.contains_key(&entity_leaf_address(key.0)),
             "a live entity must not be staged for deletion"
         );
     }
@@ -1036,8 +1210,13 @@ mod tests {
     fn entity_create_call_commits_the_entity() {
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_calldata(50, b"hello")),
+        )
+        .unwrap();
 
         assert!(rs.result.is_success());
 
@@ -1094,7 +1273,7 @@ mod tests {
 
         // First submission: valid at nonce 0, and it advances the sender to 1.
         validate_nonce(&mut db, &tx).expect("a fresh account's nonce 0 is valid");
-        let rs = arkiv_transact(&mut db, 10, tx.clone()).unwrap();
+        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx.clone()).unwrap();
         assert!(rs.result.is_success());
         assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
         db.commit(rs.state);
@@ -1147,7 +1326,7 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         let tx = arkiv_tx(alice, create_calldata(50, b"hello"));
-        let rs = arkiv_transact(&mut db, 10, tx.clone()).unwrap();
+        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx.clone()).unwrap();
         db.commit(rs.state);
 
         let err = validate_nonce(&mut db, &tx).expect_err("a replay must be rejected");
@@ -1179,7 +1358,7 @@ mod tests {
             ..arkiv_tx(alice, Bytes::from_static(&[0x00]))
         };
 
-        let err = arkiv_transact(&mut db, 10, tx).expect_err("creates must be rejected");
+        let err = arkiv_transact(&mut db, 10, NO_FEES, tx).expect_err("creates must be rejected");
         let invalid = err.try_into_invalid_tx_err().expect(
             "must convert to an invalid-tx error, or reth aborts the build instead of skipping",
         );
@@ -1205,8 +1384,13 @@ mod tests {
 
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_calldata(50, b"hello")),
+        )
+        .unwrap();
         assert!(rs.result.is_success());
 
         // Reads the bitmap stored as an index account's code and checks it holds id 0.
@@ -1257,7 +1441,8 @@ mod tests {
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
         let bob = Address::repeat_byte(0xBB);
-        let rs = arkiv_transact(&mut db, 10, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
+        let rs =
+            arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
 
         assert_eq!(nonce_from(&rs), 0);
         // Only the sender (charged/bumped) is in the diff.
@@ -1329,8 +1514,13 @@ mod tests {
 
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_with_attrs_calldata(50))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_with_attrs_calldata(50)),
+        )
+        .unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
@@ -1340,7 +1530,8 @@ mod tests {
             EntityCreationNonce::new(0),
             0,
         ));
-        let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, names_calldata(key))).unwrap();
+        let rs =
+            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
         assert_eq!(names_from(&rs), vec!["color", "rank"]);
     }
 
@@ -1354,8 +1545,13 @@ mod tests {
 
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_with_attrs_calldata(50))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_with_attrs_calldata(50)),
+        )
+        .unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
@@ -1366,17 +1562,28 @@ mod tests {
             0,
         ));
 
-        let rs =
-            arkiv_transact(&mut db, 11, arkiv_tx(alice, type_id_calldata(key, "rank"))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            11,
+            NO_FEES,
+            arkiv_tx(alice, type_id_calldata(key, "rank")),
+        )
+        .unwrap();
         assert_eq!(type_id_from(&rs), AttributeType::U256.id());
-        let rs =
-            arkiv_transact(&mut db, 11, arkiv_tx(alice, type_id_calldata(key, "color"))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            11,
+            NO_FEES,
+            arkiv_tx(alice, type_id_calldata(key, "color")),
+        )
+        .unwrap();
         assert_eq!(type_id_from(&rs), AttributeType::Str.id());
 
         // Never set on this entity.
         let rs = arkiv_transact(
             &mut db,
             11,
+            NO_FEES,
             arkiv_tx(alice, type_id_calldata(key, "absent")),
         )
         .unwrap();
@@ -1392,11 +1599,13 @@ mod tests {
         let alice = Address::repeat_byte(0xAA);
         let ghost = B256::repeat_byte(0xEE);
 
-        let rs = arkiv_transact(&mut db, 10, arkiv_tx(alice, names_calldata(ghost))).unwrap();
+        let rs =
+            arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(alice, names_calldata(ghost))).unwrap();
         assert!(names_from(&rs).is_empty());
         let rs = arkiv_transact(
             &mut db,
             10,
+            NO_FEES,
             arkiv_tx(alice, type_id_calldata(ghost, "rank")),
         )
         .unwrap();
@@ -1413,8 +1622,13 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         // Created at block 10 with a 50-block lifetime → expires_at 60.
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_with_attrs_calldata(50))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_with_attrs_calldata(50)),
+        )
+        .unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
         let key = B256::from(derive_entity_address(
@@ -1425,13 +1639,20 @@ mod tests {
         ));
 
         // Last live block is 59.
-        let rs = arkiv_transact(&mut db, 59, arkiv_tx(alice, names_calldata(key))).unwrap();
+        let rs =
+            arkiv_transact(&mut db, 59, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
         assert_eq!(names_from(&rs).len(), 2, "live at 59");
 
-        let rs = arkiv_transact(&mut db, 60, arkiv_tx(alice, names_calldata(key))).unwrap();
-        assert!(names_from(&rs).is_empty(), "expired at 60");
         let rs =
-            arkiv_transact(&mut db, 60, arkiv_tx(alice, type_id_calldata(key, "rank"))).unwrap();
+            arkiv_transact(&mut db, 60, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
+        assert!(names_from(&rs).is_empty(), "expired at 60");
+        let rs = arkiv_transact(
+            &mut db,
+            60,
+            NO_FEES,
+            arkiv_tx(alice, type_id_calldata(key, "rank")),
+        )
+        .unwrap();
         assert_eq!(type_id_from(&rs), 0, "expired at 60");
     }
 
@@ -1445,14 +1666,21 @@ mod tests {
         let alice = Address::repeat_byte(0xAA);
         let bob = Address::repeat_byte(0xBB);
 
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_calldata(50, b"hello")),
+        )
+        .unwrap();
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let rs = arkiv_transact(&mut db, 11, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
+        let rs =
+            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
         assert_eq!(nonce_from(&rs), 1);
-        let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, nonces_calldata(bob))).unwrap();
+        let rs =
+            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, nonces_calldata(bob))).unwrap();
         assert_eq!(nonce_from(&rs), 0);
     }
 
@@ -1463,7 +1691,7 @@ mod tests {
         let alice = Address::repeat_byte(0xAA);
         let mut data = IEntityRegistry::entityNonceCall::SELECTOR.to_vec();
         data.extend_from_slice(&[0x01, 0x02]);
-        let rs = arkiv_transact(&mut db, 10, arkiv_tx(alice, data.into())).unwrap();
+        let rs = arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(alice, data.into())).unwrap();
         assert!(!rs.result.is_success());
     }
 
@@ -1477,8 +1705,13 @@ mod tests {
 
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
-        let rs =
-            arkiv_transact(&mut db, 10, arkiv_tx(alice, create_calldata(50, b"hello"))).unwrap();
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_calldata(50, b"hello")),
+        )
+        .unwrap();
         db.commit(rs.state);
 
         // A patch batch: cheap in the cost model (40k base) but with calldata
@@ -1500,7 +1733,7 @@ mod tests {
         }
         .abi_encode();
         let floor = intrinsic_gas(&update);
-        let rs = arkiv_transact(&mut db, 11, arkiv_tx(alice, update.into())).unwrap();
+        let rs = arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, update.into())).unwrap();
 
         assert!(rs.result.is_success());
         assert!(
@@ -1520,7 +1753,7 @@ mod tests {
         let data = create_calldata(50, b"hello");
         let mut tx = arkiv_tx(alice, data.clone());
         tx.gas_limit = intrinsic_gas(&data) - 1;
-        let rs = arkiv_transact(&mut db, 10, tx).unwrap();
+        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx).unwrap();
 
         assert!(matches!(
             rs.result,
@@ -1541,6 +1774,7 @@ mod tests {
         let rs = arkiv_transact(
             &mut db,
             10,
+            NO_FEES,
             arkiv_tx(alice, Bytes::from_static(&[0xDE, 0xAD])),
         )
         .unwrap();
@@ -1549,5 +1783,298 @@ mod tests {
         assert_eq!(rs.state.get(&alice).expect("sender").info.nonce, 1);
         // Nothing else was staged (only the sender).
         assert_eq!(rs.state.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fee accounting: EIP-1559 as revm applies it
+    // -----------------------------------------------------------------------
+
+    use reth_ethereum::evm::revm::{db::CacheDB, state::AccountInfo};
+
+    const ETH: u128 = 1_000_000_000_000_000_000;
+
+    fn funded_db(accounts: &[(Address, u128)]) -> CacheDB<EmptyDB> {
+        let mut db = CacheDB::new(EmptyDB::default());
+        for (addr, wei) in accounts {
+            db.insert_account_info(
+                *addr,
+                AccountInfo {
+                    balance: U256::from(*wei),
+                    ..Default::default()
+                },
+            );
+        }
+        db
+    }
+
+    /// A 21k plain transfer. `priority` = Some makes it EIP-1559 with `max_fee` as
+    /// the fee cap; None makes it legacy with `max_fee` as the gas price.
+    fn transfer_tx(
+        from: Address,
+        to: Address,
+        value: u128,
+        max_fee: u128,
+        priority: Option<u128>,
+    ) -> TxEnv {
+        TxEnv {
+            tx_type: if priority.is_some() { 2 } else { 0 },
+            caller: from,
+            gas_limit: ARKIV_TX_GAS,
+            gas_price: max_fee,
+            gas_priority_fee: priority,
+            kind: TxKind::Call(to),
+            value: U256::from(value),
+            chain_id: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn balance_in(rs: &ResultAndState<HaltReason>, addr: Address) -> U256 {
+        rs.state
+            .get(&addr)
+            .map(|acc| acc.info.balance)
+            .unwrap_or_default()
+    }
+
+    const ALL_CHECKS: FeeChecks = FeeChecks {
+        base_fee: true,
+        priority_fee: true,
+        balance: true,
+    };
+
+    /// The sender pays `gas_used × min(max_fee, base_fee + tip)`, not the fee
+    /// cap; the base-fee share is burned and the tip reaches the beneficiary.
+    #[test]
+    fn eip1559_sender_pays_the_effective_price_and_the_tip_goes_to_the_beneficiary() {
+        let (alice, bob, carol) = (
+            Address::repeat_byte(0xAA),
+            Address::repeat_byte(0xBB),
+            Address::repeat_byte(0xCC),
+        );
+        let mut db = funded_db(&[(alice, ETH)]);
+        let fees = FeeEnv {
+            base_fee: 5,
+            beneficiary: bob,
+            charge: true,
+        };
+        let tx = transfer_tx(alice, carol, 100, 10, Some(3));
+        validate_fees(&mut db, &tx, fees.base_fee, ALL_CHECKS).unwrap();
+        let rs = arkiv_transact(&mut db, 10, fees, tx).unwrap();
+        assert!(rs.result.is_success());
+
+        // effective = min(10, 5 + 3) = 8 per gas; tip = 8 - 5 = 3 per gas.
+        let gas = u128::from(ARKIV_TX_GAS);
+        assert_eq!(balance_in(&rs, alice), U256::from(ETH - 100 - gas * 8));
+        assert_eq!(balance_in(&rs, carol), U256::from(100));
+        assert_eq!(balance_in(&rs, bob), U256::from(gas * 3));
+    }
+
+    /// A fee cap below `base_fee + tip` caps the price, and the tip shrinks to
+    /// whatever is left above the base fee.
+    #[test]
+    fn the_fee_cap_bounds_the_effective_price() {
+        let (alice, bob, carol) = (
+            Address::repeat_byte(0xAA),
+            Address::repeat_byte(0xBB),
+            Address::repeat_byte(0xCC),
+        );
+        let mut db = funded_db(&[(alice, ETH)]);
+        let fees = FeeEnv {
+            base_fee: 5,
+            beneficiary: bob,
+            charge: true,
+        };
+        let rs =
+            arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 6, Some(3))).unwrap();
+
+        let gas = u128::from(ARKIV_TX_GAS);
+        assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 6));
+        assert_eq!(balance_in(&rs, bob), U256::from(gas));
+    }
+
+    /// A legacy transaction pays its `gasPrice`; everything above the base fee
+    /// is the beneficiary's.
+    #[test]
+    fn a_legacy_transaction_pays_its_gas_price() {
+        let (alice, bob, carol) = (
+            Address::repeat_byte(0xAA),
+            Address::repeat_byte(0xBB),
+            Address::repeat_byte(0xCC),
+        );
+        let mut db = funded_db(&[(alice, ETH)]);
+        let fees = FeeEnv {
+            base_fee: 5,
+            beneficiary: bob,
+            charge: true,
+        };
+        let rs = arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 9, None)).unwrap();
+
+        let gas = u128::from(ARKIV_TX_GAS);
+        assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 9));
+        assert_eq!(balance_in(&rs, bob), U256::from(gas * 4));
+    }
+
+    /// A zero tip credits nothing: the beneficiary must not be touched into
+    /// existence as an empty account (which would change the state root).
+    #[test]
+    fn a_zero_tip_does_not_touch_the_beneficiary() {
+        let (alice, bob, carol) = (
+            Address::repeat_byte(0xAA),
+            Address::repeat_byte(0xBB),
+            Address::repeat_byte(0xCC),
+        );
+        let mut db = funded_db(&[(alice, ETH)]);
+        let fees = FeeEnv {
+            base_fee: 5,
+            beneficiary: bob,
+            charge: true,
+        };
+        let rs =
+            arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 5, Some(0))).unwrap();
+
+        assert_eq!(
+            balance_in(&rs, alice),
+            U256::from(ETH - u128::from(ARKIV_TX_GAS) * 5)
+        );
+        assert!(
+            !rs.state.contains_key(&bob),
+            "the beneficiary must not appear in the diff for a zero tip",
+        );
+    }
+
+    /// Entity calls settle the same way: the metered gas at the effective price,
+    /// with the tip credited.
+    #[test]
+    fn an_entity_call_is_priced_at_the_effective_price() {
+        let (alice, bob) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xBB));
+        let mut db = funded_db(&[(alice, ETH)]);
+        let fees = FeeEnv {
+            base_fee: 5,
+            beneficiary: bob,
+            charge: true,
+        };
+        let tx = TxEnv {
+            tx_type: 2,
+            gas_price: 10,
+            gas_priority_fee: Some(3),
+            ..arkiv_tx(alice, create_calldata(50, b"hello"))
+        };
+        let rs = arkiv_transact(&mut db, 10, fees, tx).unwrap();
+        assert!(rs.result.is_success());
+
+        let gas = u128::from(rs.result.tx_gas_used());
+        assert!(gas > 0);
+        assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 8));
+        assert_eq!(balance_in(&rs, bob), U256::from(gas * 3));
+    }
+
+    /// A fee cap below the block base fee is rejected — as the typed error the
+    /// payload builder skips on — unless the base-fee check is disabled, which
+    /// reth does for `eth_call` / `eth_estimateGas`.
+    #[test]
+    fn a_fee_cap_below_the_base_fee_is_rejected_unless_disabled() {
+        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
+        let mut db = funded_db(&[(alice, ETH)]);
+        let tx = transfer_tx(alice, carol, 0, 4, Some(4));
+
+        let err = validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect_err("4 < base fee 5");
+        assert!(matches!(
+            err,
+            EVMError::Transaction(InvalidTransaction::GasPriceLessThanBasefee)
+        ));
+
+        // A legacy price below the base fee is rejected the same way.
+        let legacy = transfer_tx(alice, carol, 0, 4, None);
+        assert!(matches!(
+            validate_fees(&mut db, &legacy, 5, ALL_CHECKS),
+            Err(EVMError::Transaction(
+                InvalidTransaction::GasPriceLessThanBasefee
+            ))
+        ));
+
+        let relaxed = FeeChecks {
+            base_fee: false,
+            ..ALL_CHECKS
+        };
+        validate_fees(&mut db, &tx, 5, relaxed).expect("eth_call-style execution");
+    }
+
+    #[test]
+    fn a_priority_fee_above_the_fee_cap_is_rejected() {
+        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
+        let mut db = funded_db(&[(alice, ETH)]);
+        let tx = transfer_tx(alice, carol, 0, 10, Some(11));
+        assert!(matches!(
+            validate_fees(&mut db, &tx, 5, ALL_CHECKS),
+            Err(EVMError::Transaction(
+                InvalidTransaction::PriorityFeeGreaterThanMaxFee
+            ))
+        ));
+    }
+
+    /// A sender that cannot cover `gas_limit × max_fee + value` is rejected
+    /// before anything is charged — typed, so a pooled transaction whose sender
+    /// was drained since ingress is skipped rather than aborting the block. Before
+    /// this check the debit saturated and the transaction went through anyway.
+    #[test]
+    fn an_underfunded_sender_is_rejected_as_invalid_not_fatal() {
+        use alloy_evm::EvmError;
+
+        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
+        let gas = u128::from(ARKIV_TX_GAS);
+        // One wei short of gas_limit × max_fee + value.
+        let mut db = funded_db(&[(alice, gas * 10 + 100 - 1)]);
+        let tx = transfer_tx(alice, carol, 100, 10, Some(3));
+
+        let err = validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect_err("one wei short");
+        assert!(matches!(
+            err,
+            EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { .. })
+        ));
+        err.try_into_invalid_tx_err()
+            .expect("must convert to an invalid-tx error, or reth aborts the block instead");
+
+        // Exactly enough for the maximum spend passes, even though the effective
+        // charge will be lower.
+        let mut db = funded_db(&[(alice, gas * 10 + 100)]);
+        validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect("can afford the max spend");
+
+        // And the check can be switched off (eth_simulateV1 without validation).
+        let mut db = funded_db(&[(alice, 0)]);
+        let relaxed = FeeChecks {
+            balance: false,
+            ..ALL_CHECKS
+        };
+        validate_fees(&mut db, &tx, 5, relaxed).expect("balance check disabled");
+    }
+
+    /// With charging disabled (reth's `eth_call` / `eth_estimateGas`) the value
+    /// still moves and the nonce still bumps, but no gas is debited and nothing
+    /// reaches the beneficiary.
+    #[test]
+    fn a_disabled_fee_charge_moves_value_only() {
+        let (alice, bob, carol) = (
+            Address::repeat_byte(0xAA),
+            Address::repeat_byte(0xBB),
+            Address::repeat_byte(0xCC),
+        );
+        let mut db = funded_db(&[(alice, ETH)]);
+        let fees = FeeEnv {
+            base_fee: 5,
+            beneficiary: bob,
+            charge: false,
+        };
+        let rs = arkiv_transact(
+            &mut db,
+            10,
+            fees,
+            transfer_tx(alice, carol, 100, 10, Some(3)),
+        )
+        .unwrap();
+
+        assert_eq!(balance_in(&rs, alice), U256::from(ETH - 100));
+        assert_eq!(balance_in(&rs, carol), U256::from(100));
+        assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
+        assert!(!rs.state.contains_key(&bob));
     }
 }
