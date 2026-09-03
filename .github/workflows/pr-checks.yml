@@ -1,7 +1,15 @@
-# The checks lane: fmt, then tests, then clippy, on the same shared cache.
+# The checks lane: two jobs off the same shared cache.
 #
-# Ordered cheapest-first so an obvious failure reports in seconds rather than
-# after a test run.
+#   tests — cargo nextest over the workspace
+#   lint  — cargo fmt, then clippy as a blocking gate
+#
+# They were one sequential job until the timings showed why they should not be:
+# fmt, tests and clippy share a cache but nothing else, so running them in
+# series charged the pull request the sum of three independent checks. Split,
+# the lane costs the longer of the two rather than the total.
+#
+# Both jobs restore the same 650 MB archive, which is the price of the split —
+# one extra pull, against ~165s of wall clock saved.
 #
 # clippy is scoped with `--no-deps`: cargo runs clippy-driver as
 # RUSTC_WORKSPACE_WRAPPER, so only workspace crates are linted and their
@@ -39,11 +47,18 @@ concurrency:
 
 jobs:
   checks:
+    name: ${{ matrix.task }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       packages: read
+    strategy:
+      # A lint failure must not cancel the test run, or the pull request learns
+      # one thing per push instead of both.
+      fail-fast: false
+      matrix:
+        task: [tests, lint]
     env:
       # The cache tag mirrors the profile: cold-build publishes one per profile
       # from the same tree, so dispatching dev-fast measures the same lane
@@ -56,12 +71,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry is
+      # needed by anything that compiles the workspace — clippy included.
       - uses: foundry-rs/foundry-toolchain@v1
-      - uses: taiki-e/install-action@nextest
+      - if: matrix.task == 'tests'
+        uses: taiki-e/install-action@nextest
       - uses: oras-project/setup-oras@v2
 
-      # fmt needs no build tree, so it runs before the cache is even pulled.
+      # fmt needs no build tree, so it runs before the cache is even pulled and
+      # a misformatted push fails in seconds rather than after a 33s restore.
       - name: fmt
+        if: matrix.task == 'lint'
         run: cargo fmt --all --check
 
       - name: Restore the shared cache
@@ -86,17 +106,18 @@ jobs:
 
       - name: tests
         id: tests
+        if: matrix.task == 'tests'
         run: |
           set -euo pipefail
           t0=$(date +%s)
           cargo nextest run --workspace --locked --cargo-profile "$PROFILE"
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
-      # Blocking. It runs last and nothing depends on it, so a lint failure
-      # costs nothing already done: fmt and the tests have reported, and the
-      # binaries come out of pr-artifact regardless.
+      # Blocking, and now nothing waits behind it: the tests report from their
+      # own job regardless of what clippy finds.
       - name: clippy
         id: clippy
+        if: matrix.task == 'lint'
         run: |
           # pipefail matters: without it `tee` would mask clippy's exit status.
           set -euo pipefail
@@ -115,15 +136,18 @@ jobs:
       - if: always()
         run: |
           {
-            echo "## checks"
+            echo "## ${{ matrix.task }}"
             echo
             echo "| step | seconds |"
             echo "|---|---|"
             echo "| restore | ${{ steps.restore.outputs.seconds }} |"
-            echo "| tests | ${{ steps.tests.outputs.seconds }} |"
-            echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
-            echo
-            echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
+            if [ "${{ matrix.task }}" = tests ]; then
+              echo "| tests | ${{ steps.tests.outputs.seconds }} |"
+            else
+              echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
+              echo
+              echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
+            fi
             echo
             echo "cache \`${PACKAGE##*:}\`, profile \`$PROFILE\`, cargo home restored: ${{ steps.restore.outputs.cargo_home }}"
           } >> "$GITHUB_STEP_SUMMARY"
