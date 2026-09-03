@@ -13,7 +13,8 @@
 # mode is part of the metadata hash — so a merged archive is just each job
 # downloading the other's half. cold-build publishes one package per lane:
 # arkiv-build-cache carries the rlibs, arkiv-clippy-cache carries the ~700
-# dependency .rmeta a check build actually reads.
+# dependency .rmeta a check build actually reads. 246 MB against 650 MB, which
+# is also why lint restores in ~11s where tests takes ~25s.
 #
 # clippy is scoped with `--no-deps`: cargo runs clippy-driver as
 # RUSTC_WORKSPACE_WRAPPER, so only workspace crates are linted and their

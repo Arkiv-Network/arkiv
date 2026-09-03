@@ -7,7 +7,8 @@
 #   clippy — a from-scratch `cargo clippy`, for pr-checks' lint job. Check
 #            units only: ~700 dependency .rmeta, the proc-macro dylibs and the
 #            build-script output, and not one rlib, because a check build never
-#            puts an rlib on an --extern path.
+#            puts an rlib on an --extern path. 246 MB packed against the build
+#            lane's 650 MB, and pr-checks' lint restores it in ~11s.
 #
 # They were briefly one archive. Running clippy on top of the build tree grew
 # it 650 MB -> 772 MB and charged every consumer ~4s of restore, two thirds of
@@ -17,7 +18,8 @@
 # other lane's half.
 #
 # Each lane runs cold and in parallel, so the workflow's wall clock is the
-# longer of the two rather than the sum. Only dev-fast is published for now;
+# longer of the two rather than the sum: 2293s for the build lane, 1540s for
+# clippy, ~40 minutes for the workflow — what it cost before the split. Only dev-fast is published for now;
 # the profile matrix is kept so a second optimisation level is one list entry
 # away, but measuring two at once made every timing ambiguous.
 name: cold-build
