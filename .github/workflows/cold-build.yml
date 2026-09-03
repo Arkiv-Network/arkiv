@@ -2,10 +2,14 @@
 # restored target dir — and hands the resulting artifacts back so the work
 # isn't thrown away with the runner.
 #
-# Manual only: this is a measurement, not a gate.
+# Not a gate: it runs on dispatch, plus pushes to this measurement branch
+# only, since `workflow_dispatch` alone is undispatchable until the file
+# reaches the default branch.
 name: cold-build
 
 on:
+  push:
+    branches: [scx1332/ci-optimizations]
   workflow_dispatch:
     inputs:
       profile:
@@ -22,6 +26,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A push event carries no inputs, so the profile falls back to the same
+    # default the dispatch form offers.
+    env:
+      PROFILE: ${{ inputs.profile || 'release-fast' }}
     # A cold build of the reth tree with no cache at all; the cached `build`
     # job in `rust` takes ~10 minutes, so leave generous headroom.
     timeout-minutes: 240
@@ -36,8 +44,6 @@ jobs:
       # Deliberately no Swatinem/rust-cache here: a restored target dir or
       # registry would defeat the point of the measurement.
       - id: build
-        env:
-          PROFILE: ${{ inputs.profile }}
         run: |
           set -euo pipefail
           start=$(date +%s)
@@ -49,7 +55,7 @@ jobs:
           SECONDS_ELAPSED: ${{ steps.build.outputs.seconds }}
         run: |
           {
-            echo "## cold build (${{ inputs.profile }})"
+            echo "## cold build ($PROFILE)"
             echo
             echo "- wall time: ${SECONDS_ELAPSED:-n/a}s"
             echo "- target size: $(du -sh target 2>/dev/null | cut -f1)"
@@ -61,15 +67,15 @@ jobs:
       - if: always()
         run: |
           set -euo pipefail
-          tar --zstd -cf "target-${{ inputs.profile }}.tar.zst" \
+          tar --zstd -cf "target-${{ env.PROFILE }}.tar.zst" \
             -C . target
-          ls -lh "target-${{ inputs.profile }}.tar.zst"
+          ls -lh "target-${{ env.PROFILE }}.tar.zst"
 
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: target-${{ inputs.profile }}
-          path: target-${{ inputs.profile }}.tar.zst
+          name: target-${{ env.PROFILE }}
+          path: target-${{ env.PROFILE }}.tar.zst
           if-no-files-found: error
           # Large; keep it only long enough to pull down.
           retention-days: 3
