@@ -1,0 +1,77 @@
+# Measures a from-scratch workspace build — no Swatinem/rust-cache, no
+# restored target dir — and hands the resulting artifacts back so the work
+# isn't thrown away with the runner.
+#
+# Manual only: this is a measurement, not a gate.
+name: cold-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile to build"
+        required: false
+        default: "release-fast"
+        type: choice
+        options: [release-fast, dev-fast, dev, release]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A cold build of the reth tree with no cache at all; the cached `build`
+    # job in `rust` takes ~10 minutes, so leave generous headroom.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97
+      # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      # Deliberately no Swatinem/rust-cache here: a restored target dir or
+      # registry would defeat the point of the measurement.
+      - id: build
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE" --timings
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - if: always()
+        env:
+          SECONDS_ELAPSED: ${{ steps.build.outputs.seconds }}
+        run: |
+          {
+            echo "## cold build (${{ inputs.profile }})"
+            echo
+            echo "- wall time: ${SECONDS_ELAPSED:-n/a}s"
+            echo "- target size: $(du -sh target 2>/dev/null | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # upload-artifact zips its input, which is slow and lossy for a target
+      # dir full of small files with meaningful mtimes. One zstd tarball
+      # uploads far faster and restores a target dir cargo can still reuse.
+      - if: always()
+        run: |
+          set -euo pipefail
+          tar --zstd -cf "target-${{ inputs.profile }}.tar.zst" \
+            -C . target
+          ls -lh "target-${{ inputs.profile }}.tar.zst"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-${{ inputs.profile }}
+          path: target-${{ inputs.profile }}.tar.zst
+          if-no-files-found: error
+          # Large; keep it only long enough to pull down.
+          retention-days: 3
+          # Already zstd-compressed — re-zipping it just burns runner time.
+          compression-level: 0
