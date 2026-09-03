@@ -26,6 +26,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     # A push event carries no inputs, so the profile falls back to the same
     # default the dispatch form offers.
     env:
@@ -79,6 +82,30 @@ jobs:
             -cf "target-${{ env.PROFILE }}.tar.zst" \
             -C . target
           ls -lh "target-${{ env.PROFILE }}.tar.zst"
+
+      # Published as an OCI artifact rather than a Docker image layer: oras
+      # stores the blob byte-for-byte, so the zstd tarball stays 511 MB. An
+      # image layer would be gzipped by the builder instead, which is both
+      # slower and considerably larger on already-compressed input.
+      - if: always() && github.event_name != 'pull_request'
+        uses: oras-project/setup-oras@v1
+      - if: always() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECONDS_ELAPSED: ${{ steps.build.outputs.seconds }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          pkg="ghcr.io/arkiv-network/arkiv-build-cache"
+          file="target-${{ env.PROFILE }}.tar.zst"
+          oras push \
+            "$pkg:${{ env.PROFILE }}-${GITHUB_SHA::12}" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "network.arkiv.profile=${{ env.PROFILE }}" \
+            --annotation "network.arkiv.build-seconds=${SECONDS_ELAPSED:-unknown}" \
+            "$file:application/vnd.arkiv.build-cache.v1.tar+zstd"
+          echo "- package: \`$pkg:${{ env.PROFILE }}-${GITHUB_SHA::12}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - if: always()
         uses: actions/upload-artifact@v4
