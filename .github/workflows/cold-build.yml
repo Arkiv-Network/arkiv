@@ -182,7 +182,7 @@ jobs:
           delete-only-untagged-versions: true
           # Keep the most recent untagged version for one cycle. Pushing the
           # tag moves it; a job that resolved the old digest a moment earlier
-          # is still streaming ~650 MB, and deleting it immediately frees the
+          # is still streaming ~772 MB, and deleting it immediately frees the
           # blobs underneath it and 404s that pull. Scoped to untagged versions,
           # so this never touches another profile's tag.
           min-versions-to-keep: 1
