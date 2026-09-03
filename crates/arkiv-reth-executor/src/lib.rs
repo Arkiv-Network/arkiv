@@ -71,6 +71,7 @@
 pub mod arkiv;
 /// ABI op decoding: `execute(Operation[])` calldata → the spec's `Op`s.
 pub mod decode;
+pub mod expiry_queue;
 /// Revert-payload encoding: `RevertReason` / `DecodeError` → Solidity error data.
 pub mod revert;
 
@@ -81,7 +82,7 @@ use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_sol_types::{SolCall, SolError, SolEvent};
-use arkiv_bindings::IEntityRegistry;
+use arkiv_bindings::{IEntityRegistry, protocol::purgeExpiredCall};
 use reth_ethereum::{
     EthPrimitives,
     chainspec::{EthereumHardforks, Hardforks},
@@ -328,11 +329,20 @@ where
             charge: !self.cfg_env().is_fee_charge_disabled(),
             ..FeeEnv::from_block(self.inner.block())
         };
+        let chain_id = self.inner.chain_id();
         let db = self.inner.db_mut();
-        if nonce_check {
-            validate_nonce(db, &tx)?;
+        let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
+            && tx.data.starts_with(&purgeExpiredCall::SELECTOR);
+        let is_protocol_purge = is_protocol_purge(&tx, block_number, chain_id);
+        if has_purge_selector && !is_protocol_purge {
+            return Err(invalid_transaction("purgeExpired is protocol-only"));
         }
-        validate_fees(db, &tx, fees.base_fee, fee_checks)?;
+        if !is_protocol_purge {
+            if nonce_check {
+                validate_nonce(db, &tx)?;
+            }
+            validate_fees(db, &tx, fees.base_fee, fee_checks)?;
+        }
         arkiv_transact(db, block_number, fees, tx)
     }
 
@@ -362,6 +372,28 @@ where
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         self.inner.finish()
     }
+}
+
+fn is_protocol_purge(tx: &TxEnv, block_number: u64, chain_id: u64) -> bool {
+    use arkiv_bindings::{PURGE_CALLER, PURGE_GAS_LIMIT};
+
+    tx.tx_type == 2
+        && tx.caller == PURGE_CALLER
+        && tx.kind == TxKind::Call(ARKIV_ADDRESS)
+        && tx.data.starts_with(&purgeExpiredCall::SELECTOR)
+        && tx.nonce == block_number
+        && tx.chain_id == Some(chain_id)
+        && tx.gas_limit == PURGE_GAS_LIMIT
+        && tx.gas_price == u128::MAX
+        && tx.gas_priority_fee == Some(0)
+        && tx.value == U256::ZERO
+        && tx.access_list.is_empty()
+        && tx.blob_hashes.is_empty()
+        && tx.authorization_list.is_empty()
+}
+
+fn invalid_transaction<DBError>(message: impl Into<String>) -> EVMError<DBError> {
+    EVMError::Transaction(InvalidTransaction::Str(message.into().into()))
 }
 
 /// revm's pre-execution nonce check, which the no-EVM path would otherwise skip.
@@ -479,9 +511,8 @@ fn arkiv_transact<DB: Database>(
         }
     };
 
-    // A call to ARKIV_ADDRESS is either one of the read-only views or the entity
-    // state transition (`execute(Operation[])` — the only other selector
-    // `decode_ops` accepts).
+    // A call to ARKIV_ADDRESS is a read-only view, the user entity transition
+    // `execute(Operation[])`, or the protocol-only `purgeExpired(bytes32[])`.
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
@@ -492,6 +523,9 @@ fn arkiv_transact<DB: Database>(
         }
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
             return arkiv_attribute_type_id_call(db, &tx, block_number, &fees);
+        }
+        if selector == purgeExpiredCall::SELECTOR {
+            return arkiv_purge_expired(db, block_number, &tx);
         }
         return arkiv_entity_transact(db, block_number, &fees, &tx);
     }
@@ -524,6 +558,80 @@ fn arkiv_transact<DB: Database>(
     };
 
     Ok(ResultAndState::new(result, state))
+}
+
+fn arkiv_purge_expired<DB: Database>(
+    db: &mut DB,
+    block_number: u64,
+    tx: &TxEnv,
+) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+    use arkiv_bindings::MAX_PURGE_KEYS;
+    use arkiv_interfaces::statemanager::EntityUpdates;
+
+    if tx.gas_limit < intrinsic_gas(&tx.data) {
+        return Ok(out_of_gas());
+    }
+    let call = purgeExpiredCall::abi_decode_raw(&tx.data[4..])
+        .map_err(|e| invalid_transaction(format!("invalid purgeExpired calldata: {e}")))?;
+    if call.entityKeys.len() > MAX_PURGE_KEYS {
+        return Err(invalid_transaction(format!(
+            "purge contains more than {MAX_PURGE_KEYS} keys"
+        )));
+    }
+    let purge_keys = call.entityKeys;
+    let mut view = write_manager(db, parent_ref(block_number));
+    let mut modeled_gas = 0u64;
+    for key in &purge_keys {
+        let key_bytes = key.0;
+        let Some(entity) = view
+            .get_entity(key_bytes, ReadMode::ViewWithOverlay)
+            .map_err(state_fault("read purge entity"))?
+        else {
+            continue;
+        };
+        if entity.expires_at > block_number {
+            continue;
+        }
+        modeled_gas =
+            modeled_gas.saturating_add(arkiv_interfaces::gas::purge_cost(entity.attributes.len()));
+        if modeled_gas > tx.gas_limit {
+            return Ok(out_of_gas());
+        }
+        view.update_entity(EntityUpdates::deletion(key_bytes))
+            .map_err(state_fault("stage purge deletion"))?;
+    }
+    let deltas = view
+        .get_uncommitted_deltas()
+        .map_err(state_fault("purge deltas"))?;
+    view.equality_index_mut()
+        .apply_deltas(&deltas)
+        .map_err(state_fault("purge equality index"))?;
+    view.range_index_mut()
+        .apply_deltas(&deltas)
+        .map_err(state_fault("purge range index"))?;
+    StateView::commit(&mut view).map_err(state_fault("commit purge"))?;
+    let state = view.into_base().into_state();
+    let gas_used = modeled_gas.max(intrinsic_gas(&tx.data));
+    Ok(ResultAndState::new(
+        ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas: ResultGas::default().with_total_gas_spent(gas_used),
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        },
+        state,
+    ))
+}
+
+fn out_of_gas() -> ResultAndState<HaltReason> {
+    ResultAndState::new(
+        ExecutionResult::Halt {
+            reason: HaltReason::OutOfGas(OutOfGasError::Basic),
+            gas: ResultGas::default(),
+            logs: Vec::new(),
+        },
+        EvmState::default(),
+    )
 }
 
 /// The entity state transition for a call to [`ARKIV_ADDRESS`].
@@ -1009,6 +1117,90 @@ mod tests {
             chain_id: Some(1),
             ..Default::default()
         }
+    }
+
+    fn protocol_purge_tx(block: u64, keys: Vec<B256>) -> TxEnv {
+        use arkiv_bindings::{PURGE_CALLER, PURGE_GAS_LIMIT};
+
+        TxEnv {
+            tx_type: 2,
+            caller: PURGE_CALLER,
+            gas_limit: PURGE_GAS_LIMIT,
+            gas_price: u128::MAX,
+            kind: TxKind::Call(ARKIV_ADDRESS),
+            data: purgeExpiredCall { entityKeys: keys }.abi_encode().into(),
+            nonce: block,
+            chain_id: Some(1),
+            gas_priority_fee: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn protocol_purge_requires_the_exact_envelope() {
+        let tx = protocol_purge_tx(10, Vec::new());
+        assert!(is_protocol_purge(&tx, 10, 1));
+
+        let mut user = tx.clone();
+        user.caller = Address::repeat_byte(0xAA);
+        assert!(!is_protocol_purge(&user, 10, 1));
+
+        let mut wrong_nonce = tx.clone();
+        wrong_nonce.nonce += 1;
+        assert!(!is_protocol_purge(&wrong_nonce, 10, 1));
+
+        let mut wrong_gas = tx;
+        wrong_gas.gas_limit -= 1;
+        assert!(!is_protocol_purge(&wrong_gas, 10, 1));
+    }
+
+    #[test]
+    fn malformed_and_oversized_purges_are_invalid_transactions() {
+        use alloy_evm::EvmError;
+
+        let mut db = EmptyDB::default();
+        let mut malformed = protocol_purge_tx(10, Vec::new());
+        malformed.data = purgeExpiredCall::SELECTOR.into();
+        let error = arkiv_purge_expired(&mut db, 10, &malformed).unwrap_err();
+        assert!(error.try_into_invalid_tx_err().is_ok());
+
+        let oversized = protocol_purge_tx(
+            10,
+            (0..=arkiv_bindings::MAX_PURGE_KEYS)
+                .map(|i| B256::repeat_byte(i as u8))
+                .collect(),
+        );
+        let error = arkiv_purge_expired(&mut db, 10, &oversized).unwrap_err();
+        assert!(error.try_into_invalid_tx_err().is_ok());
+    }
+
+    #[test]
+    fn protocol_purge_skips_a_live_entity() {
+        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
+
+        let mut db = CacheDB::new(EmptyDB::default());
+        let alice = Address::repeat_byte(0xAA);
+        let created = arkiv_transact(
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, create_calldata(50, b"live")),
+        )
+        .unwrap();
+        db.commit(created.state);
+        let key = B256::from(derive_entity_address(
+            1,
+            &alice.into_array(),
+            EntityCreationNonce::new(0),
+            0,
+        ));
+
+        let purged = arkiv_purge_expired(&mut db, 11, &protocol_purge_tx(11, vec![key])).unwrap();
+        assert!(purged.result.is_success());
+        assert!(
+            !purged.state.contains_key(&entity_leaf_address(key.0)),
+            "a live entity must not be staged for deletion"
+        );
     }
 
     /// A create call through `arkiv_transact`: the entity is committed at its minted

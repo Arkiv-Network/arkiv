@@ -287,6 +287,22 @@ impl<P: Provider> ArkivClient<P> {
             .expect("arkiv_getEntity")
     }
 
+    /// Whether the entity record physically exists, ignoring logical expiry.
+    pub async fn debug_entity_exists(&self, key: B256) -> bool {
+        self.provider
+            .raw_request("arkiv_debugEntityExists".into(), (key,))
+            .await
+            .expect("arkiv_debugEntityExists")
+    }
+
+    /// Whether the entity record physically existed after a past block.
+    pub async fn debug_entity_exists_at(&self, key: B256, block: u64) -> bool {
+        self.provider
+            .raw_request("arkiv_debugEntityExists".into(), (key, block))
+            .await
+            .expect("arkiv_debugEntityExists (historical)")
+    }
+
     /// `arkiv_getEntity` as of a past block.
     pub async fn get_entity_at(&self, key: B256, block: u64) -> serde_json::Value {
         self.provider
