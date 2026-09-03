@@ -67,7 +67,16 @@ jobs:
       - if: always()
         run: |
           set -euo pipefail
-          tar --zstd -cf "target-${{ env.PROFILE }}.tar.zst" \
+          # `tar --zstd` compresses at level 3; level 10 with a 128 MB window
+          # is ~21% smaller for a few extra seconds, and still unpacks with a
+          # plain `tar --zstd -xf`.
+          #
+          # `*.o` is the C intermediates jemalloc/rocksdb leave behind after
+          # producing their .a archives. Everything else stays: deps/*.rmeta,
+          # .fingerprint and the build-script `out` trees are all load-bearing
+          # if this tarball is ever restored as a build cache.
+          tar -I 'zstd -10 -T0 --long=27' --exclude='*.o' \
+            -cf "target-${{ env.PROFILE }}.tar.zst" \
             -C . target
           ls -lh "target-${{ env.PROFILE }}.tar.zst"
 
