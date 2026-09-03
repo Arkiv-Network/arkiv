@@ -53,6 +53,28 @@ jobs:
           cargo build --workspace --locked --profile "$PROFILE" --timings
           echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
 
+      # Drop the C intermediates jemalloc and rocksdb leave behind once their
+      # .a archives exist — ~1200 files, ~174 MB, that nothing links against.
+      #
+      # Nothing else here is dead weight: deps/*.rmeta is what lets dependent
+      # crates typecheck without recompiling, .fingerprint decides freshness,
+      # and both copies of libjemalloc.a stay because the build script emits
+      # rustc-link-search pointing at out/build/lib.
+      - if: always()
+        id: prune
+        run: |
+          set -euo pipefail
+          before=$(du -sm target | cut -f1)
+          count=$(find target -name '*.o' | wc -l)
+          find target -name '*.o' -delete
+          after=$(du -sm target | cut -f1)
+          echo "pruned $count object files: ${before}MB -> ${after}MB"
+          {
+            echo "before=${before}"
+            echo "after=${after}"
+            echo "removed=${count}"
+          } >> "$GITHUB_OUTPUT"
+
       - if: always()
         env:
           SECONDS_ELAPSED: ${{ steps.build.outputs.seconds }}
@@ -61,7 +83,8 @@ jobs:
             echo "## cold build ($PROFILE)"
             echo
             echo "- wall time: ${SECONDS_ELAPSED:-n/a}s"
-            echo "- target size: $(du -sh target 2>/dev/null | cut -f1)"
+            echo "- target size: ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB"
+            echo "- pruned: ${{ steps.prune.outputs.removed }} object files"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # upload-artifact zips its input, which is slow and lossy for a target
@@ -74,11 +97,9 @@ jobs:
           # is ~21% smaller for a few extra seconds, and still unpacks with a
           # plain `tar --zstd -xf`.
           #
-          # `*.o` is the C intermediates jemalloc/rocksdb leave behind after
-          # producing their .a archives. Everything else stays: deps/*.rmeta,
-          # .fingerprint and the build-script `out` trees are all load-bearing
-          # if this tarball is ever restored as a build cache.
-          tar -I 'zstd -10 -T0 --long=27' --exclude='*.o' \
+          # The tree was pruned in place by the step above, so this packs
+          # exactly what a restored build cache needs.
+          tar -I 'zstd -10 -T0 --long=27' \
             -cf "target-${{ env.PROFILE }}.tar.zst" \
             -C . target
           ls -lh "target-${{ env.PROFILE }}.tar.zst"
