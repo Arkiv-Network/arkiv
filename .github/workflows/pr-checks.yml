@@ -1,22 +1,23 @@
-# The checks lane: two jobs off the same shared cache.
+# The checks lane: two jobs off two different caches.
 #
-#   tests — cargo nextest over the workspace
-#   lint  — cargo fmt, then clippy as a blocking gate
+#   tests — cargo nextest over the workspace, from the build cache
+#   lint  — cargo fmt, then clippy as a blocking gate, from the clippy cache
 #
 # They were one sequential job until the timings showed why they should not be:
-# fmt, tests and clippy share a cache but nothing else, so running them in
-# series charged the pull request the sum of three independent checks. Split,
-# the lane costs the longer of the two rather than the total.
+# fmt, tests and clippy share nothing but a checkout, so running them in series
+# charged the pull request the sum of three independent checks. Split, the lane
+# costs the longer of the two rather than the total.
 #
-# The margin has since narrowed. cold-build now warms clippy too, which took it
-# from 212s to 28s and left tests as the critical path: the split is worth ~35s
-# of wall clock, against a second pull of the same 772 MB archive. What keeps
-# it split is the reporting — a lint failure and a test failure land
-# independently, so a push learns both at once rather than one per attempt.
+# The two now pull different packages, because they need different trees. A
+# check unit and a build unit for the same crate have different fingerprints —
+# mode is part of the metadata hash — so a merged archive is just each job
+# downloading the other's half. cold-build publishes one package per lane:
+# arkiv-build-cache carries the rlibs, arkiv-clippy-cache carries the ~700
+# dependency .rmeta a check build actually reads.
 #
 # clippy is scoped with `--no-deps`: cargo runs clippy-driver as
 # RUSTC_WORKSPACE_WRAPPER, so only workspace crates are linted and their
-# dependencies are reused straight from the restored cache instead of being
+# dependencies come back warm from the restored cache instead of being
 # re-analysed. Without it clippy also lints every dependency, which is both
 # slow and not actionable.
 name: pr-checks
@@ -62,7 +63,9 @@ jobs:
       # from the same tree, so dispatching dev-fast measures the same lane
       # against the cheaper optimisation level.
       PROFILE: ${{ inputs.profile || 'dev-fast' }}
-      PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache:${{ inputs.tag || inputs.profile || 'dev-fast' }}
+      # One package per lane: the tests job wants the build tree, the lint job
+      # wants the check tree, and neither has any use for the other.
+      PACKAGE: ghcr.io/arkiv-network/arkiv-${{ matrix.task == 'lint' && 'clippy' || 'build' }}-cache:${{ inputs.tag || inputs.profile || 'dev-fast' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
@@ -126,11 +129,11 @@ jobs:
 
       # Blocking, and now nothing waits behind it: the tests report from their
       # own job regardless of what clippy finds.
-      # Fast because cold-build ran this exact command before packing the
-      # cache, so the check artifacts for untouched workspace crates come back
-      # warm. Any divergence from that invocation — profile, `--no-deps`, the
-      # `-D warnings` argument — changes the fingerprint and silently costs the
-      # full 212s again.
+      # Fast because cold-build's clippy lane ran this exact command to
+      # produce the cache this job restored, so every untouched crate comes
+      # back warm. Any divergence from that invocation — profile, `--no-deps`,
+      # the `-D warnings` argument — changes the fingerprint and silently costs
+      # the full 212s again.
       - name: clippy
         id: clippy
         if: matrix.task == 'lint'
