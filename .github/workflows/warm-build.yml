@@ -12,10 +12,10 @@ on:
     branches: [scx1332/ci-optimizations]
   workflow_dispatch:
     inputs:
-      run_id:
-        description: "cold-build run whose artifact to restore"
+      package:
+        description: "OCI package holding the build cache"
         required: false
-        default: "33748295613"
+        default: "ghcr.io/arkiv-network/arkiv-build-cache:release-fast-5fbfe2aadc2a"
       profile:
         description: "Cargo profile"
         required: false
@@ -31,11 +31,11 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      # download-artifact needs this to read another run's artifacts.
-      actions: read
+      # Reading the build-cache package off GHCR.
+      packages: read
     env:
       PROFILE: ${{ inputs.profile || 'release-fast' }}
-      RUN_ID: ${{ inputs.run_id || '33748295613' }}
+      PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:release-fast-5fbfe2aadc2a' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97
@@ -44,18 +44,21 @@ jobs:
 
       # Deliberately no Swatinem/rust-cache: the restored tree is the only
       # cache under test.
-      - uses: actions/download-artifact@v4
-        with:
-          name: target-${{ env.PROFILE }}
-          run-id: ${{ env.RUN_ID }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: oras-project/setup-oras@v1
 
-      - name: Restore the build tree
+      - name: Pull and restore the build tree
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
           t0=$(date +%s)
-          tar --zstd -xpf "target-${PROFILE}.tar.zst"
-          echo "restored in $(( $(date +%s) - t0 ))s: $(du -sh target | cut -f1)"
+          oras pull "$PACKAGE"
+          echo "pulled in $(( $(date +%s) - t0 ))s"
+          t1=$(date +%s)
+          # The tarball holds target/<profile>/, so unpack from the repo root.
+          tar --zstd -xpf target-*.tar.zst
+          echo "restored in $(( $(date +%s) - t1 ))s: $(du -sh target | cut -f1)"
 
       # `-v` isn't needed: cargo prints one "Compiling" line per unit it
       # actually rebuilds, so counting them shows what the cache saved.
@@ -74,7 +77,7 @@ jobs:
         run: |
           warm=${{ steps.warm.outputs.seconds }}
           {
-            echo "## warm build ($PROFILE), cache from run $RUN_ID"
+            echo "## warm build ($PROFILE), cache from \`$PACKAGE\`"
             echo
             echo "| | seconds |"
             echo "|---|---|"
