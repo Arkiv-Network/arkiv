@@ -8,8 +8,11 @@
 # series charged the pull request the sum of three independent checks. Split,
 # the lane costs the longer of the two rather than the total.
 #
-# Both jobs restore the same 650 MB archive, which is the price of the split —
-# one extra pull, against ~165s of wall clock saved.
+# The margin has since narrowed. cold-build now warms clippy too, which took it
+# from 212s to 28s and left tests as the critical path: the split is worth ~35s
+# of wall clock, against a second pull of the same 772 MB archive. What keeps
+# it split is the reporting — a lint failure and a test failure land
+# independently, so a push learns both at once rather than one per attempt.
 #
 # clippy is scoped with `--no-deps`: cargo runs clippy-driver as
 # RUSTC_WORKSPACE_WRAPPER, so only workspace crates are linted and their
@@ -123,6 +126,11 @@ jobs:
 
       # Blocking, and now nothing waits behind it: the tests report from their
       # own job regardless of what clippy finds.
+      # Fast because cold-build ran this exact command before packing the
+      # cache, so the check artifacts for untouched workspace crates come back
+      # warm. Any divergence from that invocation — profile, `--no-deps`, the
+      # `-D warnings` argument — changes the fingerprint and silently costs the
+      # full 212s again.
       - name: clippy
         id: clippy
         if: matrix.task == 'lint'

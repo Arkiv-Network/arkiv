@@ -4,7 +4,7 @@
 # One package, one version per profile, tagged by profile name. `pr-artifact`
 # and `pr-checks` restore whichever tag matches the profile they build with, so
 # this is the only thing that writes them — and the version a tag move leaves
-# behind is deleted, rather than accumulating a 511 MB blob per commit.
+# behind is deleted, rather than accumulating a 772 MB blob per commit.
 #
 # Only dev-fast is published for now. The matrix is kept so a second profile
 # is one list entry away, but measuring two optimisation levels at once made
@@ -148,7 +148,7 @@ jobs:
           echo "mb=$(( $(stat -c%s "$ARCHIVE") / 1024 / 1024 ))" >> "$GITHUB_OUTPUT"
 
       # Published as an OCI artifact rather than a Docker image layer: oras
-      # stores the blob byte-for-byte, so the zstd tarball stays ~511 MB. An
+      # stores the blob byte-for-byte, so the zstd tarball stays ~772 MB. An
       # image layer would be gzipped by the builder instead, which is both
       # slower and considerably larger on already-compressed input.
       - name: Publish
