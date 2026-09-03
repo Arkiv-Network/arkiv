@@ -1,19 +1,6 @@
 name: kurtosis
 
 on:
-  push:
-    branches: [main]
-    paths: &kurtosis-paths
-      - "bin/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "scripts/kurtosis/**"
-      - "kurtosis/**"
-      - ".github/workflows/kurtosis.yml"
-  pull_request:
-    paths: *kurtosis-paths
   workflow_dispatch:
 
 concurrency:
