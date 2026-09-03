@@ -43,7 +43,7 @@ jobs:
     # job in `rust` takes ~10 minutes, so leave generous headroom.
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
@@ -115,7 +115,7 @@ jobs:
       # image layer would be gzipped by the builder instead, which is both
       # slower and considerably larger on already-compressed input.
       - if: always() && github.event_name != 'pull_request'
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
       - if: always() && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -135,7 +135,7 @@ jobs:
           echo "- package: \`$pkg:${{ env.PROFILE }}-${GITHUB_SHA::12}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: target-${{ env.PROFILE }}
           path: target-${{ env.PROFILE }}.tar.zst

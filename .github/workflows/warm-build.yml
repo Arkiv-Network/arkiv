@@ -37,14 +37,14 @@ jobs:
       PROFILE: ${{ inputs.profile || 'release-fast' }}
       PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:release-fast-5fbfe2aadc2a' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
       - uses: foundry-rs/foundry-toolchain@v1
 
       # Deliberately no Swatinem/rust-cache: the restored tree is the only
       # cache under test.
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Pull and restore the build tree
         env:
