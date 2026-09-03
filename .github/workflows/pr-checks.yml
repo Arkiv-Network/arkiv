@@ -87,12 +87,25 @@ jobs:
           set -euo pipefail
           oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
           t0=$(date +%s)
-          oras pull "$PACKAGE"
-          tar --zstd -xpf target-cache.tar.zst
+          # `target` restricts extraction to that member: the archive is created
+          # as `-cf ... target`, but nothing on this side enforced it, and a
+          # member such as .cargo/config.toml would land on the checkout and be
+          # read by the very next cargo invocation.
+          #
+          # A miss is not fatal. Without this the lane hard-fails on a GHCR
+          # blip, or in the window before the first cold-build publishes, and
+          # the error reads like a broken build rather than a cold cache.
+          if oras pull "$PACKAGE"; then
+            tar --zstd --no-same-owner -xpf target-cache.tar.zst target
+            echo "cache=hit" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no build cache at $PACKAGE - compiling cold"
+            echo "cache=miss" >> "$GITHUB_OUTPUT"
+          fi
           # Only full-test-cache ships one. Restoring it skips both the
           # crates.io fetch and the unpack into registry/src.
           if [ -f cargo-home.tar.zst ]; then
-            tar --zstd -xpf cargo-home.tar.zst -C "${CARGO_HOME:-$HOME/.cargo}"
+            tar --zstd --no-same-owner -xpf cargo-home.tar.zst -C "${CARGO_HOME:-$HOME/.cargo}" registry git
             echo "cargo_home=yes" >> "$GITHUB_OUTPUT"
           else
             echo "cargo_home=no" >> "$GITHUB_OUTPUT"
@@ -144,5 +157,5 @@ jobs:
               echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
             fi
             echo
-            echo "cache \`${PACKAGE##*:}\`, profile \`$PROFILE\`, cargo home restored: ${{ steps.restore.outputs.cargo_home }}"
+            echo "cache \`${PACKAGE##*:}\` ${{ steps.restore.outputs.cache }}, profile \`$PROFILE\`, cargo home restored: ${{ steps.restore.outputs.cargo_home }}"
           } >> "$GITHUB_STEP_SUMMARY"
