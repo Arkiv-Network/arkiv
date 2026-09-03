@@ -51,7 +51,7 @@ jsonrpsee = { version = "0.26", features = ["server"] }
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 tracing = "0.1"
-turso = { version = "=0.8.0-pre.7", default-features = false }
+turso = { version = "=0.7.2", default-features = false }
 
 # alloy primitives used by the Arkiv protocol crates.
 alloy-rlp = "0.3"
