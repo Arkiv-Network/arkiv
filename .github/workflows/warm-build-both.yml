@@ -1,0 +1,87 @@
+# Restores the *tests* cache and then does both jobs on it: build the
+# binaries, and build+run the test suite.
+#
+# The question is whether one cache serves both. The tests cache costs
+# almost nothing extra to produce (519 MB vs 511 MB, 1406s vs 1490s cold),
+# so if it makes the binary build warm too, there is no reason to publish
+# two caches.
+name: warm-build-both
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Build cache to restore"
+        required: false
+        default: "ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9"
+  push:
+    branches: [scx1332/ci-optimizations]
+    paths: [".github/workflows/warm-build-both.yml"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  both:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    env:
+      PROFILE: release-fast
+      PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: taiki-e/install-action@nextest
+      - uses: oras-project/setup-oras@v2
+
+      - name: Pull and restore the tests cache
+        id: restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          t0=$(date +%s)
+          oras pull "$PACKAGE"
+          tar --zstd -xpf target-tests-*.tar.zst
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+          du -sh target
+
+      - name: Build the binaries
+        id: bins
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE" 2>&1 | tee bins.log
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+          echo "recompiled=$(grep -c ' Compiling ' bins.log || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and run the tests
+        id: tests
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo nextest run --workspace --locked --cargo-profile "$PROFILE" 2>&1 | tee tests.log
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+          echo "recompiled=$(grep -c ' Compiling ' tests.log || true)" >> "$GITHUB_OUTPUT"
+
+      - if: always()
+        run: |
+          {
+            echo "## one cache, both jobs ($PROFILE)"
+            echo
+            echo "| step | seconds | crates recompiled |"
+            echo "|---|---|---|"
+            echo "| pull + restore | ${{ steps.restore.outputs.seconds }} | - |"
+            echo "| build binaries | ${{ steps.bins.outputs.seconds }} | ${{ steps.bins.outputs.recompiled }} |"
+            echo "| build + run tests | ${{ steps.tests.outputs.seconds }} | ${{ steps.tests.outputs.recompiled }} |"
+            echo
+            echo "Baselines: binaries cold 1490s / warm-from-binary-cache 373s;"
+            echo "tests cold (build+run) 1406s."
+          } >> "$GITHUB_STEP_SUMMARY"
