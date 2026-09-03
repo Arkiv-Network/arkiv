@@ -1,0 +1,119 @@
+# The cold-build -> package experiment, but for the test binaries.
+#
+# Separate from `cold-build` on purpose: dev-dependencies pull in a different
+# (larger) graph, so this produces its own cache under its own tag and leaves
+# the binary-only flow alone.
+name: cold-build-tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile"
+        required: false
+        default: "release-fast"
+  push:
+    branches: [scx1332/ci-optimizations]
+    # Only this file, so iterating on other workflows doesn't start a build.
+    paths: [".github/workflows/cold-build-tests.yml"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PROFILE: ${{ inputs.profile || 'release-fast' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: taiki-e/install-action@nextest
+
+      # No rust-cache: the point is a genuine cold build.
+      #
+      # Note `--cargo-profile`, not `--profile`: for nextest, `--profile` picks
+      # a *nextest* profile, and the cargo profile has its own flag.
+      - name: Cold build and run the test suite
+        id: build
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo nextest run --workspace --locked --cargo-profile "$PROFILE" --no-fail-fast 2>&1 \
+            | while IFS= read -r line; do printf '%s %s\n' "$(date +%s)" "$line"; done \
+            | tee tests.log
+          echo "total=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+          # nextest prints "Starting <n> tests" once compilation is done, so
+          # this splits build time from test-run time.
+          starting=$(grep -m1 ' Starting ' tests.log | cut -d' ' -f1 || echo "")
+          if [ -n "$starting" ]; then
+            echo "compile=$(( starting - t0 ))" >> "$GITHUB_OUTPUT"
+            echo "run=$(( $(date +%s) - starting ))" >> "$GITHUB_OUTPUT"
+          fi
+          echo "compiled=$(grep -c ' Compiling ' tests.log || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Prune C intermediates
+        if: always()
+        id: prune
+        run: |
+          set -euo pipefail
+          before=$(du -sm target | cut -f1)
+          count=$(find target -name '*.o' | wc -l)
+          find target -name '*.o' -delete
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$(du -sm target | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "removed=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Pack
+        if: always()
+        id: pack
+        run: |
+          set -euo pipefail
+          tar -I 'zstd -10 -T0 --long=27' -cf "target-tests-${PROFILE}.tar.zst" target
+          echo "bytes=$(stat -c%s "target-tests-${PROFILE}.tar.zst")" >> "$GITHUB_OUTPUT"
+          ls -lh "target-tests-${PROFILE}.tar.zst"
+
+      - uses: oras-project/setup-oras@v2
+        if: always()
+      - name: Publish to GHCR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          ref="ghcr.io/arkiv-network/arkiv-build-cache:tests-${PROFILE}-${GITHUB_SHA::12}"
+          oras push "$ref" \
+            --artifact-type "application/vnd.arkiv.build-cache.v1" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "network.arkiv.profile=${PROFILE}" \
+            --annotation "network.arkiv.contents=test-binaries" \
+            "target-tests-${PROFILE}.tar.zst:application/vnd.arkiv.build-cache.v1.tar+zstd"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "PKG_REF=$ref" >> "$GITHUB_ENV"
+
+      - if: always()
+        run: |
+          {
+            echo "## cold build with tests ($PROFILE)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| total | ${{ steps.build.outputs.total }}s |"
+            echo "| compiling | ${{ steps.build.outputs.compile }}s |"
+            echo "| running tests | ${{ steps.build.outputs.run }}s |"
+            echo "| units compiled | ${{ steps.build.outputs.compiled }} |"
+            echo "| target size | ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB |"
+            echo "| package | $(( ${{ steps.pack.outputs.bytes }} / 1048576 ))MB |"
+            echo
+            echo "Binary-only baseline: 1490s cold, 511MB package."
+            echo "\`${PKG_REF:-not published}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
