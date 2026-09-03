@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-bindings"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-contract",
  "alloy-primitives",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-contract",
  "alloy-network",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-genesis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -1428,11 +1428,11 @@ dependencies = [
 
 [[package]]
 name = "arkiv-interfaces"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "arkiv-query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-chainspec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-executor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-mpt-committed-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-rpc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-statemanager"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
@@ -1541,14 +1541,14 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-uncommitted-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arkiv-interfaces",
 ]
 
 [[package]]
 name = "arkiv-rpc-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
