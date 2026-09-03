@@ -12,9 +12,14 @@ on:
       profile:
         description: "Cargo profile, and the cache tag that mirrors it"
         required: false
-        default: "release-fast"
+        default: "dev-fast"
         type: choice
-        options: [release-fast, dev-fast]
+        options: [dev-fast]
+  # `workflow_dispatch` is not startable until this file reaches the default
+  # branch, so pushes to the working branch are how to measure it by hand.
+  # TEMPORARY: drop before merging.
+  push:
+    branches: [scx1332/ci-optimizations]
   pull_request:
 
 # Gates pull requests. Superseded runs are pointless once the head moves,
@@ -34,8 +39,8 @@ jobs:
       # The cache tag mirrors the profile: cold-build publishes one per profile
       # from the same tree, so dispatching dev-fast measures the same lane
       # against the cheaper optimisation level.
-      PROFILE: ${{ inputs.profile || 'release-fast' }}
-      PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache:${{ inputs.profile || 'release-fast' }}
+      PROFILE: ${{ inputs.profile || 'dev-fast' }}
+      PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache:${{ inputs.profile || 'dev-fast' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
@@ -91,4 +96,4 @@ jobs:
     needs: build
     uses: ./.github/workflows/kurtosis.yml
     with:
-      artifact: arkiv-binaries-${{ inputs.profile || 'release-fast' }}-${{ github.sha }}
+      artifact: arkiv-binaries-${{ inputs.profile || 'dev-fast' }}-${{ github.sha }}

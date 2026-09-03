@@ -6,9 +6,9 @@
 # this is the only thing that writes them — and the version a tag move leaves
 # behind is deleted, rather than accumulating a 511 MB blob per commit.
 #
-# release-fast and dev-fast are built as a matrix so the two are directly
-# comparable: same tree, same steps, same measurements, different optimisation
-# level.
+# Only dev-fast is published for now. The matrix is kept so a second profile
+# is one list entry away, but measuring two optimisation levels at once made
+# every timing ambiguous, so the comparison lane is parked.
 #
 # It builds both the workspace binaries and the test binaries: dev-dependencies
 # pull a larger graph, and a cache that covers them serves the binary lane just
@@ -22,12 +22,6 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
-  # `workflow_dispatch` is not startable until this file reaches the default
-  # branch, so until then touching the file itself is how to run it by hand.
-  push:
-    branches: [scx1332/ci-optimizations]
-    paths: [".github/workflows/cold-build.yml"]
-
 
 env:
   PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache
@@ -48,7 +42,7 @@ jobs:
       # tag, and a half-refreshed pair is still usable.
       fail-fast: false
       matrix:
-        profile: [release-fast, dev-fast]
+        profile: [dev-fast]
     env:
       PROFILE: ${{ matrix.profile }}
     # A cold build of the reth tree with no cache at all took ~25 minutes for
