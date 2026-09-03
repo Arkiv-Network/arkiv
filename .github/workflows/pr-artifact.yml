@@ -1,0 +1,78 @@
+# The fast lane: restore the shared cache and get shippable binaries out.
+#
+# Nothing else runs here — fmt, tests and clippy live in pr-checks so a lint
+# failure never delays the artifact, and the two run in parallel.
+name: pr-artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Build cache to restore"
+        required: false
+        default: "ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9"
+  push:
+    branches: [scx1332/ci-optimizations]
+    paths: [".github/workflows/pr-artifact.yml"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    env:
+      PROFILE: release-fast
+      PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: oras-project/setup-oras@v2
+
+      - name: Restore the shared cache
+        id: restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          t0=$(date +%s)
+          oras pull "$PACKAGE"
+          tar --zstd -xpf target-tests-*.tar.zst
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE"
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # The binaries are already stripped by the profile, so there is nothing
+      # for zip to gain — level 1 keeps the upload quick.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arkiv-binaries-${{ github.sha }}
+          path: |
+            target/release-fast/arkiv-reth
+            target/release-fast/arkiv-cli
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7
+
+      - if: always()
+        run: |
+          {
+            echo "## artifact"
+            echo "- restore: ${{ steps.restore.outputs.seconds }}s"
+            echo "- build: ${{ steps.build.outputs.seconds }}s"
+            ls -lh target/release-fast/arkiv-reth target/release-fast/arkiv-cli 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
