@@ -79,6 +79,11 @@ impl ChainPruningMap {
     }
 
     /// Select candidates only when the map includes the requested parent.
+    ///
+    /// Reth's `PayloadBuilder::try_build` method is synchronous and cannot
+    /// await Turso's asynchronous query API. This adapter runs the query on
+    /// the node runtime and limits the payload builder delay to
+    /// [`SELECT_TIMEOUT`].
     pub(crate) fn select_expired(
         &self,
         parent: u64,
@@ -96,6 +101,11 @@ impl ChainPruningMap {
         })
     }
 
+    /// Run the Turso query used by the synchronous payload builder adapter.
+    ///
+    /// Turso exposes asynchronous query and row APIs. Keep that work in this
+    /// method so [`Self::select_expired`] only has to bridge the synchronous
+    /// `PayloadBuilder::try_build` interface to the node runtime.
     async fn select_expired_async(
         &self,
         parent: u64,
