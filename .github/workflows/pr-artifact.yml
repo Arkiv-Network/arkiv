@@ -13,12 +13,10 @@ on:
         description: "Build cache to restore; cold-build refreshes :latest nightly"
         required: false
         default: "ghcr.io/arkiv-network/arkiv-build-cache:latest"
-  push:
-    branches: [scx1332/ci-optimizations]
-    paths:
-      - ".github/workflows/pr-artifact.yml"
-      - ".github/workflows/kurtosis.yml"
+  pull_request:
 
+# Gates pull requests. Superseded runs are pointless once the head moves,
+# so a new push cancels the one in flight.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

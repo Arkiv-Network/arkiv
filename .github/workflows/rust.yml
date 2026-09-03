@@ -1,5 +1,13 @@
 name: rust
+# The heavyweight lane, and no longer a pull-request gate: `pr-checks` and
+# `pr-artifact` cover fmt, tests, clippy and the binaries from a restored cache
+# in a fraction of the time. What is left here runs on main and on tags, where
+# thoroughness matters more than latency — udeps, a plain-`dev` compile, and
+# the multi-arch image publish that moves `latest`.
 on:
+  push:
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 env:

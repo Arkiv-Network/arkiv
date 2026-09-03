@@ -12,8 +12,9 @@
 name: cold-build
 
 on:
-  # Nightly from main. A scheduled trigger only ever fires from the default
-  # branch and only once this file is on it, so until then use the dispatch.
+  # Nightly from main. Rebuilding the cache is a deliberate act, never
+  # something a source change triggers: outside the schedule it is dispatch
+  # only.
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
@@ -24,11 +25,6 @@ on:
         default: "release-fast"
         type: choice
         options: [release-fast, dev-fast, dev, release]
-  # Rebuilding the cache is a deliberate act, not something a source change
-  # should trigger; touching this file is how to run it by hand from a branch.
-  push:
-    branches: [scx1332/ci-optimizations]
-    paths: [".github/workflows/cold-build.yml"]
 
 concurrency:
   group: ${{ github.workflow }}
