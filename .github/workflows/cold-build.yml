@@ -8,14 +8,13 @@
 name: cold-build
 
 on:
+  # Rebuilding the cache is a deliberate act, not something a source change
+  # should trigger. `workflow_dispatch` alone is not startable until this
+  # file reaches the default branch, so until then touching the file itself
+  # is the way to run it by hand.
   push:
     branches: [scx1332/ci-optimizations]
-    # Editing workflows or docs must not kick off a 25-minute cold build;
-    # only a change that could alter compilation is worth re-measuring.
-    paths-ignore:
-      - ".github/**"
-      - "docs/**"
-      - "**.md"
+    paths: [".github/workflows/cold-build.yml"]
   workflow_dispatch:
     inputs:
       profile:
