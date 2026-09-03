@@ -115,3 +115,5 @@ inherits = "release"
 opt-level = 2
 lto = "off"
 codegen-units = 16
+# `release` already carries no debug info; this drops the symbol table too.
+strip = "symbols"
