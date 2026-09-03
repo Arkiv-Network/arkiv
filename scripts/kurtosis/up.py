@@ -7,6 +7,7 @@ arkiv-reth execution client image and Lighthouse consensus client.
 Usage: scripts/kurtosis/up.py [enclave]
 """
 
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -33,11 +34,24 @@ def run(*cmd):
 def buildx(tag, dockerfile):
     # Keep the local BuildKit cache between runs; compiling reth is expensive,
     # while the final image is loaded into the local Docker daemon for Kurtosis.
+    ci_args = []
+    cache_args = []
+    if os.environ.get("CI"):
+        # Limit memory use during the large release build. The hosted runner
+        # cannot reuse a local cache, so do not export a duplicate cache there.
+        ci_args = ["--build-arg", "CARGO_BUILD_JOBS=2"]
+    else:
+        cache_args = [
+            "--cache-from",
+            f"type=local,src={CACHE}",
+            "--cache-to",
+            f"type=local,dest={CACHE},mode=max",
+        ]
     run(
         "docker", "buildx", "build", "--builder", BUILDER, "-t", tag,
         "-f", dockerfile,
-        "--cache-from", f"type=local,src={CACHE}",
-        "--cache-to", f"type=local,dest={CACHE},mode=max",
+        *ci_args,
+        *cache_args,
         "--load", ".",
     )  # fmt: skip
 

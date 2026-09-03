@@ -33,6 +33,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 # BuildKit fills TARGETARCH in from the platform being built for.
 ARG TARGETARCH
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 COPY --from=planner /build/recipe.json recipe.json
 # jemalloc, which reth links in, fixes its page size at compile time — and both
 # the cook and the build step compile it. arm64 is built for 64 KiB pages: such

@@ -71,7 +71,6 @@
 pub mod arkiv;
 /// ABI op decoding: `execute(Operation[])` calldata → the spec's `Op`s.
 pub mod decode;
-pub mod expiry_queue;
 /// Revert-payload encoding: `RevertReason` / `DecodeError` → Solidity error data.
 pub mod revert;
 

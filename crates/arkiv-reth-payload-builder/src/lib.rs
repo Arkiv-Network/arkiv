@@ -1,8 +1,9 @@
 //! Arkiv payload builder: prepend a bounded, protocol-generated purge transaction.
 
+mod chain_pruning_map;
+
 use alloy_consensus::{
-    BlockHeader, SignableTransaction, Transaction, TxEip1559, TxEnvelope,
-    transaction::SignerRecoverable,
+    SignableTransaction, Transaction, TxEip1559, TxEnvelope, transaction::SignerRecoverable,
 };
 use alloy_network::TxSignerSync;
 use alloy_primitives::{B256, Bytes, TxKind, U256};
@@ -12,9 +13,10 @@ use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
-use arkiv_reth_executor::{ARKIV_ADDRESS, expiry_queue::expiry_queue};
+use arkiv_reth_executor::ARKIV_ADDRESS;
 use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
 use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
+use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
     BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
@@ -32,14 +34,15 @@ use reth_ethereum::{
         BestTransactions, EthPooledTransaction, TransactionOrigin, TransactionPool,
         ValidPoolTransaction, error::InvalidPoolTransactionError,
     },
-    provider::{CanonStateNotification, CanonStateSubscriptions, Chain},
+    provider::CanonStateSubscriptions,
 };
 use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
-use reth_storage_api::StateProviderFactory;
+use reth_storage_api::{BlockReader, ReceiptProvider, StateProviderFactory};
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
-use tracing::warn;
+use tokio::runtime::Handle;
+use tracing::{debug, info, warn};
 
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
@@ -51,7 +54,12 @@ impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for ArkivPayloadSer
 where
     Node: FullNodeTypes<Types: NodeTypes<Primitives = EthPrimitives, Payload = EthEngineTypes>>,
     <Node::Types as NodeTypes>::ChainSpec: EthChainSpec + EthereumHardforks,
-    Node::Provider: StateProviderFactory + Unpin,
+    Node::Provider: StateProviderFactory
+        + BlockReader<Block = reth_ethereum::Block>
+        + ReceiptProvider<Receipt = reth_ethereum::Receipt>
+        + Clone
+        + Unpin
+        + 'static,
     Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + 'static,
     Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>
         + Send
@@ -63,11 +71,15 @@ where
         pool: Pool,
         evm: Evm,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
+        let pruning_path = ctx.config().datadir().data_dir().join("arkiv-pruning.db");
+        let pruning_map = ChainPruningMap::open(&pruning_path, Handle::current()).await?;
+        info!(target: "arkiv-reth", path = %pruning_path.display(), "opened chain pruning map");
         let payload_builder = ArkivPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
             evm,
             chain_id: ctx.chain_spec().chain().id(),
+            pruning_map: pruning_map.clone(),
             config: EthereumBuilderConfig::new()
                 .with_extra_data(ctx.payload_builder_config().extra_data()),
         };
@@ -81,15 +93,24 @@ where
                 .max_payload_tasks(conf.max_payload_tasks),
             payload_builder,
         );
+        spawn_catch_up(
+            ctx.task_executor(),
+            ctx.provider().clone(),
+            pruning_map.clone(),
+        );
         let provider = ctx.provider().clone();
-        let notifications = ctx
-            .provider()
-            .canonical_state_stream()
-            .inspect(move |notification| {
-                if let Err(error) = apply_canonical_update(&provider, notification) {
-                    warn!(target: "arkiv-reth", %error, "failed to update expiry queue");
+        let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
+            move |notification| {
+                let provider = provider.clone();
+                let pruning_map = pruning_map.clone();
+                async move {
+                    if let Err(error) = catch_up(provider, pruning_map).await {
+                        warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
+                    }
+                    notification
                 }
-            });
+            },
+        ));
         let (service, handle) = PayloadBuilderService::new(generator, notifications);
         ctx.task_executor().spawn_critical_os_thread(
             "payload-service",
@@ -100,81 +121,124 @@ where
     }
 }
 
-fn apply_canonical_update<P>(
-    provider: &P,
-    notification: &CanonStateNotification<EthPrimitives>,
-) -> eyre::Result<()>
-where
-    P: StateProviderFactory,
+fn spawn_catch_up<P>(
+    executor: &reth_ethereum::tasks::TaskExecutor,
+    provider: P,
+    pruning_map: ChainPruningMap,
+) where
+    P: StateProviderFactory
+        + BlockReader<Block = reth_ethereum::Block>
+        + ReceiptProvider<Receipt = reth_ethereum::Receipt>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
-    let committed = notification.committed();
-    let reverted = notification.reverted();
-    let mut touched = BTreeSet::new();
-    collect_touched_keys(&committed, &mut touched);
-    if let Some(reverted) = &reverted {
-        collect_touched_keys(reverted, &mut touched);
-    }
-    if touched.is_empty() {
-        return Ok(());
-    }
-
-    let state_hash = (!committed.is_empty())
-        .then(|| committed.tip().hash())
-        .or_else(|| {
-            reverted
-                .as_ref()
-                .map(|chain| chain.first().header().parent_hash())
-        });
-    let Some(state_hash) = state_hash else {
-        return Ok(());
-    };
-    let state = provider
-        .state_by_block_hash(state_hash)
-        .map_err(|error| eyre::eyre!("canonical state {state_hash}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
-    let mut queue = expiry_queue()
-        .write()
-        .map_err(|_| eyre::eyre!("expiry queue poisoned"))?;
-    for key in touched {
-        match entities
-            .get(key.0)
-            .map_err(|error| eyre::eyre!("read canonical entity {key}: {error:?}"))?
-        {
-            Some(entity) => queue.insert(key, entity.expires_at, entity.attributes.len()),
-            None => queue.remove(key),
+    executor.spawn_task(async move {
+        if let Err(error) = catch_up(provider, pruning_map).await {
+            warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
         }
-    }
-    Ok(())
+    });
 }
 
-fn collect_touched_keys(chain: &Chain<EthPrimitives>, keys: &mut BTreeSet<B256>) {
-    for log in chain.logs_iter() {
-        if log.address != ARKIV_ADDRESS {
-            continue;
+async fn catch_up<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
+where
+    P: StateProviderFactory
+        + BlockReader<Block = reth_ethereum::Block>
+        + ReceiptProvider<Receipt = reth_ethereum::Receipt>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let _guard = pruning_map.update_guard().await;
+    loop {
+        let watermark = pruning_map.watermark().await?;
+        let tip = provider
+            .best_block_number()
+            .map_err(|error| eyre::eyre!("read chain tip: {error:?}"))?;
+        if watermark >= tip {
+            return Ok(());
         }
-        let topics = log.topics();
-        if topics.len() > 1
-            && matches!(
-                topics[0],
-                IEntityRegistry::EntityCreated::SIGNATURE_HASH
-                    | IEntityRegistry::EntityPatched::SIGNATURE_HASH
-                    | IEntityRegistry::ExpiryExtended::SIGNATURE_HASH
-                    | IEntityRegistry::OwnershipTransferred::SIGNATURE_HASH
-                    | IEntityRegistry::EntityDeleted::SIGNATURE_HASH
-            )
-        {
-            keys.insert(topics[1]);
-        }
+        let height = watermark + 1;
+        let block_provider = provider.clone();
+        let (entries, removed) =
+            tokio::task::spawn_blocking(move || pruning_updates_at(&block_provider, height))
+                .await
+                .map_err(|error| {
+                    eyre::eyre!("join pruning replay for block {height}: {error}")
+                })??;
+        pruning_map.apply_next(height, &entries, &removed).await?;
     }
-    for transaction in chain.transactions_iter() {
+}
+
+fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
+where
+    P: StateProviderFactory
+        + BlockReader<Block = reth_ethereum::Block>
+        + ReceiptProvider<Receipt = reth_ethereum::Receipt>,
+{
+    let block = provider
+        .block_by_number(height)
+        .map_err(|error| eyre::eyre!("read block {height}: {error:?}"))?
+        .ok_or_else(|| eyre::eyre!("block {height} is unavailable"))?;
+    let receipts = provider
+        .receipts_by_block(height.into())
+        .map_err(|error| eyre::eyre!("read receipts for block {height}: {error:?}"))?
+        .ok_or_else(|| eyre::eyre!("receipts for block {height} are unavailable"))?;
+    let mut touched = BTreeSet::new();
+    for log in receipts.iter().flat_map(|receipt| &receipt.logs) {
+        collect_log_key(log, &mut touched);
+    }
+    for transaction in block.body.transactions() {
         if transaction.to() != Some(ARKIV_ADDRESS)
             || !transaction.input().starts_with(&purgeExpiredCall::SELECTOR)
         {
             continue;
         }
         if let Ok(call) = purgeExpiredCall::abi_decode(transaction.input()) {
-            keys.extend(call.entityKeys);
+            touched.extend(call.entityKeys);
         }
+    }
+
+    let state = provider
+        .history_by_block_number(height)
+        .map_err(|error| eyre::eyre!("read state for block {height}: {error:?}"))?;
+    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
+    let mut entries = Vec::with_capacity(touched.len());
+    let mut removed = Vec::new();
+    for key in touched {
+        match entities
+            .get(key.0)
+            .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error:?}"))?
+        {
+            Some(entity) => entries.push(PruningEntry {
+                key,
+                expires_at: entity.expires_at,
+                attribute_count: entity.attributes.len(),
+            }),
+            None => removed.push(key),
+        }
+    }
+    Ok((entries, removed))
+}
+
+fn collect_log_key(log: &alloy_primitives::Log, keys: &mut BTreeSet<B256>) {
+    if log.address != ARKIV_ADDRESS {
+        return;
+    }
+    let topics = log.topics();
+    if topics.len() > 1
+        && matches!(
+            topics[0],
+            IEntityRegistry::EntityCreated::SIGNATURE_HASH
+                | IEntityRegistry::EntityPatched::SIGNATURE_HASH
+                | IEntityRegistry::ExpiryExtended::SIGNATURE_HASH
+                | IEntityRegistry::OwnershipTransferred::SIGNATURE_HASH
+                | IEntityRegistry::EntityDeleted::SIGNATURE_HASH
+        )
+    {
+        keys.insert(topics[1]);
     }
 }
 
@@ -185,6 +249,7 @@ pub struct ArkivPayloadBuilder<Pool, Client, Evm> {
     evm: Evm,
     config: EthereumBuilderConfig,
     chain_id: u64,
+    pruning_map: ChainPruningMap,
 }
 
 impl<Pool, Client, Evm> PayloadBuilder for ArkivPayloadBuilder<Pool, Client, Evm>
@@ -206,13 +271,18 @@ where
         reth_payload_builder_primitives::PayloadBuilderError,
     > {
         let block = args.config.parent_header.number + 1;
-        let keys = expiry_queue()
-            .read()
-            .expect("expiry queue poisoned")
-            // `expires_at` is the entity's first non-live block, so entities due
-            // at this height are eligible. Writes in this block must resolve to
-            // a later expiry and cannot enter this selection.
-            .select_expired(block, MAX_PURGE_KEYS, PURGE_GAS_LIMIT);
+        let keys = self
+            .pruning_map
+            .select_expired(
+                args.config.parent_header.number,
+                block,
+                MAX_PURGE_KEYS,
+                PURGE_GAS_LIMIT,
+            )
+            .unwrap_or_else(|error| {
+                debug!(target: "arkiv-reth", %error, block, "skip pruning for payload");
+                Vec::new()
+            });
         let purge = protocol_transaction(self.chain_id, block, keys);
         default_ethereum_payload(
             self.evm.clone(),
