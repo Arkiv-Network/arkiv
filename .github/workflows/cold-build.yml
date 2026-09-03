@@ -10,6 +10,12 @@ name: cold-build
 on:
   push:
     branches: [scx1332/ci-optimizations]
+    # Editing workflows or docs must not kick off a 25-minute cold build;
+    # only a change that could alter compilation is worth re-measuring.
+    paths-ignore:
+      - ".github/**"
+      - "docs/**"
+      - "**.md"
   workflow_dispatch:
     inputs:
       profile:

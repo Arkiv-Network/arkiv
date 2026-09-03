@@ -1,0 +1,88 @@
+# Restores a build tree produced by `cold-build` and rebuilds on top of it,
+# to answer one question: how much of a cold build does a restored cache
+# actually save?
+#
+# The cache is only reusable in CI. Cargo's fingerprints and the .d files
+# record absolute paths, and CI builds under /home/runner/work/arkiv/arkiv,
+# so a restore on a developer machine at a different path recompiles anyway.
+name: warm-build
+
+on:
+  push:
+    branches: [scx1332/ci-optimizations]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "cold-build run whose artifact to restore"
+        required: false
+        default: "33748295613"
+      profile:
+        description: "Cargo profile"
+        required: false
+        default: "release-fast"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # download-artifact needs this to read another run's artifacts.
+      actions: read
+    env:
+      PROFILE: ${{ inputs.profile || 'release-fast' }}
+      RUN_ID: ${{ inputs.run_id || '33748295613' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      # Deliberately no Swatinem/rust-cache: the restored tree is the only
+      # cache under test.
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-${{ env.PROFILE }}
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore the build tree
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          tar --zstd -xpf "target-${PROFILE}.tar.zst"
+          echo "restored in $(( $(date +%s) - t0 ))s: $(du -sh target | cut -f1)"
+
+      # `-v` isn't needed: cargo prints one "Compiling" line per unit it
+      # actually rebuilds, so counting them shows what the cache saved.
+      - name: Rebuild on the restored tree
+        id: warm
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE" 2>&1 | tee build.log
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+          echo "recompiled=$(grep -c '^ *Compiling ' build.log || true)" >> "$GITHUB_OUTPUT"
+
+      - if: always()
+        env:
+          COLD_SECONDS: "1490"
+        run: |
+          warm=${{ steps.warm.outputs.seconds }}
+          {
+            echo "## warm build ($PROFILE), cache from run $RUN_ID"
+            echo
+            echo "| | seconds |"
+            echo "|---|---|"
+            echo "| cold (no cache) | $COLD_SECONDS |"
+            echo "| warm (restored) | ${warm:-n/a} |"
+            echo
+            echo "- crates recompiled: ${{ steps.warm.outputs.recompiled }}"
+            if [ -n "${warm:-}" ] && [ "$warm" -gt 0 ]; then
+              echo "- saved: $(( COLD_SECONDS - warm ))s ($(( (COLD_SECONDS - warm) * 100 / COLD_SECONDS ))%)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
