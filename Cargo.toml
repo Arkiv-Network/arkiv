@@ -21,6 +21,10 @@ reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", default-fe
     "jemalloc",
 ] }
 reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+# The `ChainSpecParser` trait behind `--chain`; arkiv-reth-chainspec implements it.
+reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+# `NodeRecord`, the bootnode type in the `EthChainSpec` trait the Arkiv chain spec implements.
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # The jemalloc allocator itself. `reth`'s "jemalloc" feature only wires up the
 # jemalloc *stats* reporting in node-core/metrics/provider; the allocator has to
 # be declared as `#[global_allocator]` by the binary, which is what reth's own
@@ -94,6 +98,7 @@ arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
+arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }
 arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store" }
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
