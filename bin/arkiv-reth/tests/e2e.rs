@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
@@ -1265,4 +1265,75 @@ async fn base_fee_floor_follows_the_genesis_file() {
     let fees = base_fees(&client, 6).await;
     let _ = std::fs::remove_file(&genesis_path);
     assert_eq!(fees, vec![10; 7], "the floor is the genesis baseFeePerGas");
+}
+
+/// EIP-1559 accounting end to end: the sender's balance drops by
+/// `gas_used × effectiveGasPrice` — the receipt's figure, not the fee cap — the
+/// block's beneficiary receives `gas_used × (effective − base_fee)`, and the
+/// base-fee share is burned. Before this the executor charged the fee cap and
+/// burned all of it, so receipts and balances disagreed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_tip() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let provider = client.provider();
+    let recipient = DEV_KEY_1.parse::<PrivateKeySigner>().unwrap().address();
+    const FEE_CAP: u128 = 3_000_000_000;
+    const TIP: u128 = 1_000_000_000;
+    const VALUE: u128 = 1_000;
+
+    let before = provider.get_balance(caller).await.expect("eth_getBalance");
+    let nonce = provider
+        .get_transaction_count(caller)
+        .await
+        .expect("transaction count");
+    // The idle dev chain sits at its 1 gwei floor, so the effective price is
+    // base + tip = 2 gwei: strictly below the cap, which is the point.
+    let tx = TransactionRequest::default()
+        .with_to(recipient)
+        .with_value(U256::from(VALUE))
+        .with_nonce(nonce)
+        .with_gas_limit(21_000)
+        .with_max_fee_per_gas(FEE_CAP)
+        .with_max_priority_fee_per_gas(TIP)
+        .with_chain_id(DEV_CHAIN_ID);
+    let receipt = provider
+        .send_transaction(tx)
+        .await
+        .expect("the pool accepts the transfer")
+        .get_receipt()
+        .await
+        .expect("mined");
+    assert!(receipt.status(), "the transfer succeeds");
+
+    let block = provider
+        .get_block_by_number(receipt.block_number.expect("mined").into())
+        .await
+        .expect("eth_getBlockByNumber")
+        .expect("the receipt's block exists");
+    let base_fee = u128::from(block.header.base_fee_per_gas.expect("post-London"));
+    let gas_used = u128::from(receipt.gas_used);
+    let effective = receipt.effective_gas_price;
+    assert_eq!(effective, (base_fee + TIP).min(FEE_CAP));
+    assert!(
+        effective < FEE_CAP,
+        "the fee cap must not be what is charged"
+    );
+
+    let after = provider.get_balance(caller).await.expect("eth_getBalance");
+    assert_eq!(
+        before - after,
+        U256::from(VALUE + gas_used * effective),
+        "the sender pays value + gas_used × effectiveGasPrice",
+    );
+    // The dev miner picks a fresh random beneficiary per block, so its balance is
+    // exactly this block's tips.
+    let tips = provider
+        .get_balance(block.header.beneficiary)
+        .await
+        .expect("eth_getBalance");
+    assert_eq!(
+        tips,
+        U256::from(gas_used * (effective - base_fee)),
+        "the beneficiary receives the tip; the base fee is burned",
+    );
 }

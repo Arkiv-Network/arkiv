@@ -27,9 +27,11 @@ repository.
   the deployed environments set the tx-pool floors today.
 - Without the rule (releases up to `v0.1.0`) the protocol floor is **7 wei**:
   an idle chain decays there in about 140 blocks.
-- The Arkiv executor charges `gas_used × max_fee_per_gas` and burns it. It does
-  **not** check the tx fee cap against the block base fee, does not compute the
-  effective price, and pays nothing to the coinbase.
+- The Arkiv executor settles fees as revm does: the sender pays
+  `gas_used × min(max_fee, base_fee + tip)`, the base-fee share is burned, the
+  tip goes to the block beneficiary, and the fee cap, priority fee and sender
+  balance are validated first (§6). Up to `v0.1.0` it charged the fee cap,
+  burned all of it, and validated none of that.
 
 ## 1. The formula
 
@@ -176,39 +178,42 @@ Two consequences worth knowing:
 - **On `v0.1.0`, the base fee of every deployed Arkiv chain sits at 7 wei when
   traffic is below target.** Clients that pin a price (the harness's
   `EXECUTE_GAS_PRICE` and the e2e probe both pin 1 gwei) massively overpay, and
-  because of §6 that overpayment is charged in full. With the §7 rule the same
-  chains sit at their genesis base fee, 1 gwei, so a 1 gwei client pays the
-  going rate.
+  on `v0.1.0` that overpayment is charged in full (§6). With the §7 rule the
+  same chains sit at their genesis base fee, 1 gwei, so a 1 gwei client pays
+  the going rate.
 
 ## 6. What the Arkiv executor does with fees
 
-`ArkivEvm::transact_raw` (`crates/arkiv-reth-executor/src/lib.rs:229`)
-bypasses revm's whole handler pipeline, including its pre-execution validation
-and post-execution reward. The consequences for fees:
+`ArkivEvm::transact_raw` (`crates/arkiv-reth-executor/src/lib.rs`) bypasses
+revm's whole handler pipeline, so its pre-execution validation and its
+post-execution fee settlement are re-done in the executor. As of this branch
+they match revm:
 
-- **No fee-cap check against the block base fee.** revm's
-  `GasPriceLessThanBasefee` check never runs, and the executor never reads
-  `block().basefee` (there is no reference to it in the crate). For blocks the
-  node builds itself this is covered by the tx pool, which only offers
-  transactions whose fee cap is at least the pending base fee. For blocks
-  received over the Engine API or P2P nothing re-checks it, so a producer could
-  include an under-priced transaction and every node would accept the block.
-  The crate's module doc lists this as a known gap.
-- **The sender pays the fee cap, not the effective price.** All three transaction
-  paths compute `gas_cost = gas_used × tx.gas_price` (`lib.rs:354`, `:438`,
-  `:478`). For EIP-1559 transactions reth fills `TxEnv.gas_price` with
-  `max_fee_per_gas` (`alloy-evm/src/tx.rs:205`), so the debit is
-  `gas_used × max_fee_per_gas` with no refund of `max_fee − (base_fee + tip)`.
-  The receipt's `effectiveGasPrice` field, computed by reth's RPC layer, still
-  reports the EIP-1559 effective price, so the receipt and the actual balance
-  change disagree whenever `max_fee_per_gas > base_fee + max_priority_fee_per_gas`.
-- **Everything is burned.** revm's `reward_beneficiary` never runs, so the
-  coinbase (the CL's `--suggested-fee-recipient`, `feeRecipient` in the chart)
-  receives nothing. The producer's income from a block is zero regardless of
-  tips.
-- **Unused gas is not charged.** Only `gas_used` is debited, and the reported
-  figure is floored at the intrinsic minimum so `eth_estimateGas` returns a
-  pool-acceptable limit.
+- **Validation** (`validate_fees`), before anything is charged, as typed
+  invalid-transaction errors so the payload builder skips the transaction
+  rather than aborting the block: the priority fee may not exceed the fee cap;
+  the effective price may not fall below the block base fee; the sender must
+  cover `gas_limit × max_fee + value`. Each honours the revm `CfgEnv` flag reth
+  sets for the matching RPC path (`eth_call` and `eth_estimateGas` disable the
+  base-fee check and fee charging; `eth_simulateV1` without validation disables
+  the balance check).
+- **Settlement** (`charge_sender`): the sender pays `gas_used × effective`,
+  where `effective = min(max_fee, base_fee + priority_fee)` for EIP-1559 and
+  the `gasPrice` for legacy transactions. `gas_used × base_fee` is burned and
+  `gas_used × (effective − base_fee)` is credited to the block beneficiary,
+  the CL's `--suggested-fee-recipient` (`feeRecipient` in the chart). A zero
+  tip credits nothing, so the beneficiary is never touched into existence as
+  an empty account. Only gas used is charged, never the limit.
+- **Receipts agree with state.** reth's RPC computes `effectiveGasPrice` the
+  same way, so the receipt's figure times gas used is exactly the balance
+  change.
+
+Up to `v0.1.0` none of this held: all three paths charged
+`gas_used × tx.gas_price`, which for EIP-1559 transactions is the fee cap, with
+no refund of `max_fee − effective`; nothing was credited to the beneficiary;
+the fee cap was never checked against the base fee; and the balance debit
+saturated, so an underfunded sender paid what it had and the transaction still
+succeeded.
 
 The header base fee itself is untouched by all of this: it is set and validated
 by reth exactly as on Ethereum, and block validity depends on it.
@@ -265,8 +270,8 @@ reth's `EthereumNode`, its Ethereum CLI `run`, and the previous
   into the pool and parked, never mined. Setting that flag to the genesis base
   fee makes such transactions fail at submission instead, which is friendlier
   to clients.
-- With the floor in place and the executor of §6 charging the fee cap, every
-  sender pays at least the floor per gas, whatever it signs.
+- With the floor in place, the pool only offers transactions whose fee cap is
+  at least the floor, so every mined sender pays at least the floor per gas.
 
 ### Tests
 
