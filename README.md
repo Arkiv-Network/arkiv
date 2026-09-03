@@ -21,6 +21,7 @@ arkiv/
 │   ├── arkiv-harness                   # node client with shared config types
 │   ├── arkiv-interfaces
 │   ├── arkiv-query                     # Parser for Arkiv DB query language
+│   ├── arkiv-reth-chainspec            # reth ChainSpec + the Arkiv minimum-base-fee rule, and the --chain parser
 │   ├── arkiv-reth-executor             # Main EVM integration with modifications (e.g: smart contracts not supported)
 │   ├── arkiv-reth-mpt-committed-store  # Implement storage
 │   ├── arkiv-reth-rpc                  # available JSON RPC endpoints (read-only)

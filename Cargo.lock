@@ -1450,17 +1450,36 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-harness",
+ "arkiv-reth-chainspec",
  "arkiv-reth-executor",
  "arkiv-reth-rpc",
  "clap",
  "eyre",
  "reth",
  "reth-cli-util",
- "reth-ethereum-cli",
+ "reth-ethereum",
  "reth-node-ethereum",
+ "reth-storage-api",
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "arkiv-reth-chainspec"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-genesis",
+ "alloy-primitives",
+ "eyre",
+ "reth-cli",
+ "reth-ethereum",
+ "reth-ethereum-cli",
+ "reth-network-peers",
+ "serde_json",
 ]
 
 [[package]]

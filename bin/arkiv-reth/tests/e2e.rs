@@ -1186,3 +1186,83 @@ async fn a_pooled_create_transaction_does_not_stall_block_production() {
         "a contract deployment must never be mined",
     );
 }
+
+/// The base fee of every block up to `until`, as the RPC reports it.
+async fn base_fees(client: &ArkivClient<impl Provider>, until: u64) -> Vec<u64> {
+    let mut fees = Vec::new();
+    for number in 0..=until {
+        let block = client
+            .provider()
+            .get_block_by_number(number.into())
+            .await
+            .expect("eth_getBlockByNumber")
+            .unwrap_or_else(|| panic!("block {number} exists"));
+        fees.push(block.header.base_fee_per_gas.expect("post-London header"));
+    }
+    fees
+}
+
+/// The Arkiv base-fee rule on `--dev`: an idle chain holds reth's 1 gwei dev-genesis
+/// base fee instead of decaying 12.5% per empty block toward the 7 wei protocol
+/// minimum. Stock reth would report 1 gwei, 875 M, 765 M, ... here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_dev_chain_holds_the_genesis_base_fee() {
+    let (_node, client, _caller) = spawn_dev(DEV_KEY_0).await;
+    client.wait_for_block(6, READY).await;
+
+    let fees = base_fees(&client, 6).await;
+    assert_eq!(
+        fees,
+        vec![1_000_000_000; 7],
+        "every empty block must carry the genesis base fee",
+    );
+
+    // And a transaction priced at exactly the floor is what the SDK sends by
+    // default (1 gwei): the pool accepts it and it is mined.
+    client
+        .execute(vec![create_op(1000, Bytes::from_static(b"floor"), vec![])])
+        .await;
+}
+
+/// The floor follows the genesis file: `baseFeePerGas` of 10 wei floors the chain
+/// at 10 wei. Without the rule the run would read 10, 9, 8, 7, 7, 7, 7.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn base_fee_floor_follows_the_genesis_file() {
+    let genesis = serde_json::json!({
+        "config": {
+            "chainId": 424242,
+            "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
+            "byzantiumBlock": 0, "constantinopleBlock": 0, "petersburgBlock": 0,
+            "istanbulBlock": 0, "berlinBlock": 0, "londonBlock": 0,
+            "mergeNetsplitBlock": 0, "terminalTotalDifficulty": 0,
+            "terminalTotalDifficultyPassed": true,
+            "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0
+        },
+        "baseFeePerGas": "0xa",
+        "gasLimit": "0x3938700",
+        "difficulty": "0x0",
+        "alloc": {}
+    });
+    let genesis_path = std::env::temp_dir().join(format!(
+        "arkiv-e2e-genesis-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&genesis_path, genesis.to_string()).expect("write genesis");
+
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .arg("--chain")
+        .arg(genesis_path.to_str().unwrap())
+        .spawn();
+    let client = arkiv_harness::connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    assert_eq!(client.chain_id().await, 424242);
+    client.wait_for_block(6, READY).await;
+
+    let fees = base_fees(&client, 6).await;
+    let _ = std::fs::remove_file(&genesis_path);
+    assert_eq!(fees, vec![10; 7], "the floor is the genesis baseFeePerGas");
+}

@@ -69,13 +69,14 @@ pub mod revert;
 pub use arkiv::{ArkivExecutor, OpEffect};
 pub use decode::{DecodeError, decode_ops, derive_entity_address};
 
+use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use arkiv_bindings::IEntityRegistry;
 use reth_ethereum::{
     EthPrimitives,
-    chainspec::ChainSpec,
+    chainspec::{EthereumHardforks, Hardforks},
     evm::{
         EthEvm, EthEvmConfig,
         primitives::{Database, EvmEnv},
@@ -781,15 +782,24 @@ impl EvmFactory for ArkivEvmFactory {
 /// Builds the Arkiv block executor: reth's stock Ethereum block executor driven
 /// by [`ArkivEvmFactory`]. This is the type arkiv-reth hands to
 /// `EthereumNode::components().executor(..)`.
+///
+/// Generic over the node's chain spec with the same bounds reth's own
+/// `EthereumExecutorBuilder` asks for, so the node can run on arkiv-reth-chainspec's
+/// `ArkivChainSpec` (the minimum-base-fee rule) as well as on reth's `ChainSpec`.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct ArkivExecutorBuilder;
 
 impl<Node> ExecutorBuilder<Node> for ArkivExecutorBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    Node: FullNodeTypes<
+        Types: NodeTypes<
+            ChainSpec: Hardforks + EthExecutorSpec + EthereumHardforks,
+            Primitives = EthPrimitives,
+        >,
+    >,
 {
-    type EVM = EthEvmConfig<ChainSpec, ArkivEvmFactory>;
+    type EVM = EthEvmConfig<<Node::Types as NodeTypes>::ChainSpec, ArkivEvmFactory>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
         tracing::info!(

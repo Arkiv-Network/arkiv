@@ -16,12 +16,19 @@ path = "src/main.rs"
 reth.workspace = true
 # Only for the `#[global_allocator]` declaration in main.rs.
 reth-cli-util.workspace = true
-reth-ethereum-cli.workspace = true
 reth-node-ethereum.workspace = true
+# `LocalPayloadAttributesBuilder` for the `--dev` miner, via the umbrella's `node` feature.
+reth-ethereum = { workspace = true, features = ["node"] }
+# `EthStorage`, the node's storage type.
+reth-storage-api.workspace = true
+# The chain spec with the minimum-base-fee rule, and its `--chain` parser.
+arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true
+# The RPC block type the debug launcher converts (`DebugNode::RpcBlock`).
+alloy-rpc-types.workspace = true
 eyre.workspace = true
 clap.workspace = true
 tracing.workspace = true
