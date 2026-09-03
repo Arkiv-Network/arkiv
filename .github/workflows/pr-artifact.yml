@@ -1,7 +1,9 @@
 # The fast lane: restore the shared cache and get shippable binaries out.
 #
-# Nothing else runs here — fmt, tests and clippy live in pr-checks so a lint
-# failure never delays the artifact, and the two run in parallel.
+# fmt, tests and clippy live in pr-checks so a lint failure never delays the
+# artifact, and the two run in parallel. The Kurtosis smoke test hangs off the
+# build here rather than in its own workflow: artifacts are only downloadable
+# by name from within the run that produced them.
 name: pr-artifact
 
 on:
@@ -76,3 +78,12 @@ jobs:
             echo "- build: ${{ steps.build.outputs.seconds }}s"
             ls -lh target/release-fast/arkiv-reth target/release-fast/arkiv-cli 2>/dev/null || true
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Runs the devnet against the binary just built. Passing the artifact name
+  # makes it package that binary; the reusable workflow builds the image from
+  # source when the input is empty.
+  kurtosis:
+    needs: build
+    uses: ./.github/workflows/kurtosis.yml
+    with:
+      artifact: arkiv-binaries-${{ github.sha }}
