@@ -10,9 +10,11 @@
 # is one list entry away, but measuring two optimisation levels at once made
 # every timing ambiguous, so the comparison lane is parked.
 #
-# It builds both the workspace binaries and the test binaries: dev-dependencies
-# pull a larger graph, and a cache that covers them serves the binary lane just
-# as well (measured: 366s from the test cache vs 373s from a binary-only one).
+# It builds the workspace binaries, the test binaries and the clippy checks:
+# dev-dependencies pull a larger graph, and a cache that covers them serves the
+# binary lane just as well (measured: 366s from the test cache vs 373s from a
+# binary-only one). Clippy is in there because its check units are distinct
+# from the build ones — see the step for why.
 name: cold-build
 
 on:
@@ -51,6 +53,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
+        with:
+          # clippy checks the workspace below, so its artifacts land in the
+          # cache alongside the build ones.
+          components: clippy
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -77,6 +83,39 @@ jobs:
           t0=$(date +%s)
           cargo nextest run --workspace --locked --cargo-profile "$PROFILE" --no-run
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # Clippy checks are their own units: clippy-driver runs as
+      # RUSTC_WORKSPACE_WRAPPER, so a workspace crate's clippy artifact has a
+      # different fingerprint from its rustc one and `cargo build` above warms
+      # nothing for it. Running it here puts those artifacts in the cache, and
+      # pr-checks' clippy then only re-checks what the pull request touched.
+      #
+      # The invocation has to match pr-checks exactly — profile, `--no-deps`
+      # and the `-D warnings` argument are all part of the fingerprint, and any
+      # difference means the restored artifacts are ignored and the lane pays
+      # full price anyway.
+      #
+      # Not a gate: this workflow's deliverable is the cache. A lint that only
+      # main can fix must not stop the cache from being published, so the
+      # status is recorded in the summary and the build carries on. pr-checks
+      # is where clippy blocks.
+      - name: Warm clippy
+        id: clippy
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          status=0
+          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps \
+            -- -D warnings 2>&1 | tee clippy.log || status=$?
+          {
+            echo "seconds=$(( $(date +%s) - t0 ))"
+            echo "status=$status"
+            echo "lints=$(grep -c '^error: ' clippy.log || true)"
+          } >> "$GITHUB_OUTPUT"
+          # clippy.log sits next to target/, not inside it, so packing is
+          # unaffected — but leave nothing for a later glob to pick up.
+          rm -f clippy.log
 
       # Drop the C intermediates jemalloc and rocksdb leave behind once their
       # .a archives exist — ~1200 files, ~174 MB, that nothing links against.
@@ -157,6 +196,9 @@ jobs:
             echo "|---|---|"
             echo "| binaries | ${{ steps.bins.outputs.seconds }} |"
             echo "| tests | ${{ steps.tests.outputs.seconds }} |"
+            echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
+            echo
+            echo "clippy exit ${{ steps.clippy.outputs.status }}, lints: ${{ steps.clippy.outputs.lints }}"
             echo
             echo "- target: ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB (${{ steps.prune.outputs.removed }} object files pruned)"
             echo "- package: \`$PACKAGE:$PROFILE\` (${{ steps.pack.outputs.mb }}MB)"
