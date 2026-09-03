@@ -16,24 +16,19 @@ on:
         default: ""
         type: string
 
-# Literal prefix, not `github.workflow`: called from another workflow that
-# name resolves to the *caller*, which would put this job in the same group as
-# the run that is waiting on it.
-concurrency:
-  group: kurtosis-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   two-node-smoke:
     name: sequencer + follower smoke test
     runs-on: ubuntu-latest
+    # Job-level, and with a literal prefix rather than `github.workflow`: when
+    # called that name resolves to the *caller*, which would put this in the
+    # same concurrency group as the run waiting on it.
+    concurrency:
+      group: kurtosis-${{ github.ref }}
+      cancel-in-progress: false
     # Packaging a prebuilt binary is minutes; a from-source dispatch is closer
     # to an hour, so the timeout has to cover the slow path.
     timeout-minutes: 180
-    permissions:
-      contents: read
-      # download-artifact reads the run's artifacts through the API.
-      actions: read
     env:
       CI: "true"
       RUST_BACKTRACE: "1"

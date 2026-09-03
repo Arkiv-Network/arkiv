@@ -15,7 +15,9 @@ on:
         default: "ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9"
   push:
     branches: [scx1332/ci-optimizations]
-    paths: [".github/workflows/pr-artifact.yml"]
+    paths:
+      - ".github/workflows/pr-artifact.yml"
+      - ".github/workflows/kurtosis.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
