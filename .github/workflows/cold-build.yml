@@ -1,20 +1,21 @@
-# Measures a from-scratch workspace build — no Swatinem/rust-cache, no
-# restored target dir — and hands the resulting artifacts back so the work
-# isn't thrown away with the runner.
+# Rebuilds the shared build cache from scratch and republishes it under one
+# mutable tag.
 #
-# Not a gate: it runs on dispatch, plus pushes to this measurement branch
-# only, since `workflow_dispatch` alone is undispatchable until the file
-# reaches the default branch.
+# One package, one version. `pr-artifact` and `pr-checks` both restore
+# `:latest`, so this is the only thing that writes it — and every previous
+# version is deleted once the new one is in place, rather than accumulating a
+# 511 MB blob per commit.
+#
+# It builds both the workspace binaries and the test binaries: dev-dependencies
+# pull a larger graph, and a cache that covers them serves the binary lane just
+# as well (measured: 366s from the test cache vs 373s from a binary-only one).
 name: cold-build
 
 on:
-  # Rebuilding the cache is a deliberate act, not something a source change
-  # should trigger. `workflow_dispatch` alone is not startable until this
-  # file reaches the default branch, so until then touching the file itself
-  # is the way to run it by hand.
-  push:
-    branches: [scx1332/ci-optimizations]
-    paths: [".github/workflows/cold-build.yml"]
+  # Nightly from main. A scheduled trigger only ever fires from the default
+  # branch and only once this file is on it, so until then use the dispatch.
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       profile:
@@ -23,10 +24,20 @@ on:
         default: "release-fast"
         type: choice
         options: [release-fast, dev-fast, dev, release]
+  # Rebuilding the cache is a deliberate act, not something a source change
+  # should trigger; touching this file is how to run it by hand from a branch.
+  push:
+    branches: [scx1332/ci-optimizations]
+    paths: [".github/workflows/cold-build.yml"]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}
   cancel-in-progress: false
+
+env:
+  PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache
+  TAG: latest
+  ARCHIVE: target-cache.tar.zst
 
 jobs:
   build:
@@ -34,12 +45,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # A push event carries no inputs, so the profile falls back to the same
-    # default the dispatch form offers.
+    # A schedule or push event carries no inputs, so the profile falls back to
+    # the same default the dispatch form offers.
     env:
       PROFILE: ${{ inputs.profile || 'release-fast' }}
-    # A cold build of the reth tree with no cache at all; the cached `build`
-    # job in `rust` takes ~10 minutes, so leave generous headroom.
+    # A cold build of the reth tree with no cache at all took ~25 minutes for
+    # the binaries alone; the tests add to that. Leave generous headroom.
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
@@ -48,15 +59,28 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
       - uses: foundry-rs/foundry-toolchain@v1
+      - uses: taiki-e/install-action@nextest
+      - uses: oras-project/setup-oras@v2
 
-      # Deliberately no Swatinem/rust-cache here: a restored target dir or
-      # registry would defeat the point of the measurement.
-      - id: build
+      # Deliberately no Swatinem/rust-cache here: a restored target dir would
+      # defeat the point, and this is what produces the cache in the first place.
+      - name: Build binaries
+        id: bins
         run: |
           set -euo pipefail
-          start=$(date +%s)
-          cargo build --workspace --locked --profile "$PROFILE" --timings
-          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          t0=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE"
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # Compiles the test binaries without running them. The cache is the
+      # deliverable here; pr-checks is what actually runs the suite.
+      - name: Build tests
+        id: tests
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo nextest run --workspace --locked --cargo-profile "$PROFILE" --no-run
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       # Drop the C intermediates jemalloc and rocksdb leave behind once their
       # .a archives exist — ~1200 files, ~174 MB, that nothing links against.
@@ -65,81 +89,71 @@ jobs:
       # crates typecheck without recompiling, .fingerprint decides freshness,
       # and both copies of libjemalloc.a stay because the build script emits
       # rustc-link-search pointing at out/build/lib.
-      - if: always()
+      - name: Prune C intermediates
         id: prune
         run: |
           set -euo pipefail
           before=$(du -sm target | cut -f1)
           count=$(find target -name '*.o' | wc -l)
           find target -name '*.o' -delete
-          after=$(du -sm target | cut -f1)
-          echo "pruned $count object files: ${before}MB -> ${after}MB"
           {
             echo "before=${before}"
-            echo "after=${after}"
+            echo "after=$(du -sm target | cut -f1)"
             echo "removed=${count}"
           } >> "$GITHUB_OUTPUT"
 
-      - if: always()
+      # `tar --zstd` compresses at level 3; level 10 with a 128 MB window is
+      # ~21% smaller for a few extra seconds, and still unpacks with a plain
+      # `tar --zstd -xf`. The name is fixed so consumers need no glob.
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          tar -I 'zstd -10 -T0 --long=27' -cf "$ARCHIVE" target
+          echo "mb=$(( $(stat -c%s "$ARCHIVE") / 1024 / 1024 ))" >> "$GITHUB_OUTPUT"
+
+      # Published as an OCI artifact rather than a Docker image layer: oras
+      # stores the blob byte-for-byte, so the zstd tarball stays ~511 MB. An
+      # image layer would be gzipped by the builder instead, which is both
+      # slower and considerably larger on already-compressed input.
+      - name: Publish
         env:
-          SECONDS_ELAPSED: ${{ steps.build.outputs.seconds }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          oras push "$PACKAGE:$TAG" \
+            --artifact-type "application/vnd.arkiv.build-cache.v1" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "network.arkiv.profile=$PROFILE" \
+            --annotation "network.arkiv.built-at=$(date -u +%FT%TZ)" \
+            "$ARCHIVE:application/vnd.arkiv.build-cache.v1.tar+zstd"
+
+      # Moving the tag leaves the version it pointed at behind, untagged but
+      # still occupying storage. Keep exactly the one just pushed.
+      #
+      # Not fatal if it fails: an uncollected version wastes space, whereas
+      # failing here would mask a cache that published fine.
+      - name: Drop superseded versions
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: arkiv-network
+          package-name: arkiv-build-cache
+          package-type: container
+          min-versions-to-keep: 1
+
+      - if: always()
         run: |
           {
             echo "## cold build ($PROFILE)"
             echo
-            echo "- wall time: ${SECONDS_ELAPSED:-n/a}s"
-            echo "- target size: ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB"
-            echo "- pruned: ${{ steps.prune.outputs.removed }} object files"
+            echo "| step | seconds |"
+            echo "|---|---|"
+            echo "| binaries | ${{ steps.bins.outputs.seconds }} |"
+            echo "| tests | ${{ steps.tests.outputs.seconds }} |"
+            echo
+            echo "- target: ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB (${{ steps.prune.outputs.removed }} object files pruned)"
+            echo "- package: \`$PACKAGE:$TAG\` (${{ steps.pack.outputs.mb }}MB)"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # upload-artifact zips its input, which is slow and lossy for a target
-      # dir full of small files with meaningful mtimes. One zstd tarball
-      # uploads far faster and restores a target dir cargo can still reuse.
-      - if: always()
-        run: |
-          set -euo pipefail
-          # `tar --zstd` compresses at level 3; level 10 with a 128 MB window
-          # is ~21% smaller for a few extra seconds, and still unpacks with a
-          # plain `tar --zstd -xf`.
-          #
-          # The tree was pruned in place by the step above, so this packs
-          # exactly what a restored build cache needs.
-          tar -I 'zstd -10 -T0 --long=27' \
-            -cf "target-${{ env.PROFILE }}.tar.zst" \
-            -C . target
-          ls -lh "target-${{ env.PROFILE }}.tar.zst"
-
-      # Published as an OCI artifact rather than a Docker image layer: oras
-      # stores the blob byte-for-byte, so the zstd tarball stays 511 MB. An
-      # image layer would be gzipped by the builder instead, which is both
-      # slower and considerably larger on already-compressed input.
-      - if: always() && github.event_name != 'pull_request'
-        uses: oras-project/setup-oras@v2
-      - if: always() && github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SECONDS_ELAPSED: ${{ steps.build.outputs.seconds }}
-        run: |
-          set -euo pipefail
-          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
-          pkg="ghcr.io/arkiv-network/arkiv-build-cache"
-          file="target-${{ env.PROFILE }}.tar.zst"
-          oras push \
-            "$pkg:${{ env.PROFILE }}-${GITHUB_SHA::12}" \
-            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
-            --annotation "network.arkiv.profile=${{ env.PROFILE }}" \
-            --annotation "network.arkiv.build-seconds=${SECONDS_ELAPSED:-unknown}" \
-            "$file:application/vnd.arkiv.build-cache.v1.tar+zstd"
-          echo "- package: \`$pkg:${{ env.PROFILE }}-${GITHUB_SHA::12}\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: target-${{ env.PROFILE }}
-          path: target-${{ env.PROFILE }}.tar.zst
-          if-no-files-found: error
-          # Large; keep it only long enough to pull down.
-          retention-days: 3
-          # Already zstd-compressed — re-zipping it just burns runner time.
-          compression-level: 0

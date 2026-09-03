@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: "Build cache to restore"
+        description: "Build cache to restore; cold-build refreshes :latest nightly"
         required: false
-        default: "ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9"
+        default: "ghcr.io/arkiv-network/arkiv-build-cache:latest"
   push:
     branches: [scx1332/ci-optimizations]
     paths:
@@ -32,7 +32,7 @@ jobs:
       packages: read
     env:
       PROFILE: release-fast
-      PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:tests-release-fast-5e838b2953c9' }}
+      PACKAGE: ${{ inputs.package || 'ghcr.io/arkiv-network/arkiv-build-cache:latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
@@ -49,7 +49,7 @@ jobs:
           oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
           t0=$(date +%s)
           oras pull "$PACKAGE"
-          tar --zstd -xpf target-tests-*.tar.zst
+          tar --zstd -xpf target-cache.tar.zst
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       - name: Build
