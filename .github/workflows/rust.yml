@@ -1,9 +1,13 @@
 name: rust
+# The heavyweight lane, and no longer a pull-request gate: `pr-checks` and
+# `pr-artifact` cover fmt, tests, clippy and the binaries from a restored cache
+# in a fraction of the time. What is left here runs on main and on tags, where
+# thoroughness matters more than latency — udeps, a plain-`dev` compile, and
+# the multi-arch image publish that moves `latest`.
 on:
   push:
     branches: [main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 env:
@@ -18,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
         with:
           components: rustfmt
@@ -33,7 +37,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
@@ -51,7 +55,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
@@ -70,7 +74,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo-udeps needs a nightly rustc to run its analysis, independent of
       # the workspace's pinned 1.97 stable toolchain.
       - uses: dtolnay/rust-toolchain@nightly
@@ -120,9 +124,9 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -131,11 +135,11 @@ jobs:
       # Tags are bound in `docker-manifest`; the metadata steps here supply the
       # OCI labels that go into each per-platform image.
       - id: meta-reth
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/arkiv-reth
       - id: build-reth
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/arkiv-reth.Dockerfile
@@ -146,11 +150,11 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/arkiv-reth:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
 
       - id: meta-reth-dev
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/arkiv-reth-dev
       - id: build-reth-dev
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/arkiv-reth-dev.Dockerfile
@@ -176,7 +180,7 @@ jobs:
       # original attempt, and an expired artifact would leave the merge job
       # with a single platform.
       - if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
@@ -202,13 +206,13 @@ jobs:
       matrix:
         image: [arkiv-reth, arkiv-reth-dev]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-*
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -216,7 +220,7 @@ jobs:
 
       # `latest` moves only with main commits; tag pushes add the version tag.
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
           flavor: |
