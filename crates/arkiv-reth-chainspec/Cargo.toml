@@ -1,0 +1,32 @@
+[package]
+name = "arkiv-reth-chainspec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Arkiv chain specification: reth's `ChainSpec` with one protocol rule on
+# top — the EIP-1559 base fee never drops below the genesis block's base fee.
+# Also the `--chain` parser that produces it, so the node, the pool, the payload
+# builder and consensus all see the same rule.
+
+[dependencies]
+# reth's stock `ChainSpec` and the traits (`EthChainSpec`, `Hardforks`,
+# `EthereumHardforks`) the wrapper delegates to.
+reth-ethereum.workspace = true
+# The `ChainSpecParser` trait the `--chain` value parser implements.
+reth-cli.workspace = true
+# reth's own `--chain` parser (named chains, genesis file, inline JSON), wrapped.
+reth-ethereum-cli.workspace = true
+# `NodeRecord`, the bootnode type in `EthChainSpec::bootnodes`.
+reth-network-peers.workspace = true
+# `EthExecutorSpec` (deposit contract address), required of a node's chain spec.
+alloy-evm.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+eyre.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,232 @@
+# Rebuilds the shared build caches from scratch and republishes them.
+#
+# Two lanes, two packages, because two consumers want different trees:
+#
+#   build  — `cargo build` plus the test binaries, for pr-artifact and the
+#            tests job. Rlibs, and everything it takes to link them.
+#   clippy — a from-scratch `cargo clippy`, for pr-checks' lint job. Check
+#            units only: ~700 dependency .rmeta, the proc-macro dylibs and the
+#            build-script output, and not one rlib, because a check build never
+#            puts an rlib on an --extern path. 246 MB packed against the build
+#            lane's 650 MB, and pr-checks' lint restores it in ~11s.
+#
+# They were briefly one archive. Running clippy on top of the build tree grew
+# it 650 MB -> 772 MB and charged every consumer ~4s of restore, two thirds of
+# which never run clippy: a check unit's fingerprint differs from the build
+# unit's for the same crate — mode is part of the metadata hash — so the two
+# trees share nothing, and merging them only means each job downloading the
+# other lane's half.
+#
+# Each lane runs cold and in parallel, so the workflow's wall clock is the
+# longer of the two rather than the sum: 2293s for the build lane, 1540s for
+# clippy, ~40 minutes for the workflow — what it cost before the split. Only dev-fast is published for now;
+# the profile matrix is kept so a second optimisation level is one list entry
+# away, but measuring two at once made every timing ambiguous.
+name: cold-build
+
+on:
+  # Nightly from main. Rebuilding a cache is a deliberate act, never something
+  # a source change triggers: outside the schedule it is dispatch only.
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  # The same name in both packages, so consumers need neither a glob nor a
+  # per-lane case.
+  ARCHIVE: target-cache.tar.zst
+
+jobs:
+  cache:
+    name: ${{ matrix.lane }} (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # Per lane and profile, so no leg ever queues behind another's cold build.
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.lane }}-${{ matrix.profile }}
+      cancel-in-progress: false
+    strategy:
+      # One lane failing must not cancel the other: each publishes its own
+      # package, and a half-refreshed pair is still usable — a stale clippy
+      # cache costs seconds, not correctness.
+      fail-fast: false
+      matrix:
+        profile: [dev-fast]
+        lane: [build, clippy]
+    env:
+      PROFILE: ${{ matrix.profile }}
+      PACKAGE: ghcr.io/arkiv-network/arkiv-${{ matrix.lane }}-cache
+    # A cold build of the reth tree with no cache at all took ~25 minutes for
+    # the binaries alone; the tests add to that. Leave generous headroom.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+        with:
+          components: ${{ matrix.lane == 'clippy' && 'clippy' || '' }}
+      # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile
+      # installs. The clippy lane needs them too: check mode still compiles and
+      # runs every build script, C and all.
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
+      - uses: foundry-rs/foundry-toolchain@v1
+      - if: matrix.lane == 'build'
+        uses: taiki-e/install-action@nextest
+      - uses: oras-project/setup-oras@v2
+
+      # Deliberately no Swatinem/rust-cache in either lane: a restored target
+      # dir would defeat the point, and this is what produces the caches in the
+      # first place.
+      - name: Build binaries
+        id: bins
+        if: matrix.lane == 'build'
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE"
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # Compiles the test binaries without running them. dev-dependencies pull
+      # a larger graph, and a cache that covers them serves the binary lane just
+      # as well (measured: 366s from the test cache vs 373s from a binary-only
+      # one). The cache is the deliverable; pr-checks runs the suite.
+      - name: Build tests
+        id: tests
+        if: matrix.lane == 'build'
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo nextest run --workspace --locked --cargo-profile "$PROFILE" --no-run
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # The whole clippy lane. Cold, in an empty target dir, which is what
+      # keeps the tree small: nothing here is ever linked, so no rlib is
+      # produced and the archive is a fraction of the build lane's.
+      #
+      # The invocation has to match pr-checks exactly — profile, `--no-deps`
+      # and the `-D warnings` argument are all part of the fingerprint, and any
+      # difference means the restored artifacts are ignored and the pull
+      # request silently pays the full ~212s anyway.
+      #
+      # Not a gate: this workflow's deliverable is the cache. A lint that only
+      # main can fix must not stop it from being published, so the status goes
+      # to the summary and the lane carries on. pr-checks is where clippy
+      # blocks.
+      - name: Clippy
+        id: clippy
+        if: matrix.lane == 'clippy'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          status=0
+          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps \
+            -- -D warnings 2>&1 | tee clippy.log || status=$?
+          {
+            echo "seconds=$(( $(date +%s) - t0 ))"
+            echo "status=$status"
+            echo "lints=$(grep -c '^error: ' clippy.log || true)"
+          } >> "$GITHUB_OUTPUT"
+          # clippy.log sits next to target/, not inside it, so packing is
+          # unaffected — but leave nothing for a later glob to pick up.
+          rm -f clippy.log
+
+      # Drop the C intermediates jemalloc and rocksdb leave behind once their
+      # .a archives exist — ~1200 files, ~174 MB, that nothing links against.
+      # Both lanes run the build scripts, so both accumulate them.
+      #
+      # Nothing else here is dead weight: deps/*.rmeta is what lets dependent
+      # crates typecheck without recompiling, .fingerprint decides freshness,
+      # and both copies of libjemalloc.a stay because the build script emits
+      # rustc-link-search pointing at out/build/lib.
+      - name: Prune C intermediates
+        id: prune
+        run: |
+          set -euo pipefail
+          before=$(du -sm target | cut -f1)
+          count=$(find target -name '*.o' | wc -l)
+          find target -name '*.o' -delete
+          {
+            echo "before=${before}"
+            echo "after=$(du -sm target | cut -f1)"
+            echo "removed=${count}"
+          } >> "$GITHUB_OUTPUT"
+
+      # `tar --zstd` compresses at level 3; level 10 with a 128 MB window is
+      # ~21% smaller for a few extra seconds, and still unpacks with a plain
+      # `tar --zstd -xf`.
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          tar -I 'zstd -10 -T0 --long=27' -cf "$ARCHIVE" target
+          echo "mb=$(( $(stat -c%s "$ARCHIVE") / 1024 / 1024 ))" >> "$GITHUB_OUTPUT"
+
+      # Published as an OCI artifact rather than a Docker image layer: oras
+      # stores the blob byte-for-byte, so the zstd tarball keeps its size. An
+      # image layer would be gzipped by the builder instead, which is both
+      # slower and considerably larger on already-compressed input.
+      #
+      # Two tags: the profile, which is what consumers pull, and `latest`,
+      # claimed only by the default profile — with a second profile in the
+      # matrix an unconditional `latest` would be whichever leg finished last.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          tags="$PROFILE"
+          [ "$PROFILE" = dev-fast ] && tags="$PROFILE,latest"
+          oras push "$PACKAGE:$tags" \
+            --artifact-type "application/vnd.arkiv.build-cache.v1" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "network.arkiv.profile=$PROFILE" \
+            --annotation "network.arkiv.lane=${{ matrix.lane }}" \
+            --annotation "network.arkiv.built-at=$(date -u +%FT%TZ)" \
+            "$ARCHIVE:application/vnd.arkiv.build-cache.v1.tar+zstd"
+
+      # Moving a tag leaves the version it pointed at behind, untagged but still
+      # occupying storage. Deleting exactly the untagged ones keeps one live
+      # version per profile without either lane having to know about the other —
+      # a version count would delete a sibling profile's cache. Each lane owns
+      # its own package now, so this can no longer reach across lanes either.
+      #
+      # Not fatal if it fails: an uncollected version wastes space, whereas
+      # failing here would mask a cache that published fine.
+      - name: Drop superseded versions
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: arkiv-network
+          package-name: arkiv-${{ matrix.lane }}-cache
+          package-type: container
+          delete-only-untagged-versions: true
+          # Keep the most recent untagged version for one cycle. Pushing the
+          # tags moves them; a job that resolved the old digest a moment
+          # earlier is still streaming hundreds of MB, and deleting it
+          # immediately frees the blobs underneath it and 404s that pull.
+          min-versions-to-keep: 1
+
+      - if: always()
+        run: |
+          {
+            echo "## cold build: ${{ matrix.lane }} ($PROFILE)"
+            echo
+            echo "| step | seconds |"
+            echo "|---|---|"
+            if [ "${{ matrix.lane }}" = build ]; then
+              echo "| binaries | ${{ steps.bins.outputs.seconds }} |"
+              echo "| tests | ${{ steps.tests.outputs.seconds }} |"
+            else
+              echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
+              echo
+              echo "clippy exit ${{ steps.clippy.outputs.status }}, lints: ${{ steps.clippy.outputs.lints }}"
+            fi
+            echo
+            echo "- target: ${{ steps.prune.outputs.before }}MB -> ${{ steps.prune.outputs.after }}MB (${{ steps.prune.outputs.removed }} object files pruned)"
+            echo "- package: \`$PACKAGE:$PROFILE\` (${{ steps.pack.outputs.mb }}MB)"
+          } >> "$GITHUB_STEP_SUMMARY"

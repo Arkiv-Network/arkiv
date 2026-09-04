@@ -1,42 +1,56 @@
+# Two-node devnet smoke test.
+#
+# Normally called by `pr-artifact` once the binaries are built, so it packages
+# that `arkiv-reth` into the image instead of recompiling the reth tree inside
+# BuildKit. Dispatched on its own it falls back to the from-source Dockerfile,
+# which is slow but self-contained.
 name: kurtosis
 
 on:
-  push:
-    branches: [main]
-    paths: &kurtosis-paths
-      - "bin/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "scripts/kurtosis/**"
-      - "kurtosis/**"
-      - ".github/workflows/kurtosis.yml"
-  pull_request:
-    paths: *kurtosis-paths
   workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  workflow_call:
+    inputs:
+      artifact:
+        description: "Artifact holding a prebuilt arkiv-reth; empty builds from source"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   two-node-smoke:
     name: sequencer + follower smoke test
     runs-on: ubuntu-latest
+    # Job-level, and with a literal prefix rather than `github.workflow`: when
+    # called that name resolves to the *caller*, which would put this in the
+    # same concurrency group as the run waiting on it.
+    concurrency:
+      group: kurtosis-${{ github.ref }}
+      cancel-in-progress: false
+    # Packaging a prebuilt binary is minutes; a from-source dispatch is closer
+    # to an hour, so the timeout has to cover the slow path.
     timeout-minutes: 180
     env:
       CI: "true"
       RUST_BACKTRACE: "1"
+      ARTIFACT: ${{ inputs.artifact }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
+      # Only the from-source path compiles anything on the runner.
       - name: Install native build dependencies
+        if: inputs.artifact == ''
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
+
+      - name: Fetch the prebuilt arkiv-reth
+        if: inputs.artifact != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: prebuilt
 
       - name: Install Kurtosis CLI
         run: |
@@ -57,6 +71,12 @@ jobs:
       - name: Start sequencer and follower and run health check
         run: |
           set -euxo pipefail
+          # up.py packages this binary when the variable is set, and builds the
+          # image from source when it is empty.
+          if [ -n "$ARTIFACT" ]; then
+            chmod +x prebuilt/arkiv-reth
+            export ARKIV_RETH_BINARY="$PWD/prebuilt/arkiv-reth"
+          fi
           python3 scripts/kurtosis/up.py arkiv-harness
 
       - name: Collect Kurtosis diagnostics

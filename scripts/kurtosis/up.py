@@ -4,17 +4,25 @@
 The Arkiv chain is run from the remote ethereum-package with the local
 arkiv-reth execution client image and Lighthouse consensus client.
 
+Set ARKIV_RETH_BINARY to an already-compiled arkiv-reth to package that
+binary instead of compiling the workspace inside Docker. CI points it at the
+binary the build lane produced; leaving it unset keeps the from-source build.
+
 Usage: scripts/kurtosis/up.py [enclave]
 """
 
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CACHE, BUILDER = ROOT / ".docker/caches", "arkiv-harness"
 enclave = sys.argv[1] if len(sys.argv) > 1 else "arkiv-harness"
+prebuilt = os.environ.get("ARKIV_RETH_BINARY")
 
 
 def log(message):
@@ -33,13 +41,41 @@ def run(*cmd):
 def buildx(tag, dockerfile):
     # Keep the local BuildKit cache between runs; compiling reth is expensive,
     # while the final image is loaded into the local Docker daemon for Kurtosis.
+    ci_args = []
+    cache_args = []
+    if os.environ.get("CI"):
+        # Limit memory use during the large release build. The hosted runner
+        # cannot reuse a local cache, so do not export a duplicate cache there.
+        ci_args = ["--build-arg", "CARGO_BUILD_JOBS=2"]
+    else:
+        cache_args = [
+            "--cache-from",
+            f"type=local,src={CACHE}",
+            "--cache-to",
+            f"type=local,dest={CACHE},mode=max",
+        ]
     run(
         "docker", "buildx", "build", "--builder", BUILDER, "-t", tag,
         "-f", dockerfile,
-        "--cache-from", f"type=local,src={CACHE}",
-        "--cache-to", f"type=local,dest={CACHE},mode=max",
+        *ci_args,
+        *cache_args,
         "--load", ".",
     )  # fmt: skip
+
+
+def package_prebuilt(tag, binary):
+    # No builder, no cache: the image is one COPY over a distro base, and the
+    # context holds nothing but the binary, so this takes a couple of seconds.
+    binary = Path(binary).resolve()
+    if not binary.is_file():
+        sys.exit(f"ARKIV_RETH_BINARY does not point at a file: {binary}")
+    with tempfile.TemporaryDirectory() as context:
+        shutil.copy2(binary, Path(context) / "arkiv-reth")
+        run(
+            "docker", "build", "-t", tag,
+            "-f", str(ROOT / "docker/arkiv-reth-prebuilt.Dockerfile"),
+            context,
+        )  # fmt: skip
 
 
 def remove_stopped_enclave(name):
@@ -60,18 +96,23 @@ def remove_stopped_enclave(name):
             return
 
 
-CACHE.mkdir(parents=True, exist_ok=True)
-# Create the named builder lazily so the first invocation works on a new host.
-if subprocess.run(["docker", "buildx", "inspect", BUILDER], capture_output=True).returncode:
-    run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
+if not prebuilt:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    # Create the named builder lazily so the first invocation works on a new host.
+    if subprocess.run(["docker", "buildx", "inspect", BUILDER], capture_output=True).returncode:
+        run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
 
 log(f"START Arkiv Kurtosis bring-up (enclave={enclave})")
 log(f"Docker version: {subprocess.check_output(['docker', '--version'], text=True).strip()}")
 log(
     f"Kurtosis version: {subprocess.check_output(['kurtosis', 'version'], text=True).splitlines()[0]}"
 )
-log("==> build images")
-buildx("arkiv-reth:dev", "docker/arkiv-reth.Dockerfile")
+if prebuilt:
+    log(f"==> package prebuilt arkiv-reth ({prebuilt})")
+    package_prebuilt("arkiv-reth:dev", prebuilt)
+else:
+    log("==> build images")
+    buildx("arkiv-reth:dev", "docker/arkiv-reth.Dockerfile")
 
 # Start the two-node network only after the image is available to Kurtosis.
 remove_stopped_enclave(enclave)

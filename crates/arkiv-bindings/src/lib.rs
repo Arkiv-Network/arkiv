@@ -27,6 +27,7 @@
 //! the selector — fails loudly rather than silently forking the wire.
 
 pub mod encode;
+pub mod protocol;
 pub mod types;
 
 alloy_sol_types::sol! {
@@ -131,6 +132,14 @@ pub const OP_PATCH: u8 = 2;
 pub const OP_EXTEND_EXPIRY: u8 = 3;
 pub const OP_TRANSFER_OWNERSHIP: u8 = 4;
 pub const OP_DELETE: u8 = 5;
+
+/// Maximum number of expired entities carried by one protocol purge transaction.
+pub const MAX_PURGE_KEYS: usize = 10;
+/// Strict gas limit for one protocol purge transaction.
+pub const PURGE_GAS_LIMIT: u64 = 1_000_000;
+/// Sender recovered from the public protocol transaction envelope.
+pub const PURGE_CALLER: alloy_primitives::Address =
+    alloy_primitives::address!("5fF20D1C9FeA02C505a2c18F6d42feaeaf44C0Af");
 
 /// Creation flags. Like the `typeId`s they belong to the protocol rather than
 /// the ABI, so the type lives in the spec crate and is re-exported here.

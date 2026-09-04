@@ -11,7 +11,13 @@
 //!    `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`,
 //!    `arkiv_getBlockTiming`.
 //!
+//! The node runs on its own [`node::ArkivNode`] types instead of `EthereumNode`
+//! because it is generic over [`arkiv_reth_chainspec::ArkivChainSpec`], where
+//! reth's is hard-wired to reth's `ChainSpec`.
+//!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
+
+mod node;
 
 // jemalloc, as reth's own binary does it. reth fragments badly under the stock
 // system allocator on long syncs, and the allocator can only be chosen by the
@@ -24,11 +30,13 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 #[cfg(unix)]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
-use arkiv_reth_executor::ArkivExecutorBuilder;
+use arkiv_reth_chainspec::ArkivChainSpecParser;
+use arkiv_reth_executor::ArkivEvmFactory;
 use clap::Parser;
-use reth::cli::Cli;
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_ethereum::{EthereumNode, node::EthereumAddOns};
+use node::ArkivNode;
+use reth::{beacon_consensus::EthBeaconConsensus, cli::Cli};
+use reth_node_ethereum::EthEvmConfig;
+use std::sync::Arc;
 use tracing::info;
 
 fn main() {
@@ -37,26 +45,33 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
-        info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
-        let handle = builder
-            // Standard Ethereum node types (primitives, chainspec, payload, storage).
-            .with_types::<EthereumNode>()
-            // Default Ethereum components, but our executor replaces the EVM one.
-            .with_components(EthereumNode::components().executor(ArkivExecutorBuilder::default()))
-            // Standard Ethereum add-ons (RPC, engine API, validator).
-            .with_add_ons(EthereumAddOns::default())
-            // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
-            .extend_rpc_modules(|ctx| {
-                let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone())?;
-                ctx.modules.merge_configured(module)?;
-                info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
-                Ok(())
-            })
-            .launch_with_debug_capabilities()
-            .await?;
-        handle.wait_for_node_exit().await
-    }) {
+    // `run_with_components` rather than `run`: the latter is bound to reth's
+    // `ChainSpec`. The components closure gives the non-`node` subcommands
+    // (`init`, `import`, `db`, ...) the same executor and consensus the node uses.
+    if let Err(err) = Cli::<ArkivChainSpecParser>::parse().run_with_components::<ArkivNode>(
+        |spec| {
+            (
+                EthEvmConfig::new_with_evm_factory(spec.clone(), ArkivEvmFactory::default()),
+                Arc::new(EthBeaconConsensus::new(spec)),
+            )
+        },
+        async move |builder, _| {
+            info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
+            let handle = builder
+                // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
+                .node(ArkivNode)
+                // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
+                .extend_rpc_modules(|ctx| {
+                    let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone())?;
+                    ctx.modules.merge_configured(module)?;
+                    info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
+                    Ok(())
+                })
+                .launch_with_debug_capabilities()
+                .await?;
+            handle.wait_for_node_exit().await
+        },
+    ) {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }

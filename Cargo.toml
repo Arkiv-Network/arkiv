@@ -21,6 +21,10 @@ reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", default-fe
     "jemalloc",
 ] }
 reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+# The `ChainSpecParser` trait behind `--chain`; arkiv-reth-chainspec implements it.
+reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+# `NodeRecord`, the bootnode type in the `EthChainSpec` trait the Arkiv chain spec implements.
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # The jemalloc allocator itself. `reth`'s "jemalloc" feature only wires up the
 # jemalloc *stats* reporting in node-core/metrics/provider; the allocator has to
 # be declared as `#[global_allocator]` by the binary, which is what reth's own
@@ -34,6 +38,10 @@ reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
 reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 
 # JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
 # reth v2.5.0 uses so the RpcModule we register merges into reth's rpc modules.
@@ -43,6 +51,7 @@ jsonrpsee = { version = "0.26", features = ["server"] }
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 tracing = "0.1"
+turso = { version = "=0.7.2", default-features = false }
 
 # alloy primitives used by the Arkiv protocol crates.
 alloy-rlp = "0.3"
@@ -65,6 +74,8 @@ alloy-eips = "2.3"
 alloy-sol-types = "1.6.1"
 alloy-provider = "2.3"
 alloy-signer-local = { version = "2.3", features = ["mnemonic"] }
+alloy-rpc-types-engine = "2.3"
+futures-util = "0.3"
 alloy-network = "2.3"
 alloy-contract = "2.3"
 alloy-rpc-types = "2.3"
@@ -78,6 +89,7 @@ tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
@@ -86,7 +98,34 @@ arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
+arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }
 arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store" }
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
+arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
+
+# Copied from yagna (.cargo/config). A dev build without debug info or
+# incremental state, with dependencies optimized — much faster to link and to
+# run than plain `dev`, at the cost of debuggability and rebuild speed.
+[profile.dev-fast]
+inherits = "dev"
+debug = false
+incremental = false
+# `debug = false` stops rustc emitting debug info; this drops the symbol table
+# the linker would still write, matching release-fast.
+strip = "symbols"
+
+# Set the default for dependencies.
+[profile.dev-fast.package."*"]
+opt-level = 2
+
+# Also from yagna: an optimized build that trades some runtime speed for much
+# shorter link times — no LTO, more codegen units, opt-level 2.
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16
+# `release` already carries no debug info; this drops the symbol table too.
+strip = "symbols"

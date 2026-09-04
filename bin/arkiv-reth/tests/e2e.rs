@@ -6,16 +6,17 @@
 //! historical reads — all against real reth state over JSON-RPC.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_network::TransactionBuilder;
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::SolEvent;
+use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
-    Attribute, AttributeType, AttributeValue, IEntityRegistry, Ident32, Operation,
+    Attribute, AttributeType, AttributeValue, ENTITY_MAX_ATTRIBUTES, IEntityRegistry, Ident32,
+    MAX_PURGE_KEYS, Operation, protocol::purgeExpiredCall,
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
@@ -39,6 +40,60 @@ async fn spawn_dev(
     let client = connect(&node.http_url(), signer);
     node.wait_ready(&client, READY).await;
     (node, client, caller)
+}
+
+async fn physical_entity_count_at(
+    client: &ArkivClient<impl Provider>,
+    keys: &[B256],
+    block: u64,
+) -> usize {
+    let mut count = 0;
+    for key in keys {
+        count += usize::from(client.debug_entity_exists_at(*key, block).await);
+    }
+    count
+}
+
+async fn wait_for_first_purge(
+    client: &ArkivClient<impl Provider>,
+    keys: &[B256],
+    first_block: u64,
+) -> (u64, usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut block = first_block;
+    loop {
+        let tip = client.block_number().await;
+        while block <= tip {
+            let remaining = physical_entity_count_at(client, keys, block).await;
+            if remaining < keys.len() {
+                return (block, remaining);
+            }
+            block += 1;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no physical purge occurred within 30 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_all_purged(client: &ArkivClient<impl Provider>, keys: &[B256]) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut remaining = 0;
+        for key in keys {
+            remaining += usize::from(client.debug_entity_exists(*key).await);
+        }
+        if remaining == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "physical pruning did not finish within 30 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// A create carrying `payload` under `text/plain`, with a purely relative
@@ -192,7 +247,7 @@ async fn nonces_view_tracks_creates_over_a_live_node() {
 /// the revert data — decodable by the SDK — not as plain strings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_revert_errors_over_a_live_node() {
-    use alloy_sol_types::{SolCall, SolError};
+    use alloy_sol_types::SolError;
 
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
@@ -965,6 +1020,149 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
     );
 }
 
+/// The producer's protocol transaction physically removes a short-lived entity;
+/// this uses the debug read because the public read hides expiry even without a purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_entity_is_physically_purged() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    client
+        .execute(vec![create_op(8, Bytes::from_static(b"purge-me"), vec![])])
+        .await;
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    let expires_at = hex_quantity(&client.get_entity(key).await["expiresAt"]);
+    assert!(
+        client.debug_entity_exists(key).await,
+        "record exists before expiry"
+    );
+
+    // A successful simulation must not remove the canonical schedule entry.
+    let calldata = IEntityRegistry::executeCall {
+        ops: vec![Operation::delete(key)],
+    }
+    .abi_encode();
+    client
+        .provider()
+        .raw_request::<_, Bytes>(
+            "eth_call".into(),
+            (
+                serde_json::json!({
+                    "from": caller,
+                    "to": ARKIV_ADDRESS,
+                    "data": format!("0x{}", alloy_primitives::hex::encode(calldata)),
+                }),
+                "latest",
+            ),
+        )
+        .await
+        .expect("simulated delete succeeds");
+    assert!(
+        client.debug_entity_exists(key).await,
+        "simulation does not delete canonical state"
+    );
+
+    let (purged_at, remaining) = wait_for_first_purge(&client, &[key], expires_at).await;
+    assert_eq!(remaining, 0, "the entity is physically purged");
+    assert!(
+        client.get_entity(key).await.is_null(),
+        "expired entity is logically absent"
+    );
+    assert!(
+        !client.debug_entity_exists_at(key, purged_at).await,
+        "expired entity record was physically purged"
+    );
+    assert!(
+        client.debug_entity_exists_at(key, purged_at - 1).await,
+        "record existed before the purge block"
+    );
+}
+
+/// The count cap drains one common-expiry cohort over successive blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn purge_respects_max_keys_per_block() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let entity_count = u64::try_from(MAX_PURGE_KEYS).unwrap() + 1;
+    client
+        .execute(
+            (0..entity_count)
+                .map(|_| create_op(8, Bytes::new(), vec![]))
+                .collect(),
+        )
+        .await;
+    let keys: Vec<_> = (0..entity_count)
+        .map(|nonce| {
+            B256::from(derive_entity_address(
+                DEV_CHAIN_ID,
+                &caller.into_array(),
+                EntityCreationNonce::new(nonce),
+                0,
+            ))
+        })
+        .collect();
+    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
+
+    let (_, remaining) = wait_for_first_purge(&client, &keys, expires_at).await;
+    assert_eq!(remaining, 1, "the per-block key limit is enforced");
+    wait_for_all_purged(&client, &keys).await;
+}
+
+/// Patch-expanded entities obey the strict purge transaction gas limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn purge_respects_strict_gas_limit_after_attribute_patches() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let keys: Vec<_> = (0..6)
+        .map(|nonce| {
+            B256::from(derive_entity_address(
+                DEV_CHAIN_ID,
+                &caller.into_array(),
+                EntityCreationNonce::new(nonce),
+                0,
+            ))
+        })
+        .collect();
+
+    let mut ops: Vec<_> = (0..6)
+        .map(|i| create_op(8, Bytes::from(vec![i]), vec![]))
+        .collect();
+    // Each patch grows the stored entity to the per-operation maximum. Six
+    // purges would cost 1.02m gas, so only five fit in the 1m transaction.
+    for (entity, key) in keys.iter().enumerate() {
+        let attributes = (0..ENTITY_MAX_ATTRIBUTES)
+            .map(|offset| {
+                let name = format!("a{entity}_{offset:02}");
+                Attribute::from_value(
+                    Ident32::encode(&name).unwrap(),
+                    &AttributeValue::u256_from_u64(offset as u64),
+                )
+                .unwrap()
+            })
+            .collect();
+        ops.push(Operation::patch(*key, attributes));
+    }
+    client.execute(ops).await;
+    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
+    for key in &keys {
+        assert_eq!(
+            client.get_entity(*key).await["attributes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            ENTITY_MAX_ATTRIBUTES
+        );
+    }
+
+    let (_, remaining) = wait_for_first_purge(&client, &keys, expires_at).await;
+    assert_eq!(
+        remaining, 1,
+        "the sixth purge does not exceed the gas limit"
+    );
+    wait_for_all_purged(&client, &keys).await;
+}
+
 /// How many creates [`no_transaction_is_included_twice_over_a_live_node`] fires.
 ///
 /// The bug it guards was reported at roughly 1 tx in 200, so this is a few
@@ -1184,5 +1382,212 @@ async fn a_pooled_create_transaction_does_not_stall_block_production() {
             .expect("eth_getTransactionReceipt")
             .is_none(),
         "a contract deployment must never be mined",
+    );
+}
+
+/// A user can submit `purgeExpired` to the stock pool, but the executor must
+/// reject it as a skippable invalid transaction instead of aborting payloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pooled_user_purge_does_not_stall_block_production() {
+    let (node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let nonce = client
+        .provider()
+        .get_transaction_count(caller)
+        .await
+        .expect("transaction count");
+    let purge = TransactionRequest::default()
+        .with_to(ARKIV_ADDRESS)
+        // Selector only: deliberately malformed ABI for purgeExpired(bytes32[]).
+        .with_input(Bytes::copy_from_slice(&purgeExpiredCall::SELECTOR))
+        .with_nonce(nonce)
+        .with_gas_limit(1_000_000)
+        .with_gas_price(1_000_000_000)
+        .with_chain_id(DEV_CHAIN_ID);
+    let purge_hash = *client
+        .provider()
+        .send_transaction(purge)
+        .await
+        .expect("the pool accepts purge calldata at ingress")
+        .tx_hash();
+
+    let bystander_signer: PrivateKeySigner = DEV_KEY_1.parse().unwrap();
+    let bystander_addr = bystander_signer.address();
+    let bystander = connect(&node.http_url(), bystander_signer);
+    bystander
+        .execute(vec![create_op(
+            1000,
+            Bytes::from_static(b"still-building"),
+            vec![],
+        )])
+        .await;
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &bystander_addr.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    assert_eq!(
+        bystander.get_entity(key).await["payload"],
+        "0x7374696c6c2d6275696c64696e67"
+    );
+    assert!(
+        client
+            .provider()
+            .get_transaction_receipt(purge_hash)
+            .await
+            .expect("eth_getTransactionReceipt")
+            .is_none(),
+        "the user purge must be skipped, not mined"
+    );
+}
+
+/// The base fee of every block up to `until`, as the RPC reports it.
+async fn base_fees(client: &ArkivClient<impl Provider>, until: u64) -> Vec<u64> {
+    let mut fees = Vec::new();
+    for number in 0..=until {
+        let block = client
+            .provider()
+            .get_block_by_number(number.into())
+            .await
+            .expect("eth_getBlockByNumber")
+            .unwrap_or_else(|| panic!("block {number} exists"));
+        fees.push(block.header.base_fee_per_gas.expect("post-London header"));
+    }
+    fees
+}
+
+/// The Arkiv base-fee rule on `--dev`: an idle chain holds reth's 1 gwei dev-genesis
+/// base fee instead of decaying 12.5% per empty block toward the 7 wei protocol
+/// minimum. Stock reth would report 1 gwei, 875 M, 765 M, ... here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_dev_chain_holds_the_genesis_base_fee() {
+    let (_node, client, _caller) = spawn_dev(DEV_KEY_0).await;
+    client.wait_for_block(6, READY).await;
+
+    let fees = base_fees(&client, 6).await;
+    assert_eq!(
+        fees,
+        vec![1_000_000_000; 7],
+        "every empty block must carry the genesis base fee",
+    );
+
+    // And a transaction priced at exactly the floor is what the SDK sends by
+    // default (1 gwei): the pool accepts it and it is mined.
+    client
+        .execute(vec![create_op(1000, Bytes::from_static(b"floor"), vec![])])
+        .await;
+}
+
+/// The floor follows the genesis file: `baseFeePerGas` of 10 wei floors the chain
+/// at 10 wei. Without the rule the run would read 10, 9, 8, 7, 7, 7, 7.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn base_fee_floor_follows_the_genesis_file() {
+    let genesis = serde_json::json!({
+        "config": {
+            "chainId": 424242,
+            "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
+            "byzantiumBlock": 0, "constantinopleBlock": 0, "petersburgBlock": 0,
+            "istanbulBlock": 0, "berlinBlock": 0, "londonBlock": 0,
+            "mergeNetsplitBlock": 0, "terminalTotalDifficulty": 0,
+            "terminalTotalDifficultyPassed": true,
+            "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0
+        },
+        "baseFeePerGas": "0xa",
+        "gasLimit": "0x3938700",
+        "difficulty": "0x0",
+        "alloc": {}
+    });
+    let genesis_path = std::env::temp_dir().join(format!(
+        "arkiv-e2e-genesis-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&genesis_path, genesis.to_string()).expect("write genesis");
+
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .arg("--chain")
+        .arg(genesis_path.to_str().unwrap())
+        .spawn();
+    let client = arkiv_harness::connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    assert_eq!(client.chain_id().await, 424242);
+    client.wait_for_block(6, READY).await;
+
+    let fees = base_fees(&client, 6).await;
+    let _ = std::fs::remove_file(&genesis_path);
+    assert_eq!(fees, vec![10; 7], "the floor is the genesis baseFeePerGas");
+}
+
+/// EIP-1559 accounting end to end: the sender's balance drops by
+/// `gas_used × effectiveGasPrice` — the receipt's figure, not the fee cap — the
+/// block's beneficiary receives `gas_used × (effective − base_fee)`, and the
+/// base-fee share is burned. Before this the executor charged the fee cap and
+/// burned all of it, so receipts and balances disagreed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_tip() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let provider = client.provider();
+    let recipient = DEV_KEY_1.parse::<PrivateKeySigner>().unwrap().address();
+    const FEE_CAP: u128 = 3_000_000_000;
+    const TIP: u128 = 1_000_000_000;
+    const VALUE: u128 = 1_000;
+
+    let before = provider.get_balance(caller).await.expect("eth_getBalance");
+    let nonce = provider
+        .get_transaction_count(caller)
+        .await
+        .expect("transaction count");
+    // The idle dev chain sits at its 1 gwei floor, so the effective price is
+    // base + tip = 2 gwei: strictly below the cap, which is the point.
+    let tx = TransactionRequest::default()
+        .with_to(recipient)
+        .with_value(U256::from(VALUE))
+        .with_nonce(nonce)
+        .with_gas_limit(21_000)
+        .with_max_fee_per_gas(FEE_CAP)
+        .with_max_priority_fee_per_gas(TIP)
+        .with_chain_id(DEV_CHAIN_ID);
+    let receipt = provider
+        .send_transaction(tx)
+        .await
+        .expect("the pool accepts the transfer")
+        .get_receipt()
+        .await
+        .expect("mined");
+    assert!(receipt.status(), "the transfer succeeds");
+
+    let block = provider
+        .get_block_by_number(receipt.block_number.expect("mined").into())
+        .await
+        .expect("eth_getBlockByNumber")
+        .expect("the receipt's block exists");
+    let base_fee = u128::from(block.header.base_fee_per_gas.expect("post-London"));
+    let gas_used = u128::from(receipt.gas_used);
+    let effective = receipt.effective_gas_price;
+    assert_eq!(effective, (base_fee + TIP).min(FEE_CAP));
+    assert!(
+        effective < FEE_CAP,
+        "the fee cap must not be what is charged"
+    );
+
+    let after = provider.get_balance(caller).await.expect("eth_getBalance");
+    assert_eq!(
+        before - after,
+        U256::from(VALUE + gas_used * effective),
+        "the sender pays value + gas_used × effectiveGasPrice",
+    );
+    // The dev miner picks a fresh random beneficiary per block, so its balance is
+    // exactly this block's tips.
+    let tips = provider
+        .get_balance(block.header.beneficiary)
+        .await
+        .expect("eth_getBalance");
+    assert_eq!(
+        tips,
+        U256::from(gas_used * (effective - base_fee)),
+        "the beneficiary receives the tip; the base fee is burned",
     );
 }

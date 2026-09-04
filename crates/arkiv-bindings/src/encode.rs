@@ -2,11 +2,11 @@
 //!
 //! # Operations
 //!
-//! Each op has a constructor that takes only its own fields and ABI-encodes
-//! them into the [`Operation::operationData`] blob, so callers never assemble
-//! the tagged union by hand. [`Operation::payload_of`] is the inverse, and
-//! rejects a blob that is not the **canonical** encoding of its struct — a
-//! spec requirement (`arkiv-node-api.md` §3), and the reason decode compares
+//! Each op has a constructor that takes only its own fields and ABI-encodes them
+//! into the [`Operation::operationData`] blob, so callers never assemble the tagged union by hand.
+//!
+//! [`Operation::payload_of`] is the inverse, and rejects a blob that is not the **canonical** encoding
+//! of its struct — a spec requirement (`arkiv-node-api.md` §3), and the reason decode compares
 //! against a re-encode rather than trusting the decoder to be strict.
 //!
 //! # Attributes
@@ -15,14 +15,28 @@
 //! `AttributeValue` ↔ wire mapping is written down, in both directions. The
 //! encoding is selected by `typeId`:
 //!
-//! | typeId | wire bytes |
-//! |---|---|
-//! | `0` (tombstone) | zero-length |
-//! | word types (`bool`, `int`, `u64`, `u256`, `decimal`, `bytes32`, `address`, `entity_key`) | exactly one 32-byte word, right-aligned as Solidity would (sign-extended for `int`) |
-//! | `string`, `bytes` | raw bytes, unpadded |
+//! | typeId            | wire bytes                              |
+//! |-------------------|-----------------------------------------|
+//! | `0` (tombstone)   | zero-length                             |
+//! | word types        | ABI encoded data, exactly one 32 bytes  |
+//! | `string`, `bytes` | raw bytes, unpadded                     |
 //!
-//! Attributes must be sorted strictly ascending by name; the [`Operation`]
-//! constructors sort automatically.
+//! See the [Contract ABI Specification](https://docs.soliditylang.org/en/latest/abi-spec.html) for more details.
+//!
+//! Where word types can be any of the following below.
+//!
+//! -> Padded with trailing zero-bytes to a length of 32 bytes
+//!     - `bool`
+//!     - `int` (sign-extended)
+//!     - `u64`
+//!     - `u256`
+//!     - `decimal`
+//!     - `address`
+//! -> Full-width 32-byte values occupy the entire word.
+//!     - `bytes32`
+//!     - `entity_key`
+//!
+//! Attributes must be sorted strictly ascending by name; the [`Operation`] constructors sort them automatically.
 
 use core::fmt;
 
