@@ -1,0 +1,65 @@
+# One-shot cleanup. Delete this file once it has run; it is not meant to reach main.
+#
+# `full-test-cache` and `release-fast` are leftovers from the build-cache
+# benchmarking series. Nothing pulls either: every consumer resolves its tag
+# from the profile, and dev-fast is the only profile option left. A personal
+# token cannot remove them without the delete:packages scope, but a workflow's
+# GITHUB_TOKEN can with `packages: write`, which is why this runs here.
+#
+# Triggered on push to its own branch: workflow_dispatch would need the file to
+# exist on the default branch first, and this file should never get there.
+name: purge-stale-cache-tags
+
+on:
+  push:
+    branches: [scx1332/ci-purge-stale-cache-tags]
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OWNER: arkiv-network
+      PKG: arkiv-build-cache
+    steps:
+      - name: Before
+        run: |
+          set -euo pipefail
+          gh api "orgs/$OWNER/packages/container/$PKG/versions" \
+            --jq '.[] | "\(.id)\t\(.metadata.container.tags | join(",") // "<untagged>")"'
+
+      # Resolved by tag rather than by a hard-coded id, so a version that moved
+      # since this was written cannot cause the wrong blob to be deleted. The
+      # live tags are asserted against explicitly: a version carrying dev-fast
+      # or latest is what every consumer pulls, and deleting one would break
+      # every pull request until the next nightly cold-build.
+      - name: Delete the stale tags
+        run: |
+          set -euo pipefail
+          for tag in full-test-cache release-fast; do
+            id=$(gh api "orgs/$OWNER/packages/container/$PKG/versions" \
+              --jq ".[] | select(.metadata.container.tags | index(\"$tag\")) | .id")
+            if [ -z "$id" ]; then
+              echo "no version tagged $tag — nothing to do"
+              continue
+            fi
+            tags=$(gh api "orgs/$OWNER/packages/container/$PKG/versions/$id" \
+              --jq '.metadata.container.tags | join(",")')
+            case ",$tags," in
+              *,dev-fast,*|*,latest,*)
+                echo "::error::version $id is tagged '$tags' — refusing to delete a live cache"
+                exit 1 ;;
+            esac
+            echo "deleting $tag (version $id, tags: $tags)"
+            gh api -X DELETE "orgs/$OWNER/packages/container/$PKG/versions/$id"
+          done
+
+      - name: After
+        run: |
+          set -euo pipefail
+          gh api "orgs/$OWNER/packages/container/$PKG/versions" \
+            --jq '.[] | "\(.id)\t\(.metadata.container.tags | join(",") // "<untagged>")"' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
