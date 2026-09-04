@@ -33,8 +33,9 @@ arkiv/
 │   ├── arkiv-reth-dev.Dockerfile
 │   └── arkiv-reth.Dockerfile
 │
-├── kurtosis/  
-│   └── arkiv-chain.yaml                # ethereum-package args
+├── kurtosis/
+│   ├── arkiv-chain.yaml                # ethereum-package args
+│   └── integration/                    # bun + Arkiv SDK tests against the running enclave
 │
 ├── scripts/
 │   └── kurtosis/                       # up / down helpers
@@ -73,7 +74,7 @@ CI runs three workflows:
 - `[rust.yml](./.github/workflows/rust.yml)`: 🦀 Rust checks and 🐳 Docker publishing for
 `arkiv-reth` and `arkiv-reth-dev`.
 - `[lint.yml](./.github/workflows/lint.yml)`: 🐍 Linting and formatting with [Black]((https://black.readthedocs.io)) over the Python scripts, using configs from `[pyproject.toml](./pyproject.toml)`.
-- `[kurtosis.yml](./.github/workflows/kurtosis.yml)`: 🧪 the two-node sequencer/follower smoke test.
+- `[kurtosis.yml](./.github/workflows/kurtosis.yml)`: 🧪 the two-node sequencer/follower smoke test, followed by the SDK integration tests in `kurtosis/integration`.
 
 Enable the local pre-commit hook with `pip install pre-commit && pre-commit install` — black then runs on staged Python before each commit.
 
