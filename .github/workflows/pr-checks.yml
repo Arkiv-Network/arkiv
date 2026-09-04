@@ -106,14 +106,6 @@ jobs:
             echo "::warning::no build cache at $PACKAGE - compiling cold"
             echo "cache=miss" >> "$GITHUB_OUTPUT"
           fi
-          # Only full-test-cache ships one. Restoring it skips both the
-          # crates.io fetch and the unpack into registry/src.
-          if [ -f cargo-home.tar.zst ]; then
-            tar --zstd --no-same-owner -xpf cargo-home.tar.zst -C "${CARGO_HOME:-$HOME/.cargo}" registry git
-            echo "cargo_home=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "cargo_home=no" >> "$GITHUB_OUTPUT"
-          fi
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       - name: tests
@@ -166,5 +158,5 @@ jobs:
               echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
             fi
             echo
-            echo "cache \`${PACKAGE##*:}\` ${{ steps.restore.outputs.cache }}, profile \`$PROFILE\`, cargo home restored: ${{ steps.restore.outputs.cargo_home }}"
+            echo "cache \`${PACKAGE##*:}\` ${{ steps.restore.outputs.cache }}, profile \`$PROFILE\`"
           } >> "$GITHUB_STEP_SUMMARY"
