@@ -1,0 +1,173 @@
+# The checks lane: two jobs off two different caches.
+#
+#   tests — cargo nextest over the workspace, from the build cache
+#   lint  — cargo fmt, then clippy as a blocking gate, from the clippy cache
+#
+# They were one sequential job until the timings showed why they should not be:
+# fmt, tests and clippy share nothing but a checkout, so running them in series
+# charged the pull request the sum of three independent checks. Split, the lane
+# costs the longer of the two rather than the total.
+#
+# The two now pull different packages, because they need different trees. A
+# check unit and a build unit for the same crate have different fingerprints —
+# mode is part of the metadata hash — so a merged archive is just each job
+# downloading the other's half. cold-build publishes one package per lane:
+# arkiv-build-cache carries the rlibs, arkiv-clippy-cache carries the ~700
+# dependency .rmeta a check build actually reads. 246 MB against 650 MB, which
+# is also why lint restores in ~11s where tests takes ~25s.
+#
+# clippy is scoped with `--no-deps`: cargo runs clippy-driver as
+# RUSTC_WORKSPACE_WRAPPER, so only workspace crates are linted and their
+# dependencies come back warm from the restored cache instead of being
+# re-analysed. Without it clippy also lints every dependency, which is both
+# slow and not actionable.
+name: pr-checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile to build with"
+        required: false
+        default: "dev-fast"
+        type: choice
+        options: [dev-fast]
+      tag:
+        description: "Cache tag; defaults to the profile's own mirrored cache"
+        required: false
+        default: ""
+        type: string
+  pull_request:
+
+# Gates pull requests. Superseded runs are pointless once the head moves,
+# so a new push cancels the one in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      # A lint failure must not cancel the test run, or the pull request learns
+      # one thing per push instead of both.
+      fail-fast: false
+      matrix:
+        task: [tests, lint]
+    env:
+      # The cache tag mirrors the profile: cold-build publishes one per profile
+      # from the same tree, so dispatching dev-fast measures the same lane
+      # against the cheaper optimisation level.
+      PROFILE: ${{ inputs.profile || 'dev-fast' }}
+      # One package per lane: the tests job wants the build tree, the lint job
+      # wants the check tree, and neither has any use for the other.
+      PACKAGE: ghcr.io/arkiv-network/arkiv-${{ matrix.task == 'lint' && 'clippy' || 'build' }}-cache:${{ inputs.tag || inputs.profile || 'dev-fast' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry is
+      # needed by anything that compiles the workspace — clippy included.
+      - uses: foundry-rs/foundry-toolchain@v1
+      - if: matrix.task == 'tests'
+        uses: taiki-e/install-action@nextest
+      - uses: oras-project/setup-oras@v2
+
+      # fmt needs no build tree, so it runs before the cache is even pulled and
+      # a misformatted push fails in seconds rather than after a 33s restore.
+      - name: fmt
+        if: matrix.task == 'lint'
+        run: cargo fmt --all --check
+
+      - name: Restore the shared cache
+        id: restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          t0=$(date +%s)
+          # `target` restricts extraction to that member: the archive is created
+          # as `-cf ... target`, but nothing on this side enforced it, and a
+          # member such as .cargo/config.toml would land on the checkout and be
+          # read by the very next cargo invocation.
+          #
+          # A miss is not fatal. Without this the lane hard-fails on a GHCR
+          # blip, or in the window before the first cold-build publishes, and
+          # the error reads like a broken build rather than a cold cache.
+          if oras pull "$PACKAGE"; then
+            tar --zstd --no-same-owner -xpf target-cache.tar.zst target
+            echo "cache=hit" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no build cache at $PACKAGE - compiling cold"
+            echo "cache=miss" >> "$GITHUB_OUTPUT"
+          fi
+          # Only full-test-cache ships one. Restoring it skips both the
+          # crates.io fetch and the unpack into registry/src.
+          if [ -f cargo-home.tar.zst ]; then
+            tar --zstd --no-same-owner -xpf cargo-home.tar.zst -C "${CARGO_HOME:-$HOME/.cargo}" registry git
+            echo "cargo_home=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo_home=no" >> "$GITHUB_OUTPUT"
+          fi
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      - name: tests
+        id: tests
+        if: matrix.task == 'tests'
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo nextest run --workspace --locked --cargo-profile "$PROFILE"
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # Blocking, and now nothing waits behind it: the tests report from their
+      # own job regardless of what clippy finds.
+      # Fast because cold-build's clippy lane ran this exact command to
+      # produce the cache this job restored, so every untouched crate comes
+      # back warm. Any divergence from that invocation — profile, `--no-deps`,
+      # the `-D warnings` argument — changes the fingerprint and silently costs
+      # the full 212s again.
+      - name: clippy
+        id: clippy
+        if: matrix.task == 'lint'
+        run: |
+          # pipefail matters: without it `tee` would mask clippy's exit status.
+          set -euo pipefail
+          t0=$(date +%s)
+          # Clippy exits 0 on lint warnings, so `-D warnings` is what makes
+          # this a gate rather than a report.
+          status=0
+          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps \
+            -- -D warnings 2>&1 | tee clippy.log || status=$?
+          {
+            echo "seconds=$(( $(date +%s) - t0 ))"
+            echo "lints=$(grep -c '^error: ' clippy.log || true)"
+          } >> "$GITHUB_OUTPUT"
+          exit $status
+
+      - if: always()
+        run: |
+          {
+            echo "## ${{ matrix.task }}"
+            echo
+            echo "| step | seconds |"
+            echo "|---|---|"
+            echo "| restore | ${{ steps.restore.outputs.seconds }} |"
+            if [ "${{ matrix.task }}" = tests ]; then
+              echo "| tests | ${{ steps.tests.outputs.seconds }} |"
+            else
+              echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
+              echo
+              echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
+            fi
+            echo
+            echo "cache \`${PACKAGE##*:}\` ${{ steps.restore.outputs.cache }}, profile \`$PROFILE\`, cargo home restored: ${{ steps.restore.outputs.cargo_home }}"
+          } >> "$GITHUB_STEP_SUMMARY"
