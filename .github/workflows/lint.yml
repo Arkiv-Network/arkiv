@@ -1,16 +1,25 @@
+# Python formatting for the helper scripts. Independent of the Rust lanes: it
+# needs no toolchain, no build cache and no runner time to speak of, so it runs
+# on its own rather than queueing behind pr-checks.
 name: lint
+
 on:
+  workflow_dispatch:
+  pull_request:
   push:
     branches: [main]
     tags: ["v*"]
-  pull_request:
-  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   black:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: psf/black@stable
         with:
           options: "--check --diff"

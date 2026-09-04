@@ -25,6 +25,7 @@ reth-storage-api.workspace = true
 arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
+arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true
 # The RPC block type the debug launcher converts (`DebugNode::RpcBlock`).

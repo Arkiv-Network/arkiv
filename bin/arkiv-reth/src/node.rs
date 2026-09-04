@@ -7,18 +7,15 @@
 
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivExecutorBuilder;
+use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder, PayloadTypes},
-    builder::{
-        DebugNode, Node, NodeAdapter,
-        components::{BasicPayloadServiceBuilder, ComponentsBuilder},
-    },
+    builder::{DebugNode, Node, NodeAdapter, components::ComponentsBuilder},
 };
 use reth_ethereum::{Block, EthPrimitives, engine::local::LocalPayloadAttributesBuilder};
 use reth_node_ethereum::{
     EthEngineTypes, EthereumAddOns, EthereumConsensusBuilder, EthereumEngineValidatorBuilder,
-    EthereumEthApiBuilder, EthereumNetworkBuilder, EthereumNode, EthereumPayloadBuilder,
-    EthereumPoolBuilder,
+    EthereumEthApiBuilder, EthereumNetworkBuilder, EthereumNode, EthereumPoolBuilder,
 };
 use reth_storage_api::EthStorage;
 use std::sync::Arc;
@@ -40,7 +37,7 @@ impl NodeTypes for ArkivNode {
 pub type ArkivComponentsBuilder<N> = ComponentsBuilder<
     N,
     EthereumPoolBuilder,
-    BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
+    ArkivPayloadServiceBuilder,
     EthereumNetworkBuilder,
     ArkivExecutorBuilder,
     EthereumConsensusBuilder,
@@ -55,7 +52,9 @@ where
         EthereumAddOns<NodeAdapter<N>, EthereumEthApiBuilder, EthereumEngineValidatorBuilder>;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
-        EthereumNode::components().executor(ArkivExecutorBuilder::default())
+        EthereumNode::components()
+            .executor(ArkivExecutorBuilder::default())
+            .payload(ArkivPayloadServiceBuilder)
     }
 
     fn add_ons(&self) -> Self::AddOns {

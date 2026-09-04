@@ -1,0 +1,113 @@
+# The fast lane: restore the shared cache and get shippable binaries out.
+#
+# fmt, tests and clippy live in pr-checks so a lint failure never delays the
+# artifact, and the two run in parallel. The Kurtosis smoke test hangs off the
+# build here rather than in its own workflow: artifacts are only downloadable
+# by name from within the run that produced them.
+name: pr-artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile, and the cache tag that mirrors it"
+        required: false
+        default: "dev-fast"
+        type: choice
+        options: [dev-fast]
+  pull_request:
+  # Also on main, and deliberately: the Kurtosis smoke test hangs off this
+  # workflow, so without this there is no devnet check after a merge — which is
+  # exactly where two independently-green pull requests interact. It costs ~5
+  # minutes here rather than the ~44 the from-source devnet cost on main.
+  push:
+    branches: [main]
+
+# Gates pull requests. Superseded runs are pointless once the head moves,
+# so a new push cancels the one in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    env:
+      # The cache tag mirrors the profile: cold-build publishes one per profile
+      # from the same tree, so dispatching dev-fast measures the same lane
+      # against the cheaper optimisation level.
+      PROFILE: ${{ inputs.profile || 'dev-fast' }}
+      PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache:${{ inputs.profile || 'dev-fast' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: oras-project/setup-oras@v2
+
+      - name: Restore the shared cache
+        id: restore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          oras login ghcr.io -u '${{ github.actor }}' --password-stdin <<< "$GH_TOKEN"
+          t0=$(date +%s)
+          # `target` restricts extraction to that member: the archive is created
+          # as `-cf ... target`, but nothing on this side enforced it, and a
+          # member such as .cargo/config.toml would land on the checkout and be
+          # read by the very next cargo invocation.
+          #
+          # A miss is not fatal. Without this the lane hard-fails on a GHCR
+          # blip, or in the window before the first cold-build publishes, and
+          # the error reads like a broken build rather than a cold cache.
+          if oras pull "$PACKAGE"; then
+            tar --zstd --no-same-owner -xpf target-cache.tar.zst target
+            echo "cache=hit" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no build cache at $PACKAGE - compiling cold"
+            echo "cache=miss" >> "$GITHUB_OUTPUT"
+          fi
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          cargo build --workspace --locked --profile "$PROFILE"
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # The binaries are already stripped by the profile, so there is nothing
+      # for zip to gain — level 1 keeps the upload quick.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arkiv-binaries-${{ env.PROFILE }}-${{ github.sha }}
+          path: |
+            target/${{ env.PROFILE }}/arkiv-reth
+            target/${{ env.PROFILE }}/arkiv-cli
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7
+
+      - if: always()
+        run: |
+          {
+            echo "## artifact"
+            echo "- restore: ${{ steps.restore.outputs.seconds }}s (cache ${{ steps.restore.outputs.cache }})"
+            echo "- build: ${{ steps.build.outputs.seconds }}s"
+            ls -lh "target/$PROFILE/arkiv-reth" "target/$PROFILE/arkiv-cli" 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Runs the devnet against the binary just built. Passing the artifact name
+  # makes it package that binary; the reusable workflow builds the image from
+  # source when the input is empty.
+  kurtosis:
+    needs: build
+    uses: ./.github/workflows/kurtosis.yml
+    with:
+      artifact: arkiv-binaries-${{ inputs.profile || 'dev-fast' }}-${{ github.sha }}
