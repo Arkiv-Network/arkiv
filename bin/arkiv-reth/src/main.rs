@@ -11,12 +11,9 @@
 //!    `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount`,
 //!    `arkiv_getBlockTiming`.
 //!
-//! Plus one protocol rule carried by the chain spec rather than a component:
-//! the base fee never drops below the genesis base fee
-//! ([`arkiv_reth_chainspec::ArkivChainSpec`]). That is why the node runs on its
-//! own [`node::ArkivNode`] types instead of `EthereumNode` — reth's is hard-wired
-//! to reth's `ChainSpec` — and why the CLI is parameterised with
-//! [`ArkivChainSpecParser`].
+//! The node runs on its own [`node::ArkivNode`] types instead of `EthereumNode`
+//! because it is generic over [`arkiv_reth_chainspec::ArkivChainSpec`], where
+//! reth's is hard-wired to reth's `ChainSpec`.
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
