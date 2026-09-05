@@ -1,310 +1,731 @@
 //! Rust definitions for "Cells" in GolemDB, alongwith the logic for encoding and decoding them
+//!
+//! # Wire format
+//!
+//! A cell is one metadata byte followed by the value bytes:
+//!
+//! ```text
+//! [ indexable: 1 bit | type id: 7 bits ] [ value bytes … ]
+//! ```
+//!
+//! Only `str` and `bytes` are variable sized. The type id alone says whether the
+//! value is fixed width, and if so how wide; a variable-width value's length is
+//! however much of the cell is left. So there is no length field and no
+//! multi-byte metadata.
 
-/// A reference to an opaque cell with no guarantees about its content.
-/// A lightweight wrapper around a byte slice, representing the raw data of a cell.
-/// For validity and type guarantees, use `ParsedCellRef` instead.
-pub struct OpaqueCellRef<'a> {
-    pub data_ref: &'a [u8],
-}
+use core::fmt;
 
-impl<'a> OpaqueCellRef<'a> {
-    pub fn new(data_ref: &'a [u8]) -> Self {
-        Self { data_ref }
-    }
+/// The longest `str` value in bytes a cell may carry.
+///
+/// This layer imposes only the format's own bound; a deployment is free to
+/// enforce something tighter on top.
+pub const MAX_STR_LEN: usize = 256;
 
-    pub fn as_bytes(&self) -> &[u8] {
-        self.data_ref
-    }
+/// The longest `bytes` value in bytes a cell may carry.
+pub const MAX_BYTES_LEN: usize = 256;
 
-    pub fn len(&self) -> usize {
-        self.data_ref.len()
-    }
+/// The metadata byte's high bit: whether the cell is indexable.
+const INDEXABLE_BIT: u8 = 0b1000_0000;
 
-    pub fn is_empty(&self) -> bool {
-        self.data_ref.is_empty()
-    }
+/// The metadata byte's low 7 bits: the type id.
+const TYPE_ID_MASK: u8 = !INDEXABLE_BIT;
 
-    /// Convert this `OpaqueCellRef` into an owned `OpaqueCell` by copying the data.
-    pub fn into_owned(self) -> OpaqueCell {
-        OpaqueCell {
-            data: self.data_ref.to_vec(),
-        }
-    }
-}
+/// One past the last type id: the id space is 7 bits wide.
+pub const TYPE_ID_SPACE: u8 = 128;
 
-/// An owned opaque cell, which is a vector of bytes.
-pub struct OpaqueCell {
-    pub data: Vec<u8>,
-}
-
-impl OpaqueCell {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self { data }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if the cell is empty
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Convert this `OpaqueCell` into an `OpaqueCellRef` by borrowing the data.
-    pub fn as_ref(&self) -> OpaqueCellRef<'_> {
-        OpaqueCellRef {
-            data_ref: &self.data,
-        }
-    }
-}
-
-pub enum CellParseError {
-    InvalidFormat,
-    InvalidType,
-    UnknownType(String),
-    Other(String),
-}
+/// The first type id belonging to the custom block.
+pub const CUSTOM_TYPE_ID_BASE: u8 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TypeSize(u8);
-const _: () = assert!(
-    std::mem::size_of::<usize>() >= std::mem::size_of::<u8>(),
-    "usize must be at least 8 bits"
-);
-
-impl TypeSize {
-    pub fn new(size: usize) -> Self {
-        if size == 0 || size > 256 {
-            panic!("TypeSize must be between 1 and 256 bytes");
-        }
-        Self(size as u8 - 1) // Store as 0-255 internally
-    }
-
-    /// Create a `TypeSize` from a `u8`, where 0 represents 1 byte and 255 represents 256 bytes.
-    pub fn from_u8(size: u8) -> Self {
-        if size > 255 {
-            panic!("TypeSize must be between 1 and 256 bytes");
-        }
-        Self(size) // Store as 0-255 internally
-    }
-
-    pub fn size(&self) -> usize {
-        (self.0 + 1) as usize // Return as 1-256 externally
-    }
+pub enum CellParseError {
+    /// The cell is too short to hold its metadata byte.
+    Empty,
+    /// The type id names a slot the spec reserves for future use.
+    ReservedType(u8),
+    /// A fixed-width type whose value is not exactly that wide.
+    LengthMismatch { expected: usize, actual: usize },
+    /// A variable-width value longer than its type allows.
+    TooLong { max: usize, actual: usize },
+    /// A `bool` whose byte is neither 0 nor 1.
+    InvalidBool(u8),
+    /// A `str` whose bytes are not valid UTF-8.
+    InvalidUtf8,
 }
 
-#[non_exhaustive]
-pub enum CellDataRef<'a> {
-    Tombstone,
-    Boolean(&'a [u8]),
-    String(TypeSize, &'a [u8]),
-    Bytes(TypeSize, &'a [u8]),
-    UnsignedInteger(TypeSize, &'a [u8]),
-    SignedInteger(TypeSize, &'a [u8]),
-    Float(TypeSize, &'a [u8]),
-    Date32(&'a [u8]),
-    TimeStamp64(&'a [u8]),
-    // --- for future expansion ---
-    Custom(TypeSize, &'a [u8]), // For custom types
-}
-
-impl<'a> CellDataRef<'a> {
-    pub fn try_from(
-        type_data: (u8, Option<TypeSize>),
-        raw_data: &'a [u8],
-    ) -> Result<Self, CellParseError> {
-        let type_discriminant =
-            TypeDiscriminant::from_type_data_with_raw_data_verification(type_data, raw_data)?;
-        match type_discriminant {
-            TypeDiscriminant::Tombstone => Ok(Self::Tombstone),
-            TypeDiscriminant::Boolean => Ok(Self::Boolean(&raw_data[..1])),
-            TypeDiscriminant::String(ts) => Ok(Self::String(ts, &raw_data[..ts.size()])),
-            TypeDiscriminant::Bytes(ts) => Ok(Self::Bytes(ts, &raw_data[..ts.size()])),
-            TypeDiscriminant::UnsignedInteger(ts) => {
-                Ok(Self::UnsignedInteger(ts, &raw_data[..ts.size()]))
-            }
-            TypeDiscriminant::SignedInteger(ts) => {
-                Ok(Self::SignedInteger(ts, &raw_data[..ts.size()]))
-            }
-            TypeDiscriminant::Float(ts) => Ok(Self::Float(ts, &raw_data[..ts.size()])),
-            TypeDiscriminant::Date32 => Ok(Self::Date32(&raw_data[..4])),
-            TypeDiscriminant::TimeStamp64 => Ok(Self::TimeStamp64(&raw_data[..8])),
-            TypeDiscriminant::Custom(ts) => Ok(Self::Custom(ts, &raw_data[..ts.size()])),
-            _ => Err(CellParseError::UnknownType("".into())), // Handle unknown types
-        }
-    }
-
-    pub fn len(&self) -> usize {
+impl fmt::Display for CellParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CellDataRef::Tombstone => 0,
-            CellDataRef::Boolean(_) => 1,
-            CellDataRef::String(size, _) => size.size(),
-            CellDataRef::Bytes(size, _) => size.size(),
-            CellDataRef::UnsignedInteger(size, _) => size.size(),
-            CellDataRef::SignedInteger(size, _) => size.size(),
-            CellDataRef::Float(size, _) => size.size(),
-            CellDataRef::Date32(_) => 4,
-            CellDataRef::TimeStamp64(_) => 8,
-            CellDataRef::Custom(size, _) => size.size(),
-            _ => 0, // For future expansion, default to 0
+            Self::Empty => write!(f, "cell is missing its metadata byte"),
+            Self::ReservedType(id) => write!(f, "type id {id} is reserved"),
+            Self::LengthMismatch { expected, actual } => {
+                write!(f, "expected {expected} value bytes, got {actual}")
+            }
+            Self::TooLong { max, actual } => {
+                write!(f, "value is {actual} bytes, the maximum is {max}")
+            }
+            Self::InvalidBool(b) => write!(f, "bool byte must be 0 or 1, got {b}"),
+            Self::InvalidUtf8 => write!(f, "str value is not valid UTF-8"),
         }
     }
 }
 
-/// A discriminant for the type of data stored in a cell, used for parsing and validation.
-#[non_exhaustive]
-pub enum TypeDiscriminant {
-    Tombstone,
-    Boolean,
-    /// Valid type sizes: 0-255, denoting 1-256 bytes.
-    String(TypeSize),
-    /// Valid type sizes: 0-255, denoting 1-256 bytes.
-    Bytes(TypeSize),
-    /// Valid type sizes: 8, 32, 64, 128, 256 bits (1, 4, 8, 16, 32 bytes).
-    UnsignedInteger(TypeSize),
-    /// Valid type sizes: 8, 32, 64, 128, 256 bits (1, 4, 8, 16, 32 bytes).
-    SignedInteger(TypeSize),
-    /// Valid type sizes: 32, 64, 128, 256 bits (4, 8, 16, 32 bytes).
-    Decimal(TypeSize),
-    /// Valid type sizes: 32, 64 bits (4, 8 bytes).
-    Float(TypeSize),
-    Date32,
-    TimeStamp64,
-    Custom(TypeSize),
+impl core::error::Error for CellParseError {}
+
+/// The width exponent `w` of a `4 · 2^w`-byte family: 4, 8, 16 or 32 bytes.
+///
+/// The four members of such a family sit at consecutive type ids `base + w`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Width {
+    W4,
+    W8,
+    W16,
+    W32,
 }
 
-impl TypeDiscriminant {
-    pub fn from_type_data_with_raw_data_verification(
-        type_data: (u8, Option<TypeSize>),
-        raw_data: &[u8],
-    ) -> Result<Self, CellParseError> {
-        let (type_class, type_len) = type_data;
-        match type_class {
-            0x00 => Ok(TypeDiscriminant::Tombstone),
-            0x01 => Ok(TypeDiscriminant::Boolean),
-            0x02 => {
-                let size = type_len.ok_or(CellParseError::InvalidFormat)?;
-                Ok(TypeDiscriminant::String(size))
-            }
-            0x03 => {
-                let size = type_len.ok_or(CellParseError::InvalidFormat)?;
-                Ok(TypeDiscriminant::Bytes(size))
-            }
-            0x04 => {
-                let ts = type_len.ok_or(CellParseError::InvalidFormat)?;
-                if ts.size() != 8
-                    || ts.size() != 32
-                    || ts.size() != 64
-                    || ts.size() != 128
-                    || ts.size() != 256
-                {
-                    return Err(CellParseError::UnknownType(format!(
-                        "UnsignedInteger:{}",
-                        ts.size()
-                    )));
-                }
-                Ok(TypeDiscriminant::UnsignedInteger(ts))
-            }
-            0x05 => {
-                let ts = type_len.ok_or(CellParseError::InvalidFormat)?;
-                if ts.size() != 8
-                    || ts.size() != 32
-                    || ts.size() != 64
-                    || ts.size() != 128
-                    || ts.size() != 256
-                {
-                    return Err(CellParseError::UnknownType(format!(
-                        "SignedInteger:{}",
-                        ts.size()
-                    )));
-                }
-                Ok(TypeDiscriminant::SignedInteger(ts))
-            }
-            0x05 => {
-                let ts = type_len.ok_or(CellParseError::InvalidFormat)?;
-                if ts.size() != 32 || ts.size() != 64 || ts.size() != 128 || ts.size() != 256 {
-                    return Err(CellParseError::UnknownType(format!(
-                        "UnsignedInteger:{}",
-                        ts.size()
-                    )));
-                }
-                Ok(TypeDiscriminant::Decimal(ts))
-            }
-            0x06 => {
-                let ts = type_len.ok_or(CellParseError::InvalidFormat)?;
-                if ts.size() != 32 || ts.size() != 64 {
-                    return Err(CellParseError::UnknownType(format!(
-                        "UnsignedInteger:{}",
-                        ts.size()
-                    )));
-                }
-                Ok(TypeDiscriminant::Float(ts))
-            }
-            0x07 => Ok(TypeDiscriminant::Date32),
-            0x08 => Ok(TypeDiscriminant::TimeStamp64),
-            0x09 => {
-                let size = type_len.ok_or(CellParseError::InvalidFormat)?;
-                Ok(TypeDiscriminant::Custom(size))
-            }
-            _ => Err(CellParseError::InvalidType),
+impl Width {
+    /// The `w` in `4 · 2^w`, i.e. the type id's offset within its family.
+    pub const fn w(self) -> u8 {
+        match self {
+            Self::W4 => 0,
+            Self::W8 => 1,
+            Self::W16 => 2,
+            Self::W32 => 3,
+        }
+    }
+
+    /// Inverse of [`Width::w`]; `w` must be 0–3.
+    const fn from_w(w: u8) -> Self {
+        match w {
+            0 => Self::W4,
+            1 => Self::W8,
+            2 => Self::W16,
+            _ => Self::W32,
+        }
+    }
+
+    /// The value width in bytes: `4 · 2^w`.
+    pub const fn bytes(self) -> usize {
+        4usize << self.w()
+    }
+}
+
+/// The width of a float: `f32` or `f64`.
+///
+/// `f16` and `f128` are reserved at ids 26–27, so this is deliberately not a
+/// `4 · 2^w` family — it is a two-member family at ids 24–25.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FloatWidth {
+    F32,
+    F64,
+}
+
+impl FloatWidth {
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F64 => 8,
         }
     }
 }
 
-/// A cell which can be parsed into specific types.
-pub struct ParsedCellRef<'a> {
-    pub is_indexable: bool,
-    pub data_ref: CellDataRef<'a>,
-}
+/// A custom, per-deployment type id from the 64–127 block.
+///
+/// A newtype so a `CellType::Custom` cannot be built holding an id from the core
+/// block. What the id *means* is up to the deployment's type registry, so a
+/// custom value's bytes are [`ValueLayout::Opaque`] here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CustomTypeId(u8);
 
-impl<'a> ParsedCellRef<'a> {
-    /// Try to parse an `OpaqueCellRef` into a `ParsedCellRef`. A `ParsedCellRef`
-    /// guarantees that the cell is valid and can be interpreted as a specific type.
-    pub fn try_from(opaque: &'a OpaqueCellRef<'a>) -> Result<Self, CellParseError> {
-        // A cell should have atleast:
-        // - 1 byte for metadata + 1 byte of data = 2 bytes; or
-        // - 2 bytes for metadata + 1 byte of data = 3 bytes
-        //
-        // The distinction between 1 byte and 2 byte metadata is the first bit of the first byte
-        // [<is_multi_byte_metadata: 1 bit> <other_metadata: 7 bits>]
-        let is_multi_byte_metadata =
-            (opaque.len() > 0) && (opaque.as_bytes()[0] & 0b1000_0000 != 0);
-        let minimum_bytes = 2 + if is_multi_byte_metadata { 1 } else { 0 };
-        if opaque.len() < minimum_bytes {
-            return Err(CellParseError::InvalidFormat);
-        }
-
-        // The second bit of the first byte indicates whether the cell is indexable or not.
-        let is_indexable = opaque.as_bytes()[0] & 0b0100_0000 != 0;
-
-        // First byte's certain bits are used to determine the type of the cell,
-        // and the length of the type data if it's multi-byte metadata.
-        let type_data = {
-            let type_class = opaque.as_bytes()[0] & 0b0011_1111;
-            let type_len = if is_multi_byte_metadata {
-                Some(TypeSize::from_u8(opaque.as_bytes()[1]))
-            } else {
-                None
-            };
-            (type_class, type_len)
-        };
-
-        let raw_data = if is_multi_byte_metadata {
-            &opaque.as_bytes()[2..]
+impl CustomTypeId {
+    /// `id` must be in 64–127; anything else is not a custom type.
+    pub const fn new(id: u8) -> Option<Self> {
+        if id >= CUSTOM_TYPE_ID_BASE && id < TYPE_ID_SPACE {
+            Some(Self(id))
         } else {
-            &opaque.as_bytes()[1..]
-        };
+            None
+        }
+    }
 
-        let data_ref = CellDataRef::try_from(type_data, raw_data)?;
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
 
+/// How many value bytes a type's cell carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueLayout {
+    /// Exactly this many bytes.
+    Fixed(usize),
+    /// Up to `max` bytes; the actual length is the rest of the cell.
+    Variable { max: usize },
+    /// Whatever the deployment's type registry says — not checked here.
+    Opaque,
+}
+
+/// The type of a cell's value — the 7-bit type-id space, decoded.
+///
+/// | id     | type                                  | family                | value bytes               | order-encoding     |
+/// | ------ | ------------------------------------- | --------------------- | ------------------------- | ------------------ |
+/// | 0      | tombstone                             | singleton             | 0                         | —                  |
+/// | 1      | `bool`                                | singleton             | 1                         | —                  |
+/// | 2      | `str`                                 | singleton             | var (≤ [`MAX_STR_LEN`])   | raw UTF-8          |
+/// | 3      | `bytes` (field-only)                  | singleton             | var (≤ [`MAX_BYTES_LEN`]) | —                  |
+/// | 4      | `bytes20`                             | singleton             | 20                        | plain bytes        |
+/// | 5–7    | *reserved singletons*                 |                       |                           |                    |
+/// | 8–11   | `bytes4` `bytes8` `bytes16` `bytes32` | `8 + w`               | 4·2^w                     | plain bytes        |
+/// | 12–15  | `u32` `u64` `u128` `u256`             | `12 + w`              | 4·2^w                     | plain BE           |
+/// | 16–19  | `i32` `i64` `i128` `i256`             | `16 + w`              | 4·2^w                     | sign-bit-biased BE |
+/// | 20–23  | `dec32` `dec64` `dec128` `dec256`     | `20 + w`              | 4·2^w (fixed scale)       | sign-bit-biased BE |
+/// | 24–25  | `f32` `f64`                           | floats (26–27 rsvd)   | 4 / 8                     | IEEE total-order   |
+/// | 28–29  | `date32` `timestamp64`                | time (30–31 rsvd)     | 4 / 8                     | sign-bit-biased BE |
+/// | 32–63  | *reserved — future core families*     | 8 aligned blocks of 4 |                           |                    |
+/// | 64–127 | *custom types*                        | per deployment        |                           |                    |
+///
+/// The order-encoding column says how a value must be laid out for a bytewise
+/// comparison to match a value comparison. It is recorded here but not applied
+/// here: `AttributeValue::index_bytes` in `arkiv-interfaces` owns those
+/// transforms today. Whether an ordered type is actually *offered* for range
+/// queries is a separate, policy question — `QueryCapabilities` answers it, and
+/// answers "no" for some types this column can order (`bytes32`, for one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellType {
+    /// A deleted cell: no value bytes at all.
+    Tombstone,
+    Bool,
+    Str,
+    /// Field-only: storable, but never range-indexed. Variable width, and byte
+    /// blobs have no meaningful order.
+    Bytes,
+    /// An address-width byte string; its own singleton rather than part of the
+    /// `4 · 2^w` family below, because 20 is not a power-of-two multiple of 4.
+    Bytes20,
+    /// `bytes4`, `bytes8`, `bytes16`, `bytes32`.
+    FixedBytes(Width),
+    /// `u32`, `u64`, `u128`, `u256`.
+    Uint(Width),
+    /// `i32`, `i64`, `i128`, `i256`.
+    Int(Width),
+    /// `dec32`, `dec64`, `dec128`, `dec256`, each at the fixed scale the spec
+    /// pins for its width.
+    Decimal(Width),
+    /// `f32`, `f64`.
+    Float(FloatWidth),
+    /// Days since the Unix epoch, signed.
+    Date32,
+    /// Microseconds since the Unix epoch, signed.
+    Timestamp64,
+    Custom(CustomTypeId),
+}
+
+impl CellType {
+    /// The type id this type occupies in the metadata byte's low 7 bits.
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::Tombstone => 0,
+            Self::Bool => 1,
+            Self::Str => 2,
+            Self::Bytes => 3,
+            Self::Bytes20 => 4,
+            Self::FixedBytes(w) => 8 + w.w(),
+            Self::Uint(w) => 12 + w.w(),
+            Self::Int(w) => 16 + w.w(),
+            Self::Decimal(w) => 20 + w.w(),
+            Self::Float(FloatWidth::F32) => 24,
+            Self::Float(FloatWidth::F64) => 25,
+            Self::Date32 => 28,
+            Self::Timestamp64 => 29,
+            Self::Custom(c) => c.get(),
+        }
+    }
+
+    /// Decode a type id. `id` must already be masked to 7 bits; ids the spec
+    /// reserves come back as [`CellParseError::ReservedType`].
+    pub const fn from_id(id: u8) -> Result<Self, CellParseError> {
+        match id {
+            0 => Ok(Self::Tombstone),
+            1 => Ok(Self::Bool),
+            2 => Ok(Self::Str),
+            3 => Ok(Self::Bytes),
+            4 => Ok(Self::Bytes20),
+            8..=11 => Ok(Self::FixedBytes(Width::from_w(id - 8))),
+            12..=15 => Ok(Self::Uint(Width::from_w(id - 12))),
+            16..=19 => Ok(Self::Int(Width::from_w(id - 16))),
+            20..=23 => Ok(Self::Decimal(Width::from_w(id - 20))),
+            24 => Ok(Self::Float(FloatWidth::F32)),
+            25 => Ok(Self::Float(FloatWidth::F64)),
+            28 => Ok(Self::Date32),
+            29 => Ok(Self::Timestamp64),
+            64..=127 => Ok(Self::Custom(CustomTypeId(id))),
+            // 5–7, 26–27, 30–31 and 32–63 are reserved; 128.. cannot fit the
+            // 7-bit field and is treated the same way.
+            _ => Err(CellParseError::ReservedType(id)),
+        }
+    }
+
+    /// How many value bytes follow the metadata byte.
+    pub const fn layout(self) -> ValueLayout {
+        match self {
+            Self::Tombstone => ValueLayout::Fixed(0),
+            Self::Bool => ValueLayout::Fixed(1),
+            Self::Str => ValueLayout::Variable { max: MAX_STR_LEN },
+            Self::Bytes => ValueLayout::Variable { max: MAX_BYTES_LEN },
+            Self::Bytes20 => ValueLayout::Fixed(20),
+            Self::FixedBytes(w) | Self::Uint(w) | Self::Int(w) | Self::Decimal(w) => {
+                ValueLayout::Fixed(w.bytes())
+            }
+            Self::Float(f) => ValueLayout::Fixed(f.bytes()),
+            Self::Date32 => ValueLayout::Fixed(4),
+            Self::Timestamp64 => ValueLayout::Fixed(8),
+            Self::Custom(_) => ValueLayout::Opaque,
+        }
+    }
+
+    /// Check that `value` is a well-formed body for this type.
+    pub fn validate(self, value: &[u8]) -> Result<(), CellParseError> {
+        match self.layout() {
+            ValueLayout::Fixed(n) if value.len() != n => {
+                return Err(CellParseError::LengthMismatch {
+                    expected: n,
+                    actual: value.len(),
+                });
+            }
+            ValueLayout::Variable { max } if value.len() > max => {
+                return Err(CellParseError::TooLong {
+                    max,
+                    actual: value.len(),
+                });
+            }
+            _ => {}
+        }
+        match (self, value) {
+            (Self::Bool, [b]) if *b > 1 => Err(CellParseError::InvalidBool(*b)),
+            (Self::Str, v) if core::str::from_utf8(v).is_err() => Err(CellParseError::InvalidUtf8),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A cell: a type, its value bytes, and whether it is indexable.
+///
+/// Borrows the value rather than copying it — cells are read straight out of
+/// storage buffers, and a `str` or `bytes` value can be up to 256 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cell<'a> {
+    ty: CellType,
+    value: &'a [u8],
+    indexable: bool,
+}
+
+impl<'a> Cell<'a> {
+    /// Build a cell, validating `value` against `ty`.
+    pub fn new(ty: CellType, value: &'a [u8], indexable: bool) -> Result<Self, CellParseError> {
+        ty.validate(value)?;
         Ok(Self {
-            is_indexable,
-            data_ref,
+            ty,
+            value,
+            indexable,
         })
+    }
+
+    /// Decode a cell: one metadata byte, then the value bytes.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, CellParseError> {
+        let (&metadata, value) = bytes.split_first().ok_or(CellParseError::Empty)?;
+        Self::new(
+            CellType::from_id(metadata & TYPE_ID_MASK)?,
+            value,
+            metadata & INDEXABLE_BIT != 0,
+        )
+    }
+
+    /// Append this cell's wire bytes to `out` — the inverse of [`Cell::parse`].
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(1 + self.value.len());
+        out.push(self.metadata());
+        out.extend_from_slice(self.value);
+    }
+
+    /// This cell's wire bytes. [`Cell::encode_into`] avoids the allocation.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// The metadata byte: the indexable bit over the type id.
+    pub const fn metadata(&self) -> u8 {
+        self.ty.id() | if self.indexable { INDEXABLE_BIT } else { 0 }
+    }
+
+    pub const fn cell_type(&self) -> CellType {
+        self.ty
+    }
+
+    /// The value bytes, without the metadata byte.
+    pub const fn value(&self) -> &'a [u8] {
+        self.value
+    }
+
+    pub const fn is_indexable(&self) -> bool {
+        self.indexable
+    }
+
+    /// The value as a `str`, if this cell holds one.
+    pub fn as_str(&self) -> Option<&'a str> {
+        match self.ty {
+            CellType::Str => core::str::from_utf8(self.value).ok(),
+            _ => None,
+        }
+    }
+
+    /// The value as a `bool`, if this cell holds one.
+    pub fn as_bool(&self) -> Option<bool> {
+        match (self.ty, self.value) {
+            (CellType::Bool, [b]) => Some(*b != 0),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ZEROS: [u8; 32] = [0; 32];
+
+    /// One test vector: name, wire bytes, indexable, type, value bytes.
+    type Vector = (&'static str, &'static [u8], bool, CellType, &'static [u8]);
+
+    /// One cell per row: its wire bytes, and what they mean. Every core family
+    /// appears at least once, at both settings of the indexable bit.
+    #[rustfmt::skip]
+    const VECTORS: &[Vector] = &[
+        ("tombstone",      &[0x00],                          false, CellType::Tombstone,               &[]),
+        ("bool false",     &[0x01, 0x00],                    false, CellType::Bool,                    &[0x00]),
+        ("bool true, idx", &[0x81, 0x01],                    true,  CellType::Bool,                    &[0x01]),
+        ("str empty",      &[0x02],                          false, CellType::Str,                     &[]),
+        ("str ascii",      &[0x02, b'h', b'i'],              false, CellType::Str,                     b"hi"),
+        ("str 2-byte utf8",&[0x02, 0xC3, 0xA9],              false, CellType::Str,                     &[0xC3, 0xA9]),
+        ("str 4-byte utf8",&[0x82, 0xF0, 0x9F, 0xA6, 0x80],  true,  CellType::Str,                     &[0xF0, 0x9F, 0xA6, 0x80]),
+        ("bytes empty",    &[0x03],                          false, CellType::Bytes,                   &[]),
+        ("bytes 2",        &[0x03, 0xDE, 0xAD],              false, CellType::Bytes,                   &[0xDE, 0xAD]),
+        ("bytes20",        &ZEROS_CELL_20,                   false, CellType::Bytes20,                 &ZEROS20),
+        ("bytes4",         &[0x08, 1, 2, 3, 4],              false, CellType::FixedBytes(Width::W4),   &[1, 2, 3, 4]),
+        ("bytes8, idx",    &[0x89, 1, 2, 3, 4, 5, 6, 7, 8],  true,  CellType::FixedBytes(Width::W8),   &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ("bytes16",        &ZEROS_CELL_16_AT_0A,             false, CellType::FixedBytes(Width::W16),  &ZEROS16),
+        ("bytes32",        &ZEROS_CELL_32_AT_0B,             false, CellType::FixedBytes(Width::W32),  &ZEROS),
+        ("u32",            &[0x0C, 0, 0, 0, 7],              false, CellType::Uint(Width::W4),         &[0, 0, 0, 7]),
+        ("u64, idx",       &[0x8D, 0, 0, 0, 0, 0, 0, 0, 7],  true,  CellType::Uint(Width::W8),         &[0, 0, 0, 0, 0, 0, 0, 7]),
+        ("u128",           &ZEROS_CELL_16_AT_0E,             false, CellType::Uint(Width::W16),        &ZEROS16),
+        ("u256",           &ZEROS_CELL_32_AT_0F,             false, CellType::Uint(Width::W32),        &ZEROS),
+        ("i32",            &[0x10, 0x80, 0, 0, 1],           false, CellType::Int(Width::W4),          &[0x80, 0, 0, 1]),
+        ("i64",            &[0x11, 0x80, 0, 0, 0, 0, 0, 0, 1], false, CellType::Int(Width::W8),        &[0x80, 0, 0, 0, 0, 0, 0, 1]),
+        ("i128",           &ZEROS_CELL_16_AT_12,             false, CellType::Int(Width::W16),         &ZEROS16),
+        ("i256",           &ZEROS_CELL_32_AT_13,             false, CellType::Int(Width::W32),         &ZEROS),
+        ("dec32",          &[0x14, 0x80, 0, 0, 1],           false, CellType::Decimal(Width::W4),      &[0x80, 0, 0, 1]),
+        ("dec64",          &[0x15, 0, 0, 0, 0, 0, 0, 0, 0],  false, CellType::Decimal(Width::W8),      &[0, 0, 0, 0, 0, 0, 0, 0]),
+        ("dec128",         &ZEROS_CELL_16_AT_16,             false, CellType::Decimal(Width::W16),     &ZEROS16),
+        ("dec256",         &ZEROS_CELL_32_AT_17,             false, CellType::Decimal(Width::W32),     &ZEROS),
+        ("f32",            &[0x18, 0x3F, 0x80, 0, 0],        false, CellType::Float(FloatWidth::F32),  &[0x3F, 0x80, 0, 0]),
+        ("f64",            &[0x19, 0x3F, 0xF0, 0, 0, 0, 0, 0, 0], false, CellType::Float(FloatWidth::F64), &[0x3F, 0xF0, 0, 0, 0, 0, 0, 0]),
+        ("date32",         &[0x1C, 0x80, 0, 0x4E, 0x20],     false, CellType::Date32,                  &[0x80, 0, 0x4E, 0x20]),
+        ("timestamp64",    &[0x9D, 0x80, 0, 0, 0, 0, 0, 0, 1], true, CellType::Timestamp64,            &[0x80, 0, 0, 0, 0, 0, 0, 1]),
+        ("custom 64, 0 B", &[0x40],                          false, CellType::Custom(CustomTypeId(64)), &[]),
+        ("custom 100",     &[0x64, 9, 9, 9],                 false, CellType::Custom(CustomTypeId(100)), &[9, 9, 9]),
+        ("custom 127, idx",&[0xFF, 1],                       true,  CellType::Custom(CustomTypeId(127)), &[1]),
+    ];
+
+    // The wide vectors, spelled out so the byte strings above stay one line each.
+    const ZEROS16: [u8; 16] = [0; 16];
+    const ZEROS20: [u8; 20] = [0; 20];
+    const ZEROS_CELL_20: [u8; 21] = prepend_20(0x04);
+    const ZEROS_CELL_16_AT_0A: [u8; 17] = prepend_16(0x0A);
+    const ZEROS_CELL_16_AT_0E: [u8; 17] = prepend_16(0x0E);
+    const ZEROS_CELL_16_AT_12: [u8; 17] = prepend_16(0x12);
+    const ZEROS_CELL_16_AT_16: [u8; 17] = prepend_16(0x16);
+    const ZEROS_CELL_32_AT_0B: [u8; 33] = prepend_32(0x0B);
+    const ZEROS_CELL_32_AT_0F: [u8; 33] = prepend_32(0x0F);
+    const ZEROS_CELL_32_AT_13: [u8; 33] = prepend_32(0x13);
+    const ZEROS_CELL_32_AT_17: [u8; 33] = prepend_32(0x17);
+
+    const fn prepend_16(meta: u8) -> [u8; 17] {
+        let mut out = [0u8; 17];
+        out[0] = meta;
+        out
+    }
+    const fn prepend_20(meta: u8) -> [u8; 21] {
+        let mut out = [0u8; 21];
+        out[0] = meta;
+        out
+    }
+    const fn prepend_32(meta: u8) -> [u8; 33] {
+        let mut out = [0u8; 33];
+        out[0] = meta;
+        out
+    }
+
+    #[test]
+    fn vectors_decode_to_their_stated_meaning() {
+        for (name, bytes, indexable, ty, value) in VECTORS {
+            let cell = Cell::parse(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(cell.cell_type(), *ty, "{name}: type");
+            assert_eq!(cell.value(), *value, "{name}: value");
+            assert_eq!(cell.is_indexable(), *indexable, "{name}: indexable");
+            assert_eq!(cell.metadata(), bytes[0], "{name}: metadata byte");
+        }
+    }
+
+    #[test]
+    fn vectors_re_encode_to_the_same_bytes() {
+        for (name, bytes, indexable, ty, value) in VECTORS {
+            let cell = Cell::new(*ty, value, *indexable).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(cell.encode(), *bytes, "{name}");
+        }
+    }
+
+    /// The type ids each cover a distinct id, and the set is the spec's.
+    #[test]
+    fn vectors_cover_every_core_family() {
+        let mut seen: Vec<u8> = VECTORS
+            .iter()
+            .map(|(_, b, ..)| b[0] & TYPE_ID_MASK)
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let expected: Vec<u8> = (0..TYPE_ID_SPACE)
+            .filter(|id| CellType::from_id(*id).is_ok() && *id < CUSTOM_TYPE_ID_BASE)
+            .collect();
+        assert!(
+            expected.iter().all(|id| seen.contains(id)),
+            "uncovered core ids: {:?}",
+            expected
+                .iter()
+                .filter(|id| !seen.contains(id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every id round-trips through `from_id`/`id`, and the reserved slots are
+    /// exactly the ones the spec lists.
+    #[test]
+    fn id_space_matches_the_spec() {
+        const RESERVED: &[u8] = &[5, 6, 7, 26, 27, 30, 31];
+        for id in 0..TYPE_ID_SPACE {
+            let reserved = RESERVED.contains(&id) || (32..64).contains(&id);
+            match CellType::from_id(id) {
+                Ok(ty) => {
+                    assert!(!reserved, "id {id} should be reserved");
+                    assert_eq!(ty.id(), id);
+                }
+                Err(e) => {
+                    assert!(reserved, "id {id} should decode");
+                    assert_eq!(e, CellParseError::ReservedType(id));
+                }
+            }
+        }
+    }
+
+    /// Exhaustive over the whole metadata byte and every value length up to
+    /// past the widest fixed type: parsing never panics, a cell that parses
+    /// re-encodes to the exact bytes it came from, and acceptance agrees with
+    /// the layout table.
+    #[test]
+    fn every_metadata_byte_and_length() {
+        // 0x01 is a valid `bool`, valid UTF-8, and a valid byte anywhere else,
+        // so length is the only thing under test.
+        let payload = [0x01u8; 40];
+        for metadata in 0..=u8::MAX {
+            for len in 0..=payload.len() {
+                let mut bytes = vec![metadata];
+                bytes.extend_from_slice(&payload[..len]);
+
+                let accepted = match CellType::from_id(metadata & TYPE_ID_MASK) {
+                    Err(_) => false,
+                    Ok(ty) => match ty.layout() {
+                        ValueLayout::Fixed(n) => len == n,
+                        ValueLayout::Variable { max } => len <= max,
+                        ValueLayout::Opaque => true,
+                    },
+                };
+
+                match Cell::parse(&bytes) {
+                    Ok(cell) => {
+                        assert!(accepted, "0x{metadata:02X} len {len}: should have failed");
+                        assert_eq!(cell.encode(), bytes, "0x{metadata:02X} len {len}");
+                    }
+                    Err(_) => assert!(!accepted, "0x{metadata:02X} len {len}: should parse"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_cells() {
+        let err = |bytes: &[u8]| Cell::parse(bytes).unwrap_err();
+
+        assert_eq!(err(&[]), CellParseError::Empty);
+        assert_eq!(err(&[5]), CellParseError::ReservedType(5));
+        assert_eq!(err(&[32]), CellParseError::ReservedType(32));
+        assert_eq!(
+            err(&[CellType::Bytes20.id(), 0, 0]),
+            CellParseError::LengthMismatch {
+                expected: 20,
+                actual: 2
+            }
+        );
+        assert_eq!(
+            err(&[CellType::Bool.id(), 2]),
+            CellParseError::InvalidBool(2)
+        );
+        assert_eq!(
+            err(&[CellType::Str.id(), 0xFF]),
+            CellParseError::InvalidUtf8
+        );
+
+        let long = [&[CellType::Str.id()][..], &[b'a'; MAX_STR_LEN + 1]].concat();
+        assert_eq!(
+            err(&long),
+            CellParseError::TooLong {
+                max: MAX_STR_LEN,
+                actual: MAX_STR_LEN + 1
+            }
+        );
+    }
+
+    #[test]
+    fn typed_accessors() {
+        assert_eq!(
+            Cell::parse(&[0x02, b'h', b'i']).unwrap().as_str(),
+            Some("hi")
+        );
+        assert_eq!(Cell::parse(&[0x01, 1]).unwrap().as_bool(), Some(true));
+        assert_eq!(Cell::parse(&[0x01, 0]).unwrap().as_bool(), Some(false));
+        // Wrong type: no coercion, no panic.
+        assert_eq!(Cell::parse(&[0x01, 1]).unwrap().as_str(), None);
+        assert_eq!(Cell::parse(&[0x00]).unwrap().as_bool(), None);
+    }
+
+    #[test]
+    fn custom_ids_are_the_top_block() {
+        assert!(CustomTypeId::new(63).is_none());
+        assert_eq!(CustomTypeId::new(64).unwrap().get(), 64);
+        assert_eq!(CustomTypeId::new(127).unwrap().get(), 127);
+        assert!(CustomTypeId::new(128).is_none());
+        assert_eq!(
+            CellType::from_id(100).unwrap().layout(),
+            ValueLayout::Opaque
+        );
+    }
+}
+
+/// Properties that must hold over generated inputs, rather than over the fixed
+/// vectors above. These cover what [`tests::every_metadata_byte_and_length`]
+/// cannot: arbitrary *content*, and lengths past the variable-width maximum.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Every type in the table, each width included.
+    fn any_cell_type() -> impl Strategy<Value = CellType> {
+        (0u8..TYPE_ID_SPACE).prop_filter_map("reserved id", |id| CellType::from_id(id).ok())
+    }
+
+    /// A type paired with a value whose *content* is valid for it. Lengths
+    /// deliberately straddle the variable-width maximum, so `TooLong` is the one
+    /// error [`build_encode_parse_round_trips`] may see.
+    fn any_valid_cell() -> impl Strategy<Value = (CellType, Vec<u8>)> {
+        any_cell_type().prop_flat_map(|ty| {
+            let value = match ty {
+                // Content-constrained: not every byte string of the right
+                // length is a valid value.
+                CellType::Bool => prop::collection::vec(0u8..=1, 1..=1).boxed(),
+                CellType::Str => prop::string::string_regex(".{0,140}")
+                    .unwrap()
+                    .prop_map(String::into_bytes)
+                    .boxed(),
+                // Length is the only constraint.
+                _ => match ty.layout() {
+                    ValueLayout::Fixed(n) => prop::collection::vec(any::<u8>(), n..=n).boxed(),
+                    ValueLayout::Variable { max } => {
+                        prop::collection::vec(any::<u8>(), 0..=max + 8).boxed()
+                    }
+                    ValueLayout::Opaque => prop::collection::vec(any::<u8>(), 0..64).boxed(),
+                },
+            };
+            (Just(ty), value)
+        })
+    }
+
+    proptest! {
+        /// Parsing arbitrary bytes never panics, and whatever parses re-encodes
+        /// to the exact bytes it came from.
+        #[test]
+        fn parse_is_total_and_encode_inverts_it(bytes in prop::collection::vec(any::<u8>(), 0..600)) {
+            if let Ok(cell) = Cell::parse(&bytes) {
+                prop_assert_eq!(cell.encode(), bytes);
+            }
+        }
+
+        /// A cell built from a valid (type, value) survives encode → parse
+        /// unchanged, at both settings of the indexable bit.
+        #[test]
+        fn build_encode_parse_round_trips(
+            (ty, value) in any_valid_cell(),
+            indexable in any::<bool>(),
+        ) {
+            let built = match Cell::new(ty, &value, indexable) {
+                Ok(cell) => cell,
+                // The generator straddles the variable-width maximum on
+                // purpose; an over-long value must be rejected, not encoded.
+                Err(e) => {
+                    let too_long = matches!(e, CellParseError::TooLong { .. });
+                    prop_assert!(too_long, "expected TooLong, got {}", e);
+                    return Ok(());
+                }
+            };
+            let encoded = built.encode();
+            let parsed = Cell::parse(&encoded).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(parsed, built);
+            prop_assert_eq!(parsed.cell_type(), ty);
+            prop_assert_eq!(parsed.value(), &value[..]);
+            prop_assert_eq!(parsed.is_indexable(), indexable);
+        }
+
+        /// The indexable bit and the type id never bleed into each other.
+        #[test]
+        fn metadata_byte_splits_cleanly(ty in any_cell_type(), indexable in any::<bool>()) {
+            let value = vec![0u8; match ty.layout() {
+                ValueLayout::Fixed(n) => n,
+                _ => 0,
+            }];
+            let cell = Cell::new(ty, &value, indexable).unwrap();
+            let metadata = cell.metadata();
+            prop_assert_eq!(metadata & TYPE_ID_MASK, ty.id());
+            prop_assert_eq!(metadata & INDEXABLE_BIT != 0, indexable);
+        }
+
+        /// A `str` cell parses exactly when its bytes are UTF-8 — the parser
+        /// agrees with the standard library, not with its own idea of UTF-8.
+        #[test]
+        fn str_accepts_exactly_utf8(value in prop::collection::vec(any::<u8>(), 0..=MAX_STR_LEN)) {
+            let cell = [&[CellType::Str.id()][..], &value].concat();
+            let parsed = Cell::parse(&cell);
+            prop_assert_eq!(parsed.is_ok(), core::str::from_utf8(&value).is_ok());
+            if let Ok(cell) = parsed {
+                prop_assert_eq!(cell.as_str(), Some(core::str::from_utf8(&value).unwrap()));
+            }
+        }
+
+        /// Reserved ids stay reserved whatever follows them.
+        #[test]
+        fn reserved_ids_never_parse(
+            id in (0u8..TYPE_ID_SPACE).prop_filter("valid id", |id| CellType::from_id(*id).is_err()),
+            indexable in any::<bool>(),
+            tail in prop::collection::vec(any::<u8>(), 0..40),
+        ) {
+            let metadata = id | if indexable { INDEXABLE_BIT } else { 0 };
+            let cell = [&[metadata][..], &tail].concat();
+            prop_assert_eq!(Cell::parse(&cell), Err(CellParseError::ReservedType(id)));
+        }
     }
 }

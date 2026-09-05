@@ -6,4 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-eyre.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
