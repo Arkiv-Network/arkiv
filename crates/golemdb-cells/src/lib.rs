@@ -39,6 +39,10 @@ pub const TYPE_ID_SPACE: u8 = 128;
 /// The first type id belonging to the custom block.
 pub const CUSTOM_TYPE_ID_BASE: u8 = 64;
 
+/// How many bytes [`CellParseError::InvalidUtf8`] quotes back. Enough to show
+/// the longest UTF-8 sequence and its neighbours, short enough for a log line.
+pub const UTF8_SNIPPET_LEN: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellParseError {
     /// The cell is too short to hold its metadata byte.
@@ -48,7 +52,11 @@ pub enum CellParseError {
     /// A variable-width cell that stops before its length byte.
     MissingLength,
     /// A fixed-width type whose value is not exactly that wide.
-    LengthMismatch { expected: usize, actual: usize },
+    LengthMismatch {
+        ty: CellType,
+        expected: usize,
+        actual: usize,
+    },
     /// The length byte declares more value bytes than the cell carries — the
     /// cell was cut short.
     Truncated { declared: usize, actual: usize },
@@ -59,8 +67,29 @@ pub enum CellParseError {
     TooLong { max: usize, actual: usize },
     /// A `bool` whose byte is neither 0 nor 1.
     InvalidBool(u8),
-    /// A `str` whose bytes are not valid UTF-8.
-    InvalidUtf8,
+    /// A `str` whose bytes are not valid UTF-8, with a window onto the bytes
+    /// that failed. Build one with [`CellParseError::invalid_utf8`].
+    ///
+    /// The window is copied inline rather than borrowed or boxed, so the error
+    /// stays `Copy` and rejecting a cell costs no allocation — this parses
+    /// untrusted input, so the reject path is the hot one under attack.
+    InvalidUtf8 {
+        /// How many bytes were valid before the failure.
+        valid_up_to: usize,
+        /// The value's full length, which `snippet` may not cover.
+        total: usize,
+        /// Up to [`UTF8_SNIPPET_LEN`] bytes starting at `valid_up_to`, so the
+        /// window shows the failure rather than the start of a long value.
+        snippet: [u8; UTF8_SNIPPET_LEN],
+        /// How much of `snippet` is real; the rest is zero padding.
+        snippet_len: u8,
+    },
+    /// The type id is in the custom block (64–127) but this build has the
+    /// `custom_types` feature off, so it has no way to interpret the cell.
+    ///
+    /// Defined whether or not the feature is on, so that turning it on does not
+    /// change the shape of this enum for anything matching on it.
+    CustomTypesDisabled(u8),
 }
 
 impl fmt::Display for CellParseError {
@@ -69,8 +98,16 @@ impl fmt::Display for CellParseError {
             Self::Empty => write!(f, "cell is missing its metadata byte"),
             Self::ReservedType(id) => write!(f, "type id {id} is reserved"),
             Self::MissingLength => write!(f, "cell is missing its length byte"),
-            Self::LengthMismatch { expected, actual } => {
-                write!(f, "expected {expected} value bytes, got {actual}")
+            Self::LengthMismatch {
+                ty,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "{} expects {expected} value bytes, got {actual}",
+                    ty.name()
+                )
             }
             Self::Truncated { declared, actual } => {
                 write!(
@@ -85,12 +122,59 @@ impl fmt::Display for CellParseError {
                 write!(f, "value is {actual} bytes, the maximum is {max}")
             }
             Self::InvalidBool(b) => write!(f, "bool byte must be 0 or 1, got {b}"),
-            Self::InvalidUtf8 => write!(f, "str value is not valid UTF-8"),
+            Self::InvalidUtf8 {
+                valid_up_to,
+                total,
+                snippet,
+                snippet_len,
+            } => {
+                write!(
+                    f,
+                    "str is not valid UTF-8 at byte {valid_up_to} of {total}: "
+                )?;
+                let len = *snippet_len as usize;
+                for (i, b) in snippet[..len].iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{b:02x}")?;
+                }
+                if valid_up_to + len < *total {
+                    write!(f, " …")?;
+                }
+                Ok(())
+            }
+            Self::CustomTypesDisabled(id) => {
+                write!(f, "type id {id} is custom; the custom_types feature is off")
+            }
         }
     }
 }
 
 impl core::error::Error for CellParseError {}
+
+impl CellParseError {
+    /// The [`InvalidUtf8`](CellParseError::InvalidUtf8) for `value`, whose first
+    /// `valid_up_to` bytes decoded before it went wrong.
+    ///
+    /// `const` so test vectors and other tables can name the expected error
+    /// without spelling out the padded snippet array.
+    pub const fn invalid_utf8(value: &[u8], valid_up_to: usize) -> Self {
+        let mut snippet = [0u8; UTF8_SNIPPET_LEN];
+        let mut i = 0;
+        // A plain loop rather than `copy_from_slice`, which is not const.
+        while i < UTF8_SNIPPET_LEN && valid_up_to + i < value.len() {
+            snippet[i] = value[valid_up_to + i];
+            i += 1;
+        }
+        Self::InvalidUtf8 {
+            valid_up_to,
+            total: value.len(),
+            snippet,
+            snippet_len: i as u8,
+        }
+    }
+}
 
 /// The width exponent `w` of a `4 · 2^w`-byte family: 4, 8, 16 or 32 bytes.
 ///
@@ -155,9 +239,13 @@ impl FloatWidth {
 /// block. What the id *means* is up to the deployment's type registry, so this
 /// layer only frames a custom value — [`ValueLayout::LengthPrefixed`] — and
 /// never inspects its content.
+///
+/// Behind the `custom_types` feature, which is off by default.
+#[cfg(feature = "custom_types")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CustomTypeId(u8);
 
+#[cfg(feature = "custom_types")]
 impl CustomTypeId {
     /// `id` must be in 64–127; anything else is not a custom type.
     pub const fn new(id: u8) -> Option<Self> {
@@ -206,7 +294,7 @@ impl ValueLayout {
 /// | 24–25  | `f32` `f64`                           | floats (26–27 rsvd)   | 4 / 8                     | IEEE total-order   |
 /// | 28–29  | `date32` `timestamp64`                | time (30–31 rsvd)     | 4 / 8                     | sign-bit-biased BE |
 /// | 32–63  | *reserved — future core families*     | 8 aligned blocks of 4 |                           |                    |
-/// | 64–127 | *custom types*                        | per deployment        |                           |                    |
+/// | 64–127 | *custom types* (`custom_types`)       | per deployment        | var (≤ [`MAX_VALUE_LEN`]) |                    |
 ///
 /// The order-encoding column says how a value must be laid out for a bytewise
 /// comparison to match a value comparison. It is recorded here but not applied
@@ -241,6 +329,10 @@ pub enum CellType {
     Date32,
     /// Microseconds since the Unix epoch, signed.
     Timestamp64,
+    /// A per-deployment type from the 64–127 block. Behind the `custom_types`
+    /// feature; without it those ids are rejected as
+    /// [`CellParseError::CustomTypesDisabled`].
+    #[cfg(feature = "custom_types")]
     Custom(CustomTypeId),
 }
 
@@ -261,7 +353,50 @@ impl CellType {
             Self::Float(FloatWidth::F64) => 25,
             Self::Date32 => 28,
             Self::Timestamp64 => 29,
+            #[cfg(feature = "custom_types")]
             Self::Custom(c) => c.get(),
+        }
+    }
+
+    /// The type's name as the spec's table writes it — `"bytes20"`, `"u64"`,
+    /// `"dec128"`. What errors and diagnostics print.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Tombstone => "tombstone",
+            Self::Bool => "bool",
+            Self::Str => "str",
+            Self::Bytes => "bytes",
+            Self::Bytes20 => "bytes20",
+            Self::FixedBytes(w) => match w {
+                Width::W4 => "bytes4",
+                Width::W8 => "bytes8",
+                Width::W16 => "bytes16",
+                Width::W32 => "bytes32",
+            },
+            Self::Uint(w) => match w {
+                Width::W4 => "u32",
+                Width::W8 => "u64",
+                Width::W16 => "u128",
+                Width::W32 => "u256",
+            },
+            Self::Int(w) => match w {
+                Width::W4 => "i32",
+                Width::W8 => "i64",
+                Width::W16 => "i128",
+                Width::W32 => "i256",
+            },
+            Self::Decimal(w) => match w {
+                Width::W4 => "dec32",
+                Width::W8 => "dec64",
+                Width::W16 => "dec128",
+                Width::W32 => "dec256",
+            },
+            Self::Float(FloatWidth::F32) => "f32",
+            Self::Float(FloatWidth::F64) => "f64",
+            Self::Date32 => "date32",
+            Self::Timestamp64 => "timestamp64",
+            #[cfg(feature = "custom_types")]
+            Self::Custom(_) => "custom",
         }
     }
 
@@ -282,7 +417,10 @@ impl CellType {
             25 => Ok(Self::Float(FloatWidth::F64)),
             28 => Ok(Self::Date32),
             29 => Ok(Self::Timestamp64),
+            #[cfg(feature = "custom_types")]
             64..=127 => Ok(Self::Custom(CustomTypeId(id))),
+            #[cfg(not(feature = "custom_types"))]
+            64..=127 => Err(CellParseError::CustomTypesDisabled(id)),
             // 5–7, 26–27, 30–31 and 32–63 are reserved; 128.. cannot fit the
             // 7-bit field and is treated the same way.
             _ => Err(CellParseError::ReservedType(id)),
@@ -298,9 +436,9 @@ impl CellType {
         match self {
             Self::Tombstone => ValueLayout::Fixed(0),
             Self::Bool => ValueLayout::Fixed(1),
-            Self::Str | Self::Bytes | Self::Custom(_) => {
-                ValueLayout::LengthPrefixed { max: MAX_VALUE_LEN }
-            }
+            #[cfg(feature = "custom_types")]
+            Self::Custom(_) => ValueLayout::LengthPrefixed { max: MAX_VALUE_LEN },
+            Self::Str | Self::Bytes => ValueLayout::LengthPrefixed { max: MAX_VALUE_LEN },
             Self::Bytes20 => ValueLayout::Fixed(20),
             Self::FixedBytes(w) | Self::Uint(w) | Self::Int(w) | Self::Decimal(w) => {
                 ValueLayout::Fixed(w.bytes())
@@ -316,6 +454,7 @@ impl CellType {
         match self.layout() {
             ValueLayout::Fixed(n) if value.len() != n => {
                 return Err(CellParseError::LengthMismatch {
+                    ty: self,
                     expected: n,
                     actual: value.len(),
                 });
@@ -330,7 +469,12 @@ impl CellType {
         }
         match (self, value) {
             (Self::Bool, [b]) if *b > 1 => Err(CellParseError::InvalidBool(*b)),
-            (Self::Str, v) if core::str::from_utf8(v).is_err() => Err(CellParseError::InvalidUtf8),
+            (Self::Str, v) => match core::str::from_utf8(v) {
+                Ok(_) => Ok(()),
+                // `valid_up_to` is where the decoder stopped, so the snippet
+                // starts on the offending byte rather than the value's start.
+                Err(e) => Err(CellParseError::invalid_utf8(v, e.valid_up_to())),
+            },
             _ => Ok(()),
         }
     }
@@ -341,13 +485,13 @@ impl CellType {
 /// Borrows the value rather than copying it — cells are read straight out of
 /// storage buffers, and a `str` or `bytes` value can be up to 256 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cell<'a> {
+pub struct CellValue<'a> {
     ty: CellType,
     value: &'a [u8],
     indexable: bool,
 }
 
-impl<'a> Cell<'a> {
+impl<'a> CellValue<'a> {
     /// Build a cell, validating `value` against `ty`.
     pub fn new(ty: CellType, value: &'a [u8], indexable: bool) -> Result<Self, CellParseError> {
         ty.validate(value)?;
@@ -382,6 +526,7 @@ impl<'a> Cell<'a> {
             ValueLayout::Fixed(n) => {
                 if rest.len() < n {
                     return Err(CellParseError::LengthMismatch {
+                        ty,
                         expected: n,
                         actual: rest.len(),
                     });
@@ -458,13 +603,159 @@ impl<'a> Cell<'a> {
             _ => None,
         }
     }
+
+    /// The value as the raw bytes of `want`, or `None` if this cell holds some
+    /// other type. The width comes from `want`, so a mismatch cannot compile
+    /// into a silent reinterpretation.
+    fn exact<const N: usize>(&self, want: CellType) -> Option<[u8; N]> {
+        if self.ty != want {
+            return None;
+        }
+        // Infallible: `validate` already fixed the width for a fixed-width
+        // type, and every caller below asks for that type's own width.
+        self.value.try_into().ok()
+    }
+
+    // -- byte strings ------------------------------------------------------
+
+    /// The value of a `bytes` cell. For a fixed-width byte string use
+    /// [`as_bytes4`](Self::as_bytes4) and friends, which give a sized array.
+    pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        (self.ty == CellType::Bytes).then_some(self.value)
+    }
+
+    pub fn as_bytes4(&self) -> Option<[u8; 4]> {
+        self.exact(CellType::FixedBytes(Width::W4))
+    }
+
+    pub fn as_bytes8(&self) -> Option<[u8; 8]> {
+        self.exact(CellType::FixedBytes(Width::W8))
+    }
+
+    pub fn as_bytes16(&self) -> Option<[u8; 16]> {
+        self.exact(CellType::FixedBytes(Width::W16))
+    }
+
+    /// An address-width byte string.
+    pub fn as_bytes20(&self) -> Option<[u8; 20]> {
+        self.exact(CellType::Bytes20)
+    }
+
+    pub fn as_bytes32(&self) -> Option<[u8; 32]> {
+        self.exact(CellType::FixedBytes(Width::W32))
+    }
+
+    // -- unsigned integers, big-endian -------------------------------------
+
+    pub fn as_u32(&self) -> Option<u32> {
+        self.exact(CellType::Uint(Width::W4))
+            .map(u32::from_be_bytes)
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        self.exact(CellType::Uint(Width::W8))
+            .map(u64::from_be_bytes)
+    }
+
+    pub fn as_u128(&self) -> Option<u128> {
+        self.exact(CellType::Uint(Width::W16))
+            .map(u128::from_be_bytes)
+    }
+
+    /// A `u256` as its 32 big-endian bytes — Rust has no `u256`, so widening it
+    /// into one is the caller's job (`alloy_primitives::U256::from_be_bytes`).
+    pub fn as_u256_be(&self) -> Option<[u8; 32]> {
+        self.exact(CellType::Uint(Width::W32))
+    }
+
+    // -- signed integers, two's complement big-endian ----------------------
+    //
+    // Plain two's complement, not the sign-biased form the order-encoding
+    // column describes: that bias belongs to index keys, not to stored values.
+
+    pub fn as_i32(&self) -> Option<i32> {
+        self.exact(CellType::Int(Width::W4)).map(i32::from_be_bytes)
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        self.exact(CellType::Int(Width::W8)).map(i64::from_be_bytes)
+    }
+
+    pub fn as_i128(&self) -> Option<i128> {
+        self.exact(CellType::Int(Width::W16))
+            .map(i128::from_be_bytes)
+    }
+
+    /// An `i256` as its 32 big-endian bytes; see [`as_u256_be`](Self::as_u256_be).
+    pub fn as_i256_be(&self) -> Option<[u8; 32]> {
+        self.exact(CellType::Int(Width::W32))
+    }
+
+    // -- decimals ----------------------------------------------------------
+    //
+    // These return the *unscaled* mantissa. The spec pins a fixed scale per
+    // width, but that scale is not represented in this crate yet, so applying
+    // it is the caller's job — see the note on `CellType::Decimal`.
+
+    pub fn as_dec32_unscaled(&self) -> Option<i32> {
+        self.exact(CellType::Decimal(Width::W4))
+            .map(i32::from_be_bytes)
+    }
+
+    pub fn as_dec64_unscaled(&self) -> Option<i64> {
+        self.exact(CellType::Decimal(Width::W8))
+            .map(i64::from_be_bytes)
+    }
+
+    pub fn as_dec128_unscaled(&self) -> Option<i128> {
+        self.exact(CellType::Decimal(Width::W16))
+            .map(i128::from_be_bytes)
+    }
+
+    /// A `dec256` mantissa as its 32 big-endian bytes.
+    pub fn as_dec256_unscaled_be(&self) -> Option<[u8; 32]> {
+        self.exact(CellType::Decimal(Width::W32))
+    }
+
+    // -- floats, IEEE-754 big-endian ---------------------------------------
+
+    pub fn as_f32(&self) -> Option<f32> {
+        self.exact(CellType::Float(FloatWidth::F32))
+            .map(f32::from_be_bytes)
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        self.exact(CellType::Float(FloatWidth::F64))
+            .map(f64::from_be_bytes)
+    }
+
+    // -- time --------------------------------------------------------------
+
+    /// Days since the Unix epoch, signed.
+    pub fn as_date32(&self) -> Option<i32> {
+        self.exact(CellType::Date32).map(i32::from_be_bytes)
+    }
+
+    /// Microseconds since the Unix epoch, signed.
+    pub fn as_timestamp64(&self) -> Option<i64> {
+        self.exact(CellType::Timestamp64).map(i64::from_be_bytes)
+    }
+
+    // -- custom ------------------------------------------------------------
+
+    /// A custom cell's id and its bytes, which this layer does not interpret.
+    #[cfg(feature = "custom_types")]
+    pub fn as_custom(&self) -> Option<(CustomTypeId, &'a [u8])> {
+        match self.ty {
+            CellType::Custom(id) => Some((id, self.value)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ZEROS: [u8; 32] = [0; 32];
 
     /// One test vector: name, wire bytes, indexable, type, value bytes.
     type Vector = (&'static str, &'static [u8], bool, CellType, &'static [u8]);
@@ -473,74 +764,117 @@ mod tests {
     /// appears at least once, at both settings of the indexable bit.
     #[rustfmt::skip]
     const VECTORS: &[Vector] = &[
-        ("tombstone",      &[0x00],                          false, CellType::Tombstone,               &[]),
-        ("bool false",     &[0x01, 0x00],                    false, CellType::Bool,                    &[0x00]),
-        ("bool true, idx", &[0x81, 0x01],                    true,  CellType::Bool,                    &[0x01]),
-        ("str empty",      &[0x02, 0x00],                    false, CellType::Str,                     &[]),
-        ("str ascii",      &[0x02, 0x02, b'h', b'i'],        false, CellType::Str,                     b"hi"),
-        ("str 2-byte utf8",&[0x02, 0x02, 0xC3, 0xA9],        false, CellType::Str,                     &[0xC3, 0xA9]),
-        ("str 4-byte utf8",&[0x82, 0x04, 0xF0, 0x9F, 0xA6, 0x80], true, CellType::Str,                 &[0xF0, 0x9F, 0xA6, 0x80]),
-        ("bytes empty",    &[0x03, 0x00],                    false, CellType::Bytes,                   &[]),
-        ("bytes 2",        &[0x03, 0x02, 0xDE, 0xAD],        false, CellType::Bytes,                   &[0xDE, 0xAD]),
-        ("bytes20",        &ZEROS_CELL_20,                   false, CellType::Bytes20,                 &ZEROS20),
-        ("bytes4",         &[0x08, 1, 2, 3, 4],              false, CellType::FixedBytes(Width::W4),   &[1, 2, 3, 4]),
-        ("bytes8, idx",    &[0x89, 1, 2, 3, 4, 5, 6, 7, 8],  true,  CellType::FixedBytes(Width::W8),   &[1, 2, 3, 4, 5, 6, 7, 8]),
-        ("bytes16",        &ZEROS_CELL_16_AT_0A,             false, CellType::FixedBytes(Width::W16),  &ZEROS16),
-        ("bytes32",        &ZEROS_CELL_32_AT_0B,             false, CellType::FixedBytes(Width::W32),  &ZEROS),
-        ("u32",            &[0x0C, 0, 0, 0, 7],              false, CellType::Uint(Width::W4),         &[0, 0, 0, 7]),
-        ("u64, idx",       &[0x8D, 0, 0, 0, 0, 0, 0, 0, 7],  true,  CellType::Uint(Width::W8),         &[0, 0, 0, 0, 0, 0, 0, 7]),
-        ("u128",           &ZEROS_CELL_16_AT_0E,             false, CellType::Uint(Width::W16),        &ZEROS16),
-        ("u256",           &ZEROS_CELL_32_AT_0F,             false, CellType::Uint(Width::W32),        &ZEROS),
-        ("i32",            &[0x10, 0x80, 0, 0, 1],           false, CellType::Int(Width::W4),          &[0x80, 0, 0, 1]),
-        ("i64",            &[0x11, 0x80, 0, 0, 0, 0, 0, 0, 1], false, CellType::Int(Width::W8),        &[0x80, 0, 0, 0, 0, 0, 0, 1]),
-        ("i128",           &ZEROS_CELL_16_AT_12,             false, CellType::Int(Width::W16),         &ZEROS16),
-        ("i256",           &ZEROS_CELL_32_AT_13,             false, CellType::Int(Width::W32),         &ZEROS),
-        ("dec32",          &[0x14, 0x80, 0, 0, 1],           false, CellType::Decimal(Width::W4),      &[0x80, 0, 0, 1]),
-        ("dec64",          &[0x15, 0, 0, 0, 0, 0, 0, 0, 0],  false, CellType::Decimal(Width::W8),      &[0, 0, 0, 0, 0, 0, 0, 0]),
-        ("dec128",         &ZEROS_CELL_16_AT_16,             false, CellType::Decimal(Width::W16),     &ZEROS16),
-        ("dec256",         &ZEROS_CELL_32_AT_17,             false, CellType::Decimal(Width::W32),     &ZEROS),
-        ("f32",            &[0x18, 0x3F, 0x80, 0, 0],        false, CellType::Float(FloatWidth::F32),  &[0x3F, 0x80, 0, 0]),
-        ("f64",            &[0x19, 0x3F, 0xF0, 0, 0, 0, 0, 0, 0], false, CellType::Float(FloatWidth::F64), &[0x3F, 0xF0, 0, 0, 0, 0, 0, 0]),
-        ("date32",         &[0x1C, 0x80, 0, 0x4E, 0x20],     false, CellType::Date32,                  &[0x80, 0, 0x4E, 0x20]),
-        ("timestamp64",    &[0x9D, 0x80, 0, 0, 0, 0, 0, 0, 1], true, CellType::Timestamp64,            &[0x80, 0, 0, 0, 0, 0, 0, 1]),
+        // name              wire bytes                             idx    type                              value
+        ("tombstone",       &[0x00],                               false, CellType::Tombstone,              &[]),
+        ("bool false",      &[0x01, 0x00],                         false, CellType::Bool,                   &[0x00]),
+        ("bool true, idx",  &[0x81, 0x01],                         true,  CellType::Bool,                   &[0x01]),
+        ("str empty",       &[0x02, 0x00],                         false, CellType::Str,                    &[]),
+        ("str ascii",       &[0x02, 0x02, b'h', b'i'],             false, CellType::Str,                    b"hi"),
+        ("str 2-byte utf8", &[0x02, 0x02, 0xC3, 0xA9],             false, CellType::Str,                    &[0xC3, 0xA9]),
+        ("str 4-byte utf8", &[0x82, 0x04, 0xF0, 0x9F, 0xA6, 0x80], true,  CellType::Str,                    &[0xF0, 0x9F, 0xA6, 0x80]),
+        // The accept side of the UTF-8 boundary BAD_VECTORS attacks: an
+        // embedded NUL is valid UTF-8, and these are the last code points
+        // before each rejected range.
+        ("str with a NUL",  &[0x02, 0x03, b'a', 0x00, b'b'],       false, CellType::Str,                    &[b'a', 0x00, b'b']),
+        ("str U+D7FF",      &[0x02, 0x03, 0xED, 0x9F, 0xBF],       false, CellType::Str,                    &[0xED, 0x9F, 0xBF]),
+        ("str U+FFFF",      &[0x02, 0x03, 0xEF, 0xBF, 0xBF],       false, CellType::Str,                    &[0xEF, 0xBF, 0xBF]),
+        ("str U+10FFFF",    &[0x02, 0x04, 0xF4, 0x8F, 0xBF, 0xBF], false, CellType::Str,                    &[0xF4, 0x8F, 0xBF, 0xBF]),
+        ("bytes empty",     &[0x03, 0x00],                         false, CellType::Bytes,                  &[]),
+        ("bytes 2",         &[0x03, 0x02, 0xDE, 0xAD],             false, CellType::Bytes,                  &[0xDE, 0xAD]),
+        ("bytes20",         &BYTES20_ZERO_CELL,                    false, CellType::Bytes20,                &ZERO_VALUE_20),
+        ("bytes4",          &[0x08, 1, 2, 3, 4],                   false, CellType::FixedBytes(Width::W4),  &[1, 2, 3, 4]),
+        ("bytes8, idx",     &[0x89, 1, 2, 3, 4, 5, 6, 7, 8],       true,  CellType::FixedBytes(Width::W8),  &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ("bytes16",         &BYTES16_ZERO_CELL,                    false, CellType::FixedBytes(Width::W16), &ZERO_VALUE_16),
+        ("bytes32",         &BYTES32_ZERO_CELL,                    false, CellType::FixedBytes(Width::W32), &ZERO_VALUE_32),
+        ("u32",             &[0x0C, 0, 0, 0, 7],                   false, CellType::Uint(Width::W4),        &[0, 0, 0, 7]),
+        ("u64, idx",        &[0x8D, 0, 0, 0, 0, 0, 0, 0, 7],       true,  CellType::Uint(Width::W8),        &[0, 0, 0, 0, 0, 0, 0, 7]),
+        ("u128",            &U128_ZERO_CELL,                       false, CellType::Uint(Width::W16),       &ZERO_VALUE_16),
+        ("u256",            &U256_ZERO_CELL,                       false, CellType::Uint(Width::W32),       &ZERO_VALUE_32),
+        ("i32",             &[0x10, 0x80, 0, 0, 1],                false, CellType::Int(Width::W4),         &[0x80, 0, 0, 1]),
+        ("i64",             &[0x11, 0x80, 0, 0, 0, 0, 0, 0, 1],    false, CellType::Int(Width::W8),         &[0x80, 0, 0, 0, 0, 0, 0, 1]),
+        ("i128",            &I128_ZERO_CELL,                       false, CellType::Int(Width::W16),        &ZERO_VALUE_16),
+        ("i256",            &I256_ZERO_CELL,                       false, CellType::Int(Width::W32),        &ZERO_VALUE_32),
+        ("dec32",           &[0x14, 0x80, 0, 0, 1],                false, CellType::Decimal(Width::W4),     &[0x80, 0, 0, 1]),
+        ("dec64",           &[0x15, 0, 0, 0, 0, 0, 0, 0, 0],       false, CellType::Decimal(Width::W8),     &[0, 0, 0, 0, 0, 0, 0, 0]),
+        ("dec128",          &DEC128_ZERO_CELL,                     false, CellType::Decimal(Width::W16),    &ZERO_VALUE_16),
+        ("dec256",          &DEC256_ZERO_CELL,                     false, CellType::Decimal(Width::W32),    &ZERO_VALUE_32),
+        ("f32",             &[0x18, 0x3F, 0x80, 0, 0],             false, CellType::Float(FloatWidth::F32), &[0x3F, 0x80, 0, 0]),
+        ("f64",             &[0x19, 0x3F, 0xF0, 0, 0, 0, 0, 0, 0], false, CellType::Float(FloatWidth::F64), &[0x3F, 0xF0, 0, 0, 0, 0, 0, 0]),
+        ("date32",          &[0x1C, 0x80, 0, 0x4E, 0x20],          false, CellType::Date32,                 &[0x80, 0, 0x4E, 0x20]),
+        ("timestamp64",     &[0x9D, 0x80, 0, 0, 0, 0, 0, 0, 1],    true,  CellType::Timestamp64,            &[0x80, 0, 0, 0, 0, 0, 0, 1]),
+    ];
+
+    /// The custom block's vectors, present only when the feature that decodes
+    /// those ids is on. Empty otherwise, so every test below reads the same.
+    #[cfg(feature = "custom_types")]
+    #[rustfmt::skip]
+    const CUSTOM_VECTORS: &[Vector] = &[
         ("custom 64, 0 B", &[0x40, 0x00],                    false, CellType::Custom(CustomTypeId(64)), &[]),
         ("custom 100",     &[0x64, 0x03, 9, 9, 9],           false, CellType::Custom(CustomTypeId(100)), &[9, 9, 9]),
         ("custom 127, idx",&[0xFF, 0x01, 1],                 true,  CellType::Custom(CustomTypeId(127)), &[1]),
     ];
 
-    // The wide vectors, spelled out so the byte strings above stay one line each.
-    const ZEROS16: [u8; 16] = [0; 16];
-    const ZEROS20: [u8; 20] = [0; 20];
-    const ZEROS_CELL_20: [u8; 21] = prepend_20(0x04);
-    const ZEROS_CELL_16_AT_0A: [u8; 17] = prepend_16(0x0A);
-    const ZEROS_CELL_16_AT_0E: [u8; 17] = prepend_16(0x0E);
-    const ZEROS_CELL_16_AT_12: [u8; 17] = prepend_16(0x12);
-    const ZEROS_CELL_16_AT_16: [u8; 17] = prepend_16(0x16);
-    const ZEROS_CELL_32_AT_0B: [u8; 33] = prepend_32(0x0B);
-    const ZEROS_CELL_32_AT_0F: [u8; 33] = prepend_32(0x0F);
-    const ZEROS_CELL_32_AT_13: [u8; 33] = prepend_32(0x13);
-    const ZEROS_CELL_32_AT_17: [u8; 33] = prepend_32(0x17);
+    #[cfg(not(feature = "custom_types"))]
+    const CUSTOM_VECTORS: &[Vector] = &[];
 
-    const fn prepend_16(meta: u8) -> [u8; 17] {
+    /// Every accept vector that applies to this build.
+    fn accept_vectors() -> impl Iterator<Item = &'static Vector> {
+        VECTORS.iter().chain(CUSTOM_VECTORS)
+    }
+
+    // The 16-, 20- and 32-byte vectors, lifted out of the table above so its
+    // rows stay one line each. Every one is an all-zero value of a fixed-width
+    // type, so there is no length byte and the value is the whole tail.
+    //
+    // `<TYPE>_ZERO` is the value; `<TYPE>_ZERO_CELL` is that value with its
+    // metadata byte in front.
+    const ZERO_VALUE_16: [u8; 16] = [0; 16];
+    const ZERO_VALUE_20: [u8; 20] = [0; 20];
+    const ZERO_VALUE_32: [u8; 32] = [0; 32];
+
+    const BYTES20_ZERO_CELL: [u8; 21] = zero_cell_20(CellType::Bytes20);
+
+    const BYTES16_ZERO_CELL: [u8; 17] = zero_cell_16(CellType::FixedBytes(Width::W16));
+    const U128_ZERO_CELL: [u8; 17] = zero_cell_16(CellType::Uint(Width::W16));
+    const I128_ZERO_CELL: [u8; 17] = zero_cell_16(CellType::Int(Width::W16));
+    const DEC128_ZERO_CELL: [u8; 17] = zero_cell_16(CellType::Decimal(Width::W16));
+
+    const BYTES32_ZERO_CELL: [u8; 33] = zero_cell_32(CellType::FixedBytes(Width::W32));
+    const U256_ZERO_CELL: [u8; 33] = zero_cell_32(CellType::Uint(Width::W32));
+    const I256_ZERO_CELL: [u8; 33] = zero_cell_32(CellType::Int(Width::W32));
+    const DEC256_ZERO_CELL: [u8; 33] = zero_cell_32(CellType::Decimal(Width::W32));
+
+    /// A whole cell of a 16-byte-wide type: `ty`'s metadata byte, then a
+    /// 16-byte zero value.
+    ///
+    /// Taking a [`CellType`] rather than a raw byte is what keeps the constants
+    /// above readable — the type is named, not spelled as a hex id. One
+    /// function per width, because an array's length is part of its type and a
+    /// `const fn` cannot be generic over it here.
+    const fn zero_cell_16(ty: CellType) -> [u8; 17] {
         let mut out = [0u8; 17];
-        out[0] = meta;
+        out[0] = ty.id();
         out
     }
-    const fn prepend_20(meta: u8) -> [u8; 21] {
+
+    /// A whole cell of a 20-byte-wide type. See [`zero_cell_16`].
+    const fn zero_cell_20(ty: CellType) -> [u8; 21] {
         let mut out = [0u8; 21];
-        out[0] = meta;
+        out[0] = ty.id();
         out
     }
-    const fn prepend_32(meta: u8) -> [u8; 33] {
+
+    /// A whole cell of a 32-byte-wide type. See [`zero_cell_16`].
+    const fn zero_cell_32(ty: CellType) -> [u8; 33] {
         let mut out = [0u8; 33];
-        out[0] = meta;
+        out[0] = ty.id();
         out
     }
 
     #[test]
     fn vectors_decode_to_their_stated_meaning() {
-        for (name, bytes, indexable, ty, value) in VECTORS {
-            let cell = Cell::parse(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (name, bytes, indexable, ty, value) in accept_vectors() {
+            let cell = CellValue::parse(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(cell.cell_type(), *ty, "{name}: type");
             assert_eq!(cell.value(), *value, "{name}: value");
             assert_eq!(cell.is_indexable(), *indexable, "{name}: indexable");
@@ -550,8 +884,9 @@ mod tests {
 
     #[test]
     fn vectors_re_encode_to_the_same_bytes() {
-        for (name, bytes, indexable, ty, value) in VECTORS {
-            let cell = Cell::new(*ty, value, *indexable).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (name, bytes, indexable, ty, value) in accept_vectors() {
+            let cell =
+                CellValue::new(*ty, value, *indexable).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(cell.encode(), *bytes, "{name}");
         }
     }
@@ -578,17 +913,58 @@ mod tests {
         );
     }
 
+    /// Names are the spec table's, id for id — what `LengthMismatch` and other
+    /// diagnostics print.
+    #[test]
+    fn type_names_match_the_spec() {
+        #[rustfmt::skip]
+        const NAMES: &[(u8, &str)] = &[
+            (0, "tombstone"), (1, "bool"), (2, "str"), (3, "bytes"), (4, "bytes20"),
+            (8, "bytes4"), (9, "bytes8"), (10, "bytes16"), (11, "bytes32"),
+            (12, "u32"), (13, "u64"), (14, "u128"), (15, "u256"),
+            (16, "i32"), (17, "i64"), (18, "i128"), (19, "i256"),
+            (20, "dec32"), (21, "dec64"), (22, "dec128"), (23, "dec256"),
+            (24, "f32"), (25, "f64"), (28, "date32"), (29, "timestamp64"),
+        ];
+
+        for (id, name) in NAMES {
+            assert_eq!(CellType::from_id(*id).unwrap().name(), *name, "id {id}");
+        }
+
+        // Every core id is named, and no two share a name.
+        let named: Vec<u8> = NAMES.iter().map(|(id, _)| *id).collect();
+        for id in 0..CUSTOM_TYPE_ID_BASE {
+            assert_eq!(
+                CellType::from_id(id).is_ok(),
+                named.contains(&id),
+                "id {id}"
+            );
+        }
+        let mut names: Vec<&str> = NAMES.iter().map(|(_, n)| *n).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "two types share a name");
+    }
+
     /// Every id round-trips through `from_id`/`id`, and the reserved slots are
     /// exactly the ones the spec lists.
     #[test]
     fn id_space_matches_the_spec() {
         const RESERVED: &[u8] = &[5, 6, 7, 26, 27, 30, 31];
+        // With `custom_types` off the top block decodes to nothing either, but
+        // as `CustomTypesDisabled` rather than `ReservedType`.
+        let custom_off = cfg!(not(feature = "custom_types"));
         for id in 0..TYPE_ID_SPACE {
             let reserved = RESERVED.contains(&id) || (32..64).contains(&id);
+            let disabled = custom_off && id >= CUSTOM_TYPE_ID_BASE;
             match CellType::from_id(id) {
                 Ok(ty) => {
-                    assert!(!reserved, "id {id} should be reserved");
+                    assert!(!reserved && !disabled, "id {id} should not decode");
                     assert_eq!(ty.id(), id);
+                }
+                Err(e) if disabled => {
+                    assert_eq!(e, CellParseError::CustomTypesDisabled(id));
                 }
                 Err(e) => {
                     assert!(reserved, "id {id} should decode");
@@ -624,7 +1000,7 @@ mod tests {
                     },
                 };
 
-                match Cell::parse(&bytes) {
+                match CellValue::parse(&bytes) {
                     Ok(cell) => {
                         assert!(accepted, "0x{metadata:02X} len {len}: should have failed");
                         assert_eq!(cell.encode(), bytes, "0x{metadata:02X} len {len}");
@@ -635,57 +1011,289 @@ mod tests {
         }
     }
 
+    /// One rejection vector: name, wire bytes, and the error they must produce.
+    ///
+    /// The error is asserted exactly, not just "it failed" — a cell rejected
+    /// for the wrong reason is a bug the way a cell accepted wrongly is.
+    type BadVector = (&'static str, &'static [u8], CellParseError);
+
+    /// [`CellParseError::LengthMismatch`] as a call rather than a struct
+    /// literal, so the rows below stay one line each and stay aligned.
+    const fn length_mismatch(ty: CellType, expected: usize, actual: usize) -> CellParseError {
+        CellParseError::LengthMismatch {
+            ty,
+            expected,
+            actual,
+        }
+    }
+
+    #[rustfmt::skip]
+    const BAD_VECTORS: &[BadVector] = &[
+        // name                      wire bytes                                expected error
+
+        // -- nothing to parse ---------------------------------------------
+        ("empty slice",             &[],                                      CellParseError::Empty),
+
+        // -- reserved type ids, one per reserved block --------------------
+        ("reserved singleton 5",    &[5],                                     CellParseError::ReservedType(5)),
+        ("reserved singleton 7",    &[7],                                     CellParseError::ReservedType(7)),
+        ("reserved float 26",       &[26],                                    CellParseError::ReservedType(26)),
+        ("reserved time 30",        &[30],                                    CellParseError::ReservedType(30)),
+        ("reserved family 32",      &[32],                                    CellParseError::ReservedType(32)),
+        ("reserved family 63",      &[63],                                    CellParseError::ReservedType(63)),
+        ("reserved, idx bit set",   &[0x80 | 5],                              CellParseError::ReservedType(5)),
+        ("reserved with payload",   &[32, 1, 2, 3],                           CellParseError::ReservedType(32)),
+
+        // -- fixed-width framing ------------------------------------------
+        ("bytes20 too short",       &[0x04, 0, 0],                            length_mismatch(CellType::Bytes20, 20, 2)),
+        ("u32 one byte short",      &[0x0C, 0, 0, 0],                         length_mismatch(CellType::Uint(Width::W4), 4, 3)),
+        ("u64 empty",               &[0x0D],                                  length_mismatch(CellType::Uint(Width::W8), 8, 0)),
+        ("bool empty",              &[0x01],                                  length_mismatch(CellType::Bool, 1, 0)),
+        ("bool with a spare byte",  &[0x01, 1, 9],                            CellParseError::TrailingBytes { extra: 1 }),
+        ("tombstone with a value",  &[0x00, 9],                               CellParseError::TrailingBytes { extra: 1 }),
+        ("u32 one byte over",       &[0x0C, 0, 0, 0, 7, 9],                   CellParseError::TrailingBytes { extra: 1 }),
+
+        // -- variable-width framing ---------------------------------------
+        ("str, no length byte",     &[0x02],                                  CellParseError::MissingLength),
+        ("bytes, no length byte",   &[0x03],                                  CellParseError::MissingLength),
+        #[cfg(feature = "custom_types")]
+        ("custom, no length byte",  &[0x40],                                  CellParseError::MissingLength),
+        ("str cut short",           &[0x02, 4, b'h', b'i'],                   CellParseError::Truncated { declared: 4, actual: 2 }),
+        ("bytes cut short",         &[0x03, 4, 1, 2],                         CellParseError::Truncated { declared: 4, actual: 2 }),
+        #[cfg(feature = "custom_types")]
+        ("custom cut short",        &[0x64, 3, 9],                            CellParseError::Truncated { declared: 3, actual: 1 }),
+        ("len 0 but bytes follow",  &[0x03, 0, 9, 9],                         CellParseError::TrailingBytes { extra: 2 }),
+        ("bytes, extra past end",   &[0x03, 1, 1, 9, 9],                      CellParseError::TrailingBytes { extra: 2 }),
+
+        // -- the custom block with the feature off -------------------------
+        #[cfg(not(feature = "custom_types"))]
+        ("custom 64, feature off",  &[0x40, 0x00],                            CellParseError::CustomTypesDisabled(64)),
+        #[cfg(not(feature = "custom_types"))]
+        ("custom 100, feature off", &[0x64, 0x03, 9, 9, 9],                   CellParseError::CustomTypesDisabled(100)),
+        #[cfg(not(feature = "custom_types"))]
+        ("custom 127, feature off", &[0xFF, 0x01, 1],                         CellParseError::CustomTypesDisabled(127)),
+
+        // -- content: bool -------------------------------------------------
+        ("bool byte 2",             &[0x01, 2],                               CellParseError::InvalidBool(2)),
+        ("bool byte 0xFF",          &[0x01, 0xFF],                            CellParseError::InvalidBool(0xFF)),
+
+        // -- content: str that is not really UTF-8 -------------------------
+        // Each is correctly framed, so only the content is under test.
+        ("lone continuation 0x80",  &[0x02, 1, 0x80],                         CellParseError::invalid_utf8(&[0x80], 0)),
+        ("continuation mid-str",    &[0x02, 3, b'h', 0x80, b'i'],             CellParseError::invalid_utf8(&[b'h', 0x80, b'i'], 1)),
+        ("0xFF, never in UTF-8",    &[0x02, 1, 0xFF],                         CellParseError::invalid_utf8(&[0xFF], 0)),
+        ("0xFE, never in UTF-8",    &[0x02, 1, 0xFE],                         CellParseError::invalid_utf8(&[0xFE], 0)),
+        // A lead byte promising more bytes than the value carries.
+        ("2-byte lead, no tail",    &[0x02, 1, 0xC3],                         CellParseError::invalid_utf8(&[0xC3], 0)),
+        ("3-byte lead, one tail",   &[0x02, 2, 0xE2, 0x82],                   CellParseError::invalid_utf8(&[0xE2, 0x82], 0)),
+        ("4-byte lead, two tails",  &[0x02, 3, 0xF0, 0x9F, 0xA6],             CellParseError::invalid_utf8(&[0xF0, 0x9F, 0xA6], 0)),
+        // Overlong forms: a code point encoded in more bytes than needed. The
+        // classic filter bypass — "/" and NUL smuggled past a byte comparison.
+        ("overlong '/' (C0 AF)",    &[0x02, 2, 0xC0, 0xAF],                   CellParseError::invalid_utf8(&[0xC0, 0xAF], 0)),
+        ("overlong NUL (C0 80)",    &[0x02, 2, 0xC0, 0x80],                   CellParseError::invalid_utf8(&[0xC0, 0x80], 0)),
+        ("overlong 3-byte NUL",     &[0x02, 3, 0xE0, 0x80, 0x80],             CellParseError::invalid_utf8(&[0xE0, 0x80, 0x80], 0)),
+        // UTF-16 surrogate halves are not scalar values, so not valid UTF-8.
+        ("surrogate U+D800",        &[0x02, 3, 0xED, 0xA0, 0x80],             CellParseError::invalid_utf8(&[0xED, 0xA0, 0x80], 0)),
+        ("surrogate U+DFFF",        &[0x02, 3, 0xED, 0xBF, 0xBF],             CellParseError::invalid_utf8(&[0xED, 0xBF, 0xBF], 0)),
+        // Past U+10FFFF, and the 5-byte forms UTF-8 never had.
+        ("beyond U+10FFFF",         &[0x02, 4, 0xF5, 0x80, 0x80, 0x80],       CellParseError::invalid_utf8(&[0xF5, 0x80, 0x80, 0x80], 0)),
+        ("5-byte sequence",         &[0x02, 5, 0xF8, 0x88, 0x80, 0x80, 0x80], CellParseError::invalid_utf8(&[0xF8, 0x88, 0x80, 0x80, 0x80], 0)),
+        // Framing is right but the length byte cuts a character in half — the
+        // case a length byte alone cannot catch, and UTF-8 validation does.
+        ("len splits a character",  &[0x02, 1, 0xC3, 0xA9],                   CellParseError::invalid_utf8(&[0xC3], 0)),
+    ];
+
     #[test]
-    fn rejects_malformed_cells() {
-        let err = |bytes: &[u8]| Cell::parse(bytes).unwrap_err();
+    fn bad_vectors_are_rejected_for_the_stated_reason() {
+        for (name, bytes, expected) in BAD_VECTORS {
+            let got = CellValue::parse(bytes)
+                .map(|c| c.cell_type())
+                .expect_err(&format!("{name}: parsed, should have failed"));
+            assert_eq!(got, *expected, "{name}");
+        }
+    }
 
-        assert_eq!(err(&[]), CellParseError::Empty);
-        assert_eq!(err(&[5]), CellParseError::ReservedType(5));
-        assert_eq!(err(&[32]), CellParseError::ReservedType(32));
-        assert_eq!(
-            err(&[CellType::Bytes20.id(), 0, 0]),
-            CellParseError::LengthMismatch {
-                expected: 20,
-                actual: 2
-            }
-        );
-        assert_eq!(
-            err(&[CellType::Bool.id(), 2]),
-            CellParseError::InvalidBool(2)
-        );
-        assert_eq!(
-            err(&[CellType::Str.id(), 0x01, 0xFF]),
-            CellParseError::InvalidUtf8
-        );
+    /// Each accessor decodes its own type's value.
+    #[test]
+    fn accessors_decode_their_rust_equivalents() {
+        fn parse(bytes: &[u8]) -> CellValue<'_> {
+            CellValue::parse(bytes).unwrap()
+        }
 
-        // Framing: no length byte, a length byte that overruns, and bytes past
-        // the cell's declared end.
-        assert_eq!(err(&[CellType::Str.id()]), CellParseError::MissingLength);
+        assert_eq!(parse(&[0x01, 1]).as_bool(), Some(true));
+        assert_eq!(parse(&[0x01, 0]).as_bool(), Some(false));
+        assert_eq!(parse(&[0x02, 2, b'h', b'i']).as_str(), Some("hi"));
         assert_eq!(
-            err(&[CellType::Bytes.id(), 4, 1, 2]),
-            CellParseError::Truncated {
-                declared: 4,
-                actual: 2
-            }
-        );
-        assert_eq!(
-            err(&[CellType::Bytes.id(), 1, 1, 9, 9]),
-            CellParseError::TrailingBytes { extra: 2 }
-        );
-        assert_eq!(
-            err(&[CellType::Bool.id(), 1, 9]),
-            CellParseError::TrailingBytes { extra: 1 }
+            parse(&[0x03, 2, 0xDE, 0xAD]).as_bytes(),
+            Some(&[0xDE, 0xAD][..])
         );
 
-        // A value too long to frame is rejected at construction, since the wire
-        // form cannot express it.
+        assert_eq!(parse(&[0x08, 1, 2, 3, 4]).as_bytes4(), Some([1, 2, 3, 4]));
         assert_eq!(
-            Cell::new(CellType::Str, &[b'a'; MAX_VALUE_LEN + 1], false).unwrap_err(),
-            CellParseError::TooLong {
-                max: MAX_VALUE_LEN,
-                actual: MAX_VALUE_LEN + 1
-            }
+            parse(&[&[0x04][..], &[7u8; 20]].concat()).as_bytes20(),
+            Some([7u8; 20])
         );
+        assert_eq!(
+            parse(&[&[0x0B][..], &[9u8; 32]].concat()).as_bytes32(),
+            Some([9u8; 32])
+        );
+
+        assert_eq!(
+            parse(&[&[0x0C][..], &7u32.to_be_bytes()].concat()).as_u32(),
+            Some(7)
+        );
+        assert_eq!(
+            parse(&[&[0x0D][..], &u64::MAX.to_be_bytes()].concat()).as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            parse(&[&[0x0E][..], &1u128.to_be_bytes()].concat()).as_u128(),
+            Some(1)
+        );
+        assert_eq!(
+            parse(&[&[0x0F][..], &[0xFFu8; 32]].concat()).as_u256_be(),
+            Some([0xFFu8; 32])
+        );
+
+        // Signed values are plain two's complement, so negatives round-trip.
+        assert_eq!(
+            parse(&[&[0x10][..], &(-1i32).to_be_bytes()].concat()).as_i32(),
+            Some(-1)
+        );
+        assert_eq!(
+            parse(&[&[0x11][..], &i64::MIN.to_be_bytes()].concat()).as_i64(),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            parse(&[&[0x12][..], &(-42i128).to_be_bytes()].concat()).as_i128(),
+            Some(-42)
+        );
+
+        assert_eq!(
+            parse(&[&[0x14][..], &(-5i32).to_be_bytes()].concat()).as_dec32_unscaled(),
+            Some(-5)
+        );
+
+        assert_eq!(
+            parse(&[&[0x18][..], &1.5f32.to_be_bytes()].concat()).as_f32(),
+            Some(1.5)
+        );
+        assert_eq!(
+            parse(&[&[0x19][..], &(-0.25f64).to_be_bytes()].concat()).as_f64(),
+            Some(-0.25)
+        );
+
+        assert_eq!(
+            parse(&[&[0x1C][..], &20_000i32.to_be_bytes()].concat()).as_date32(),
+            Some(20_000)
+        );
+        assert_eq!(
+            parse(&[&[0x1D][..], &(-1i64).to_be_bytes()].concat()).as_timestamp64(),
+            Some(-1)
+        );
+    }
+
+    /// An accessor answers only for its own type. Same eight bytes under `u64`,
+    /// `i64`, `dec64`, `f64`, `bytes8` and `timestamp64` — each reads out under
+    /// exactly one of them, so no cell is ever silently reinterpreted.
+    #[test]
+    fn accessors_are_exclusive() {
+        let payload = [0x80u8, 0, 0, 0, 0, 0, 0, 1];
+        for id in [0x09u8, 0x0D, 0x11, 0x15, 0x19, 0x1D] {
+            let bytes = [&[id][..], &payload].concat();
+            let cell = CellValue::parse(&bytes).unwrap();
+
+            let hits = [
+                cell.as_bytes8().is_some(),
+                cell.as_u64().is_some(),
+                cell.as_i64().is_some(),
+                cell.as_dec64_unscaled().is_some(),
+                cell.as_f64().is_some(),
+                cell.as_timestamp64().is_some(),
+            ]
+            .iter()
+            .filter(|hit| **hit)
+            .count();
+            assert_eq!(hits, 1, "id {id:#04x} answered {hits} accessors");
+
+            // Nor do the wrong-width or wrong-family accessors answer.
+            assert_eq!(cell.as_u32(), None, "id {id:#04x}");
+            assert_eq!(cell.as_u128(), None, "id {id:#04x}");
+            assert_eq!(cell.as_bool(), None, "id {id:#04x}");
+            assert_eq!(cell.as_str(), None, "id {id:#04x}");
+            assert_eq!(cell.as_bytes(), None, "id {id:#04x}");
+        }
+    }
+
+    /// The message quotes the offending bytes as hex, positioned, and says so
+    /// when the value runs past the window.
+    #[test]
+    fn invalid_utf8_message_shows_the_bytes() {
+        let msg = |cell: &[u8]| CellValue::parse(cell).unwrap_err().to_string();
+
+        assert_eq!(
+            msg(&[0x02, 3, 0xED, 0xA0, 0x80]),
+            "str is not valid UTF-8 at byte 0 of 3: ed a0 80"
+        );
+        // The window starts at the failure, not at the value's start.
+        assert_eq!(
+            msg(&[0x02, 4, b'h', b'i', 0xC0, 0xAF]),
+            "str is not valid UTF-8 at byte 2 of 4: c0 af"
+        );
+
+        // A value longer than the window is cut, and marked as cut.
+        let mut long = vec![0x02, 40];
+        long.extend_from_slice(&[b'a'; 20]);
+        long.extend_from_slice(&[0xFF; 20]);
+        assert_eq!(
+            msg(&long),
+            "str is not valid UTF-8 at byte 20 of 40: ff ff ff ff ff ff ff ff …"
+        );
+
+        // Exactly the window's worth, with nothing after it, is not marked.
+        let exact = [&[0x02, 8][..], &[0xFF; 8]].concat();
+        assert_eq!(
+            msg(&exact),
+            "str is not valid UTF-8 at byte 0 of 8: ff ff ff ff ff ff ff ff"
+        );
+    }
+
+    /// `bytes` accepts every byte string `str` rejects — the UTF-8 rule is the
+    /// type's, not the format's.
+    #[test]
+    fn bytes_accepts_what_str_rejects() {
+        for (name, bytes, expected) in BAD_VECTORS {
+            if !matches!(expected, CellParseError::InvalidUtf8 { .. }) {
+                continue;
+            }
+            // Same length byte and value, only the type id swapped.
+            // `parse_prefix`, since one vector carries a deliberate trailing
+            // byte that is a framing matter rather than a content one.
+            let as_bytes = [&[CellType::Bytes.id()][..], &bytes[1..]].concat();
+            let (cell, _) =
+                CellValue::parse_prefix(&as_bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(cell.cell_type(), CellType::Bytes, "{name}");
+            let declared = bytes[1] as usize;
+            assert_eq!(cell.value(), &bytes[2..2 + declared], "{name}");
+        }
+    }
+
+    /// A value too long to frame is rejected at construction — the wire form
+    /// has no way to express it, so there is no cell to parse.
+    #[test]
+    fn over_long_values_cannot_be_built() {
+        for ty in [CellType::Str, CellType::Bytes] {
+            assert_eq!(
+                CellValue::new(ty, &[b'a'; MAX_VALUE_LEN + 1], false).unwrap_err(),
+                CellParseError::TooLong {
+                    max: MAX_VALUE_LEN,
+                    actual: MAX_VALUE_LEN + 1
+                },
+                "{ty:?}"
+            );
+        }
+        // Exactly at the maximum still works.
+        assert!(CellValue::new(CellType::Bytes, &[0u8; MAX_VALUE_LEN], false).is_ok());
     }
 
     /// The point of the length byte: cells pack adjacently and a truncated cell
@@ -694,10 +1302,10 @@ mod tests {
     fn packed_cells_walk_and_truncation_is_caught() {
         let seven = 7u64.to_be_bytes();
         let cells = [
-            Cell::new(CellType::Str, b"hi", true).unwrap(),
-            Cell::new(CellType::Uint(Width::W8), &seven, false).unwrap(),
-            Cell::new(CellType::Bytes, &[0xDE, 0xAD], false).unwrap(),
-            Cell::new(CellType::Tombstone, &[], false).unwrap(),
+            CellValue::new(CellType::Str, b"hi", true).unwrap(),
+            CellValue::new(CellType::Uint(Width::W8), &seven, false).unwrap(),
+            CellValue::new(CellType::Bytes, &[0xDE, 0xAD], false).unwrap(),
+            CellValue::new(CellType::Tombstone, &[], false).unwrap(),
         ];
 
         let mut packed = Vec::new();
@@ -707,7 +1315,7 @@ mod tests {
 
         let mut rest = &packed[..];
         for expected in &cells {
-            let (cell, tail) = Cell::parse_prefix(rest).unwrap();
+            let (cell, tail) = CellValue::parse_prefix(rest).unwrap();
             assert_eq!(cell, *expected);
             rest = tail;
         }
@@ -717,7 +1325,7 @@ mod tests {
         // a clean walk — the truncation is always caught.
         for cut in 1..packed.len() {
             let mut rest = &packed[..cut];
-            let walked = std::iter::from_fn(|| match Cell::parse_prefix(rest) {
+            let walked = std::iter::from_fn(|| match CellValue::parse_prefix(rest) {
                 Ok((cell, tail)) => {
                     rest = tail;
                     Some(cell)
@@ -735,16 +1343,19 @@ mod tests {
     #[test]
     fn typed_accessors() {
         assert_eq!(
-            Cell::parse(&[0x02, 0x02, b'h', b'i']).unwrap().as_str(),
+            CellValue::parse(&[0x02, 0x02, b'h', b'i'])
+                .unwrap()
+                .as_str(),
             Some("hi")
         );
-        assert_eq!(Cell::parse(&[0x01, 1]).unwrap().as_bool(), Some(true));
-        assert_eq!(Cell::parse(&[0x01, 0]).unwrap().as_bool(), Some(false));
+        assert_eq!(CellValue::parse(&[0x01, 1]).unwrap().as_bool(), Some(true));
+        assert_eq!(CellValue::parse(&[0x01, 0]).unwrap().as_bool(), Some(false));
         // Wrong type: no coercion, no panic.
-        assert_eq!(Cell::parse(&[0x01, 1]).unwrap().as_str(), None);
-        assert_eq!(Cell::parse(&[0x00]).unwrap().as_bool(), None);
+        assert_eq!(CellValue::parse(&[0x01, 1]).unwrap().as_str(), None);
+        assert_eq!(CellValue::parse(&[0x00]).unwrap().as_bool(), None);
     }
 
+    #[cfg(feature = "custom_types")]
     #[test]
     fn custom_ids_are_the_top_block() {
         assert!(CustomTypeId::new(63).is_none());
@@ -757,6 +1368,23 @@ mod tests {
             CellType::from_id(100).unwrap().layout(),
             ValueLayout::LengthPrefixed { max: MAX_VALUE_LEN }
         );
+    }
+
+    /// With the feature off the custom block decodes to nothing, and says so
+    /// with its own error rather than pretending the ids are reserved.
+    #[cfg(not(feature = "custom_types"))]
+    #[test]
+    fn custom_ids_are_rejected_without_the_feature() {
+        for id in CUSTOM_TYPE_ID_BASE..TYPE_ID_SPACE {
+            assert_eq!(
+                CellType::from_id(id),
+                Err(CellParseError::CustomTypesDisabled(id)),
+                "id {id}"
+            );
+        }
+        // The core block is untouched by the feature.
+        assert_eq!(CellType::from_id(63), Err(CellParseError::ReservedType(63)));
+        assert!(CellType::from_id(29).is_ok());
     }
 }
 
@@ -803,7 +1431,7 @@ mod properties {
         /// to the exact bytes it came from.
         #[test]
         fn parse_is_total_and_encode_inverts_it(bytes in prop::collection::vec(any::<u8>(), 0..600)) {
-            if let Ok(cell) = Cell::parse(&bytes) {
+            if let Ok(cell) = CellValue::parse(&bytes) {
                 prop_assert_eq!(cell.encode(), bytes);
             }
         }
@@ -815,7 +1443,7 @@ mod properties {
             (ty, value) in any_valid_cell(),
             indexable in any::<bool>(),
         ) {
-            let built = match Cell::new(ty, &value, indexable) {
+            let built = match CellValue::new(ty, &value, indexable) {
                 Ok(cell) => cell,
                 // The generator straddles the variable-width maximum on
                 // purpose; an over-long value must be rejected, not encoded.
@@ -826,7 +1454,7 @@ mod properties {
                 }
             };
             let encoded = built.encode();
-            let parsed = Cell::parse(&encoded).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let parsed = CellValue::parse(&encoded).map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(parsed, built);
             prop_assert_eq!(parsed.cell_type(), ty);
             prop_assert_eq!(parsed.value(), &value[..]);
@@ -840,7 +1468,7 @@ mod properties {
                 ValueLayout::Fixed(n) => n,
                 _ => 0,
             }];
-            let cell = Cell::new(ty, &value, indexable).unwrap();
+            let cell = CellValue::new(ty, &value, indexable).unwrap();
             let metadata = cell.metadata();
             prop_assert_eq!(metadata & TYPE_ID_MASK, ty.id());
             prop_assert_eq!(metadata & INDEXABLE_BIT != 0, indexable);
@@ -851,7 +1479,7 @@ mod properties {
         #[test]
         fn str_accepts_exactly_utf8(value in prop::collection::vec(any::<u8>(), 0..=MAX_VALUE_LEN)) {
             let cell = [&[CellType::Str.id(), value.len() as u8][..], &value].concat();
-            let parsed = Cell::parse(&cell);
+            let parsed = CellValue::parse(&cell);
             prop_assert_eq!(parsed.is_ok(), core::str::from_utf8(&value).is_ok());
             if let Ok(cell) = parsed {
                 prop_assert_eq!(cell.as_str(), Some(core::str::from_utf8(&value).unwrap()));
@@ -864,7 +1492,7 @@ mod properties {
         fn packed_runs_round_trip(cells in prop::collection::vec(any_valid_cell(), 0..8)) {
             let cells: Vec<_> = cells
                 .iter()
-                .filter_map(|(ty, v)| Cell::new(*ty, v, false).ok())
+                .filter_map(|(ty, v)| CellValue::new(*ty, v, false).ok())
                 .collect();
 
             let mut packed = Vec::new();
@@ -874,7 +1502,7 @@ mod properties {
 
             let mut rest = &packed[..];
             for expected in &cells {
-                let (cell, tail) = Cell::parse_prefix(rest)
+                let (cell, tail) = CellValue::parse_prefix(rest)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 prop_assert_eq!(cell, *expected);
                 rest = tail;
@@ -882,17 +1510,49 @@ mod properties {
             prop_assert!(rest.is_empty());
         }
 
-        /// Reserved ids stay reserved whatever follows them.
+        /// Reserved ids stay reserved whatever follows them. Scoped to the core
+        /// block, since the custom block's verdict depends on the feature.
         #[test]
         fn reserved_ids_never_parse(
-            id in (0u8..TYPE_ID_SPACE).prop_filter("valid id", |id| CellType::from_id(*id).is_err()),
+            id in (0u8..CUSTOM_TYPE_ID_BASE)
+                .prop_filter("valid id", |id| CellType::from_id(*id).is_err()),
             indexable in any::<bool>(),
             tail in prop::collection::vec(any::<u8>(), 0..40),
         ) {
             let metadata = id | if indexable { INDEXABLE_BIT } else { 0 };
             let cell = [&[metadata][..], &tail].concat();
-            prop_assert_eq!(Cell::parse(&cell), Err(CellParseError::ReservedType(id)));
-            prop_assert_eq!(Cell::parse_prefix(&cell).err(), Some(CellParseError::ReservedType(id)));
+            prop_assert_eq!(CellValue::parse(&cell), Err(CellParseError::ReservedType(id)));
+            prop_assert_eq!(CellValue::parse_prefix(&cell).err(), Some(CellParseError::ReservedType(id)));
+        }
+
+        /// The custom block never decodes to a core type, whatever follows it,
+        /// and its verdict matches the feature this build was compiled with.
+        #[test]
+        fn custom_block_verdict_matches_the_feature(
+            id in CUSTOM_TYPE_ID_BASE..TYPE_ID_SPACE,
+            indexable in any::<bool>(),
+            tail in prop::collection::vec(any::<u8>(), 0..40),
+        ) {
+            let metadata = id | if indexable { INDEXABLE_BIT } else { 0 };
+            let cell = [&[metadata][..], &tail].concat();
+
+            #[cfg(not(feature = "custom_types"))]
+            prop_assert_eq!(
+                CellValue::parse_prefix(&cell).err(),
+                Some(CellParseError::CustomTypesDisabled(id))
+            );
+
+            // With the feature on the id always decodes; whether the cell as a
+            // whole parses is a framing question, so anything that does parse
+            // must come back as that custom type.
+            #[cfg(feature = "custom_types")]
+            {
+                let ty = CellType::Custom(CustomTypeId::new(id).unwrap());
+                prop_assert_eq!(CellType::from_id(id).unwrap(), ty);
+                if let Ok((parsed, _)) = CellValue::parse_prefix(&cell) {
+                    prop_assert_eq!(parsed.cell_type(), ty);
+                }
+            }
         }
     }
 }

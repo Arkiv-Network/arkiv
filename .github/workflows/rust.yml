@@ -60,6 +60,12 @@ jobs:
       # nextest is the test runner; installed from a prebuilt binary.
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
+      # Off-by-default features are not covered by the run above, so their code
+      # paths would rot unnoticed. Re-run only the crates that have such a
+      # feature, with it on — the workspace is already built by this point, so
+      # this compiles just those crates again.
+      - name: Test off-by-default features
+        run: cargo nextest run -p golemdb-cells --features custom_types --locked
 
   udeps:
     runs-on: ubuntu-latest
