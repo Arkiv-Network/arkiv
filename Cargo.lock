@@ -3804,6 +3804,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "golemdb-cells"
+version = "0.2.1"
+dependencies = [
+ "eyre",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
