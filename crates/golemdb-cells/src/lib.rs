@@ -2,27 +2,30 @@
 //!
 //! # Wire format
 //!
-//! A cell is one metadata byte followed by the value bytes:
+//! A cell is one metadata byte, a length byte for the variable-width types
+//! only, then the value bytes:
 //!
 //! ```text
-//! [ indexable: 1 bit | type id: 7 bits ] [ value bytes … ]
+//! [ indexable: 1 bit | type id: 7 bits ] [ len ]? [ value bytes … ]
 //! ```
 //!
-//! Only `str` and `bytes` are variable sized. The type id alone says whether the
-//! value is fixed width, and if so how wide; a variable-width value's length is
-//! however much of the cell is left. So there is no length field and no
-//! multi-byte metadata.
+//! The type id says which of the two shapes a cell has. A fixed-width type
+//! carries its width in its id, so no length byte; `str`, `bytes` and the
+//! custom types carry one.
+//!
+//! That makes every cell **self-delimiting**: its length is knowable from its
+//! own bytes. Cells can be packed adjacently and walked with
+//! [`Cell::parse_prefix`], and a cell truncated in transit is rejected rather
+//! than read as a shorter valid value.
 
 use core::fmt;
 
-/// The longest `str` value in bytes a cell may carry.
+/// The longest variable-width value a cell may carry — what one length byte can
+/// express.
 ///
 /// This layer imposes only the format's own bound; a deployment is free to
 /// enforce something tighter on top.
-pub const MAX_STR_LEN: usize = 256;
-
-/// The longest `bytes` value in bytes a cell may carry.
-pub const MAX_BYTES_LEN: usize = 256;
+pub const MAX_VALUE_LEN: usize = u8::MAX as usize;
 
 /// The metadata byte's high bit: whether the cell is indexable.
 const INDEXABLE_BIT: u8 = 0b1000_0000;
@@ -42,9 +45,17 @@ pub enum CellParseError {
     Empty,
     /// The type id names a slot the spec reserves for future use.
     ReservedType(u8),
+    /// A variable-width cell that stops before its length byte.
+    MissingLength,
     /// A fixed-width type whose value is not exactly that wide.
     LengthMismatch { expected: usize, actual: usize },
-    /// A variable-width value longer than its type allows.
+    /// The length byte declares more value bytes than the cell carries — the
+    /// cell was cut short.
+    Truncated { declared: usize, actual: usize },
+    /// Bytes left over after the cell this slice declares. Use
+    /// [`Cell::parse_prefix`] to walk a run of packed cells.
+    TrailingBytes { extra: usize },
+    /// A value longer than one length byte can express.
     TooLong { max: usize, actual: usize },
     /// A `bool` whose byte is neither 0 nor 1.
     InvalidBool(u8),
@@ -57,8 +68,18 @@ impl fmt::Display for CellParseError {
         match self {
             Self::Empty => write!(f, "cell is missing its metadata byte"),
             Self::ReservedType(id) => write!(f, "type id {id} is reserved"),
+            Self::MissingLength => write!(f, "cell is missing its length byte"),
             Self::LengthMismatch { expected, actual } => {
                 write!(f, "expected {expected} value bytes, got {actual}")
+            }
+            Self::Truncated { declared, actual } => {
+                write!(
+                    f,
+                    "cell declares {declared} value bytes but carries {actual}"
+                )
+            }
+            Self::TrailingBytes { extra } => {
+                write!(f, "{extra} bytes left over after the cell")
             }
             Self::TooLong { max, actual } => {
                 write!(f, "value is {actual} bytes, the maximum is {max}")
@@ -131,8 +152,9 @@ impl FloatWidth {
 /// A custom, per-deployment type id from the 64–127 block.
 ///
 /// A newtype so a `CellType::Custom` cannot be built holding an id from the core
-/// block. What the id *means* is up to the deployment's type registry, so a
-/// custom value's bytes are [`ValueLayout::Opaque`] here.
+/// block. What the id *means* is up to the deployment's type registry, so this
+/// layer only frames a custom value — [`ValueLayout::LengthPrefixed`] — and
+/// never inspects its content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CustomTypeId(u8);
 
@@ -151,15 +173,20 @@ impl CustomTypeId {
     }
 }
 
-/// How many value bytes a type's cell carries.
+/// How a type's value bytes are framed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueLayout {
-    /// Exactly this many bytes.
+    /// Exactly this many bytes, no length byte — the width is in the type id.
     Fixed(usize),
-    /// Up to `max` bytes; the actual length is the rest of the cell.
-    Variable { max: usize },
-    /// Whatever the deployment's type registry says — not checked here.
-    Opaque,
+    /// A length byte, then that many bytes, up to `max`.
+    LengthPrefixed { max: usize },
+}
+
+impl ValueLayout {
+    /// Whether a cell of this layout carries a length byte after its metadata.
+    pub const fn has_length_byte(self) -> bool {
+        matches!(self, Self::LengthPrefixed { .. })
+    }
 }
 
 /// The type of a cell's value — the 7-bit type-id space, decoded.
@@ -168,8 +195,8 @@ pub enum ValueLayout {
 /// | ------ | ------------------------------------- | --------------------- | ------------------------- | ------------------ |
 /// | 0      | tombstone                             | singleton             | 0                         | —                  |
 /// | 1      | `bool`                                | singleton             | 1                         | —                  |
-/// | 2      | `str`                                 | singleton             | var (≤ [`MAX_STR_LEN`])   | raw UTF-8          |
-/// | 3      | `bytes` (field-only)                  | singleton             | var (≤ [`MAX_BYTES_LEN`]) | —                  |
+/// | 2      | `str`                                 | singleton             | var (≤ [`MAX_VALUE_LEN`]) | raw UTF-8          |
+/// | 3      | `bytes` (field-only)                  | singleton             | var (≤ [`MAX_VALUE_LEN`]) | —                  |
 /// | 4      | `bytes20`                             | singleton             | 20                        | plain bytes        |
 /// | 5–7    | *reserved singletons*                 |                       |                           |                    |
 /// | 8–11   | `bytes4` `bytes8` `bytes16` `bytes32` | `8 + w`               | 4·2^w                     | plain bytes        |
@@ -262,13 +289,18 @@ impl CellType {
         }
     }
 
-    /// How many value bytes follow the metadata byte.
+    /// How this type's value bytes are framed.
+    ///
+    /// Custom types are length-prefixed because this layer cannot know their
+    /// widths, and a cell whose length only the deployment's registry knows
+    /// would not be self-delimiting.
     pub const fn layout(self) -> ValueLayout {
         match self {
             Self::Tombstone => ValueLayout::Fixed(0),
             Self::Bool => ValueLayout::Fixed(1),
-            Self::Str => ValueLayout::Variable { max: MAX_STR_LEN },
-            Self::Bytes => ValueLayout::Variable { max: MAX_BYTES_LEN },
+            Self::Str | Self::Bytes | Self::Custom(_) => {
+                ValueLayout::LengthPrefixed { max: MAX_VALUE_LEN }
+            }
             Self::Bytes20 => ValueLayout::Fixed(20),
             Self::FixedBytes(w) | Self::Uint(w) | Self::Int(w) | Self::Decimal(w) => {
                 ValueLayout::Fixed(w.bytes())
@@ -276,7 +308,6 @@ impl CellType {
             Self::Float(f) => ValueLayout::Fixed(f.bytes()),
             Self::Date32 => ValueLayout::Fixed(4),
             Self::Timestamp64 => ValueLayout::Fixed(8),
-            Self::Custom(_) => ValueLayout::Opaque,
         }
     }
 
@@ -289,7 +320,7 @@ impl CellType {
                     actual: value.len(),
                 });
             }
-            ValueLayout::Variable { max } if value.len() > max => {
+            ValueLayout::LengthPrefixed { max } if value.len() > max => {
                 return Err(CellParseError::TooLong {
                     max,
                     actual: value.len(),
@@ -327,20 +358,63 @@ impl<'a> Cell<'a> {
         })
     }
 
-    /// Decode a cell: one metadata byte, then the value bytes.
+    /// Decode exactly one cell from `bytes`, which must hold nothing else.
+    ///
+    /// Bytes left over are [`CellParseError::TrailingBytes`]; to walk a run of
+    /// packed cells use [`Cell::parse_prefix`].
     pub fn parse(bytes: &'a [u8]) -> Result<Self, CellParseError> {
-        let (&metadata, value) = bytes.split_first().ok_or(CellParseError::Empty)?;
-        Self::new(
-            CellType::from_id(metadata & TYPE_ID_MASK)?,
-            value,
-            metadata & INDEXABLE_BIT != 0,
-        )
+        let (cell, rest) = Self::parse_prefix(bytes)?;
+        if rest.is_empty() {
+            Ok(cell)
+        } else {
+            Err(CellParseError::TrailingBytes { extra: rest.len() })
+        }
     }
 
-    /// Append this cell's wire bytes to `out` — the inverse of [`Cell::parse`].
+    /// Decode the cell at the front of `bytes`, returning it and whatever
+    /// follows. Every cell is self-delimiting, so this is how a run of packed
+    /// cells is walked.
+    pub fn parse_prefix(bytes: &'a [u8]) -> Result<(Self, &'a [u8]), CellParseError> {
+        let (&metadata, rest) = bytes.split_first().ok_or(CellParseError::Empty)?;
+        let ty = CellType::from_id(metadata & TYPE_ID_MASK)?;
+
+        let (value, rest) = match ty.layout() {
+            ValueLayout::Fixed(n) => {
+                if rest.len() < n {
+                    return Err(CellParseError::LengthMismatch {
+                        expected: n,
+                        actual: rest.len(),
+                    });
+                }
+                rest.split_at(n)
+            }
+            ValueLayout::LengthPrefixed { .. } => {
+                let (&len, rest) = rest.split_first().ok_or(CellParseError::MissingLength)?;
+                let len = len as usize;
+                if rest.len() < len {
+                    return Err(CellParseError::Truncated {
+                        declared: len,
+                        actual: rest.len(),
+                    });
+                }
+                rest.split_at(len)
+            }
+        };
+
+        let cell = Self::new(ty, value, metadata & INDEXABLE_BIT != 0)?;
+        Ok((cell, rest))
+    }
+
+    /// Append this cell's wire bytes to `out` — the inverse of
+    /// [`Cell::parse`]. Appending several in a row produces a run
+    /// [`Cell::parse_prefix`] can walk back.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        out.reserve(1 + self.value.len());
+        out.reserve(2 + self.value.len());
         out.push(self.metadata());
+        if self.ty.layout().has_length_byte() {
+            // `new`/`parse` cap the value at MAX_VALUE_LEN, so this fits.
+            out.push(self.value.len() as u8);
+        }
         out.extend_from_slice(self.value);
     }
 
@@ -402,12 +476,12 @@ mod tests {
         ("tombstone",      &[0x00],                          false, CellType::Tombstone,               &[]),
         ("bool false",     &[0x01, 0x00],                    false, CellType::Bool,                    &[0x00]),
         ("bool true, idx", &[0x81, 0x01],                    true,  CellType::Bool,                    &[0x01]),
-        ("str empty",      &[0x02],                          false, CellType::Str,                     &[]),
-        ("str ascii",      &[0x02, b'h', b'i'],              false, CellType::Str,                     b"hi"),
-        ("str 2-byte utf8",&[0x02, 0xC3, 0xA9],              false, CellType::Str,                     &[0xC3, 0xA9]),
-        ("str 4-byte utf8",&[0x82, 0xF0, 0x9F, 0xA6, 0x80],  true,  CellType::Str,                     &[0xF0, 0x9F, 0xA6, 0x80]),
-        ("bytes empty",    &[0x03],                          false, CellType::Bytes,                   &[]),
-        ("bytes 2",        &[0x03, 0xDE, 0xAD],              false, CellType::Bytes,                   &[0xDE, 0xAD]),
+        ("str empty",      &[0x02, 0x00],                    false, CellType::Str,                     &[]),
+        ("str ascii",      &[0x02, 0x02, b'h', b'i'],        false, CellType::Str,                     b"hi"),
+        ("str 2-byte utf8",&[0x02, 0x02, 0xC3, 0xA9],        false, CellType::Str,                     &[0xC3, 0xA9]),
+        ("str 4-byte utf8",&[0x82, 0x04, 0xF0, 0x9F, 0xA6, 0x80], true, CellType::Str,                 &[0xF0, 0x9F, 0xA6, 0x80]),
+        ("bytes empty",    &[0x03, 0x00],                    false, CellType::Bytes,                   &[]),
+        ("bytes 2",        &[0x03, 0x02, 0xDE, 0xAD],        false, CellType::Bytes,                   &[0xDE, 0xAD]),
         ("bytes20",        &ZEROS_CELL_20,                   false, CellType::Bytes20,                 &ZEROS20),
         ("bytes4",         &[0x08, 1, 2, 3, 4],              false, CellType::FixedBytes(Width::W4),   &[1, 2, 3, 4]),
         ("bytes8, idx",    &[0x89, 1, 2, 3, 4, 5, 6, 7, 8],  true,  CellType::FixedBytes(Width::W8),   &[1, 2, 3, 4, 5, 6, 7, 8]),
@@ -429,9 +503,9 @@ mod tests {
         ("f64",            &[0x19, 0x3F, 0xF0, 0, 0, 0, 0, 0, 0], false, CellType::Float(FloatWidth::F64), &[0x3F, 0xF0, 0, 0, 0, 0, 0, 0]),
         ("date32",         &[0x1C, 0x80, 0, 0x4E, 0x20],     false, CellType::Date32,                  &[0x80, 0, 0x4E, 0x20]),
         ("timestamp64",    &[0x9D, 0x80, 0, 0, 0, 0, 0, 0, 1], true, CellType::Timestamp64,            &[0x80, 0, 0, 0, 0, 0, 0, 1]),
-        ("custom 64, 0 B", &[0x40],                          false, CellType::Custom(CustomTypeId(64)), &[]),
-        ("custom 100",     &[0x64, 9, 9, 9],                 false, CellType::Custom(CustomTypeId(100)), &[9, 9, 9]),
-        ("custom 127, idx",&[0xFF, 1],                       true,  CellType::Custom(CustomTypeId(127)), &[1]),
+        ("custom 64, 0 B", &[0x40, 0x00],                    false, CellType::Custom(CustomTypeId(64)), &[]),
+        ("custom 100",     &[0x64, 0x03, 9, 9, 9],           false, CellType::Custom(CustomTypeId(100)), &[9, 9, 9]),
+        ("custom 127, idx",&[0xFF, 0x01, 1],                 true,  CellType::Custom(CustomTypeId(127)), &[1]),
     ];
 
     // The wide vectors, spelled out so the byte strings above stay one line each.
@@ -542,8 +616,11 @@ mod tests {
                     Err(_) => false,
                     Ok(ty) => match ty.layout() {
                         ValueLayout::Fixed(n) => len == n,
-                        ValueLayout::Variable { max } => len <= max,
-                        ValueLayout::Opaque => true,
+                        // The first payload byte is the length byte, and it
+                        // must account for every byte after it.
+                        ValueLayout::LengthPrefixed { .. } => {
+                            len >= 1 && payload[0] as usize == len - 1
+                        }
                     },
                 };
 
@@ -577,24 +654,88 @@ mod tests {
             CellParseError::InvalidBool(2)
         );
         assert_eq!(
-            err(&[CellType::Str.id(), 0xFF]),
+            err(&[CellType::Str.id(), 0x01, 0xFF]),
             CellParseError::InvalidUtf8
         );
 
-        let long = [&[CellType::Str.id()][..], &[b'a'; MAX_STR_LEN + 1]].concat();
+        // Framing: no length byte, a length byte that overruns, and bytes past
+        // the cell's declared end.
+        assert_eq!(err(&[CellType::Str.id()]), CellParseError::MissingLength);
         assert_eq!(
-            err(&long),
-            CellParseError::TooLong {
-                max: MAX_STR_LEN,
-                actual: MAX_STR_LEN + 1
+            err(&[CellType::Bytes.id(), 4, 1, 2]),
+            CellParseError::Truncated {
+                declared: 4,
+                actual: 2
             }
         );
+        assert_eq!(
+            err(&[CellType::Bytes.id(), 1, 1, 9, 9]),
+            CellParseError::TrailingBytes { extra: 2 }
+        );
+        assert_eq!(
+            err(&[CellType::Bool.id(), 1, 9]),
+            CellParseError::TrailingBytes { extra: 1 }
+        );
+
+        // A value too long to frame is rejected at construction, since the wire
+        // form cannot express it.
+        assert_eq!(
+            Cell::new(CellType::Str, &[b'a'; MAX_VALUE_LEN + 1], false).unwrap_err(),
+            CellParseError::TooLong {
+                max: MAX_VALUE_LEN,
+                actual: MAX_VALUE_LEN + 1
+            }
+        );
+    }
+
+    /// The point of the length byte: cells pack adjacently and a truncated cell
+    /// is rejected rather than read as a shorter valid value.
+    #[test]
+    fn packed_cells_walk_and_truncation_is_caught() {
+        let seven = 7u64.to_be_bytes();
+        let cells = [
+            Cell::new(CellType::Str, b"hi", true).unwrap(),
+            Cell::new(CellType::Uint(Width::W8), &seven, false).unwrap(),
+            Cell::new(CellType::Bytes, &[0xDE, 0xAD], false).unwrap(),
+            Cell::new(CellType::Tombstone, &[], false).unwrap(),
+        ];
+
+        let mut packed = Vec::new();
+        for cell in &cells {
+            cell.encode_into(&mut packed);
+        }
+
+        let mut rest = &packed[..];
+        for expected in &cells {
+            let (cell, tail) = Cell::parse_prefix(rest).unwrap();
+            assert_eq!(cell, *expected);
+            rest = tail;
+        }
+        assert!(rest.is_empty());
+
+        // Cutting the run anywhere never yields the same first cell followed by
+        // a clean walk — the truncation is always caught.
+        for cut in 1..packed.len() {
+            let mut rest = &packed[..cut];
+            let walked = std::iter::from_fn(|| match Cell::parse_prefix(rest) {
+                Ok((cell, tail)) => {
+                    rest = tail;
+                    Some(cell)
+                }
+                Err(_) => None,
+            })
+            .count();
+            assert!(
+                walked < cells.len() || !rest.is_empty(),
+                "truncating at {cut} still walked the whole run"
+            );
+        }
     }
 
     #[test]
     fn typed_accessors() {
         assert_eq!(
-            Cell::parse(&[0x02, b'h', b'i']).unwrap().as_str(),
+            Cell::parse(&[0x02, 0x02, b'h', b'i']).unwrap().as_str(),
             Some("hi")
         );
         assert_eq!(Cell::parse(&[0x01, 1]).unwrap().as_bool(), Some(true));
@@ -610,9 +751,11 @@ mod tests {
         assert_eq!(CustomTypeId::new(64).unwrap().get(), 64);
         assert_eq!(CustomTypeId::new(127).unwrap().get(), 127);
         assert!(CustomTypeId::new(128).is_none());
+        // A custom type is framed like any other variable-width one, so a cell
+        // carrying it stays self-delimiting even though its content is opaque.
         assert_eq!(
             CellType::from_id(100).unwrap().layout(),
-            ValueLayout::Opaque
+            ValueLayout::LengthPrefixed { max: MAX_VALUE_LEN }
         );
     }
 }
@@ -639,17 +782,16 @@ mod properties {
                 // Content-constrained: not every byte string of the right
                 // length is a valid value.
                 CellType::Bool => prop::collection::vec(0u8..=1, 1..=1).boxed(),
-                CellType::Str => prop::string::string_regex(".{0,140}")
+                CellType::Str => prop::string::string_regex(".{0,120}")
                     .unwrap()
                     .prop_map(String::into_bytes)
                     .boxed(),
                 // Length is the only constraint.
                 _ => match ty.layout() {
                     ValueLayout::Fixed(n) => prop::collection::vec(any::<u8>(), n..=n).boxed(),
-                    ValueLayout::Variable { max } => {
+                    ValueLayout::LengthPrefixed { max } => {
                         prop::collection::vec(any::<u8>(), 0..=max + 8).boxed()
                     }
-                    ValueLayout::Opaque => prop::collection::vec(any::<u8>(), 0..64).boxed(),
                 },
             };
             (Just(ty), value)
@@ -707,13 +849,37 @@ mod properties {
         /// A `str` cell parses exactly when its bytes are UTF-8 — the parser
         /// agrees with the standard library, not with its own idea of UTF-8.
         #[test]
-        fn str_accepts_exactly_utf8(value in prop::collection::vec(any::<u8>(), 0..=MAX_STR_LEN)) {
-            let cell = [&[CellType::Str.id()][..], &value].concat();
+        fn str_accepts_exactly_utf8(value in prop::collection::vec(any::<u8>(), 0..=MAX_VALUE_LEN)) {
+            let cell = [&[CellType::Str.id(), value.len() as u8][..], &value].concat();
             let parsed = Cell::parse(&cell);
             prop_assert_eq!(parsed.is_ok(), core::str::from_utf8(&value).is_ok());
             if let Ok(cell) = parsed {
                 prop_assert_eq!(cell.as_str(), Some(core::str::from_utf8(&value).unwrap()));
             }
+        }
+
+        /// A run of cells packs and walks back unchanged, and cutting the run
+        /// short is always caught rather than read as a shorter value.
+        #[test]
+        fn packed_runs_round_trip(cells in prop::collection::vec(any_valid_cell(), 0..8)) {
+            let cells: Vec<_> = cells
+                .iter()
+                .filter_map(|(ty, v)| Cell::new(*ty, v, false).ok())
+                .collect();
+
+            let mut packed = Vec::new();
+            for cell in &cells {
+                cell.encode_into(&mut packed);
+            }
+
+            let mut rest = &packed[..];
+            for expected in &cells {
+                let (cell, tail) = Cell::parse_prefix(rest)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(cell, *expected);
+                rest = tail;
+            }
+            prop_assert!(rest.is_empty());
         }
 
         /// Reserved ids stay reserved whatever follows them.
@@ -726,6 +892,7 @@ mod properties {
             let metadata = id | if indexable { INDEXABLE_BIT } else { 0 };
             let cell = [&[metadata][..], &tail].concat();
             prop_assert_eq!(Cell::parse(&cell), Err(CellParseError::ReservedType(id)));
+            prop_assert_eq!(Cell::parse_prefix(&cell).err(), Some(CellParseError::ReservedType(id)));
         }
     }
 }
