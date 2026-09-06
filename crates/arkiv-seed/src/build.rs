@@ -1,37 +1,43 @@
 //! Materialising a [`SeedSpec`] into account state, through the node's own
 //! write path.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_trie::root::state_root_ref_unhashed;
-use arkiv_interfaces::entity::Entity;
+use arkiv_interfaces::entity::{Entity, annotations};
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op};
+use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::statemanager::{BlockRef, EntityCreationNoncesStore, EntityStore, StateView};
 use arkiv_reth_executor::ArkivExecutor;
-use arkiv_reth_mpt_committed_store::{AuxiliaryEntityDelta, RethAuxStore, annotation_delta};
+use arkiv_reth_mpt_committed_store::entities::layout::{
+    SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address,
+};
+use arkiv_reth_mpt_committed_store::{
+    AuxiliaryEntityDelta, RethAuxStore, annotation_delta, id_to_key_slot, key_to_id_slot,
+    pair_address,
+};
 use arkiv_reth_statemanager::write_manager;
 use eyre::{Result, WrapErr, bail};
 use reth_ethereum::evm::revm::{
     DatabaseCommit,
     database_interface::EmptyDB,
-    db::{AccountState, CacheDB},
+    db::{AccountState, CacheDB, DbAccount},
     primitives::KECCAK_EMPTY,
 };
 
 use crate::manifest::SeedManifest;
+use crate::sink::{AccountSink, MemorySink};
 use crate::spec::SeedSpec;
 
-/// The accounts a seed produced, plus the record of what was seeded.
+/// The accounts a seed produced in memory, plus the record of what was seeded.
 #[derive(Debug, Clone)]
 pub struct SeededState {
-    /// Every account the seed wrote: entity records, index buckets and the
-    /// system account. Base funding is merged in by [`export`](crate::export).
+    /// Every account of the genesis: entity records, index buckets, the
+    /// system account, and the base alloc merged in.
     pub alloc: BTreeMap<Address, GenesisAccount>,
-    /// What was built. Its `state_root` and `accounts` describe this alloc
-    /// alone until [`export::finish`](crate::export::finish) merges funding in.
+    /// What was built; its `state_root` and `accounts` describe `alloc`.
     pub manifest: SeedManifest,
 }
 
@@ -44,17 +50,48 @@ pub struct Progress {
     pub total: u64,
     /// Milliseconds since the build started.
     pub elapsed_ms: u128,
+    /// Accounts still held in the cache after the batch: the seed's shape
+    /// (index buckets, range nodes, the system account), not its size.
+    pub cached_accounts: usize,
+    /// Storage slots held across those accounts.
+    pub cached_slots: usize,
 }
 
-/// Build the state `spec` describes.
+/// Build the state `spec` describes in memory, `base` (funding, predeploys)
+/// merged in. For seeds a machine can hold; [`build`] with a
+/// [`StreamSink`](crate::sink::StreamSink) has no such limit.
+pub fn build_in_memory(
+    spec: &SeedSpec,
+    base: BTreeMap<Address, GenesisAccount>,
+    on_progress: impl FnMut(Progress),
+) -> Result<SeededState> {
+    let mut sink = MemorySink::default();
+    let manifest = build(spec, base, &mut sink, on_progress)?;
+    Ok(SeededState {
+        alloc: sink.into_alloc(),
+        manifest,
+    })
+}
+
+/// Build the state `spec` describes, handing every account to `sink` as it is
+/// finished, then `base` (funding, predeploys — an address both sides claim
+/// is an error: a seed never overwrites an operator's account).
 ///
 /// Batches of `spec.batch_size` creates run through the executor into a
 /// `MptStateView` over the production `WriteOverlay`, whose base is revm's
 /// in-memory `CacheDB`. Each batch commits like a block would — entities as
 /// account code, then the index, then the owners' minting nonces — and the
-/// resulting diff is folded into the cache. `on_progress` is called after every
-/// batch.
-pub fn build(spec: &SeedSpec, mut on_progress: impl FnMut(Progress)) -> Result<SeededState> {
+/// resulting diff is folded into the cache. What the batch finished for good
+/// leaves the cache for the sink right away: the entity records, and the
+/// system account's key ↔ id slots. What stays is what later batches still
+/// write — index buckets, range-index nodes, the counters — so the cache holds
+/// the seed's *shape*, not its size. `on_progress` is called after every batch.
+pub fn build(
+    spec: &SeedSpec,
+    base: BTreeMap<Address, GenesisAccount>,
+    sink: &mut impl AccountSink,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<SeedManifest> {
     spec.validate()?;
     let started = Instant::now();
     let mut db = CacheDB::new(EmptyDB::default());
@@ -128,23 +165,54 @@ pub fn build(spec: &SeedSpec, mut on_progress: impl FnMut(Progress)) -> Result<S
                     .expect("a create always adds annotations")
             })
             .collect();
+        // The `$key` index has one bucket per entity, written once: it leaves
+        // with the entity. Every other bucket is shared across entities.
+        let key_buckets: Vec<Address> = deltas
+            .iter()
+            .flat_map(|delta| delta.inserts.iter())
+            .filter(|entry| entry.attr == annotations::KEY)
+            .map(|entry| {
+                pair_address(
+                    &entry.attr,
+                    entry.value.attr_type(),
+                    &entry.value.index_bytes(),
+                )
+            })
+            .collect();
         StateView::commit(&mut view).map_err(|e| eyre::eyre!("commit seed batch: {e:?}"))?;
         RethAuxStore::new(view.backend_mut())
             .apply_inserts_bulk(&deltas)
             .map_err(|e| eyre::eyre!("index seed batch: {e:?}"))?;
         let state = view.into_base().into_state();
         db.commit(state);
-
+        release_batch(&mut db, &keys_in_order, &key_buckets, next, sink)
+            .wrap_err_with(|| format!("hand over seed batch at entity {next}"))?;
         next = end;
         on_progress(Progress {
             done: next,
             total: spec.count,
             elapsed_ms: started.elapsed().as_millis(),
+            cached_accounts: db.cache.accounts.len(),
+            cached_slots: db.cache.accounts.values().map(|a| a.storage.len()).sum(),
         });
     }
 
-    let alloc = export_cache(&db).wrap_err("export seeded accounts")?;
-    let manifest = SeedManifest {
+    // What the seed still holds — index buckets, range nodes, the system
+    // account with its counters — then the base, then the root.
+    let remaining: Vec<Address> = db.cache.accounts.keys().copied().collect();
+    for address in remaining {
+        let account = db.cache.accounts.remove(&address).expect("listed");
+        if let Some(genesis) = genesis_account(address, &account, &db)? {
+            sink.account(address, genesis)?;
+        }
+    }
+    for (address, account) in base {
+        sink.account(address, account)
+            .wrap_err("merge the base alloc (is an address both funded and seeded?)")?;
+    }
+    let finished = sink.finish()?;
+
+    Ok(SeedManifest {
         chain_id: spec.chain_id,
         count: spec.count,
         payload_size: spec.payload_size,
@@ -153,59 +221,110 @@ pub fn build(spec: &SeedSpec, mut on_progress: impl FnMut(Progress)) -> Result<S
         expires_at: spec.expires_at,
         attributes: spec.attributes.iter().map(ToString::to_string).collect(),
         seed: spec.seed,
-        state_root: state_root_ref_unhashed(alloc.iter()),
-        accounts: alloc.len() as u64,
+        state_root: finished.state_root,
+        accounts: finished.accounts,
         sample_keys,
         owner_nonces: spec.owner_nonces(),
-    };
-    Ok(SeededState { alloc, manifest })
+    })
 }
 
-/// Read every account the write path left in the cache back out as genesis
-/// accounts: nonce, balance, code, and the non-zero storage slots.
-fn export_cache(db: &CacheDB<EmptyDB>) -> Result<BTreeMap<Address, GenesisAccount>> {
-    let mut alloc = BTreeMap::new();
-    for (address, account) in &db.cache.accounts {
-        if account.account_state == AccountState::NotExisting {
-            continue;
-        }
-        let info = &account.info;
-        let code: Option<Bytes> = if info.code_hash == KECCAK_EMPTY {
-            None
-        } else {
-            let bytecode = info
-                .code
-                .as_ref()
-                .or_else(|| db.cache.contracts.get(&info.code_hash))
-                .ok_or_else(|| {
-                    eyre::eyre!("account {address}: code {} not in cache", info.code_hash)
-                })?;
-            Some(bytecode.original_bytes())
+/// Hand a committed batch's finished state to the sink and drop it from the
+/// cache: each entity's record account, its `$key` index bucket, and the
+/// system account's two bookkeeping slots for it (key → id, id → key; entity
+/// `i` holds id `i`), none of which any later batch reads or writes. Then drop
+/// the bytecodes no remaining account refers to — the shared index buckets
+/// are rewritten every batch, and revm's cache would otherwise keep every
+/// version.
+fn release_batch(
+    db: &mut CacheDB<EmptyDB>,
+    keys: &[EntityAddress],
+    key_buckets: &[Address],
+    first_id: u64,
+    sink: &mut impl AccountSink,
+) -> Result<()> {
+    for address in key_buckets {
+        let Some(account) = db.cache.accounts.remove(address) else {
+            bail!("no `$key` bucket at {address}");
         };
-        // A slot written back to zero is, in Ethereum state, an absent slot.
-        let storage: BTreeMap<B256, B256> = account
-            .storage
-            .iter()
-            .filter(|(_, value)| **value != U256::ZERO)
-            .map(|(slot, value)| (B256::from(*slot), B256::from(*value)))
-            .collect();
-        let untouched =
-            info.nonce == 0 && info.balance.is_zero() && code.is_none() && storage.is_empty();
-        if untouched {
-            continue;
-        }
-        alloc.insert(
-            *address,
-            GenesisAccount {
-                nonce: (info.nonce != 0).then_some(info.nonce),
-                balance: info.balance,
-                code,
-                storage: (!storage.is_empty()).then_some(storage),
-                private_key: None,
-            },
-        );
+        let Some(genesis) = genesis_account(*address, &account, db)? else {
+            bail!("an empty `$key` bucket at {address}");
+        };
+        sink.account(*address, genesis)?;
     }
-    Ok(alloc)
+    for (offset, key) in keys.iter().enumerate() {
+        let address = entity_leaf_address(*key);
+        let Some(account) = db.cache.accounts.remove(&address) else {
+            bail!("entity {key:?} left no account at {address}");
+        };
+        let Some(genesis) = genesis_account(address, &account, db)? else {
+            bail!("entity {key:?} left an empty account at {address}");
+        };
+        sink.account(address, genesis)?;
+
+        let id = first_id + offset as u64;
+        if let Some(system) = db.cache.accounts.get_mut(&SYSTEM_ACCOUNT_ADDRESS) {
+            for slot in [key_to_id_slot(*key), id_to_key_slot(id)] {
+                if let Some(value) = system.storage.remove(&U256::from_be_bytes(slot.0)) {
+                    sink.storage_part(SYSTEM_ACCOUNT_ADDRESS, slot, B256::from(value))?;
+                }
+            }
+        }
+    }
+    let live: HashSet<B256> = db
+        .cache
+        .accounts
+        .values()
+        .map(|account| account.info.code_hash)
+        .collect();
+    db.cache
+        .contracts
+        .retain(|hash, _| hash.is_zero() || *hash == KECCAK_EMPTY || live.contains(hash));
+    Ok(())
+}
+
+/// A cached account as a genesis account — nonce, balance, code, and the
+/// non-zero storage slots — or `None` for one that was only ever read, or
+/// written back to nothing.
+fn genesis_account(
+    address: Address,
+    account: &DbAccount,
+    db: &CacheDB<EmptyDB>,
+) -> Result<Option<GenesisAccount>> {
+    if account.account_state == AccountState::NotExisting {
+        return Ok(None);
+    }
+    let info = &account.info;
+    let code: Option<Bytes> = if info.code_hash == KECCAK_EMPTY {
+        None
+    } else {
+        let bytecode = info
+            .code
+            .as_ref()
+            .or_else(|| db.cache.contracts.get(&info.code_hash))
+            .ok_or_else(|| {
+                eyre::eyre!("account {address}: code {} not in cache", info.code_hash)
+            })?;
+        Some(bytecode.original_bytes())
+    };
+    // A slot written back to zero is, in Ethereum state, an absent slot.
+    let storage: BTreeMap<B256, B256> = account
+        .storage
+        .iter()
+        .filter(|(_, value)| **value != U256::ZERO)
+        .map(|(slot, value)| (B256::from(*slot), B256::from(*value)))
+        .collect();
+    let untouched =
+        info.nonce == 0 && info.balance.is_zero() && code.is_none() && storage.is_empty();
+    if untouched {
+        return Ok(None);
+    }
+    Ok(Some(GenesisAccount {
+        nonce: (info.nonce != 0).then_some(info.nonce),
+        balance: info.balance,
+        code,
+        storage: (!storage.is_empty()).then_some(storage),
+        private_key: None,
+    }))
 }
 
 #[cfg(test)]
@@ -295,7 +414,7 @@ mod tests {
     fn seeded_state_reads_back_through_the_store() {
         let spec = small_spec();
         let mut reports = Vec::new();
-        let state = build(&spec, |p| reports.push(p)).unwrap();
+        let state = build_in_memory(&spec, BTreeMap::new(), |p| reports.push(p)).unwrap();
         assert_eq!(reports.len(), 3);
         assert_eq!(reports.last().unwrap().done, 25);
         assert_eq!(state.manifest.count, 25);
@@ -410,14 +529,14 @@ mod tests {
     #[test]
     fn a_seed_is_deterministic() {
         let spec = small_spec();
-        let a = build(&spec, |_| {}).unwrap();
-        let b = build(&spec, |_| {}).unwrap();
+        let a = build_in_memory(&spec, BTreeMap::new(), |_| {}).unwrap();
+        let b = build_in_memory(&spec, BTreeMap::new(), |_| {}).unwrap();
         assert_eq!(a.alloc, b.alloc);
         assert_eq!(a.manifest.state_root, b.manifest.state_root);
 
         let mut other = spec;
         other.seed = 1;
-        let c = build(&other, |_| {}).unwrap();
+        let c = build_in_memory(&other, BTreeMap::new(), |_| {}).unwrap();
         assert_ne!(a.manifest.state_root, c.manifest.state_root);
     }
 
@@ -427,10 +546,10 @@ mod tests {
     /// distinct values per attribute, well under a node's 32 keys.)
     #[test]
     fn batching_does_not_change_the_state() {
-        let one = build(&small_spec(), |_| {}).unwrap();
+        let one = build_in_memory(&small_spec(), BTreeMap::new(), |_| {}).unwrap();
         let mut spec = small_spec();
         spec.batch_size = 1000;
-        let all_at_once = build(&spec, |_| {}).unwrap();
+        let all_at_once = build_in_memory(&spec, BTreeMap::new(), |_| {}).unwrap();
         assert_eq!(one.manifest.state_root, all_at_once.manifest.state_root);
         assert_eq!(one.alloc, all_at_once.alloc);
 
@@ -446,11 +565,69 @@ mod tests {
         }
     }
 
+    /// What stays in the builder's cache between batches is the seed's shape:
+    /// the same attribute values over four times the entities leave the same
+    /// accounts cached, and no slots for the entities themselves.
+    #[test]
+    fn the_cache_holds_the_shape_not_the_size() {
+        fn last_progress(count: u64) -> Progress {
+            let mut spec = small_spec();
+            spec.count = count;
+            spec.batch_size = 50;
+            let mut last = None;
+            build_in_memory(&spec, BTreeMap::new(), |p| last = Some(p)).unwrap();
+            last.unwrap()
+        }
+        // 100 entities cover every rank (mod 100) and team; 400 add nothing.
+        let small = last_progress(100);
+        let large = last_progress(400);
+        assert_eq!(large.cached_accounts, small.cached_accounts);
+        assert_eq!(large.cached_slots, small.cached_slots);
+        assert!(small.cached_accounts < 200, "{}", small.cached_accounts);
+    }
+
+    /// The streamed dump is the in-memory alloc, account for account, with
+    /// the same root — base funding included — and refuses a funded address
+    /// the seed also writes.
+    #[test]
+    fn streaming_matches_memory() {
+        use crate::sink::test_support::read_dump;
+        let spec = small_spec();
+        let funded = Address::repeat_byte(0xF0);
+        let base: BTreeMap<Address, GenesisAccount> = [(
+            funded,
+            GenesisAccount {
+                balance: U256::from(10u64).pow(U256::from(20u64)),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect();
+        let memory = build_in_memory(&spec, base.clone(), |_| {}).unwrap();
+        assert!(memory.alloc.contains_key(&funded));
+
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("state.jsonl");
+        let mut sink = crate::sink::StreamSink::create(&dump, dir.path().join("sort")).unwrap();
+        let manifest = build(&spec, base, &mut sink, |_| {}).unwrap();
+        assert_eq!(manifest, memory.manifest);
+        let (root, alloc) = read_dump(&dump);
+        assert_eq!(root, manifest.state_root);
+        assert_eq!(alloc, memory.alloc);
+        assert_eq!(alloc.len() as u64, manifest.accounts);
+
+        let clash: BTreeMap<Address, GenesisAccount> =
+            [(SYSTEM_ACCOUNT_ADDRESS, GenesisAccount::default())]
+                .into_iter()
+                .collect();
+        assert!(build_in_memory(&spec, clash, |_| {}).is_err());
+    }
+
     /// Nonce continuity: a create after genesis mints the next key.
     #[test]
     fn the_next_create_continues_the_nonce_sequence() {
         let spec = small_spec();
-        let state = build(&spec, |_| {}).unwrap();
+        let state = build_in_memory(&spec, BTreeMap::new(), |_| {}).unwrap();
         let owner = spec.owners[0];
         let next = state.manifest.owner_nonces[&owner];
         let next_key = arkiv_reth_executor::derive_entity_address(

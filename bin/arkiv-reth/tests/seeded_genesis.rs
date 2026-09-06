@@ -19,7 +19,7 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
-use arkiv_seed::{SeedManifest, SeedSpec, export};
+use arkiv_seed::{SeedManifest, SeedSpec, StreamSink, export};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is
 /// slow, and a seeded genesis has thousands of accounts to hash first).
@@ -42,8 +42,8 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// `count` entities of `payload_size` bytes, dealt to the two dev keys,
-/// expiring at `expires_at`, plus the dev funding — the whole block-0 state.
-fn seed(count: u64, payload_size: usize, expires_at: u64) -> (SeedSpec, arkiv_seed::SeededState) {
+/// expiring at `expires_at`.
+fn seed_spec(count: u64, payload_size: usize, expires_at: u64) -> SeedSpec {
     let mut spec = SeedSpec::new(
         DEV_CHAIN_ID,
         vec![dev_address(DEV_KEY_0), dev_address(DEV_KEY_1)],
@@ -51,8 +51,15 @@ fn seed(count: u64, payload_size: usize, expires_at: u64) -> (SeedSpec, arkiv_se
     spec.count = count;
     spec.payload_size = payload_size;
     spec.expires_at = expires_at;
-    let mut state = arkiv_seed::build(&spec, |_| {}).expect("seed builds");
-    export::finish(&mut state, arkiv_genesis::genesis_alloc().unwrap()).expect("funding merges");
+    spec
+}
+
+/// The spec's entities plus the dev funding — the whole block-0 state, in
+/// memory.
+fn seed(count: u64, payload_size: usize, expires_at: u64) -> (SeedSpec, arkiv_seed::SeededState) {
+    let spec = seed_spec(count, payload_size, expires_at);
+    let state = arkiv_seed::build_in_memory(&spec, arkiv_genesis::genesis_alloc().unwrap(), |_| {})
+        .expect("seed builds");
     (spec, state)
 }
 
@@ -327,19 +334,21 @@ async fn seeded_entities_expire_and_are_purged() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn init_state_imports_a_seeded_dump_at_genesis() {
     const COUNT: u64 = 300;
-    let (spec, state) = seed(COUNT, 512, 1_000_000);
+    let spec = seed_spec(COUNT, 512, 1_000_000);
+    // The dump streams out of the builder, as it would for a seed too big to
+    // hold: the root in its first line is the one the genesis names.
     let dump = scratch("state.jsonl");
-    export::write_state_dump(
-        std::io::BufWriter::new(std::fs::File::create(&dump).unwrap()),
-        state.manifest.state_root,
-        &state.alloc,
+    let mut sink = StreamSink::create(&dump, scratch("state.sort")).unwrap();
+    let manifest = arkiv_seed::build(
+        &spec,
+        arkiv_genesis::genesis_alloc().unwrap(),
+        &mut sink,
+        |_| {},
     )
-    .unwrap();
-    let genesis = export::genesis_with_state_hash(
-        export::dev_genesis(DEV_CHAIN_ID),
-        state.manifest.state_root,
-    )
-    .unwrap();
+    .expect("seed streams");
+    let genesis =
+        export::genesis_with_state_hash(export::dev_genesis(DEV_CHAIN_ID), manifest.state_root)
+            .unwrap();
     let genesis_path = scratch("state-hash-genesis.json");
     std::fs::write(&genesis_path, genesis.to_string()).unwrap();
 
@@ -357,7 +366,7 @@ async fn init_state_imports_a_seeded_dump_at_genesis() {
     // Block 0 carries the seed's root, and the state behind it.
     assert_eq!(
         genesis_header(&client).await.state_root,
-        state.manifest.state_root
+        manifest.state_root
     );
     assert_eq!(client.entity_count(None, Some(0)).await, COUNT);
     assert_eq!(client.entity_count(None, None).await, COUNT);

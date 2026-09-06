@@ -53,13 +53,13 @@ use crate::indices::{index, interpret};
 /// [`SYSTEM_ACCOUNT_ADDRESS`] slot holding the next entity id to allocate:
 /// `keccak256("arkiv.entity_count")`. Domain-tagged to stay clear of the entity
 /// store's own bookkeeping (`nonces`, …) on the shared account.
-fn entity_count_slot() -> B256 {
+pub fn entity_count_slot() -> B256 {
     keccak256(b"arkiv.entity_count")
 }
 
 /// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `key` to its entity id (stored as
 /// `id + 1`): `keccak256("arkiv.key2id" || key)`.
-fn key_to_id_slot(key: EntityAddress) -> B256 {
+pub fn key_to_id_slot(key: EntityAddress) -> B256 {
     const DOMAIN: &[u8] = b"arkiv.key2id";
     let mut buf = [0u8; DOMAIN.len() + size_of::<EntityAddress>()];
     buf[..DOMAIN.len()].copy_from_slice(DOMAIN);
@@ -69,7 +69,7 @@ fn key_to_id_slot(key: EntityAddress) -> B256 {
 
 /// [`SYSTEM_ACCOUNT_ADDRESS`] slot mapping `entity_id` to its [`EntityAddress`]:
 /// `keccak256("arkiv.id2key" || entity_id_be)`.
-fn id_to_key_slot(entity_id: u64) -> B256 {
+pub fn id_to_key_slot(entity_id: u64) -> B256 {
     const DOMAIN: &[u8] = b"arkiv.id2key";
     let mut buf = [0u8; DOMAIN.len() + size_of::<u64>()];
     buf[..DOMAIN.len()].copy_from_slice(DOMAIN);

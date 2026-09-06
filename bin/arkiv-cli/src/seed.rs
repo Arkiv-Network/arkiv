@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use alloy_primitives::Address;
 use arkiv_genesis::{Genesis, GenesisAccount};
-use arkiv_seed::{AttributeTemplate, SeedSpec, export};
+use arkiv_seed::{AttributeTemplate, SeedSpec, StreamSink, export};
 use clap::{ArgAction, Args, ValueEnum};
 use eyre::{Result, WrapErr, bail};
 
@@ -185,16 +185,6 @@ pub fn run(args: SeedGenesisArgs) -> Result<()> {
         spec.payload_size,
         spec.owners.len()
     );
-    let started = Instant::now();
-    let mut state = arkiv_seed::build(&spec, |p| {
-        eprintln!(
-            "  {}/{} entities ({:.1} s)",
-            p.done,
-            p.total,
-            p.elapsed_ms as f64 / 1000.0
-        );
-    })?;
-
     // Base accounts: the given genesis's alloc, plus the dev funding.
     let mut base_alloc: BTreeMap<Address, GenesisAccount> = base.alloc.clone();
     if args.fund_dev_accounts {
@@ -202,47 +192,59 @@ pub fn run(args: SeedGenesisArgs) -> Result<()> {
             base_alloc.entry(address).or_insert(account);
         }
     }
-    export::finish(&mut state, base_alloc)?;
-    eprintln!(
-        "built {} accounts, state root {} ({:.1} s)",
-        state.manifest.accounts,
-        state.manifest.state_root,
-        started.elapsed().as_secs_f64()
-    );
 
+    let started = Instant::now();
+    let progress = |p: arkiv_seed::Progress| {
+        eprintln!(
+            "  {}/{} entities ({:.1} s; {} accounts, {} slots cached)",
+            p.done,
+            p.total,
+            p.elapsed_ms as f64 / 1000.0,
+            p.cached_accounts,
+            p.cached_slots
+        );
+    };
     let pretty = spec.count <= PRETTY_PRINT_LIMIT;
-    match args.format {
+    let manifest = match args.format {
         SeedFormat::Genesis => {
-            let genesis = export::genesis_with_alloc(base, state.alloc.clone());
+            let state = arkiv_seed::build_in_memory(&spec, base_alloc, progress)?;
+            let genesis = export::genesis_with_alloc(base, state.alloc);
             write_json(&args.out, &genesis, pretty)?;
+            state.manifest
         }
         SeedFormat::Alloc => {
+            let state = arkiv_seed::build_in_memory(&spec, base_alloc, progress)?;
             write_json(&args.out, &state.alloc, pretty)?;
+            state.manifest
         }
         SeedFormat::Jsonl => {
-            let file = File::create(&args.out)
-                .wrap_err_with(|| format!("create {}", args.out.display()))?;
-            export::write_state_dump(
-                BufWriter::new(file),
-                state.manifest.state_root,
-                &state.alloc,
-            )?;
+            // The dump streams out as the seed builds; the sort runs spill
+            // next to it, and are gone once the root is in its first line.
+            let mut sink = StreamSink::create(&args.out, sibling(&args.out, ".sort"))?;
+            let manifest = arkiv_seed::build(&spec, base_alloc, &mut sink, progress)?;
             let genesis_out = args
                 .genesis_out
                 .clone()
                 .unwrap_or_else(|| sibling(&args.out, ".genesis.json"));
-            let genesis = export::genesis_with_state_hash(base, state.manifest.state_root)?;
+            let genesis = export::genesis_with_state_hash(base, manifest.state_root)?;
             write_json(&genesis_out, &genesis, true)?;
             eprintln!("wrote stateHash genesis to {}", genesis_out.display());
+            manifest
         }
-    }
+    };
+    eprintln!(
+        "built {} accounts, state root {} ({:.1} s)",
+        manifest.accounts,
+        manifest.state_root,
+        started.elapsed().as_secs_f64()
+    );
     eprintln!("wrote {:?} output to {}", args.format, args.out.display());
 
     let manifest_out = args
         .manifest_out
         .clone()
         .unwrap_or_else(|| sibling(&args.out, ".manifest.json"));
-    write_json(&manifest_out, &state.manifest, true)?;
+    write_json(&manifest_out, &manifest, true)?;
     eprintln!("wrote manifest to {}", manifest_out.display());
     Ok(())
 }

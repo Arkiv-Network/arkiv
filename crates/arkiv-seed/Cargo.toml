@@ -33,8 +33,13 @@ alloy-genesis.workspace = true
 # chain spec uses, so the `stateHash` a JSONL dump advertises is exactly what
 # `--chain <file>` would derive from the equivalent alloc.
 alloy-trie.workspace = true
+# RLP for the trie leaves the streaming root builder hashes.
+alloy-rlp.workspace = true
 # revm's `CacheDB`: the in-memory base the WriteOverlay stages against.
 reth-ethereum = { workspace = true, features = ["evm"] }
 serde.workspace = true
 serde_json.workspace = true
 eyre.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

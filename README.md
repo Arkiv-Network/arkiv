@@ -85,9 +85,11 @@ arkiv-reth node --dev --chain seeded.json --http
 ARKIV_SEED_COUNT=1000 scripts/kurtosis/up.py
 
 # Beyond what a genesis file can hold in memory: a `reth init-state` dump and a
-# genesis whose `stateHash` names the imported state's root. (arkiv-reth's
-# `init-state` is reth's, made to work at block 0: reth v2.5.0 alone refuses a
-# genesis import under its default storage layout.)
+# genesis whose `stateHash` names the imported state's root. The seeder streams
+# the dump and builds the root through an on-disk sort, so its memory is
+# bounded by its batch and sort buffers, not by the seed; reth's importer
+# streams too. (arkiv-reth's `init-state` is reth's, made to work at block 0:
+# reth v2.5.0 alone refuses a genesis import under its default storage layout.)
 arkiv-cli seed-genesis --count 1000000 --format jsonl --out state.jsonl
 arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jsonl
 arkiv-reth node --dev --chain state.jsonl.genesis.json --datadir /data --http
