@@ -14,7 +14,7 @@ use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
 use arkiv_reth_executor::ARKIV_ADDRESS;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
+use arkiv_reth_mpt_committed_store::{CodeBackend, RethAuxStore, RethEntityStore};
 use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
@@ -46,6 +46,10 @@ use tracing::{debug, info, warn};
 
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
+
+/// Genesis entities folded into the pruning map per transaction during the
+/// one-time bootstrap walk.
+const GENESIS_BOOTSTRAP_BATCH: usize = 10_000;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArkivPayloadServiceBuilder;
@@ -152,6 +156,9 @@ where
         + 'static,
 {
     let _guard = pruning_map.update_guard().await;
+    if !pruning_map.genesis_bootstrapped().await? {
+        bootstrap_genesis(provider.clone(), pruning_map.clone()).await?;
+    }
     loop {
         let watermark = pruning_map.watermark().await?;
         let tip = provider
@@ -170,6 +177,87 @@ where
                 })??;
         pruning_map.apply_next(height, &entries, &removed).await?;
     }
+}
+
+/// Fold the entities present at block 0 into the map.
+///
+/// A seeded genesis holds entities no block ever created, so the replay in
+/// [`catch_up`] — which learns about entities from their operation logs —
+/// would never schedule them for purging. Walk the genesis `$all` bucket once
+/// and record every entity that still exists at the watermark, as it stands
+/// there; the replay of later blocks then keeps them current like any other.
+/// The map remembers that the walk ran, so a restart does not repeat it.
+async fn bootstrap_genesis<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
+where
+    P: StateProviderFactory + Clone + Send + Sync + 'static,
+{
+    let watermark = pruning_map.watermark().await?;
+    let map = pruning_map.clone();
+    let entities =
+        tokio::task::spawn_blocking(move || bootstrap_genesis_blocking(&provider, &map, watermark))
+            .await
+            .map_err(|error| eyre::eyre!("join genesis pruning bootstrap: {error}"))??;
+    pruning_map.mark_genesis_bootstrapped().await?;
+    info!(target: "arkiv-reth", entities, watermark, "bootstrapped the chain pruning map from genesis");
+    Ok(())
+}
+
+/// The synchronous half of [`bootstrap_genesis`]: read the genesis index and
+/// the entities at `watermark`, and upsert them in batches.
+fn bootstrap_genesis_blocking<P>(
+    provider: &P,
+    pruning_map: &ChainPruningMap,
+    watermark: u64,
+) -> eyre::Result<u64>
+where
+    P: StateProviderFactory,
+{
+    let genesis = provider
+        .history_by_block_number(0)
+        .map_err(|error| eyre::eyre!("read genesis state: {error:?}"))?;
+    let mut index = RethAuxStore::new(SnapshotAccountCode::new(genesis));
+    let all = index
+        .all_entities()
+        .map_err(|error| eyre::eyre!("read the genesis $all bucket: {error:?}"))?;
+    if all.is_empty() {
+        return Ok(0);
+    }
+    let current = provider
+        .history_by_block_number(watermark)
+        .map_err(|error| eyre::eyre!("read state at block {watermark}: {error:?}"))?;
+    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(current)));
+
+    let mut batch = Vec::with_capacity(GENESIS_BOOTSTRAP_BATCH);
+    let mut inserted = 0u64;
+    for id in all.iter() {
+        let Some(key) = index
+            .key_of_id(id)
+            .map_err(|error| eyre::eyre!("resolve genesis entity id {id}: {error:?}"))?
+        else {
+            continue;
+        };
+        if let Some(entity) = entities
+            .get(key)
+            .map_err(|error| eyre::eyre!("read genesis entity {}: {error:?}", B256::from(key)))?
+        {
+            batch.push(PruningEntry {
+                key: B256::from(key),
+                expires_at: entity.expires_at,
+                attribute_count: entity.attributes.len(),
+            });
+        }
+        if batch.len() == GENESIS_BOOTSTRAP_BATCH {
+            pruning_map.bootstrap_entries_blocking(&batch)?;
+            inserted += batch.len() as u64;
+            batch.clear();
+            info!(target: "arkiv-reth", inserted, total = all.len(), "genesis pruning bootstrap in progress");
+        }
+    }
+    if !batch.is_empty() {
+        pruning_map.bootstrap_entries_blocking(&batch)?;
+        inserted += batch.len() as u64;
+    }
+    Ok(inserted)
 }
 
 fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>

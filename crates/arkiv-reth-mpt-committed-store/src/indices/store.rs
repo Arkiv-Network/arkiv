@@ -29,19 +29,23 @@
 //! "absent" without colliding with the genuine id `0`.
 
 use core::ops::Bound;
+use std::collections::BTreeMap;
 
 use crate::entities::AccountCode;
 use crate::entities::layout::SYSTEM_ACCOUNT_ADDRESS;
 use alloy_primitives::{B256, keccak256};
-use arkiv_interfaces::entity::AttributeValue;
+use arkiv_interfaces::entity::{AttributeType, AttributeValue};
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::query::{PageParams, Query, QueryMatches, QueryStats};
 
-use crate::indices::annotation::capabilities_for;
+use crate::indices::address::pair_address;
+use crate::indices::annotation::{QueryCapabilities, capabilities_for};
 use crate::indices::bitmap::Bitmap;
 use crate::indices::delta::AuxiliaryEntityDelta;
+use crate::indices::equality_index::EqualityIndex;
 use crate::indices::error::AuxError;
 use crate::indices::range;
+use crate::indices::range_index::RangeIndex;
 use crate::indices::slot::{storage_to_u64, u64_to_storage};
 use crate::indices::storage::IndexStorage;
 use crate::indices::{index, interpret};
@@ -220,6 +224,74 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Fold **insert-only** deltas in bulk: every `(attribute, value)` pair's
+    /// bitmap is read and written once for the whole batch, instead of once per
+    /// entity as [`apply_delta`](Self::apply_delta) does.
+    ///
+    /// For an insert-only batch the resulting *pair accounts* are byte-identical
+    /// to the per-entity path: a bitmap's serialization depends only on the set
+    /// of ids it holds, and a value enters the range index exactly once, when
+    /// its bitmap first becomes non-empty. Only the range index's internal node
+    /// layout may differ, because values are recorded in `(attribute, type,
+    /// value)` order rather than in entity order. That makes this a tool for
+    /// building a *fresh* state — genesis seeding — not a replacement for the
+    /// per-block write path, whose layout is consensus.
+    ///
+    /// Entity ids are allocated in delta order, as `apply_delta` would. A delta
+    /// carrying removes is rejected with [`AuxError::BulkRemovesUnsupported`].
+    pub fn apply_inserts_bulk(
+        &mut self,
+        deltas: &[AuxiliaryEntityDelta],
+    ) -> Result<(), AuxError<E>> {
+        // (attr, typeId, index bytes) → ids, in a deterministic order. The type
+        // id is part of the key because one attribute name may hold two types,
+        // each in its own bucket.
+        let mut groups: BTreeMap<(Vec<u8>, u8, Vec<u8>), Vec<u64>> = BTreeMap::new();
+        for entity in deltas {
+            if !entity.removes.is_empty() {
+                return Err(AuxError::BulkRemovesUnsupported);
+            }
+            let entity_id = self.id_for_key(entity.entity_key)?;
+            for entry in &entity.inserts {
+                let ty = entry.value.attr_type();
+                if capabilities_for(&entry.attr, ty) == QueryCapabilities::None {
+                    continue;
+                }
+                groups
+                    .entry((entry.attr.clone(), ty.id(), entry.value.index_bytes()))
+                    .or_default()
+                    .push(entity_id);
+            }
+        }
+        for ((attr, type_id, bytes), ids) in groups {
+            let ty = AttributeType::from_id(type_id).expect("came from a real attribute type");
+            let addr = pair_address(&attr, ty, &bytes);
+            let mut bitmap = EqualityIndex::new(&mut self.backend).bucket(addr)?;
+            let was_empty = bitmap.is_empty();
+            for id in ids {
+                bitmap.insert(id);
+            }
+            self.backend
+                .set_code(addr, bitmap.to_bytes())
+                .map_err(AuxError::Backend)?;
+            if was_empty {
+                let capabilities = capabilities_for(&attr, ty);
+                RangeIndex::new(&mut self.backend).insert(&attr, ty, &bytes, capabilities)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every live entity id — the `$all` bucket, read whole.
+    pub fn all_entities(&mut self) -> Result<Bitmap, AuxError<E>> {
+        EqualityIndex::new(&mut self.backend).all_entities()
+    }
+
+    /// The key behind an entity id, or `None` if the id was never allocated.
+    pub fn key_of_id(&mut self, entity_id: u64) -> Result<Option<EntityAddress>, AuxError<E>> {
+        self.id_key(entity_id)
     }
 
     /// Same type, same bytes. Ascending.
@@ -830,6 +902,88 @@ mod tests {
         assert_eq!(store.id_key(0).unwrap(), Some(key_of(0xA0)));
         assert_eq!(store.id_key(2).unwrap(), Some(key_of(0xC0)));
         assert_eq!(store.id_key(9).unwrap(), None);
+    }
+
+    /// The bulk insert-only fold lands the same pair accounts and answers the
+    /// same queries as the per-entity path — the property genesis seeding
+    /// relies on.
+    #[test]
+    fn bulk_inserts_match_the_per_entity_path() {
+        let deltas: Vec<_> = (0..40u8)
+            .map(|i| {
+                let mut attrs = user_uint("rank", u64::from(i % 5));
+                attrs.extend(user_str("name", &format!("n{}", i % 3)));
+                attrs.extend(user_int("delta", i32::from(i) - 20));
+                create(&sample(i, i % 4, 100 + u64::from(i % 7), attrs))
+            })
+            .collect();
+
+        let mut sequential = RethAuxStore::new(MemBackend::default());
+        sequential.apply_delta(&deltas).unwrap();
+        let mut bulk = RethAuxStore::new(MemBackend::default());
+        bulk.apply_inserts_bulk(&deltas).unwrap();
+
+        // Ids allocate identically, so every pair account holds the same bytes.
+        assert_eq!(sequential.backend().code, bulk.backend().code);
+
+        let queries = [
+            Query::All,
+            owner_is(addr_of(1)),
+            Query::Gte {
+                key: AnnotKey::User("rank".into()),
+                value: word(3),
+            },
+            Query::Lt {
+                key: AnnotKey::User("delta".into()),
+                value: AnnotVal::Int(-10),
+            },
+            Query::StartsWith {
+                key: AnnotKey::User("name".into()),
+                value: AnnotVal::Str("n1".into()),
+            },
+            Query::Gt {
+                key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
+                value: word(103),
+            },
+        ];
+        for query in &queries {
+            assert_eq!(
+                matching(&mut sequential, query),
+                matching(&mut bulk, query),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_rejects_removes() {
+        let mut store = RethAuxStore::new(MemBackend::default());
+        let delete = AuxiliaryEntityDelta {
+            entity_key: key_of(1),
+            inserts: Vec::new(),
+            removes: vec![entry(ALL, AttributeValue::Str(String::new()))],
+        };
+        assert!(matches!(
+            store.apply_inserts_bulk(&[delete]),
+            Err(AuxError::BulkRemovesUnsupported)
+        ));
+    }
+
+    #[test]
+    fn all_entities_and_key_of_id_round_trip() {
+        let mut store = RethAuxStore::new(MemBackend::default());
+        apply(
+            &mut store,
+            vec![
+                create(&sample(0xA0, 1, 100, vec![])),
+                create(&sample(0xB0, 2, 100, vec![])),
+            ],
+        );
+        let all: Vec<u64> = store.all_entities().unwrap().iter().collect();
+        assert_eq!(all, vec![0, 1]);
+        assert_eq!(store.key_of_id(0).unwrap(), Some(key_of(0xA0)));
+        assert_eq!(store.key_of_id(1).unwrap(), Some(key_of(0xB0)));
+        assert_eq!(store.key_of_id(2).unwrap(), None);
     }
 
     /// A `u64` as a `u256` query bound.

@@ -10,7 +10,9 @@ name = "arkiv-reth"
 path = "src/main.rs"
 
 # The assembly point and nothing else: reth's host plus the two things Arkiv
-# replaces. Anything more than wiring belongs in one of the crates below.
+# replaces. Anything more than wiring belongs in one of the crates below. The
+# one exception is `init_state`, a re-routed reth subcommand that only makes
+# sense next to the CLI dispatch.
 
 [dependencies]
 reth.workspace = true
@@ -19,8 +21,11 @@ reth-cli-util.workspace = true
 reth-node-ethereum.workspace = true
 # `LocalPayloadAttributesBuilder` for the `--dev` miner, via the umbrella's `node` feature.
 reth-ethereum = { workspace = true, features = ["node"] }
-# `EthStorage`, the node's storage type.
+# `EthStorage`, the node's storage type; the provider traits `init_state` reads through.
 reth-storage-api.workspace = true
+# `init-state` re-routed: reth's argument struct and environment setup, and the importer itself.
+reth-cli-commands.workspace = true
+reth-db-common.workspace = true
 # The chain spec with the minimum-base-fee rule, and its `--chain` parser.
 arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
@@ -40,6 +45,9 @@ tracing.workspace = true
 # the tests build calldata with arkiv-bindings and decode EntityOperation logs.
 arkiv-harness.workspace = true
 arkiv-bindings.workspace = true
+# The seeded-genesis tests build their block-0 state in-process.
+arkiv-seed.workspace = true
+arkiv-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-signer-local.workspace = true

@@ -4,6 +4,8 @@
 
 # devnet runtime artifacts
 /data
+# seeded-genesis outputs of scripts/kurtosis/up.py
+/kurtosis/.seed/
 **/datadir
 jwt.hex
 .env

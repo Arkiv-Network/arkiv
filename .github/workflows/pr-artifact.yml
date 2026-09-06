@@ -110,3 +110,8 @@ jobs:
     uses: ./.github/workflows/kurtosis.yml
     with:
       artifact: arkiv-binaries-${{ inputs.profile || 'dev-fast' }}-${{ github.sha }}
+      # The smoke test runs on a seeded genesis: a thousand 512 B entities
+      # both nodes must serve from block 0 (the seed rides in the Kurtosis
+      # package arguments, capped at 4 MiB).
+      seed_count: "1000"
+      seed_payload_size: "512"

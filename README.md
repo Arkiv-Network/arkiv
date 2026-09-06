@@ -67,6 +67,46 @@ There is no L1/L2 or settlement-chain coordination.
 
 Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
 
+### Seeding the genesis state
+
+A devnet can start with entities already in it. `arkiv-cli seed-genesis` builds
+the block-0 state offline — synthetic entities pushed through the node's own
+executor and store code, index included — and writes it in one of three shapes:
+
+```sh
+# A genesis file with the seeded accounts in `alloc` (dev chain id 1337, dev
+# accounts funded): run it with --chain, dev mode still auto-seals on it.
+arkiv-cli seed-genesis --count 2000 --payload-size 1024 --out seeded.json
+arkiv-reth node --dev --chain seeded.json --http
+
+# The ethereum-package shape: only the seeded accounts, as
+# network_params.additional_preloaded_contracts. up.py does this for you
+# (Kurtosis caps the package arguments at 4 MiB: ~1000 entities of 512 B):
+ARKIV_SEED_COUNT=1000 scripts/kurtosis/up.py
+
+# Beyond what a genesis file can hold in memory: a `reth init-state` dump and a
+# genesis whose `stateHash` names the imported state's root. (arkiv-reth's
+# `init-state` is reth's, made to work at block 0: reth v2.5.0 alone refuses a
+# genesis import under its default storage layout.)
+arkiv-cli seed-genesis --count 1000000 --format jsonl --out state.jsonl
+arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jsonl
+arkiv-reth node --dev --chain state.jsonl.genesis.json --datadir /data --http
+```
+
+Every run writes a manifest next to its output (`<out>.manifest.json`): the
+chain id, counts, owners, the state root, the first entity keys, and each
+owner's minting nonce after genesis. Entities are dealt round-robin to the
+owners (`--owner 0x…`, repeatable; default the first dev account), keyed
+exactly as the node keys creates, so an owner's next create after genesis
+mints the next nonce's key. `--attribute name:type=expr` shapes the user
+attributes (default `rank:u256=mod(100)` and `team:str=cycle(red,green,blue)`),
+`--expires-at` sets one expiry block for all (default never); expired seeded
+entities are purged by the protocol like any other.
+
+The Kurtosis smoke test in CI runs on a seeded genesis of 1000 entities
+(`kurtosis.yml`'s `seed_count` input), and `kurtosis/integration` checks both
+nodes serve the seed from block 0.
+
 ## Development
 
 CI runs three workflows: 

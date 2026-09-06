@@ -1446,6 +1446,7 @@ dependencies = [
  "arkiv-genesis",
  "arkiv-interfaces",
  "arkiv-rpc-types",
+ "arkiv-seed",
  "clap",
  "eyre",
  "hex",
@@ -1510,15 +1511,19 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",
+ "arkiv-genesis",
  "arkiv-harness",
  "arkiv-reth-chainspec",
  "arkiv-reth-executor",
  "arkiv-reth-payload-builder",
  "arkiv-reth-rpc",
+ "arkiv-seed",
  "clap",
  "eyre",
  "reth",
+ "reth-cli-commands",
  "reth-cli-util",
+ "reth-db-common",
  "reth-ethereum",
  "reth-node-ethereum",
  "reth-storage-api",
@@ -1536,11 +1541,13 @@ dependencies = [
  "alloy-evm",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-rlp",
  "eyre",
  "reth-cli",
  "reth-ethereum",
  "reth-ethereum-cli",
  "reth-network-peers",
+ "serde",
  "serde_json",
 ]
 
@@ -1646,6 +1653,25 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "arkiv-interfaces",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "arkiv-seed"
+version = "0.2.1"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-trie",
+ "arkiv-bindings",
+ "arkiv-genesis",
+ "arkiv-interfaces",
+ "arkiv-reth-executor",
+ "arkiv-reth-mpt-committed-store",
+ "arkiv-reth-statemanager",
+ "eyre",
+ "reth-ethereum",
  "serde",
  "serde_json",
 ]

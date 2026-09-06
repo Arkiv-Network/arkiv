@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS pruning_metadata (
     up_to_date_at   INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO pruning_metadata (singleton, up_to_date_at) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS pruning_bootstrap (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+    genesis_done    INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO pruning_bootstrap (singleton, genesis_done) VALUES (1, 0);
 "#;
 
 const SELECT_EXPIRED: &str = r#"
@@ -198,6 +203,70 @@ impl ChainPruningMap {
     pub(crate) async fn update_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.update_lock.lock().await
     }
+
+    /// Whether the entities present at genesis have been folded in. They never
+    /// appear in a block, so the per-block replay cannot discover them; a
+    /// one-time walk of the genesis state does, and this records that it ran.
+    pub(crate) async fn genesis_bootstrapped(&self) -> Result<bool> {
+        let connection = self
+            .database
+            .connect()
+            .wrap_err("connect for bootstrap flag")?;
+        let mut rows = connection
+            .query(
+                "SELECT genesis_done FROM pruning_bootstrap WHERE singleton = 1",
+                (),
+            )
+            .await
+            .wrap_err("query pruning bootstrap flag")?;
+        let row = rows
+            .next()
+            .await
+            .wrap_err("read pruning bootstrap flag")?
+            .ok_or_else(|| eyre!("pruning bootstrap row is missing"))?;
+        Ok(row
+            .get::<i64>(0)
+            .wrap_err("decode pruning bootstrap flag")?
+            != 0)
+    }
+
+    /// Upsert genesis entries as one transaction, leaving the watermark alone.
+    /// Called from a blocking thread, since walking the genesis state is
+    /// synchronous provider work.
+    pub(crate) fn bootstrap_entries_blocking(&self, entries: &[PruningEntry]) -> Result<()> {
+        self.runtime.block_on(async {
+            let mut connection = self
+                .database
+                .connect()
+                .wrap_err("connect for genesis bootstrap")?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .wrap_err("begin genesis bootstrap transaction")?;
+            for entry in entries {
+                upsert(&transaction, *entry).await?;
+            }
+            transaction
+                .commit()
+                .await
+                .wrap_err("commit genesis bootstrap batch")
+        })
+    }
+
+    pub(crate) async fn mark_genesis_bootstrapped(&self) -> Result<()> {
+        let connection = self
+            .database
+            .connect()
+            .wrap_err("connect for bootstrap flag")?;
+        connection
+            .execute(
+                "UPDATE pruning_bootstrap SET genesis_done = 1 WHERE singleton = 1",
+                (),
+            )
+            .await
+            .wrap_err("record genesis bootstrap")?;
+        Ok(())
+    }
 }
 
 async fn watermark(connection: &Connection) -> Result<u64> {
@@ -296,6 +365,42 @@ mod tests {
         assert_eq!(
             select(reopened, 1, 7, 10, u64::MAX).await,
             vec![B256::repeat_byte(3), B256::repeat_byte(1)]
+        );
+    }
+
+    /// Genesis entries land without touching the watermark, and the flag that
+    /// stops the walk from repeating survives a reopen.
+    #[tokio::test]
+    async fn genesis_bootstrap_is_recorded_and_selectable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pruning.db");
+        let runtime = Handle::current();
+        let map = ChainPruningMap::open(&path, runtime.clone()).await.unwrap();
+        assert!(!map.genesis_bootstrapped().await.unwrap());
+
+        let seeded = map.clone();
+        tokio::task::spawn_blocking(move || {
+            seeded
+                .bootstrap_entries_blocking(&[entry(7, 3, 1), entry(8, 9, 1)])
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        map.mark_genesis_bootstrapped().await.unwrap();
+        assert_eq!(map.watermark().await.unwrap(), 0);
+
+        // Selectable at the (unchanged) genesis watermark, expiring in order.
+        assert_eq!(
+            select(map.clone(), 0, 3, 10, u64::MAX).await,
+            vec![B256::repeat_byte(7)]
+        );
+
+        drop(map);
+        let reopened = ChainPruningMap::open(&path, runtime).await.unwrap();
+        assert!(reopened.genesis_bootstrapped().await.unwrap());
+        assert_eq!(
+            select(reopened, 0, 9, 10, u64::MAX).await,
+            vec![B256::repeat_byte(7), B256::repeat_byte(8)]
         );
     }
 
