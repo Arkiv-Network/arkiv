@@ -363,6 +363,17 @@ async fn init_state_imports_a_seeded_dump_at_genesis() {
     let _ = std::fs::remove_file(&dump);
     let _ = std::fs::remove_file(&genesis_path);
 
+    // The import left its progress file in the datadir, finished.
+    let progress: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(node.datadir().join("init-state-progress.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(progress["phase"], "done");
+    assert_eq!(progress["percent"], 100.0);
+    assert_eq!(progress["state_root"], manifest.state_root.to_string());
+    assert_eq!(progress["write"]["accounts_total"], manifest.accounts);
+    assert!(progress["error"].is_null());
+
     // Block 0 carries the seed's root, and the state behind it.
     assert_eq!(
         genesis_header(&client).await.state_root,

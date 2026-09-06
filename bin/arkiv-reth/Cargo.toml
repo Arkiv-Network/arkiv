@@ -26,6 +26,10 @@ reth-storage-api.workspace = true
 # `init-state` re-routed: reth's argument struct and environment setup, and the importer itself.
 reth-cli-commands.workspace = true
 reth-db-common.workspace = true
+# The progress file `init-state` keeps: a tracing layer on reth's log, JSON out.
+reth-tracing.workspace = true
+serde_json.workspace = true
+alloy-primitives.workspace = true
 # The chain spec with the minimum-base-fee rule, and its `--chain` parser.
 arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
@@ -48,7 +52,6 @@ arkiv-bindings.workspace = true
 # The seeded-genesis tests build their block-0 state in-process.
 arkiv-seed.workspace = true
 arkiv-genesis.workspace = true
-alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
@@ -57,4 +60,4 @@ alloy-sol-types.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 tokio.workspace = true
-serde_json.workspace = true
+tempfile.workspace = true

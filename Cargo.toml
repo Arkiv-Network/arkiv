@@ -42,6 +42,8 @@ reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0"
 # behind it: arkiv-reth re-routes that one subcommand to make it work at genesis.
 reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+# `Layers`, to hang `init-state`'s progress layer onto reth's tracing setup.
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }

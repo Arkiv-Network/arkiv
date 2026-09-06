@@ -1,19 +1,20 @@
 //! `arkiv-cli seed-genesis`: build a pre-populated block-0 state.
 //!
 //! Wraps [`arkiv_seed`] for the command line: a spec from flags, progress on
-//! stderr, and one of three outputs — a genesis JSON for `--chain <file>`, an
+//! stderr (and in a JSON file with `--progress-file`), and one of three outputs — a genesis JSON for `--chain <file>`, an
 //! alloc-only JSON for ethereum-package's `additional_preloaded_contracts`, or
 //! a `reth init-state` JSONL dump plus its `stateHash` genesis.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use arkiv_genesis::{Genesis, GenesisAccount};
-use arkiv_seed::{AttributeTemplate, SeedSpec, StreamSink, export};
+use arkiv_seed::{AttributeTemplate, SeedManifest, SeedSpec, StreamSink, export};
 use clap::{ArgAction, Args, ValueEnum};
 use eyre::{Result, WrapErr, bail};
 
@@ -113,6 +114,96 @@ pub struct SeedGenesisArgs {
     /// Entities per executor batch.
     #[arg(long, default_value_t = arkiv_seed::DEFAULT_BATCH_SIZE)]
     pub batch_size: usize,
+
+    /// Keep a JSON progress file here, replaced about once a second, for a
+    /// watcher: `phase` (seeding, finishing, done, failed), `percent`,
+    /// entities done and total, `elapsed_s`, `updated_at` (unix seconds).
+    #[arg(long)]
+    pub progress_file: Option<PathBuf>,
+}
+
+/// How often `--progress-file` is rewritten while the seed builds.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
+/// The `--progress-file` writer: the builder's per-batch progress, throttled,
+/// as one JSON document replaced whole (written next to itself, then renamed).
+struct ProgressFile {
+    path: PathBuf,
+    started: Instant,
+    last_write: Option<Instant>,
+    last: Option<arkiv_seed::Progress>,
+    total: u64,
+}
+
+impl ProgressFile {
+    fn new(path: &Path, total: u64) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            started: Instant::now(),
+            last_write: None,
+            last: None,
+            total,
+        }
+    }
+
+    /// A batch finished; write if the last write is old enough.
+    fn tick(&mut self, progress: arkiv_seed::Progress) {
+        self.last = Some(progress);
+        let due = self
+            .last_write
+            .is_none_or(|t| t.elapsed() >= PROGRESS_EVERY);
+        if due {
+            self.write("seeding", None, None);
+        }
+    }
+
+    /// Every entity is built; the sink is finishing (leftover accounts, the
+    /// sort merge, the root).
+    fn finishing(&mut self) {
+        self.write("finishing", None, None);
+    }
+
+    fn done(&mut self, root: B256) {
+        self.write("done", Some(root), None);
+    }
+
+    fn failed(&mut self, error: &str) {
+        self.write("failed", None, Some(error));
+    }
+
+    fn write(&mut self, phase: &str, root: Option<B256>, error: Option<&str>) {
+        let done = self.last.as_ref().map_or(0, |p| p.done);
+        let percent = match phase {
+            "done" => Some(100.0),
+            "failed" => None,
+            _ if self.total == 0 => None,
+            _ => Some((done as f64 * 1000.0 / self.total as f64).round() / 10.0),
+        };
+        let updated_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let document = serde_json::json!({
+            "pid": std::process::id(),
+            "phase": phase,
+            "percent": percent,
+            "elapsed_s": (self.started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+            "updated_at": updated_at,
+            "entities_done": done,
+            "entities_total": self.total,
+            "cached_accounts": self.last.as_ref().map(|p| p.cached_accounts),
+            "cached_slots": self.last.as_ref().map(|p| p.cached_slots),
+            "state_root": root.map(|r| r.to_string()),
+            "error": error,
+        });
+        let tmp = self.path.with_extension("json.tmp");
+        let written = std::fs::write(&tmp, format!("{document:#}\n"))
+            .and_then(|_| std::fs::rename(&tmp, &self.path));
+        if let Err(e) = written {
+            eprintln!("cannot write progress file {}: {e}", self.path.display());
+        }
+        self.last_write = Some(Instant::now());
+    }
 }
 
 fn parse_expiry(s: &str) -> std::result::Result<u64, String> {
@@ -194,6 +285,11 @@ pub fn run(args: SeedGenesisArgs) -> Result<()> {
     }
 
     let started = Instant::now();
+    let progress_file = RefCell::new(
+        args.progress_file
+            .as_deref()
+            .map(|path| ProgressFile::new(path, spec.count)),
+    );
     let progress = |p: arkiv_seed::Progress| {
         eprintln!(
             "  {}/{} entities ({:.1} s; {} accounts, {} slots cached)",
@@ -203,33 +299,27 @@ pub fn run(args: SeedGenesisArgs) -> Result<()> {
             p.cached_accounts,
             p.cached_slots
         );
+        if let Some(file) = progress_file.borrow_mut().as_mut() {
+            file.tick(p);
+            if p.done == p.total {
+                file.finishing();
+            }
+        }
     };
     let pretty = spec.count <= PRETTY_PRINT_LIMIT;
-    let manifest = match args.format {
-        SeedFormat::Genesis => {
-            let state = arkiv_seed::build_in_memory(&spec, base_alloc, progress)?;
-            let genesis = export::genesis_with_alloc(base, state.alloc);
-            write_json(&args.out, &genesis, pretty)?;
-            state.manifest
-        }
-        SeedFormat::Alloc => {
-            let state = arkiv_seed::build_in_memory(&spec, base_alloc, progress)?;
-            write_json(&args.out, &state.alloc, pretty)?;
-            state.manifest
-        }
-        SeedFormat::Jsonl => {
-            // The dump streams out as the seed builds; the sort runs spill
-            // next to it, and are gone once the root is in its first line.
-            let mut sink = StreamSink::create(&args.out, sibling(&args.out, ".sort"))?;
-            let manifest = arkiv_seed::build(&spec, base_alloc, &mut sink, progress)?;
-            let genesis_out = args
-                .genesis_out
-                .clone()
-                .unwrap_or_else(|| sibling(&args.out, ".genesis.json"));
-            let genesis = export::genesis_with_state_hash(base, manifest.state_root)?;
-            write_json(&genesis_out, &genesis, true)?;
-            eprintln!("wrote stateHash genesis to {}", genesis_out.display());
+    let built = build(&args, base, base_alloc, &spec, pretty, progress);
+    let manifest = match built {
+        Ok(manifest) => {
+            if let Some(file) = progress_file.borrow_mut().as_mut() {
+                file.done(manifest.state_root);
+            }
             manifest
+        }
+        Err(e) => {
+            if let Some(file) = progress_file.borrow_mut().as_mut() {
+                file.failed(&format!("{e:#}"));
+            }
+            return Err(e);
         }
     };
     eprintln!(
@@ -247,6 +337,45 @@ pub fn run(args: SeedGenesisArgs) -> Result<()> {
     write_json(&manifest_out, &manifest, true)?;
     eprintln!("wrote manifest to {}", manifest_out.display());
     Ok(())
+}
+
+/// Build the seed in the asked-for shape and write it.
+fn build(
+    args: &SeedGenesisArgs,
+    base: Genesis,
+    base_alloc: BTreeMap<Address, GenesisAccount>,
+    spec: &SeedSpec,
+    pretty: bool,
+    progress: impl FnMut(arkiv_seed::Progress),
+) -> Result<SeedManifest> {
+    let manifest = match args.format {
+        SeedFormat::Genesis => {
+            let state = arkiv_seed::build_in_memory(spec, base_alloc, progress)?;
+            let genesis = export::genesis_with_alloc(base, state.alloc);
+            write_json(&args.out, &genesis, pretty)?;
+            state.manifest
+        }
+        SeedFormat::Alloc => {
+            let state = arkiv_seed::build_in_memory(spec, base_alloc, progress)?;
+            write_json(&args.out, &state.alloc, pretty)?;
+            state.manifest
+        }
+        SeedFormat::Jsonl => {
+            // The dump streams out as the seed builds; the sort runs spill
+            // next to it, and are gone once the root is in its first line.
+            let mut sink = StreamSink::create(&args.out, sibling(&args.out, ".sort"))?;
+            let manifest = arkiv_seed::build(spec, base_alloc, &mut sink, progress)?;
+            let genesis_out = args
+                .genesis_out
+                .clone()
+                .unwrap_or_else(|| sibling(&args.out, ".genesis.json"));
+            let genesis = export::genesis_with_state_hash(base, manifest.state_root)?;
+            write_json(&genesis_out, &genesis, true)?;
+            eprintln!("wrote stateHash genesis to {}", genesis_out.display());
+            manifest
+        }
+    };
+    Ok(manifest)
 }
 
 fn write_json<T: serde::Serialize>(path: &Path, value: &T, pretty: bool) -> Result<()> {

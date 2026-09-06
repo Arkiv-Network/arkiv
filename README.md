@@ -95,6 +95,16 @@ arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jso
 arkiv-reth node --dev --chain state.jsonl.genesis.json --datadir /data --http
 ```
 
+Both long-running steps keep a progress file for a watcher, replaced whole
+about once a second: `seed-genesis --progress-file <path>`, and `init-state`
+always, at `<datadir>/init-state-progress.json` (or `$ARKIV_INIT_STATE_PROGRESS`).
+Each is one JSON document with `pid`, `phase`, `percent` of the current phase,
+`elapsed_s`, `updated_at` (unix seconds; stale for more than a few seconds
+means the process is gone), the counters behind the percent, and at the end
+`state_root` or `error`. The import's phases are `parsing` (bytes of the dump
+read), `writing` (accounts written of the total) and `hashing` (the root
+walk's position in the hashed key space), then `done` or `failed`.
+
 Every run writes a manifest next to its output (`<out>.manifest.json`): the
 chain id, counts, owners, the state root, the first entity keys, and each
 owner's minting nonce after genesis. Entities are dealt round-robin to the

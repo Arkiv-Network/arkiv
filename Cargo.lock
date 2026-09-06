@@ -1527,7 +1527,9 @@ dependencies = [
  "reth-ethereum",
  "reth-node-ethereum",
  "reth-storage-api",
+ "reth-tracing",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

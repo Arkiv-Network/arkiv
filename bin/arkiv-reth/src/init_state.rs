@@ -22,9 +22,17 @@
 //! is reth's: the same arguments, the same environment setup, the same
 //! importer and the same root check. `--without-evm` (a snapshot at a later
 //! block) is handed straight to reth.
+//!
+//! One more thing on top: an import of a large dump runs for hours, and reth
+//! reports on it only through its log. The override keeps a progress file
+//! (`<datadir>/init-state-progress.json`, or `$ARKIV_INIT_STATE_PROGRESS`)
+//! rewritten every second, for a watcher to read. See [`progress`].
+
+mod progress;
 
 use crate::node::ArkivNode;
 use arkiv_reth_chainspec::ArkivChainSpecParser;
+use progress::Progress;
 use reth::CliRunner;
 use reth::args::LogArgs;
 use reth::chainspec::EthChainSpec;
@@ -34,21 +42,50 @@ use reth_cli_commands::common::{AccessRights, Environment};
 use reth_cli_commands::init_state::InitStateCommand;
 use reth_db_common::init::init_from_state_dump;
 use reth_storage_api::{BlockNumReader, DatabaseProviderFactory, StorageSettingsCache};
+use reth_tracing::Layers;
 use std::fs::File;
 use std::io::BufReader;
+use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
 
+/// Names the progress file; without it the file sits in the datadir.
+const PROGRESS_ENV: &str = "ARKIV_INIT_STATE_PROGRESS";
+/// The progress file's name in the datadir.
+const PROGRESS_FILE: &str = "init-state-progress.json";
+/// How often the progress file is rewritten.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
 /// Run the parsed command: tracing and a runtime as reth sets them up for its
-/// blocking commands, then [`execute`].
+/// blocking commands, with the progress layer listening in, then [`execute`].
 pub fn run(command: InitStateCommand<ArkivChainSpecParser>, mut logs: LogArgs) -> eyre::Result<()> {
     let runner = CliRunner::try_default_runtime()?;
     // Per-network log directory, as reth's CLI does for every command.
     logs.log_file_directory = logs
         .log_file_directory
         .join(command.env.chain.chain().to_string());
-    let _guards = logs.init_tracing()?;
+    // The importer reports through its log; the progress file follows it.
+    let progress = Progress::new(&command.state)?;
+    let mut layers = Layers::new();
+    layers.add_layer(progress.layer());
+    let _guards = logs.init_tracing_with_layers(layers, false)?;
     let runtime = runner.runtime();
-    runner.run_blocking_until_ctrl_c(execute(command, runtime))
+    runner.run_blocking_until_ctrl_c(execute(command, runtime, progress))
+}
+
+/// Where the progress file goes: `$ARKIV_INIT_STATE_PROGRESS`, else the
+/// datadir.
+fn progress_path(command: &InitStateCommand<ArkivChainSpecParser>) -> PathBuf {
+    if let Some(path) = std::env::var_os(PROGRESS_ENV) {
+        return PathBuf::from(path);
+    }
+    command
+        .env
+        .datadir
+        .clone()
+        .resolve_datadir(command.env.chain.chain())
+        .data_dir()
+        .join(PROGRESS_FILE)
 }
 
 /// reth's `InitStateCommand::execute`, with the genesis changesets cleared
@@ -56,12 +93,36 @@ pub fn run(command: InitStateCommand<ArkivChainSpecParser>, mut logs: LogArgs) -
 async fn execute(
     command: InitStateCommand<ArkivChainSpecParser>,
     runtime: Runtime,
+    progress: Progress,
 ) -> eyre::Result<()> {
     if command.without_evm {
         // A snapshot at a later block: reth's path, untouched.
         return command.execute::<ArkivNode>(runtime).await;
     }
     info!(target: "reth::cli", "Reth init-state starting");
+    let progress_path = progress_path(&command);
+    info!(target: "arkiv-reth", path = %progress_path.display(), "progress file");
+    // Writes until dropped, which is after the outcome is recorded below.
+    let _writer = progress.spawn_writer(progress_path, PROGRESS_EVERY);
+    match import(command, runtime, &progress) {
+        Ok(hash) => {
+            progress.finish(hash);
+            Ok(())
+        }
+        Err(e) => {
+            progress.fail(&e);
+            Err(e)
+        }
+    }
+}
+
+/// Open the datadir, clear the genesis changesets if the import targets
+/// genesis, and stream the dump in. Returns the hash of the block written.
+fn import(
+    command: InitStateCommand<ArkivChainSpecParser>,
+    runtime: Runtime,
+    progress: &Progress,
+) -> eyre::Result<alloy_primitives::B256> {
     let genesis_alloc_empty = command.env.chain.genesis().alloc.is_empty();
     let Environment {
         config,
@@ -73,10 +134,10 @@ async fn execute(
     }
 
     info!(target: "reth::cli", "Initiating state dump");
-    let reader = BufReader::new(File::open(&command.state)?);
+    let reader = progress.reader(BufReader::new(File::open(&command.state)?));
     let hash = init_from_state_dump(reader, &provider_factory, config.stages.etl)?;
     info!(target: "reth::cli", hash = ?hash, "Genesis block written");
-    Ok(())
+    Ok(hash)
 }
 
 /// Delete the account and storage changeset static files when they hold
