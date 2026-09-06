@@ -296,7 +296,7 @@ async fn upsert(transaction: &Transaction<'_>, entry: PruningEntry) -> Result<()
                  attribute_count = excluded.attribute_count",
             turso::params![
                 entry.key.as_slice(),
-                sql_integer(entry.expires_at, "expiry")?,
+                sql_expiry(entry.expires_at),
                 i64::try_from(entry.attribute_count)
                     .wrap_err("attribute count exceeds SQLite INTEGER")?
             ],
@@ -308,6 +308,13 @@ async fn upsert(transaction: &Transaction<'_>, entry: PruningEntry) -> Result<()
 
 fn sql_integer(value: u64, name: &str) -> Result<i64> {
     i64::try_from(value).wrap_err_with(|| format!("{name} exceeds SQLite INTEGER"))
+}
+
+/// An expiry past `i64::MAX` (an entity that never expires is `u64::MAX`) is
+/// stored saturated: no chain reaches that height, so the row is kept for
+/// later updates but never selected.
+fn sql_expiry(expires_at: u64) -> i64 {
+    i64::try_from(expires_at).unwrap_or(i64::MAX)
 }
 
 fn key_from_blob(bytes: Vec<u8>) -> Result<B256> {
@@ -365,6 +372,32 @@ mod tests {
         assert_eq!(
             select(reopened, 1, 7, 10, u64::MAX).await,
             vec![B256::repeat_byte(3), B256::repeat_byte(1)]
+        );
+    }
+
+    /// An entity that never expires (`u64::MAX`, the seeder's default) is
+    /// stored rather than rejected, and is never selected; a later finite
+    /// expiry on the same entity still replaces it.
+    #[tokio::test]
+    async fn a_never_expiring_entry_is_kept_but_never_selected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pruning.db");
+        let map = ChainPruningMap::open(&path, Handle::current())
+            .await
+            .unwrap();
+        map.apply_next(1, &[entry(5, u64::MAX, 0)], &[])
+            .await
+            .unwrap();
+        assert!(
+            select(map.clone(), 1, (i64::MAX - 1) as u64, 10, u64::MAX)
+                .await
+                .is_empty()
+        );
+
+        map.apply_next(2, &[entry(5, 3, 0)], &[]).await.unwrap();
+        assert_eq!(
+            select(map.clone(), 2, 3, 10, u64::MAX).await,
+            vec![B256::repeat_byte(5)]
         );
     }
 
