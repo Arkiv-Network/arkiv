@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256};
@@ -115,9 +117,10 @@ pub struct SeedGenesisArgs {
     #[arg(long, default_value_t = arkiv_seed::DEFAULT_BATCH_SIZE)]
     pub batch_size: usize,
 
-    /// Keep a JSON progress file here, replaced about once a second, for a
-    /// watcher: `phase` (seeding, finishing, done, failed), `percent`,
-    /// entities done and total, `elapsed_s`, `updated_at` (unix seconds).
+    /// Keep a JSON progress file here, replaced about once a second (also
+    /// while finishing, when nothing else moves), for a watcher: `phase`
+    /// (seeding, finishing, done, failed), `percent`, entities done and
+    /// total, `elapsed_s`, `updated_at` (unix seconds).
     #[arg(long)]
     pub progress_file: Option<PathBuf>,
 }
@@ -127,28 +130,49 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 
 /// The `--progress-file` writer: the builder's per-batch progress, throttled,
 /// as one JSON document replaced whole (written next to itself, then renamed).
+///
+/// A watcher takes a file that stops moving for a process that is gone, so
+/// the finishing phase (leftover accounts, the sort merge, the root: tens of
+/// seconds at 10M entities, with no batches to report) keeps a heartbeat
+/// thread rewriting the same document until `done` or `failed`.
 struct ProgressFile {
+    document: ProgressDocument,
+    last_write: Option<Instant>,
+    heartbeat: Option<Heartbeat>,
+}
+
+/// What a write needs; the heartbeat thread carries its own copy.
+#[derive(Clone)]
+struct ProgressDocument {
     path: PathBuf,
     started: Instant,
-    last_write: Option<Instant>,
     last: Option<arkiv_seed::Progress>,
     total: u64,
+}
+
+struct Heartbeat {
+    /// Dropping it wakes the thread, which then exits.
+    stop: Sender<()>,
+    thread: JoinHandle<()>,
 }
 
 impl ProgressFile {
     fn new(path: &Path, total: u64) -> Self {
         Self {
-            path: path.to_path_buf(),
-            started: Instant::now(),
+            document: ProgressDocument {
+                path: path.to_path_buf(),
+                started: Instant::now(),
+                last: None,
+                total,
+            },
             last_write: None,
-            last: None,
-            total,
+            heartbeat: None,
         }
     }
 
     /// A batch finished; write if the last write is old enough.
     fn tick(&mut self, progress: arkiv_seed::Progress) {
-        self.last = Some(progress);
+        self.document.last = Some(progress);
         let due = self
             .last_write
             .is_none_or(|t| t.elapsed() >= PROGRESS_EVERY);
@@ -158,20 +182,48 @@ impl ProgressFile {
     }
 
     /// Every entity is built; the sink is finishing (leftover accounts, the
-    /// sort merge, the root).
+    /// sort merge, the root). Starts the heartbeat.
     fn finishing(&mut self) {
         self.write("finishing", None, None);
+        if self.heartbeat.is_some() {
+            return;
+        }
+        let (stop, stopped) = mpsc::channel::<()>();
+        let document = self.document.clone();
+        let thread = std::thread::spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(PROGRESS_EVERY) {
+                document.write("finishing", None, None);
+            }
+        });
+        self.heartbeat = Some(Heartbeat { stop, thread });
     }
 
     fn done(&mut self, root: B256) {
+        self.stop_heartbeat();
         self.write("done", Some(root), None);
     }
 
     fn failed(&mut self, error: &str) {
+        self.stop_heartbeat();
         self.write("failed", None, Some(error));
     }
 
+    /// Ends the heartbeat before a terminal write, so nothing overwrites it.
+    fn stop_heartbeat(&mut self) {
+        if let Some(Heartbeat { stop, thread }) = self.heartbeat.take() {
+            drop(stop);
+            let _ = thread.join();
+        }
+    }
+
     fn write(&mut self, phase: &str, root: Option<B256>, error: Option<&str>) {
+        self.document.write(phase, root, error);
+        self.last_write = Some(Instant::now());
+    }
+}
+
+impl ProgressDocument {
+    fn write(&self, phase: &str, root: Option<B256>, error: Option<&str>) {
         let done = self.last.as_ref().map_or(0, |p| p.done);
         let percent = match phase {
             "done" => Some(100.0),
@@ -202,7 +254,6 @@ impl ProgressFile {
         if let Err(e) = written {
             eprintln!("cannot write progress file {}: {e}", self.path.display());
         }
-        self.last_write = Some(Instant::now());
     }
 }
 
@@ -389,4 +440,47 @@ fn write_json<T: serde::Serialize>(path: &Path, value: &T, pretty: bool) -> Resu
     out.write_all(b"\n")?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn finishing_keeps_the_progress_file_moving() {
+        let dir = std::env::temp_dir().join(format!("seed-progress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("progress.json");
+        let mut file = ProgressFile::new(&path, 10);
+        file.tick(arkiv_seed::Progress {
+            done: 10,
+            total: 10,
+            elapsed_ms: 1,
+            cached_accounts: 0,
+            cached_slots: 0,
+        });
+        file.finishing();
+        let first = read(&path);
+        assert_eq!(first["phase"], "finishing");
+        assert_eq!(first["percent"], 100.0);
+
+        // With nothing else happening the heartbeat rewrites it.
+        std::thread::sleep(PROGRESS_EVERY * 2 + Duration::from_millis(200));
+        let later = read(&path);
+        assert_eq!(later["phase"], "finishing");
+        assert!(later["updated_at"].as_f64() > first["updated_at"].as_f64());
+
+        // The terminal write is the last one.
+        file.done(B256::ZERO);
+        assert!(file.heartbeat.is_none());
+        let done = read(&path);
+        assert_eq!(done["phase"], "done");
+        std::thread::sleep(PROGRESS_EVERY + Duration::from_millis(200));
+        assert_eq!(read(&path), done);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
