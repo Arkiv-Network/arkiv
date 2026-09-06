@@ -24,8 +24,6 @@ arkiv-reth-mpt-committed-store.workspace = true
 # `Ident32` — attribute-name validation, so a seed never writes a name the
 # node's decoder would have refused.
 arkiv-bindings.workspace = true
-# The dev-funding alloc merged into every seeded genesis by default.
-arkiv-genesis.workspace = true
 
 alloy-primitives.workspace = true
 alloy-genesis.workspace = true

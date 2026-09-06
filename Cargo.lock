@@ -1668,7 +1668,6 @@ dependencies = [
  "alloy-rlp",
  "alloy-trie",
  "arkiv-bindings",
- "arkiv-genesis",
  "arkiv-interfaces",
  "arkiv-reth-executor",
  "arkiv-reth-mpt-committed-store",
