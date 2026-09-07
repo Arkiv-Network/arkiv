@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS pruning_bootstrap (
     genesis_done    INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO pruning_bootstrap (singleton, genesis_done) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS pruning_bootstrap_cursor (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+    next_id         INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO pruning_bootstrap_cursor (singleton, next_id) VALUES (1, 0);
 "#;
 
 const SELECT_EXPIRED: &str = r#"
@@ -230,27 +235,58 @@ impl ChainPruningMap {
             != 0)
     }
 
-    /// Upsert genesis entries as one transaction, leaving the watermark alone.
-    /// Called from a blocking thread, since walking the genesis state is
-    /// synchronous provider work.
-    pub(crate) fn bootstrap_entries_blocking(&self, entries: &[PruningEntry]) -> Result<()> {
+    /// Where an unfinished genesis walk resumes: the first entity id it has
+    /// not folded in yet. Zero before the walk starts.
+    pub(crate) fn genesis_cursor_blocking(&self) -> Result<u64> {
         self.runtime.block_on(async {
-            let mut connection = self
+            let connection = self
                 .database
                 .connect()
-                .wrap_err("connect for genesis bootstrap")?;
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .wrap_err("connect for bootstrap cursor")?;
+            let mut rows = connection
+                .query(
+                    "SELECT next_id FROM pruning_bootstrap_cursor WHERE singleton = 1",
+                    (),
+                )
                 .await
-                .wrap_err("begin genesis bootstrap transaction")?;
-            for entry in entries {
-                upsert(&transaction, *entry).await?;
-            }
-            transaction
-                .commit()
+                .wrap_err("query pruning bootstrap cursor")?;
+            let row = rows
+                .next()
                 .await
-                .wrap_err("commit genesis bootstrap batch")
+                .wrap_err("read pruning bootstrap cursor")?
+                .ok_or_else(|| eyre!("pruning bootstrap cursor row is missing"))?;
+            let value = row
+                .get::<i64>(0)
+                .wrap_err("decode pruning bootstrap cursor")?;
+            u64::try_from(value).wrap_err("pruning bootstrap cursor is negative")
         })
+    }
+
+    /// A writer for the genesis walk: one connection kept for the whole walk.
+    /// Called from a blocking thread, since walking the genesis state is
+    /// synchronous provider work.
+    pub(crate) fn genesis_bootstrap_writer_blocking(&self) -> Result<GenesisBootstrapWriter> {
+        let connection = self
+            .database
+            .connect()
+            .wrap_err("connect for genesis bootstrap")?;
+        Ok(GenesisBootstrapWriter {
+            connection,
+            runtime: self.runtime.clone(),
+        })
+    }
+
+    /// Upsert genesis entries and move the walk's cursor to `next_id` as one
+    /// transaction, over a writer used once.
+    /// [`Self::genesis_bootstrap_writer_blocking`] is for the walk itself.
+    #[cfg(test)]
+    pub(crate) fn bootstrap_entries_blocking(
+        &self,
+        entries: &[PruningEntry],
+        next_id: u64,
+    ) -> Result<()> {
+        self.genesis_bootstrap_writer_blocking()?
+            .write_blocking(&mut entries.to_vec(), next_id)
     }
 
     pub(crate) async fn mark_genesis_bootstrapped(&self) -> Result<()> {
@@ -266,6 +302,53 @@ impl ChainPruningMap {
             .await
             .wrap_err("record genesis bootstrap")?;
         Ok(())
+    }
+}
+
+/// The genesis walk's connection; see
+/// [`ChainPruningMap::genesis_bootstrap_writer_blocking`].
+pub(crate) struct GenesisBootstrapWriter {
+    connection: Connection,
+    runtime: Handle,
+}
+
+impl GenesisBootstrapWriter {
+    /// Upsert `entries` and move the walk's cursor to `next_id` as one
+    /// transaction, leaving the watermark alone. The entries are sorted by key
+    /// first, so the transaction walks the B-tree once, in order.
+    ///
+    /// Genesis keys are hashes, so a batch touches about as many leaf pages as
+    /// it has rows, up to the whole table, and the commit writes every touched
+    /// page out again. The cost of a commit is therefore nearly the same for a
+    /// batch of a hundred thousand rows as for one of a million: callers
+    /// should make them large.
+    pub(crate) fn write_blocking(
+        &mut self,
+        entries: &mut [PruningEntry],
+        next_id: u64,
+    ) -> Result<()> {
+        entries.sort_unstable_by_key(|entry| entry.key);
+        self.runtime.block_on(async {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .wrap_err("begin genesis bootstrap transaction")?;
+            for entry in entries.iter() {
+                upsert(&transaction, *entry).await?;
+            }
+            transaction
+                .execute(
+                    "UPDATE pruning_bootstrap_cursor SET next_id = ?1 WHERE singleton = 1",
+                    turso::params![sql_integer(next_id, "bootstrap cursor")?],
+                )
+                .await
+                .wrap_err("advance genesis bootstrap cursor")?;
+            transaction
+                .commit()
+                .await
+                .wrap_err("commit genesis bootstrap batch")
+        })
     }
 }
 
@@ -414,7 +497,7 @@ mod tests {
         let seeded = map.clone();
         tokio::task::spawn_blocking(move || {
             seeded
-                .bootstrap_entries_blocking(&[entry(7, 3, 1), entry(8, 9, 1)])
+                .bootstrap_entries_blocking(&[entry(7, 3, 1), entry(8, 9, 1)], 2)
                 .unwrap();
         })
         .await
@@ -437,6 +520,45 @@ mod tests {
         );
     }
 
+    /// A walk interrupted part-way (a restart, or reth timing out the read
+    /// transaction) resumes where its last committed batch left off: the
+    /// cursor travels in the batch's transaction and survives a reopen.
+    #[tokio::test]
+    async fn genesis_bootstrap_cursor_moves_with_each_batch_and_survives_a_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pruning.db");
+        let runtime = Handle::current();
+        let map = ChainPruningMap::open(&path, runtime.clone()).await.unwrap();
+        let cursor = |map: ChainPruningMap| async move {
+            tokio::task::spawn_blocking(move || map.genesis_cursor_blocking().unwrap())
+                .await
+                .unwrap()
+        };
+        assert_eq!(cursor(map.clone()).await, 0);
+
+        let seeded = map.clone();
+        tokio::task::spawn_blocking(move || {
+            seeded
+                .bootstrap_entries_blocking(&[entry(1, 5, 0)], 40)
+                .unwrap();
+            seeded
+                .bootstrap_entries_blocking(&[entry(2, 5, 0)], 90)
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(cursor(map.clone()).await, 90);
+        assert!(!map.genesis_bootstrapped().await.unwrap());
+
+        drop(map);
+        let reopened = ChainPruningMap::open(&path, runtime).await.unwrap();
+        assert_eq!(cursor(reopened.clone()).await, 90);
+        assert_eq!(
+            select(reopened, 0, 5, 10, u64::MAX).await,
+            vec![B256::repeat_byte(1), B256::repeat_byte(2)]
+        );
+    }
+
     #[tokio::test]
     async fn reschedules_removes_and_enforces_the_gas_limit() {
         let directory = tempfile::tempdir().unwrap();
@@ -455,5 +577,58 @@ mod tests {
             select(map, 2, 5, 10, 170_000).await,
             vec![B256::repeat_byte(2)]
         );
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    fn entries(from: u64, count: usize) -> Vec<PruningEntry> {
+        (from..from + count as u64)
+            .map(|i| PruningEntry {
+                key: alloy_primitives::keccak256(i.to_be_bytes()),
+                expires_at: u64::MAX,
+                attribute_count: 3,
+            })
+            .collect()
+    }
+
+    /// `BENCH_PREFILL=4000000 cargo test -p arkiv-reth-payload-builder bench_bootstrap_batch --release -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_bootstrap_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pruning.db");
+        let map = ChainPruningMap::open(&path, Handle::current())
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut writer = map.genesis_bootstrap_writer_blocking().unwrap();
+            // Grow the table first: a fresh table hides the page-in cost.
+            let prefill: usize = std::env::var("BENCH_PREFILL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2_000_000);
+            let mut rows = entries(1_000_000_000, prefill);
+            let started = std::time::Instant::now();
+            for chunk in rows.chunks_mut(80_000) {
+                writer.write_blocking(chunk, 0).unwrap();
+            }
+            eprintln!("prefill of {prefill} rows in {:?}", started.elapsed());
+            let mut small = entries(0, 80_000);
+            let started = std::time::Instant::now();
+            writer.write_blocking(&mut small, 80_000).unwrap();
+            eprintln!(
+                "80k upserts into a {prefill}-row table in {:?}",
+                started.elapsed()
+            );
+            let mut big = entries(2_000_000_000, 1_000_000);
+            let started = std::time::Instant::now();
+            writer.write_blocking(&mut big, 80_000).unwrap();
+            eprintln!("1M upserts into the same table in {:?}", started.elapsed());
+        })
+        .await
+        .unwrap();
     }
 }

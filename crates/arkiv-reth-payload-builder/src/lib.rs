@@ -50,6 +50,15 @@ const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c
 /// Genesis entities folded into the pruning map per transaction during the
 /// one-time bootstrap walk.
 const GENESIS_BOOTSTRAP_BATCH: usize = 10_000;
+/// Chunks resolved at once, each on its own thread with its own snapshots.
+/// The reads are random pages of a state far larger than memory, so a worker
+/// mostly waits on one page fault at a time; the count is what keeps the disk
+/// busy, not the cores (capped by the cores available all the same).
+const GENESIS_BOOTSTRAP_WORKERS: usize = 32;
+/// Entries committed to the map per transaction. Genesis keys are hashes, so
+/// a commit rewrites about one leaf page per row up to the whole table
+/// however small the batch; large batches keep that amplification down.
+const GENESIS_BOOTSTRAP_ROWS_PER_COMMIT: usize = 1_000_000;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArkivPayloadServiceBuilder;
@@ -184,52 +193,142 @@ where
 /// A seeded genesis holds entities no block ever created, so the replay in
 /// [`catch_up`] — which learns about entities from their operation logs —
 /// would never schedule them for purging. Walk the genesis `$all` bucket once
-/// and record every entity that still exists at the watermark, as it stands
-/// there; the replay of later blocks then keeps them current like any other.
-/// The map remembers that the walk ran, so a restart does not repeat it.
+/// and record every entity that still exists, as it stands; the replay of the
+/// blocks after the watermark then keeps them current like any other. The map
+/// remembers that the walk ran, so a restart does not repeat it, and how far
+/// it got, so an interrupted walk resumes.
 async fn bootstrap_genesis<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
 where
     P: StateProviderFactory + Clone + Send + Sync + 'static,
 {
     let watermark = pruning_map.watermark().await?;
     let map = pruning_map.clone();
-    let entities =
-        tokio::task::spawn_blocking(move || bootstrap_genesis_blocking(&provider, &map, watermark))
-            .await
-            .map_err(|error| eyre::eyre!("join genesis pruning bootstrap: {error}"))??;
+    let entities = tokio::task::spawn_blocking(move || bootstrap_genesis_blocking(&provider, &map))
+        .await
+        .map_err(|error| eyre::eyre!("join genesis pruning bootstrap: {error}"))??;
     pruning_map.mark_genesis_bootstrapped().await?;
     info!(target: "arkiv-reth", entities, watermark, "bootstrapped the chain pruning map from genesis");
     Ok(())
 }
 
-/// The synchronous half of [`bootstrap_genesis`]: read the genesis index and
-/// the entities at `watermark`, and upsert them in batches.
-fn bootstrap_genesis_blocking<P>(
-    provider: &P,
-    pruning_map: &ChainPruningMap,
-    watermark: u64,
-) -> eyre::Result<u64>
+/// The synchronous half of [`bootstrap_genesis`]: read the genesis `$all`
+/// bucket, then resolve the entities as they stand now in chunks and upsert
+/// them batch by batch, moving the map's cursor with each batch (see
+/// [`resolve_genesis_entities`] for why now rather than at the watermark).
+///
+/// Every chunk opens its own state snapshots. reth aborts a read transaction
+/// held open past its limit (five minutes by default), and one snapshot over
+/// a walk of tens of millions of entities would take hours, failing part-way
+/// and starting over on the next attempt. The cursor makes an interrupted
+/// walk (a restart, or such a failure) resume where it stopped; upserts make
+/// a repeated batch harmless. Chunks are resolved on a few threads at once,
+/// since each is independent provider reads.
+fn bootstrap_genesis_blocking<P>(provider: &P, pruning_map: &ChainPruningMap) -> eyre::Result<u64>
 where
-    P: StateProviderFactory,
+    P: StateProviderFactory + Sync,
 {
-    let genesis = provider
-        .history_by_block_number(0)
-        .map_err(|error| eyre::eyre!("read genesis state: {error:?}"))?;
-    let mut index = RethAuxStore::new(SnapshotAccountCode::new(genesis));
-    let all = index
-        .all_entities()
-        .map_err(|error| eyre::eyre!("read the genesis $all bucket: {error:?}"))?;
+    let all = {
+        let genesis = provider
+            .history_by_block_number(0)
+            .map_err(|error| eyre::eyre!("read genesis state: {error:?}"))?;
+        let mut index = RethAuxStore::new(SnapshotAccountCode::new(genesis));
+        index
+            .all_entities()
+            .map_err(|error| eyre::eyre!("read the genesis $all bucket: {error:?}"))?
+    };
     if all.is_empty() {
         return Ok(0);
     }
-    let current = provider
-        .history_by_block_number(watermark)
-        .map_err(|error| eyre::eyre!("read state at block {watermark}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(current)));
+    let total = all.len();
+    let next_id = pruning_map.genesis_cursor_blocking()?;
+    if next_id > 0 {
+        info!(target: "arkiv-reth", next_id, total, "resuming the genesis pruning bootstrap");
+    }
+    let mut writer = pruning_map.genesis_bootstrap_writer_blocking()?;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, GENESIS_BOOTSTRAP_WORKERS);
 
-    let mut batch = Vec::with_capacity(GENESIS_BOOTSTRAP_BATCH);
+    let mut ids = all.iter().filter(|id| *id >= next_id).peekable();
     let mut inserted = 0u64;
-    for id in all.iter() {
+    let mut pending: Vec<PruningEntry> = Vec::with_capacity(GENESIS_BOOTSTRAP_ROWS_PER_COMMIT);
+    let mut resolving = std::time::Duration::ZERO;
+    while ids.peek().is_some() {
+        let chunks: Vec<Vec<u64>> = (0..workers)
+            .map(|_| ids.by_ref().take(GENESIS_BOOTSTRAP_BATCH).collect())
+            .filter(|chunk: &Vec<u64>| !chunk.is_empty())
+            .collect();
+        // Ids come out ascending, so the window's last id bounds everything done.
+        let last = *chunks
+            .last()
+            .and_then(|chunk| chunk.last())
+            .expect("a non-empty window");
+        let started = Instant::now();
+        let resolved = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|chunk| scope.spawn(move || resolve_genesis_entities(provider, chunk)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| eyre::eyre!("a genesis pruning bootstrap worker panicked"))?
+                })
+                .collect::<eyre::Result<Vec<Vec<PruningEntry>>>>()
+        })?;
+        pending.extend(resolved.into_iter().flatten());
+        resolving += started.elapsed();
+        if pending.len() < GENESIS_BOOTSTRAP_ROWS_PER_COMMIT && ids.peek().is_some() {
+            continue;
+        }
+        let started = Instant::now();
+        writer.write_blocking(&mut pending, last + 1)?;
+        inserted += pending.len() as u64;
+        info!(
+            target: "arkiv-reth",
+            inserted,
+            next_id = last + 1,
+            total,
+            resolve_ms = resolving.as_millis(),
+            write_ms = started.elapsed().as_millis(),
+            "genesis pruning bootstrap in progress"
+        );
+        pending.clear();
+        resolving = std::time::Duration::ZERO;
+    }
+    Ok(inserted)
+}
+
+/// The pruning entries of the genesis entities `ids` as they stand now, over
+/// a snapshot of the latest state opened for just this call. An id whose
+/// entity is gone by then is skipped.
+///
+/// The latest state, not the state at `watermark`: a historical read takes a
+/// `RocksDB` snapshot and reads the chain tip for every account and slot,
+/// which serialises the workers and costs more than the reads themselves.
+/// Reading past the watermark is harmless here. The blocks between it and the
+/// tip are replayed after the walk, and that replay records each entity's
+/// expiry as an absolute value and removals as removals, so whatever this
+/// walk saw is overwritten by the same facts. An entity the walk finds
+/// already gone is one the replay removes again, and an id whose key is gone
+/// was never allocated to anything else.
+fn resolve_genesis_entities<P>(provider: &P, ids: &[u64]) -> eyre::Result<Vec<PruningEntry>>
+where
+    P: StateProviderFactory,
+{
+    let latest = provider
+        .latest()
+        .map_err(|error| eyre::eyre!("read the latest state: {error:?}"))?;
+    let mut index = RethAuxStore::new(SnapshotAccountCode::new(latest));
+    let latest = provider
+        .latest()
+        .map_err(|error| eyre::eyre!("read the latest state: {error:?}"))?;
+    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(latest)));
+
+    let mut entries = Vec::with_capacity(ids.len());
+    for &id in ids {
         let Some(key) = index
             .key_of_id(id)
             .map_err(|error| eyre::eyre!("resolve genesis entity id {id}: {error:?}"))?
@@ -240,24 +339,14 @@ where
             .get(key)
             .map_err(|error| eyre::eyre!("read genesis entity {}: {error:?}", B256::from(key)))?
         {
-            batch.push(PruningEntry {
+            entries.push(PruningEntry {
                 key: B256::from(key),
                 expires_at: entity.expires_at,
                 attribute_count: entity.attributes.len(),
             });
         }
-        if batch.len() == GENESIS_BOOTSTRAP_BATCH {
-            pruning_map.bootstrap_entries_blocking(&batch)?;
-            inserted += batch.len() as u64;
-            batch.clear();
-            info!(target: "arkiv-reth", inserted, total = all.len(), "genesis pruning bootstrap in progress");
-        }
     }
-    if !batch.is_empty() {
-        pruning_map.bootstrap_entries_blocking(&batch)?;
-        inserted += batch.len() as u64;
-    }
-    Ok(inserted)
+    Ok(entries)
 }
 
 fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>

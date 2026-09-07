@@ -52,6 +52,15 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
+    // reth's log file records `debug` from every crate. turso, the SQLite
+    // behind the chain pruning map, traces every page read and B-tree step at
+    // that level: some forty lines per row written, which made the genesis
+    // pruning bootstrap ten times slower than the database itself. The file
+    // stays at debug for everything else; `--log.file.filter` still overrides.
+    let _ = reth::args::DefaultLogArgs::default()
+        .with_log_file_filter("debug,turso_core=info,turso=info".to_owned())
+        .try_init();
+
     let result = match Cli::<ArkivChainSpecParser>::parse() {
         // The genesis-aware `init-state`; every other command is reth's.
         Cli {
