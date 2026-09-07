@@ -24,6 +24,7 @@
 //!   "write": { "accounts_written": 4, "accounts_committed": 5, "accounts_total": 6,
 //!              "slots_written": 40, "slots_total": 60 },
 //!   "hash": { "position": "0x9c…", "trie_updates": 7 },
+//!   "phases": { "parsing": 41.2 },
 //!   "state_root": null,
 //!   "block_hash": null,
 //!   "error": null
@@ -34,8 +35,11 @@
 //! `failed`. `percent` is of the current phase (bytes of the dump read;
 //! accounts and slots written of the total; the hashed-key position of the root walk,
 //! which is uniform over the key space) and `null` when the phase has no
-//! measure yet. `updated_at` moves every write even when nothing else does:
-//! a file older than a few seconds means the process is gone.
+//! measure yet. `phases` has the seconds each finished phase took, so a
+//! reader that arrives late still learns how long the parse, the write and
+//! the root walk were; the current phase's time is `phase_elapsed_s`.
+//! `updated_at` moves every write even when nothing else does: a file older
+//! than a few seconds means the process is gone.
 
 use alloy_primitives::B256;
 use reth_tracing::tracing_subscriber::Layer;
@@ -93,6 +97,8 @@ struct State {
     phase: Phase,
     started: Instant,
     phase_started: Instant,
+    /// How long each finished phase took, in the order they ran.
+    phase_times: Vec<(Phase, Duration)>,
     dump_path: PathBuf,
     bytes_total: u64,
     bytes_read: u64,
@@ -115,6 +121,9 @@ impl State {
     /// back, so a late log line cannot undo a transition.
     fn advance(&mut self, phase: Phase) {
         if phase > self.phase {
+            if self.phase != Phase::Starting {
+                self.phase_times.push((self.phase, self.phase_started.elapsed()));
+            }
             self.phase = phase;
             self.phase_started = Instant::now();
         }
@@ -176,6 +185,11 @@ impl State {
                 "position": self.hash_position.map(|k| k.to_string()),
                 "trie_updates": self.trie_updates,
             },
+            "phases": self
+                .phase_times
+                .iter()
+                .map(|(phase, took)| (phase.name().to_string(), serde_json::json!(tenths(*took))))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
             "state_root": self.state_root.map(|r| r.to_string()),
             "block_hash": self.block_hash.map(|h| h.to_string()),
             "error": self.error,
@@ -208,6 +222,7 @@ impl Progress {
             phase: Phase::Starting,
             started: now,
             phase_started: now,
+            phase_times: Vec::new(),
             dump_path: dump_path.to_path_buf(),
             bytes_total,
             bytes_read: 0,
@@ -612,6 +627,9 @@ mod tests {
         });
         let doc = progress.document();
         assert_eq!(doc["phase"], "writing");
+        assert!(doc["phases"]["parsing"].is_number(), "the parse's time is kept: {doc}");
+        assert!(doc["phases"].get("starting").is_none());
+        assert!(doc["phases"].get("writing").is_none());
         assert_eq!(doc["write"]["accounts_written"], 310_000);
         assert_eq!(doc["write"]["accounts_committed"], 310_000);
         assert_eq!(doc["write"]["accounts_total"], 1_200_000);
@@ -647,6 +665,11 @@ mod tests {
         assert_eq!(doc["phase"], "done");
         assert_eq!(doc["block_hash"], B256::repeat_byte(0x01).to_string());
         assert!(doc["error"].is_null());
+        let phases = doc["phases"].as_object().unwrap();
+        let mut names = phases.keys().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["hashing", "parsing", "writing"]);
+        assert!(phases.values().all(|v| v.is_number()));
     }
 
     #[test]
