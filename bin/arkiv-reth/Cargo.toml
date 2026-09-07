@@ -26,6 +26,17 @@ reth-storage-api.workspace = true
 # `init-state` re-routed: reth's argument struct and environment setup, and the importer itself.
 reth-cli-commands.workspace = true
 reth-db-common.workspace = true
+# The streaming importer behind it: reth's ETL collector, tables, trie walk.
+reth-etl.workspace = true
+reth-db-api.workspace = true
+reth-trie.workspace = true
+reth-trie-db.workspace = true
+reth-stages-types.workspace = true
+reth-config.workspace = true
+alloy-genesis.workspace = true
+# `BlockHeader::state_root`, read off the genesis header the dump must match.
+alloy-consensus.workspace = true
+serde.workspace = true
 # The progress file `init-state` keeps: a tracing layer on reth's log, JSON out.
 reth-tracing.workspace = true
 serde_json.workspace = true

@@ -372,6 +372,12 @@ async fn init_state_imports_a_seeded_dump_at_genesis() {
     assert_eq!(progress["percent"], 100.0);
     assert_eq!(progress["state_root"], manifest.state_root.to_string());
     assert_eq!(progress["write"]["accounts_total"], manifest.accounts);
+    // The system account's line (two slots per entity) is past the streaming
+    // threshold at this size: its slots went through the slot collector.
+    let slots_total = progress["write"]["slots_total"].as_u64().unwrap();
+    assert!(slots_total >= 2 * COUNT, "{slots_total}");
+    assert_eq!(progress["write"]["slots_written"], slots_total);
+    assert_eq!(progress["dump"]["slots_parsed"], slots_total);
     assert!(progress["error"].is_null());
 
     // Block 0 carries the seed's root, and the state behind it.

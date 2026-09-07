@@ -1504,6 +1504,8 @@ dependencies = [
 name = "arkiv-reth"
 version = "0.2.1"
 dependencies = [
+ "alloy-consensus",
+ "alloy-genesis",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
@@ -1523,11 +1525,18 @@ dependencies = [
  "reth",
  "reth-cli-commands",
  "reth-cli-util",
+ "reth-config",
+ "reth-db-api",
  "reth-db-common",
  "reth-ethereum",
+ "reth-etl",
  "reth-node-ethereum",
+ "reth-stages-types",
  "reth-storage-api",
  "reth-tracing",
+ "reth-trie",
+ "reth-trie-db",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

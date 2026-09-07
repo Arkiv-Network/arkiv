@@ -23,11 +23,19 @@
 //! importer and the same root check. `--without-evm` (a snapshot at a later
 //! block) is handed straight to reth.
 //!
+//! At genesis under the v2 layout the import itself is not reth's either but
+//! [`import`]'s: the same tables, changesets and root walk, with an account's
+//! storage streamed into its own ETL collector as the line is read, so the
+//! dump's largest line — the store's system account, two slots per seeded
+//! entity — no longer sets the importer's peak memory. Past genesis, or on the
+//! legacy layout, the dump goes to reth's importer as before.
+//!
 //! One more thing on top: an import of a large dump runs for hours, and reth
 //! reports on it only through its log. The override keeps a progress file
 //! (`<datadir>/init-state-progress.json`, or `$ARKIV_INIT_STATE_PROGRESS`)
 //! rewritten every second, for a watcher to read. See [`progress`].
 
+mod import;
 mod progress;
 
 use crate::node::ArkivNode;
@@ -129,33 +137,37 @@ fn import(
         provider_factory,
         ..
     } = command.env.init::<ArkivNode>(AccessRights::RW, runtime)?;
-    if genesis_alloc_empty {
+    let seeding_genesis_v2 = at_genesis_under_v2(&provider_factory)?;
+    if seeding_genesis_v2 && genesis_alloc_empty {
         clear_genesis_changesets(&provider_factory)?;
     }
 
     info!(target: "reth::cli", "Initiating state dump");
     let reader = progress.reader(BufReader::new(File::open(&command.state)?));
-    let hash = init_from_state_dump(reader, &provider_factory, config.stages.etl)?;
+    let hash = if seeding_genesis_v2 {
+        import::import_at_genesis(reader, &provider_factory, config.stages.etl)?
+    } else {
+        init_from_state_dump(reader, &provider_factory, config.stages.etl)?
+    };
     info!(target: "reth::cli", hash = ?hash, "Genesis block written");
     Ok(hash)
 }
 
-/// Delete the account and storage changeset static files when they hold
-/// nothing but the genesis block's empty entry: a v2-layout datadir at block 0.
-fn clear_genesis_changesets<PF>(factory: &PF) -> eyre::Result<()>
+/// Whether the datadir is at block 0 under storage layout v2: the case reth's
+/// importer cannot handle and [`import`] takes over. The legacy layout keeps
+/// changesets in MDBX, where reth's importer appends block 0 without
+/// complaint; past genesis the files hold real history.
+fn at_genesis_under_v2<PF>(factory: &PF) -> eyre::Result<bool>
 where
-    PF: DatabaseProviderFactory<Provider: BlockNumReader + StorageSettingsCache>
-        + StaticFileProviderFactory,
+    PF: DatabaseProviderFactory<Provider: BlockNumReader + StorageSettingsCache>,
 {
     let provider = factory.database_provider_ro()?;
-    // The legacy layout keeps changesets in MDBX, where the importer appends
-    // block 0 without complaint; past genesis the files hold real history.
-    let at_genesis = provider.last_block_number()? == 0;
-    let storage_v2 = provider.cached_storage_settings().storage_v2;
-    drop(provider);
-    if !(at_genesis && storage_v2) {
-        return Ok(());
-    }
+    Ok(provider.last_block_number()? == 0 && provider.cached_storage_settings().storage_v2)
+}
+
+/// Delete the account and storage changeset static files, which hold nothing
+/// but the genesis block's empty entry.
+fn clear_genesis_changesets<PF: StaticFileProviderFactory>(factory: &PF) -> eyre::Result<()> {
     let static_files = factory.static_file_provider();
     for segment in [
         StaticFileSegment::AccountChangeSets,

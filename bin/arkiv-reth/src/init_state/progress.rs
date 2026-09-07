@@ -1,8 +1,8 @@
 //! A progress file for `init-state`, rewritten every second, so a watcher can
 //! tell a slow import from a dead one.
 //!
-//! reth's importer reports through its log alone: parsed accounts every 100k,
-//! written accounts every 100k and at every commit, and the position of the
+//! The importer reports through its log alone: parsed accounts every 100k,
+//! written accounts and slots at every commit, and the position of the
 //! state-root walk at every flush. [`ProgressLayer`] is a tracing layer that
 //! picks those events up; [`CountingReader`] adds how much of the dump has
 //! been read, which is the only signal during the parse; and
@@ -20,8 +20,9 @@
 //!   "elapsed_s": 812.4,
 //!   "phase_elapsed_s": 301.0,
 //!   "updated_at": 1757168522.4,
-//!   "dump": { "path": "state.jsonl", "bytes_read": 1, "bytes_total": 2, "accounts_parsed": 3 },
-//!   "write": { "accounts_written": 4, "accounts_committed": 5, "accounts_total": 6 },
+//!   "dump": { "path": "state.jsonl", "bytes_read": 1, "bytes_total": 2, "accounts_parsed": 3, "slots_parsed": 30 },
+//!   "write": { "accounts_written": 4, "accounts_committed": 5, "accounts_total": 6,
+//!              "slots_written": 40, "slots_total": 60 },
 //!   "hash": { "position": "0x9c…", "trie_updates": 7 },
 //!   "state_root": null,
 //!   "block_hash": null,
@@ -31,7 +32,7 @@
 //!
 //! `phase` runs `starting`, `parsing`, `writing`, `hashing`, then `done` or
 //! `failed`. `percent` is of the current phase (bytes of the dump read;
-//! accounts written of the total; the hashed-key position of the root walk,
+//! accounts and slots written of the total; the hashed-key position of the root walk,
 //! which is uniform over the key space) and `null` when the phase has no
 //! measure yet. `updated_at` moves every write even when nothing else does:
 //! a file older than a few seconds means the process is gone.
@@ -99,6 +100,9 @@ struct State {
     accounts_written: u64,
     accounts_committed: u64,
     accounts_total: Option<u64>,
+    slots_parsed: u64,
+    slots_written: u64,
+    slots_total: Option<u64>,
     hash_position: Option<B256>,
     trie_updates: u64,
     state_root: Option<B256>,
@@ -127,11 +131,13 @@ impl State {
                 self.bytes_read as f64 / self.bytes_total as f64
             }
             Phase::Writing => {
-                let total = self.accounts_total?;
+                // Accounts and slots are rows alike; the slot total is known
+                // from the start of the phase or not at all.
+                let total = self.accounts_total? + self.slots_total.unwrap_or(0);
                 if total == 0 {
                     return None;
                 }
-                self.accounts_written as f64 / total as f64
+                (self.accounts_written + self.slots_written) as f64 / total as f64
             }
             Phase::Hashing => key_fraction(self.hash_position?),
             Phase::Done => 1.0,
@@ -157,11 +163,14 @@ impl State {
                 "bytes_read": self.bytes_read,
                 "bytes_total": self.bytes_total,
                 "accounts_parsed": self.accounts_parsed,
+                "slots_parsed": self.slots_parsed,
             },
             "write": {
                 "accounts_written": self.accounts_written,
                 "accounts_committed": self.accounts_committed,
                 "accounts_total": self.accounts_total,
+                "slots_written": self.slots_written,
+                "slots_total": self.slots_total,
             },
             "hash": {
                 "position": self.hash_position.map(|k| k.to_string()),
@@ -206,6 +215,9 @@ impl Progress {
             accounts_written: 0,
             accounts_committed: 0,
             accounts_total: None,
+            slots_parsed: 0,
+            slots_written: 0,
+            slots_total: None,
             hash_position: None,
             trie_updates: 0,
             state_root: None,
@@ -420,6 +432,9 @@ struct Fields {
     parsed_accounts: Option<u64>,
     total_accounts: Option<u64>,
     accounts_len: Option<u64>,
+    parsed_slots: Option<u64>,
+    total_slots: Option<u64>,
+    slots_len: Option<u64>,
     last_account_key: Option<B256>,
     total_flushed_updates: Option<u64>,
     root: Option<B256>,
@@ -445,6 +460,19 @@ impl Fields {
         }
         if let Some(n) = self.accounts_len {
             s.accounts_total = Some(n);
+        }
+        if let Some(n) = self.parsed_slots {
+            s.slots_parsed = n;
+        }
+        if let Some(n) = self.total_slots {
+            s.slots_written = n;
+            s.advance(Phase::Writing);
+            if self.message.starts_with("All accounts written") {
+                s.slots_total = Some(n);
+            }
+        }
+        if let Some(n) = self.slots_len {
+            s.slots_total = Some(n);
         }
         if let Some(key) = self.last_account_key {
             s.hash_position = Some(key);
@@ -473,6 +501,9 @@ impl Fields {
             "parsed_accounts" => self.parsed_accounts = Some(value),
             "total_accounts" => self.total_accounts = Some(value),
             "accounts_len" => self.accounts_len = Some(value),
+            "parsed_slots" => self.parsed_slots = Some(value),
+            "total_slots" => self.total_slots = Some(value),
+            "slots_len" => self.slots_len = Some(value),
             "total_flushed_updates" => self.total_flushed_updates = Some(value),
             _ => {}
         }
