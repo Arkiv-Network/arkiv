@@ -1492,6 +1492,10 @@ name = "arkiv-interfaces"
 version = "0.2.1"
 
 [[package]]
+name = "arkiv-mint-engine"
+version = "0.2.1"
+
+[[package]]
 name = "arkiv-query"
 version = "0.2.1"
 dependencies = [
@@ -1516,6 +1520,7 @@ dependencies = [
  "arkiv-reth-payload-builder",
  "arkiv-reth-rpc",
  "clap",
+ "dev-flaky",
  "eyre",
  "reth",
  "reth-cli-util",
@@ -2997,6 +3002,28 @@ dependencies = [
  "rustc_version 0.4.1",
  "syn 2.0.119",
  "unicode-xid",
+]
+
+[[package]]
+name = "dev-flaky"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dffe3f7fcd29a2376d6c028acded9494760f1ed9713b63eb9435da85abf1753e"
+dependencies = [
+ "dev-report",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dev-report"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa7839cdf97616d8798bea478d6825fca285863947ec4ad145bd4ca7777a9637"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

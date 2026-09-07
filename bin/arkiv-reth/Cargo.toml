@@ -50,3 +50,4 @@ alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+dev-flaky = "0.9.1"
