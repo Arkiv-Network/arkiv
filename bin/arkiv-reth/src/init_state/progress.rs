@@ -122,7 +122,8 @@ impl State {
     fn advance(&mut self, phase: Phase) {
         if phase > self.phase {
             if self.phase != Phase::Starting {
-                self.phase_times.push((self.phase, self.phase_started.elapsed()));
+                self.phase_times
+                    .push((self.phase, self.phase_started.elapsed()));
             }
             self.phase = phase;
             self.phase_started = Instant::now();
@@ -627,7 +628,10 @@ mod tests {
         });
         let doc = progress.document();
         assert_eq!(doc["phase"], "writing");
-        assert!(doc["phases"]["parsing"].is_number(), "the parse's time is kept: {doc}");
+        assert!(
+            doc["phases"]["parsing"].is_number(),
+            "the parse's time is kept: {doc}"
+        );
         assert!(doc["phases"].get("starting").is_none());
         assert!(doc["phases"].get("writing").is_none());
         assert_eq!(doc["write"]["accounts_written"], 310_000);
