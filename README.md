@@ -97,3 +97,14 @@ git push origin v0.2.0
 **GitHub UI** — [Releases](https://github.com/Arkiv-Network/arkiv/releases) → *Draft a new release* → *Choose a tag* → type the new `vX.Y.Z` and pick *Create new tag on publish* (target: `main`) → *Publish release*.
 
 Either way, the build shows up under [Actions → rust](https://github.com/Arkiv-Network/arkiv/actions/workflows/rust.yml); images appear on GHCR when the `docker` job finishes (~1 h, cold build).
+
+## Malachite local devnet
+
+A separate [four-validator Malachite proof of concept](devnet/malachite/README.md)
+runs native Arkiv execution nodes with per-block BFT finality. Build and run its
+write/pruning/quorum smoke test with:
+
+```sh
+python3 devnet/malachite/run.py build
+python3 devnet/malachite/run.py up --check
+```
