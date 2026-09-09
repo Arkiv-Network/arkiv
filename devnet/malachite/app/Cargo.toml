@@ -1,0 +1,48 @@
+[package]
+name = "malachitebft-eth-app"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+malachitebft-eth-types.workspace = true
+malachitebft-app.workspace = true
+malachitebft-config.workspace = true
+clap = { workspace = true, features = ["derive"] }
+toml.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+malachitebft-eth-engine.workspace = true
+malachitebft-app-channel.workspace = true
+malachitebft-proto.workspace = true
+
+alloy-consensus = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-rpc-types-engine = { workspace = true }
+ethereum_ssz = "0.8"
+
+hex.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+derive-where.workspace = true
+color-eyre.workspace = true
+prost.workspace = true
+rand.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+
+[dev-dependencies]
+tempfile = "3"

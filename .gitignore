@@ -13,3 +13,6 @@ jwt.hex
 !/.docker/caches/.gitkeep
 
 .DS_Store
+
+/devnet/malachite/target/
+/devnet/malachite/__pycache__/

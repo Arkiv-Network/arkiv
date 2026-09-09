@@ -129,3 +129,7 @@ lto = "off"
 codegen-units = 16
 # `release` already carries no debug info; this drops the symbol table too.
 strip = "symbols"
+
+[patch.crates-io]
+# Fix the private proc_macro re-export; see vendor/proc-macro-error2/PATCH.md.
+proc-macro-error2 = { path = "vendor/proc-macro-error2" }
