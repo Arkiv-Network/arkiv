@@ -100,7 +100,7 @@ Either way, the build shows up under [Actions → rust](https://github.com/Arkiv
 
 ## Malachite local devnet
 
-A separate [three-validator Malachite proof of concept](devnet/malachite/README.md)
+A separate [four-validator Malachite proof of concept](devnet/malachite/README.md)
 runs native Arkiv execution nodes with per-block BFT finality. Build and run its
 write/pruning/quorum smoke test with:
 

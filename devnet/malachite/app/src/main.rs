@@ -27,7 +27,7 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     Testnet {
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 4)]
         nodes: usize,
         #[arg(long, default_value = "multi-threaded:2")]
         runtime: String,
@@ -43,10 +43,7 @@ fn main() -> eyre::Result<()> {
     let home = args.home.ok_or_else(|| eyre::eyre!("--home is required"))?;
     match args.command {
         Command::Testnet { nodes, runtime } => {
-            ensure!(
-                nodes == 3,
-                "this PoC requires three equal-weight validators"
-            );
+            ensure!(nodes == 4, "this PoC requires four equal-weight validators");
             ensure!(
                 runtime == "multi-threaded:2",
                 "this PoC uses two runtime threads per validator"

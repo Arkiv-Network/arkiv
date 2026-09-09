@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Three equal-weight Malachite validators + three native arkiv-reth processes."""
+"""Four equal-weight Malachite validators + four native arkiv-reth processes."""
 import argparse
 import json
 import os
@@ -14,7 +14,7 @@ import urllib.request
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-VALIDATOR_COUNT = 3
+VALIDATOR_COUNT = 4
 
 
 def rpc(node, method, params=()):
@@ -160,8 +160,8 @@ def initialize(data, cli, consensus):
 
 def smoke(cli, processes=None, restart=None):
     nodes = list(range(VALIDATOR_COUNT))
-    wait_for("three nodes finalizing", lambda: agreement(nodes, 4))
-    print("PASS: three nodes agree on finalized hash and state root", flush=True)
+    wait_for("four nodes finalizing", lambda: agreement(nodes, 4))
+    print("PASS: four nodes agree on finalized hash and state root", flush=True)
     # Submit to each node, exercising EL transaction gossip and rotating proposers.
     for node in nodes:
         output = subprocess.check_output(
@@ -217,25 +217,37 @@ def smoke(cli, processes=None, restart=None):
         )
         print(f"PASS: write submitted to node {node}, finalized and purged everywhere", flush=True)
     if processes is not None:
-        # Terminate consensus only; retain EL to check its finalized view remains unchanged.
-        victim = processes[-1]
-        victim.terminate()
-        victim.wait(timeout=15)
-        # Allow any in-flight quorum certificate to finish before observing the halt.
+        recovery_check(processes, restart)
+        for i in [2, 3]:
+            processes[VALIDATOR_COUNT + i].terminate()
+            processes[VALIDATOR_COUNT + i].wait(timeout=15)
+        # Let any pending certificate complete before the check.
         time.sleep(3)
         before = [finalized(i) for i in [0, 1]]
         time.sleep(5)
         assert before == [finalized(i) for i in [0, 1]], "two validators finalized without quorum"
-        print("PASS: two of three validators cannot advance finality", flush=True)
-        height = max(finalized(i) for i in nodes) + 4
-        restart(2)
-        wait_for("all three validators resume", lambda: agreement(nodes, height))
-        print(
-            "PASS: restarting the third validator restores finality with matching state", flush=True
-        )
+        print("PASS: two of four validators cannot advance finality", flush=True)
 
 
-def up(data, check):
+def recovery_check(processes, restart):
+    nodes = list(range(VALIDATOR_COUNT))
+    victim = secrets.randbelow(VALIDATOR_COUNT)
+    survivors = [i for i in nodes if i != victim]
+    print(f"Kill node {victim} (consensus and execution)", flush=True)
+    for index in [VALIDATOR_COUNT + victim, victim]:
+        processes[index].kill()
+        processes[index].wait(timeout=15)
+    try:
+        height = max(finalized(i) for i in survivors) + 4
+        wait_for("three validators advance", lambda: agreement(survivors, height))
+        print("PASS: three validators advance by at least four blocks", flush=True)
+    finally:
+        restart(victim)
+    wait_for("node recovers", lambda: agreement(nodes, height + 2))
+    print(f"PASS: node {victim} recovers with matching finalized hash and state", flush=True)
+
+
+def up(data, check, recovery_only=False):
     reth, cli, consensus = binaries()
     for binary in [reth, cli, consensus]:
         if not binary.is_file():
@@ -323,16 +335,25 @@ def up(data, check):
         for i in range(VALIDATOR_COUNT):
             start_consensus(i)
 
-        def restart_consensus(i):
+        def restart_node(i):
+            spawn(processes[i].args, f"el-{i}")
+            processes[i] = processes.pop()
+            wait_for("execution RPC restarts", lambda: rpc(i, "eth_chainId") == hex(64331))
+            for j in range(VALIDATOR_COUNT):
+                if i != j:
+                    rpc(i, "admin_addPeer", [enodes[j]])
+                    rpc(j, "admin_addPeer", [enodes[i]])
             start_consensus(i)
             processes[VALIDATOR_COUNT + i] = processes.pop()
 
         wait_for("initial finality", lambda: agreement(range(VALIDATOR_COUNT), 2))
         print(
-            f"Three-validator devnet running. RPC: 127.0.0.1:18545–18547; logs: {data}", flush=True
+            f"Four-validator devnet running. RPC: 127.0.0.1:18545–18548; logs: {data}", flush=True
         )
-        if check:
-            smoke(cli, processes, restart_consensus)
+        if recovery_only:
+            recovery_check(processes, restart_node)
+        elif check:
+            smoke(cli, processes, restart_node)
         else:
             while True:
                 for process in processes:
@@ -355,7 +376,7 @@ def up(data, check):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["build", "up", "check"])
+    parser.add_argument("command", choices=["build", "up", "check", "recovery-check"])
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/malachite")
     parser.add_argument(
         "--check", action="store_true", help="run writes, pruning and quorum smoke tests, then stop"
@@ -366,7 +387,7 @@ def main():
     elif args.command == "check":
         smoke(binaries()[1])
     else:
-        up(args.data_dir.resolve(), args.check)
+        up(args.data_dir.resolve(), args.check, args.command == "recovery-check")
 
 
 if __name__ == "__main__":

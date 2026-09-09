@@ -9,4 +9,4 @@ to subscribers, so the local startup workaround is unnecessary.
 
 The adapter uses the 0.5.0 configuration and application callback APIs, certificate
 signatures, value synchronization, and liveness messages. A small local CLI generates
-the three-validator configuration and starts each node.
+the four-validator configuration and starts each node.

@@ -154,7 +154,12 @@ pub async fn run(
                 }
             }
             AppMsg::ReceivedProposalPart { from, part, reply } => {
-                let mut proposed = state.received_proposal_part(from, part).await?;
+                let parent = state.latest_block.ok_or_else(|| eyre!("missing parent"))?;
+                // Wait for the parent before checking a future proposal.
+                let mut proposed = state
+                    .received_proposal_part(from, part)
+                    .await?
+                    .filter(|p| p.height.as_u64() == parent.block_number + 1);
                 if let Some(p) = proposed.as_mut() {
                     let parent = state.latest_block.ok_or_else(|| eyre!("missing parent"))?;
                     if let Err(error) = validate(&engine, &p.value, p.height, parent).await {

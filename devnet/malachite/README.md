@@ -1,12 +1,11 @@
 # Malachite + Arkiv local proof of concept
 
-Three equal-weight validators, each paired with its own `arkiv-reth` execution
-client. All three votes are required to finalize a block. This is an independent
+Four equal-weight validators, each paired with its own `arkiv-reth` execution
+client. Three votes are required to finalize a block. This is an independent
 local chain (ID 64331), with no Lighthouse or settlement chain.
 
-Finality requires strictly more than two-thirds of voting power. With three
-equal-weight validators, one offline validator halts finality; tolerating one
-offline validator requires at least four equal-weight validators.
+Finality requires strictly more than two-thirds of voting power. With four
+equal-weight validators, the chain can continue with one validator offline.
 
 ## Run
 
@@ -18,14 +17,25 @@ python3 devnet/malachite/run.py build
 python3 devnet/malachite/run.py up --check
 ```
 
-`--check` checks three-node finality, writes submitted through every execution
-endpoint, expiry extension and physical entity pruning, loss of progress with one validator stopped,
-and recovery after that validator restarts. All processes stop afterward;
+`--check` checks four-node finality, writes submitted through every execution
+endpoint, expiry extension and physical entity pruning, progress with one node stopped,
+recovery after restart, and loss of progress with two validators stopped. All processes stop afterward;
 data and logs remain in `data/malachite` for inspection.
 
-For an interactive devnet, omit `--check`. Ctrl-C stops all six processes.
+For an interactive devnet, omit `--check`. Ctrl-C stops all eight processes.
 In a second terminal, `python3 devnet/malachite/run.py check` runs the write and
 pruning checks without stopping validators.
+
+To test a random node failure on a fresh devnet:
+
+```sh
+python3 devnet/malachite/run.py recovery-check --data-dir data/malachite-recovery-next
+```
+
+This command kills both processes for one random node, checks that the other
+three finalize at least four more blocks, then restarts the node with its saved
+data. It checks that all four nodes reach the same finalized block and state.
+All processes stop after the test. This test also runs as part of `up --check`.
 
 Each launch requires a fresh data directory. To keep results from earlier runs:
 
@@ -37,13 +47,13 @@ Prebuilt binaries can be selected with `ARKIV_RETH_BINARY`, `ARKIV_CLI_BINARY`,
 and `ARKIV_CONSENSUS_BINARY` (absolute paths). The launcher never deletes an
 existing chain or stops processes it did not start.
 
-| Interface | Node 0 | Node 1 | Node 2 |
-| --- | --- | --- | --- |
-| Ethereum/Arkiv RPC | 18545 | 18546 | 18547 |
-| Authenticated Engine API | 18551 | 18552 | 18553 |
-| Execution P2P | 30303 | 30304 | 30305 |
-| Consensus P2P | 27000 | 27001 | 27002 |
-| Consensus metrics | 29000 | 29001 | 29002 |
+| Interface | Node 0 | Node 1 | Node 2 | Node 3 |
+| --- | --- | --- | --- | --- |
+| Ethereum/Arkiv RPC | 18545 | 18546 | 18547 | 18548 |
+| Authenticated Engine API | 18551 | 18552 | 18553 | 18554 |
+| Execution P2P | 30303 | 30304 | 30305 | 30306 |
+| Consensus P2P | 27000 | 27001 | 27002 | 27003 |
+| Consensus metrics | 29000 | 29001 | 29002 | 29003 |
 
 RPC, Engine API, and consensus connections use localhost. These are development
 keys and funded test accounts, not production credentials.
@@ -68,7 +78,7 @@ uses Cancun / Engine API V3, with later execution hardforks inactive.
   advances. Sync transports the actual payload and certificate; historical
   decisions are retained. Startup checks local execution/consensus agreement
   and can replay a durable decision whose fork-choice update was interrupted.
-- Genesis contains three independently generated validator keys with weight 1.
+- Genesis contains four independently generated validator keys with weight 1.
   Membership remains fixed; proposer selection rotates by height and round.
 - Block timestamps use whole seconds and never intentionally run ahead of wall
   time. This PoC targets approximately one block per second, not subsecond block
@@ -103,12 +113,12 @@ settlement. Do not connect it to an existing Arkiv network.
 
 Verified locally on 2026-09-09 with Arkiv/reth v2.5.0:
 
-- Three equal-weight validators finalize identical block hashes and state roots.
+- Four equal-weight validators finalize identical block hashes and state roots.
 - Writes submitted to every node become visible at a common finalized height.
 - Extending expiry preserves the entity past its original expiry; subsequent
-  physical purge is observed on all three nodes.
-- Finality stops when one validator goes offline: two of three votes are insufficient.
-- Restarting the third validator restores finality with matching state.
+  physical purge is observed on all four nodes.
+- Three validators continue when one node stops; that node recovers after restart.
+- Two validators cannot advance finality.
 
 Regression tests cover accepting only Engine API `VALID`, payload-digest
 integrity, round-recovery message encoding, and persistence/rejection of conflicting durable decisions:
