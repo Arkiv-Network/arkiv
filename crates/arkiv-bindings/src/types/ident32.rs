@@ -1,9 +1,9 @@
 //! Validation and string-conversion impls for the ABI-generated [`Ident32`] UDVT.
 //!
 //! [`Ident32`] is a left-aligned, null-padded 32-byte ASCII identifier.
-//! Valid characters: `a-z`, `0-9`, `.`, `-`, `_`. Must start with `a-z`.
+//! Valid characters: `A-Z a-z`, `0-9`, `.`, `-`, `_`. Must start with `A-Z a-z`.
 //!
-//! These impl blocks mirror the validation rules in `contracts/types/Ident32.sol`.
+//! Names follow the attribute-name grammar in `arkiv-node-api.md`.
 
 use alloy_primitives::FixedBytes;
 use arkiv_interfaces::entity::annotations::SYSTEM_PREFIX;
@@ -11,17 +11,16 @@ use eyre::{Result, bail};
 
 use crate::Ident32;
 
-/// Valid character bitmap: a-z, 0-9, '.', '-', '_'.
-/// Mirrors `IDENT_CHARSET` in Ident32.sol.
+/// Valid character bitmap: A-Z, a-z, 0-9, '.', '-', '_'.
 const IDENT_CHARSET: u128 = (1 << 0x2D)
     | (1 << 0x2E)
     | (((1 << 10) - 1) << 0x30)
+    | (((1u128 << 26) - 1) << 0x41)
     | (1 << 0x5F)
     | (((1u128 << 26) - 1) << 0x61);
 
-/// Leading byte bitmap: a-z only.
-/// Mirrors `IDENT_LEADING` in Ident32.sol.
-const IDENT_LEADING: u128 = ((1u128 << 26) - 1) << 0x61;
+/// Leading byte bitmap: A-Z and a-z only.
+const IDENT_LEADING: u128 = (((1u128 << 26) - 1) << 0x41) | (((1u128 << 26) - 1) << 0x61);
 
 /// A structured Ident32 validation failure, carrying the evidence the
 /// `Ident32Empty` / `Ident32InvalidByte` ABI errors report.
@@ -36,9 +35,8 @@ pub enum Ident32ByteError {
 
 /// Validate raw bytes as an `Ident32`, reporting the first offending byte.
 ///
-/// Mirrors `validateIdent32` in Ident32.sol: non-empty, leading byte `a-z`,
-/// remaining bytes in `a-z 0-9 . - _`, and once null padding starts every
-/// later byte must be null too.
+/// The name must start with an ASCII letter. Other bytes must be ASCII
+/// letters, digits, `.`, `-`, or `_`. All bytes after the first null must be null.
 pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> {
     if bytes[0] == 0 {
         return Err(Ident32ByteError::Empty);
@@ -64,13 +62,8 @@ pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> 
 
 /// Validate a **system** attribute name (`$payload`, `$contentType`).
 ///
-/// System names are protocol-defined, not client-chosen, so no charset applies:
-/// the real names are camelCase (`$contentType`, `$createdAtBlock`), which the
-/// user charset — lowercase, digits, `.-_` — would reject outright. Validating
-/// them against a charset would be theatre anyway, because the set of writable
-/// system names is a **closed allow-list** of exact strings
-/// (`annotations::USER_MANAGED`); anything else is rejected as engine-owned.
-/// That check is strictly stronger than any charset.
+/// System names use a separate namespace with a leading `$`.
+/// The caller checks writable names against `annotations::USER_MANAGED`.
 ///
 /// So this enforces only what the encoding itself needs: a leading `$`, a
 /// non-empty remainder, and contiguous null padding (no bytes after the
@@ -116,7 +109,7 @@ impl Ident32 {
 
     /// Encode a **system** attribute name (leading `$`), for callers building
     /// `$payload` / `$contentType` triples. [`Ident32::encode`] rejects these
-    /// by design — its leading-byte charset is `a-z`.
+    /// by design — its leading-byte charset is `A-Z a-z`.
     pub fn system(s: &str) -> Result<Self> {
         let bytes = s.as_bytes();
         if bytes.len() > 32 {
@@ -131,10 +124,10 @@ impl Ident32 {
 
     /// Encode a string into an `Ident32`, validating the charset.
     ///
-    /// Rules (mirrors `validateIdent32` in Ident32.sol):
+    /// Attribute-name rules:
     /// - Non-empty, at most 32 bytes
-    /// - First byte must be `a-z`
-    /// - Remaining bytes must be in `a-z 0-9 . - _`
+    /// - First byte must be `A-Z a-z`
+    /// - Remaining bytes must be in `A-Z a-z 0-9 . - _`
     pub fn encode(s: &str) -> Result<Self> {
         let bytes = s.as_bytes();
         if bytes.is_empty() {
@@ -241,8 +234,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_uppercase() {
-        assert!(Ident32::encode("Hello").is_err());
+    fn accepts_uppercase_and_preserves_case() {
+        for name in [
+            "Hello",
+            "projectId",
+            "LEVEL",
+            "a.b-c_D9",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+        ] {
+            let id = Ident32::encode(name).unwrap();
+            assert_eq!(id.decode().unwrap(), name);
+            assert!(validate_ident32_bytes(&id.0.0).is_ok());
+            assert_eq!(id.validate().unwrap().decode().unwrap(), name);
+        }
+        assert_ne!(
+            Ident32::encode("Level").unwrap().into_word(),
+            Ident32::encode("level").unwrap().into_word()
+        );
     }
 
     #[test]
