@@ -12,6 +12,9 @@ import { privateKeyToAccount } from "viem/accounts"
 // First EL RPC published by `kurtosis/arkiv-chain.yaml` (the sequencer).
 export const RPC_URL = process.env.ARKIV_RPC_URL ?? "http://127.0.0.1:32003"
 
+// Second EL RPC: the follower, which only replays what the sequencer produces.
+export const FOLLOWER_RPC_URL = process.env.ARKIV_FOLLOWER_RPC_URL ?? "http://127.0.0.1:32010"
+
 // The first account ethereum-package prefunds in every genesis it generates
 // (m/44'/60'/0'/0/0 of its well-known mnemonic). Override with
 // ARKIV_FUNDED_KEY; for `arkiv-reth --dev` that is the first hardhat key.
@@ -40,3 +43,16 @@ export async function connect() {
 }
 
 export type Devnet = Awaited<ReturnType<typeof connect>>
+
+// A raw JSON-RPC call, for the `arkiv_*` methods whose wire shape SDK 0.7 does
+// not type (or types differently from what this node serves).
+export async function rpc<T = unknown>(method: string, params: unknown[], url = RPC_URL): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  })
+  const body = (await response.json()) as { result?: T; error?: { code: number; message: string } }
+  if (body.error) throw new Error(`${method}: ${body.error.code} ${body.error.message}`)
+  return body.result as T
+}
