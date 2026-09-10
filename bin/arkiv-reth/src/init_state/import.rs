@@ -89,18 +89,19 @@ pub fn import_at_genesis<PF>(
     etl: EtlConfig,
 ) -> eyre::Result<B256>
 where
-    PF: DatabaseProviderFactory<
-        ProviderRW: DBProvider<Tx: DbTxMut>
-                        + BlockNumReader
-                        + BlockHashReader
-                        + HeaderProvider
-                        + StageCheckpointWriter
-                        + StaticFileProviderFactory
-                        + RocksDBProviderFactory
-                        + NodePrimitivesProvider
-                        + StorageSettingsCache
-                        + TrieWriter,
-    >,
+    PF: StaticFileProviderFactory
+        + DatabaseProviderFactory<
+            ProviderRW: DBProvider<Tx: DbTxMut>
+                            + BlockNumReader
+                            + BlockHashReader
+                            + HeaderProvider
+                            + StageCheckpointWriter
+                            + StaticFileProviderFactory
+                            + RocksDBProviderFactory
+                            + NodePrimitivesProvider
+                            + StorageSettingsCache
+                            + TrieWriter,
+        >,
 {
     ensure!(etl.file_size > 0, "ETL file size cannot be zero");
     let (block, hash, expected_root) = {
@@ -119,28 +120,12 @@ where
         (block, hash, header.state_root())
     };
 
-    // The first line names the root the rest must hash to.
-    let mut first = String::new();
-    reader.read_line(&mut first)?;
-    #[derive(Deserialize)]
-    struct DumpRoot {
-        root: B256,
-    }
-    let dump_root = serde_json::from_str::<DumpRoot>(&first)
-        .wrap_err("the dump does not start with its state root")?
-        .root;
-    if dump_root != expected_root {
-        error!(target: TARGET,
-            ?dump_root,
-            ?expected_root,
-            "State root from state dump does not match state root in current header."
-        );
-        bail!(
-            "state root {dump_root} in the dump does not match {expected_root} in the genesis header"
-        );
-    }
+    validate_dump_root(&mut reader, expected_root)?;
 
     let (accounts, slots) = parse(&mut reader, etl)?;
+    // The caller has rejected existing state and recorded an import attempt.
+    // Parsing failures leave even the empty genesis changesets intact.
+    super::clear_genesis_changesets(factory)?;
     write(factory, block, accounts, slots)?;
 
     info!(target: TARGET, "All accounts written to database, starting state root computation (may take some time)");
@@ -171,6 +156,27 @@ where
     }
     provider.commit()?;
     Ok(hash)
+}
+
+/// Check the dump's first line before any destructive work.
+pub(super) fn validate_dump_root(
+    mut reader: impl BufRead,
+    expected_root: B256,
+) -> eyre::Result<()> {
+    let mut first = String::new();
+    reader.read_line(&mut first)?;
+    #[derive(Deserialize)]
+    struct DumpRoot {
+        root: B256,
+    }
+    let dump_root = serde_json::from_str::<DumpRoot>(&first)
+        .wrap_err("the dump does not start with its state root")?
+        .root;
+    ensure!(
+        dump_root == expected_root,
+        "state root {dump_root} in the dump does not match {expected_root} in the genesis header"
+    );
+    Ok(())
 }
 
 /// Read every account line into the two collectors.

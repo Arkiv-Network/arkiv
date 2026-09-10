@@ -15,13 +15,14 @@
 //! "reset the changeset files before importing" step explicitly skips block 0,
 //! so nothing upstream clears the way.
 //!
-//! This override runs the same command with one step in between: when the
-//! import targets genesis and the genesis has no alloc, it deletes the two
-//! changeset segments before importing, so the importer starts them at block 0
-//! itself — exactly what it does for a later snapshot block. Everything else
-//! is reth's: the same arguments, the same environment setup, the same
-//! importer and the same root check. `--without-evm` (a snapshot at a later
-//! block) is handed straight to reth.
+//! Before deleting those segments, this override requires an empty alloc,
+//! validates the dump header, and rejects existing state or a prior import
+//! attempt. It records the attempt in MDBX, then records completion only after
+//! every write and the computed-root check succeed. Node startup requires this
+//! completion record for an externally supplied genesis state root. Failed or
+//! interrupted imports must be repeated in a fresh datadir; a retry never
+//! clears an existing import's history. See [`status`]. `--without-evm` (a
+//! snapshot at a later block) is handed straight to reth.
 //!
 //! At genesis under the v2 layout the import itself is not reth's either but
 //! [`import`]'s: the same tables, changesets and root walk, with an account's
@@ -37,6 +38,7 @@
 
 mod import;
 mod progress;
+pub(crate) mod status;
 
 use crate::node::ArkivNode;
 use arkiv_reth_chainspec::ArkivChainSpecParser;
@@ -44,7 +46,7 @@ use progress::Progress;
 use reth::CliRunner;
 use reth::args::LogArgs;
 use reth::chainspec::EthChainSpec;
-use reth::providers::{StaticFileProviderFactory, StaticFileSegment};
+use reth::providers::{DBProvider, StaticFileProviderFactory, StaticFileSegment};
 use reth::tasks::Runtime;
 use reth_cli_commands::common::{AccessRights, Environment};
 use reth_cli_commands::init_state::InitStateCommand;
@@ -52,7 +54,7 @@ use reth_db_common::init::init_from_state_dump;
 use reth_storage_api::{BlockNumReader, DatabaseProviderFactory, StorageSettingsCache};
 use reth_tracing::Layers;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Seek};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
@@ -96,8 +98,7 @@ fn progress_path(command: &InitStateCommand<ArkivChainSpecParser>) -> PathBuf {
         .join(PROGRESS_FILE)
 }
 
-/// reth's `InitStateCommand::execute`, with the genesis changesets cleared
-/// between opening the datadir and importing.
+/// reth's `InitStateCommand::execute`, with guarded genesis import and progress.
 async fn execute(
     command: InitStateCommand<ArkivChainSpecParser>,
     runtime: Runtime,
@@ -124,45 +125,57 @@ async fn execute(
     }
 }
 
-/// Open the datadir, clear the genesis changesets if the import targets
-/// genesis, and stream the dump in. Returns the hash of the block written.
+/// Validate and record a genesis import before streaming the dump, and persist
+/// completion only after it succeeds. Returns the hash of the block written.
 fn import(
     command: InitStateCommand<ArkivChainSpecParser>,
     runtime: Runtime,
     progress: &Progress,
 ) -> eyre::Result<alloy_primitives::B256> {
-    let genesis_alloc_empty = command.env.chain.genesis().alloc.is_empty();
+    let chain = command.env.chain.clone();
     let Environment {
         config,
         provider_factory,
         ..
     } = command.env.init::<ArkivNode>(AccessRights::RW, runtime)?;
-    let seeding_genesis_v2 = at_genesis_under_v2(&provider_factory)?;
-    if seeding_genesis_v2 && genesis_alloc_empty {
-        clear_genesis_changesets(&provider_factory)?;
-    }
-
     info!(target: "reth::cli", "Initiating state dump");
-    let reader = progress.reader(BufReader::new(File::open(&command.state)?));
+    let mut reader = BufReader::new(File::open(&command.state)?);
+    let (at_genesis, seeding_genesis_v2) = {
+        let provider = provider_factory.database_provider_ro()?;
+        let at_genesis = provider.last_block_number()? == 0;
+        (
+            at_genesis,
+            at_genesis && provider.cached_storage_settings().storage_v2,
+        )
+    };
+    if at_genesis {
+        eyre::ensure!(
+            chain.genesis().alloc.is_empty(),
+            "genesis alloc already supplies state; init-state requires an empty alloc and a fresh datadir"
+        );
+        // Validate the header on the same open file that will be imported, before
+        // recording an attempt or deleting anything. Invalid input is retryable.
+        import::validate_dump_root(&mut reader, chain.genesis_header().state_root)?;
+        reader.rewind()?;
+        let provider = provider_factory.database_provider_rw()?;
+        status::ensure_fresh(provider.tx_ref())?;
+        status::record(provider.tx_ref(), &chain, false)?;
+        provider.commit()?;
+        info!(target: "arkiv-reth", "Genesis import attempt recorded; incomplete imports require a fresh datadir");
+    }
+    let reader = progress.reader(reader);
     let hash = if seeding_genesis_v2 {
         import::import_at_genesis(reader, &provider_factory, config.stages.etl)?
     } else {
         init_from_state_dump(reader, &provider_factory, config.stages.etl)?
     };
+    if at_genesis {
+        let provider = provider_factory.database_provider_rw()?;
+        status::record(provider.tx_ref(), &chain, true)?;
+        provider.commit()?;
+    }
     info!(target: "reth::cli", hash = ?hash, "Genesis block written");
     Ok(hash)
-}
-
-/// Whether the datadir is at block 0 under storage layout v2: the case reth's
-/// importer cannot handle and [`import`] takes over. The legacy layout keeps
-/// changesets in MDBX, where reth's importer appends block 0 without
-/// complaint; past genesis the files hold real history.
-fn at_genesis_under_v2<PF>(factory: &PF) -> eyre::Result<bool>
-where
-    PF: DatabaseProviderFactory<Provider: BlockNumReader + StorageSettingsCache>,
-{
-    let provider = factory.database_provider_ro()?;
-    Ok(provider.last_block_number()? == 0 && provider.cached_storage_settings().storage_v2)
 }
 
 /// Delete the account and storage changeset static files, which hold nothing
