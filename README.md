@@ -91,9 +91,29 @@ ARKIV_SEED_COUNT=1000 scripts/kurtosis/up.py
 # streams too. (arkiv-reth's `init-state` is reth's, made to work at block 0:
 # reth v2.5.0 alone refuses a genesis import under its default storage layout.)
 arkiv-cli seed-genesis --count 1000000 --format jsonl --out state.jsonl
-arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jsonl
+arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jsonl && \
 arkiv-reth node --dev --chain state.jsonl.genesis.json --datadir /data --http
 ```
+
+A genesis with a nonempty `stateHash` and empty `alloc` requires a successful
+`init-state` before the node can start. Completion is recorded in the database
+after the computed state root matches; the progress JSON is only for monitoring.
+Both storage layouts enforce this check before starting node services.
+
+Imports are one attempt per datadir. An unreadable dump or invalid first-line
+root is rejected before the attempt begins and can be corrected in place. Once
+an attempt is recorded, a failed or interrupted import requires a **fresh
+datadir**; the command does not resume it or erase it automatically. Keep the
+failed directory for diagnosis, import the original complete dump into a new
+directory, and point `node` at that directory only after the command succeeds.
+Retries against a successfully imported datadir are rejected without replacing
+its state or changesets. Do not delete or fabricate the database's import record.
+
+Datadirs seeded by older binaries have no completion record and are refused by
+this startup guard, even if they previously started. Re-provision them from the
+original dump into a fresh datadir. This is not an in-place migration for a
+seeded chain that has advanced beyond genesis. Ordinary alloc-based genesis
+startup is unchanged; later-block snapshot imports retain reth's existing path.
 
 Both long-running steps keep a progress file for a watcher, replaced whole
 about once a second: `seed-genesis --progress-file <path>`, and `init-state`
