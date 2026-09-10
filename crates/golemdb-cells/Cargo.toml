@@ -1,0 +1,18 @@
+[package]
+name = "golemdb-cells"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The per-deployment type block (ids 64–127). Off by default: a deployment that
+# defines no custom types should reject those ids outright rather than accept
+# cells it cannot interpret.
+custom_types = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
