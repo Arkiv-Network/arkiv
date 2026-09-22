@@ -15,3 +15,8 @@ license.workspace = true
 # of any host's type stack. See the crate-level docs in `src/lib.rs`.
 
 [dependencies]
+
+[features]
+# The store conformance suite. Off by default: it is test scaffolding, pulled
+# in by whoever is proving an implementation, not by production dependents.
+conformance = []
