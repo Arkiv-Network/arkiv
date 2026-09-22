@@ -116,6 +116,7 @@ pub struct Metered<T> {
 }
 
 impl<T> Metered<T> {
+    /// Pair a value with what producing it cost.
     pub const fn new(value: T, receipt: Receipt) -> Self {
         Self { value, receipt }
     }
@@ -149,30 +150,30 @@ impl RecordKey {
 
     /// Left-pad a 20-byte address into the 32-byte key space, ABI style.
     pub const fn from_address(address: [u8; 20]) -> Self {
-        let mut key = [0u8; 32];
-        let mut i = 0;
-        while i < 20 {
-            key[12 + i] = address[i];
-            i += 1;
+        let mut padded = [0u8; 32];
+        let mut byte = 0;
+        while byte < 20 {
+            padded[12 + byte] = address[byte];
+            byte += 1;
         }
-        Self(key)
+        Self(padded)
     }
 
     /// The inverse of [`from_address`](Self::from_address). `None` if the
     /// leading 12 bytes are not zero, i.e. this key is not a padded address.
     pub const fn as_address(&self) -> Option<[u8; 20]> {
-        let mut i = 0;
-        while i < 12 {
-            if self.0[i] != 0 {
+        let mut leading = 0;
+        while leading < 12 {
+            if self.0[leading] != 0 {
                 return None;
             }
-            i += 1;
+            leading += 1;
         }
         let mut address = [0u8; 20];
-        let mut j = 0;
-        while j < 20 {
-            address[j] = self.0[12 + j];
-            j += 1;
+        let mut byte = 0;
+        while byte < 20 {
+            address[byte] = self.0[12 + byte];
+            byte += 1;
         }
         Some(address)
     }
@@ -201,19 +202,28 @@ pub enum CellKind {
 pub struct TypeId(pub u8);
 
 impl TypeId {
+    /// A single byte, `0` or `1`. Equality only.
     pub const BOOL: Self = Self(1);
+    /// Four bytes, sign-bit-biased big-endian for ordering.
     pub const I32: Self = Self(2);
+    /// Thirty-two bytes, plain big-endian.
     pub const U256: Self = Self(3);
+    /// A 256-bit signed decimal, 18 places, sign-bit-biased big-endian.
     pub const DEC: Self = Self(4);
+    /// Thirty-two opaque bytes. Equality only — no meaningful ordering.
     pub const BYTES32: Self = Self(5);
     /// Variable width, **field-only** — an attribute of this type is
     /// [`StoreError::InvalidArgument`].
     pub const BYTES: Self = Self(6);
+    /// UTF-8 up to a cap. Equality and prefix; ordering is raw byte order.
     pub const STR: Self = Self(7);
+    /// Eight bytes, plain big-endian. The block-number domain.
     pub const U64: Self = Self(8);
 
     /// The Arkiv profile's registered types.
+    /// A 20-byte Ethereum address. Equality only.
     pub const ADDR: Self = Self(32);
+    /// A 32-byte Arkiv entity key. Equality only.
     pub const KEY: Self = Self(33);
 
     /// `0` is reserved; the tag byte's kind bit caps ids at 127.
@@ -254,10 +264,12 @@ pub enum IndexClass {
 }
 
 impl IndexClass {
+    /// Whether `<`, `<=`, `>` and `>=` are answerable from this index.
     pub const fn supports_range(self) -> bool {
         matches!(self, Self::EqRange)
     }
 
+    /// Whether a byte-prefix match is answerable from this index.
     pub const fn supports_prefix(self) -> bool {
         matches!(self, Self::EqPrefix)
     }
@@ -276,6 +288,8 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// An **indexed** cell: visible to `query` and `count`, and priced for
+    /// the index maintenance it triggers.
     pub fn attribute(type_id: TypeId, value: Vec<u8>) -> Self {
         Self {
             kind: CellKind::Attribute,
@@ -284,6 +298,8 @@ impl Cell {
         }
     }
 
+    /// A **non-indexed** cell: invisible to queries, priced only for the
+    /// bytes moved, and readable solely by point read.
     pub fn field(type_id: TypeId, value: Vec<u8>) -> Self {
         Self {
             kind: CellKind::Field,
