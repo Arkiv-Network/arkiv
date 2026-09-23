@@ -89,6 +89,62 @@ impl<T: NodeReader> NodeReader for &T {
     }
 }
 
+/// A durable node store: reads, plus a flush that makes a staged batch
+/// durable in one step.
+pub trait NodeStore: NodeReader {
+    fn flush(&self, staged: MemNodeStore) -> Result<(), Self::Error>;
+}
+
+impl<T: NodeStore> NodeStore for std::sync::Arc<T> {
+    fn flush(&self, staged: MemNodeStore) -> Result<(), Self::Error> {
+        (**self).flush(staged)
+    }
+}
+
+impl<T: NodeStore> NodeStore for &T {
+    fn flush(&self, staged: MemNodeStore) -> Result<(), Self::Error> {
+        (**self).flush(staged)
+    }
+}
+
+/// An in-memory [`NodeStore`] shared between readers, for tests.
+#[derive(Debug, Default)]
+pub struct SharedMemNodeStore {
+    nodes: std::sync::Mutex<MemNodeStore>,
+}
+
+impl SharedMemNodeStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.lock().expect("poisoned").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl NodeReader for SharedMemNodeStore {
+    type Error = Never;
+
+    fn node(&self, hash: &B256) -> Result<Option<Vec<u8>>, Never> {
+        self.nodes.lock().expect("poisoned").node(hash)
+    }
+}
+
+impl NodeStore for SharedMemNodeStore {
+    fn flush(&self, mut staged: MemNodeStore) -> Result<(), Never> {
+        let mut nodes = self.nodes.lock().expect("poisoned");
+        for (h, rlp) in staged.drain() {
+            nodes.put_node(h, rlp);
+        }
+        Ok(())
+    }
+}
+
 /// A reader that consults `overlay` first, then `base`. This is how a batch of
 /// nodes written during a block is visible to the same block's later reads
 /// before the batch reaches the durable store.

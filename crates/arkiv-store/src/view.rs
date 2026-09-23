@@ -233,67 +233,65 @@ impl<'a, S: NodeReader> DbView<'a, S> {
         };
         self.scan(attr, ty, &from, to.as_deref())
     }
+}
 
-    // ── Commit ────────────────────────────────────────────────────────────
+/// Apply `changes` on top of the database at `roots`, reading and writing
+/// through `store`, and return the new roots. The old roots stay valid.
+pub fn commit_changes<W: NodeReader + NodeSink>(
+    store: &mut W,
+    roots: DbRoots,
+    changes: &DbChanges,
+) -> Result<DbRoots, StoreError<W::Error>> {
+    let mut entity_changes = Changes::new();
+    // index id -> its trie changes
+    let mut index_changes: BTreeMap<Vec<u8>, Changes> = BTreeMap::new();
 
-    /// Apply `changes` on top of this view, writing the new nodes into
-    /// `sink`, and return the new roots. This view is unchanged.
-    pub fn commit<W: NodeReader<Error = S::Error> + NodeSink>(
-        &self,
-        sink: &mut W,
-        changes: &DbChanges,
-    ) -> Result<DbRoots, StoreError<S::Error>> {
-        let mut entity_changes = Changes::new();
-        // index id -> its trie changes
-        let mut index_changes: BTreeMap<Vec<u8>, Changes> = BTreeMap::new();
-
-        for (key, after) in &changes.entities {
-            let before = self.entity(key)?;
-            entity_changes.insert(key.to_vec(), after.as_ref().map(record::encode));
-            if let Some(delta) = annotation_delta(*key, before.as_ref(), after.as_ref()) {
-                for AttrEntry { attr, value } in &delta.removes {
-                    index_changes
-                        .entry(index_id(attr, value.attr_type()))
-                        .or_default()
-                        .insert(index_entry_key(value, key), None);
-                }
-                for AttrEntry { attr, value } in &delta.inserts {
-                    index_changes
-                        .entry(index_id(attr, value.attr_type()))
-                        .or_default()
-                        .insert(index_entry_key(value, key), Some(INDEX_PRESENT.to_vec()));
-                }
+    for (key, after) in &changes.entities {
+        let before = DbView::at(&*store, roots).entity(key)?;
+        entity_changes.insert(key.to_vec(), after.as_ref().map(record::encode));
+        if let Some(delta) = annotation_delta(*key, before.as_ref(), after.as_ref()) {
+            for AttrEntry { attr, value } in &delta.removes {
+                index_changes
+                    .entry(index_id(attr, value.attr_type()))
+                    .or_default()
+                    .insert(index_entry_key(value, key), None);
+            }
+            for AttrEntry { attr, value } in &delta.inserts {
+                index_changes
+                    .entry(index_id(attr, value.attr_type()))
+                    .or_default()
+                    .insert(index_entry_key(value, key), Some(INDEX_PRESENT.to_vec()));
             }
         }
-
-        let mut index_root_changes = Changes::new();
-        for (id, trie_changes) in &index_changes {
-            let old = match Trie::get(sink, self.roots.indexes, id)? {
-                Some(bytes) => B256::try_from(bytes.as_slice())
-                    .map_err(|_| StoreError::Malformed("index root length"))?,
-                None => EMPTY_ROOT_HASH,
-            };
-            let new = Trie::update(sink, old, trie_changes)?;
-            if new != old {
-                let value = (new != EMPTY_ROOT_HASH).then(|| new.to_vec());
-                index_root_changes.insert(id.clone(), value);
-            }
-        }
-
-        let nonce_changes: Changes = changes
-            .nonces
-            .iter()
-            .map(|(owner, nonce)| (nonce_key(owner), Some(nonce_value(*nonce))))
-            .collect();
-
-        let roots = DbRoots {
-            entities: Trie::update(sink, self.roots.entities, &entity_changes)?,
-            nonces: Trie::update(sink, self.roots.nonces, &nonce_changes)?,
-            indexes: Trie::update(sink, self.roots.indexes, &index_root_changes)?,
-        };
-        roots.store(sink);
-        Ok(roots)
     }
+
+    let mut index_root_changes = Changes::new();
+    for (id, trie_changes) in &index_changes {
+        let old = match Trie::get(store, roots.indexes, id)? {
+            Some(bytes) => B256::try_from(bytes.as_slice())
+                .map_err(|_| StoreError::Malformed("index root length"))?,
+            None => EMPTY_ROOT_HASH,
+        };
+        let new = Trie::update(store, old, trie_changes)?;
+        if new != old {
+            let value = (new != EMPTY_ROOT_HASH).then(|| new.to_vec());
+            index_root_changes.insert(id.clone(), value);
+        }
+    }
+
+    let nonce_changes: Changes = changes
+        .nonces
+        .iter()
+        .map(|(owner, nonce)| (nonce_key(owner), Some(nonce_value(*nonce))))
+        .collect();
+
+    let roots = DbRoots {
+        entities: Trie::update(store, roots.entities, &entity_changes)?,
+        nonces: Trie::update(store, roots.nonces, &nonce_changes)?,
+        indexes: Trie::update(store, roots.indexes, &index_root_changes)?,
+    };
+    roots.store(store);
+    Ok(roots)
 }
 
 /// The smallest byte string greater than every string with `prefix`. `None`
@@ -334,9 +332,8 @@ mod tests {
     }
 
     fn commit(store: &mut MemNodeStore, roots: DbRoots, changes: DbChanges) -> DbRoots {
-        let view = DbView::at(&*store, roots);
         let mut staging = Staging::new(&*store);
-        let roots = view.commit(&mut staging, &changes).unwrap();
+        let roots = commit_changes(&mut staging, roots, &changes).unwrap();
         for (h, rlp) in staging.into_staged().drain() {
             store.put_node(h, rlp);
         }

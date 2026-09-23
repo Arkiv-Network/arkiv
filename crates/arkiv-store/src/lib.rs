@@ -29,12 +29,12 @@ pub mod view;
 
 pub use alloy_primitives::{Address, B256, U256};
 pub use annotations::{AttrEntry, EntityDelta, annotation_delta, entity_annotations};
-pub use arkiv_trie::{MemNodeStore, NodeReader, NodeSink, Staging};
+pub use arkiv_trie::{MemNodeStore, NodeReader, NodeSink, NodeStore, SharedMemNodeStore, Staging};
 pub use mdbx::ArkivDb;
 pub use query::{evaluate, evaluate_page};
 pub use record::{RecordError, decode, encode};
 pub use roots::{DbRoots, EMPTY_DB_ROOT};
-pub use view::{DbChanges, DbView, StoreError};
+pub use view::{DbChanges, DbView, StoreError, commit_changes};
 
 /// The Ethereum account whose storage slot 0 holds the database root. The
 /// address is the ASCII string `arkiv-database-root!`, exactly 20 bytes, so it

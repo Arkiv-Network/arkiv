@@ -1,6 +1,13 @@
-//! [`MptStateView`] — the spec's `StateView` over Ethereum's one MPT account
-//! state: per-store staging maps over a base `B`, flushed through on commit.
-//! Base reads bypass the staging, which is all `ViewOnBase` is.
+//! [`MptStateView`] — the spec's `StateView` over two backends: the Ethereum
+//! account state (balances, transaction nonces, the anchor slot) through a
+//! base `B`, and the Arkiv database (entities, minting nonces, the index)
+//! through a node store `N`. Per-store staging maps sit over both, flushed
+//! through on commit. Base reads bypass the staging, which is all
+//! `ViewOnBase` is.
+//!
+//! A commit of the database side writes new trie nodes into `N` and the new
+//! database root into the anchor slot through `B`, so the Ethereum diff a
+//! transaction returns carries exactly one word of Arkiv state: its root.
 
 use core::cell::RefCell;
 use core::mem;
@@ -8,6 +15,7 @@ use core::ops::Bound;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeMap;
 
+use alloy_primitives::B256;
 use arkiv_interfaces::entity::{AttributeValue, Entity};
 use arkiv_interfaces::gas::PlaceholderCost;
 use arkiv_interfaces::primitives::{
@@ -18,23 +26,32 @@ use arkiv_interfaces::statemanager::{
     EntityStore, EntityUpdates, EqualityIndexStore, PruningMeta, PruningStore, RangeIndexStore,
     ReadMode, SessionId, StateCommit, StateView, StoreKind,
 };
-use arkiv_reth_mpt_committed_store::{
-    AccountCode, AttrEntry, AuxError, AuxiliaryEntityDelta, BalanceAccess, CodeBackend,
-    CodeBackendError, IndexStorage, NonceAccess, RethAccountBalancesStore, RethAccountNoncesStore,
-    RethAuxStore, RethEntityCreationNoncesStore, RethEntityStore, annotation_delta,
-};
 use arkiv_reth_uncommitted_store::MemPruningStore;
+use arkiv_store::{
+    AttrEntry, DbChanges, DbRoots, DbView, EntityDelta, NodeReader, NodeSink, StoreError,
+    annotation_delta, commit_changes,
+};
 
-/// What can go wrong in an [`MptStateView`], generic over the base's error `E`.
+use crate::seams::{
+    AnchorAccess, BalanceAccess, NonceAccess, RethAccountBalancesStore, RethAccountNoncesStore,
+};
+
+/// What can go wrong in an [`MptStateView`]: `E` is the base's error, `S` the
+/// node store's.
 #[derive(Debug)]
-pub enum MptError<E> {
+pub enum MptError<E, S> {
     Backend(E),
-    Entity(CodeBackendError<E>),
-    Index(AuxError<E>),
+    Store(StoreError<S>),
     /// The operation isn't available on this host.
     Unsupported(&'static str),
     /// The view cannot graduate — see [`StateView::graduate`].
     Graduate(&'static str),
+}
+
+impl<E, S> From<StoreError<S>> for MptError<E, S> {
+    fn from(e: StoreError<S>) -> Self {
+        Self::Store(e)
+    }
 }
 
 fn next_session() -> SessionId {
@@ -46,32 +63,56 @@ fn next_session() -> SessionId {
 }
 
 #[derive(Debug)]
-pub struct MptStateView<B, C = PlaceholderCost> {
-    // RefCell because the spec's reads are `&self` while every reth seam reads
+pub struct MptStateView<B, N, C = PlaceholderCost> {
+    // RefCell because the spec's reads are `&self` while every seam reads
     // with `&mut` (caches). Borrows never overlap: each method takes one.
     base: RefCell<B>,
+    nodes: RefCell<N>,
+    /// The database roots this view reads as its base.
+    roots: DbRoots,
     costs: C,
     block: BlockRef,
     session: SessionId,
     entities: BTreeMap<EntityAddress, EntityUpdates>,
-    index: BTreeMap<EntityAddress, AuxiliaryEntityDelta>,
+    index: BTreeMap<EntityAddress, EntityDelta>,
     balances: BTreeMap<UserAddress, UserBalance>,
     account_nonces: BTreeMap<UserAddress, UserNonce>,
     creation_nonces: BTreeMap<UserAddress, EntityCreationNonce>,
     pruning: MemPruningStore,
+    /// The database root after the last commit.
     commitment: Option<Commitment>,
 }
 
-impl<B> MptStateView<B> {
-    pub fn new(base: B, block: BlockRef) -> Self {
-        Self::with_cost_model(base, block, PlaceholderCost)
+impl<B, N> MptStateView<B, N>
+where
+    B: AnchorAccess,
+    N: NodeReader,
+{
+    /// Open a view: the base's anchor slot names the database root.
+    pub fn new(base: B, nodes: N, block: BlockRef) -> Result<Self, MptError<B::Error, N::Error>> {
+        Self::with_cost_model(base, nodes, block, PlaceholderCost)
     }
 }
 
-impl<B, C> MptStateView<B, C> {
-    pub fn with_cost_model(base: B, block: BlockRef, costs: C) -> Self {
-        Self {
+impl<B, N, C> MptStateView<B, N, C>
+where
+    B: AnchorAccess,
+    N: NodeReader,
+{
+    pub fn with_cost_model(
+        mut base: B,
+        nodes: N,
+        block: BlockRef,
+        costs: C,
+    ) -> Result<Self, MptError<B::Error, N::Error>> {
+        let root = base.db_root().map_err(MptError::Backend)?;
+        let roots = DbRoots::load(&nodes, root)
+            .map_err(|e| MptError::Store(StoreError::Store(e)))?
+            .ok_or(MptError::Store(StoreError::UnknownRoot(root)))?;
+        Ok(Self {
             base: RefCell::new(base),
+            nodes: RefCell::new(nodes),
+            roots,
             costs,
             block,
             session: next_session(),
@@ -82,9 +123,11 @@ impl<B, C> MptStateView<B, C> {
             creation_nonces: BTreeMap::new(),
             pruning: MemPruningStore::new(),
             commitment: None,
-        }
+        })
     }
+}
 
+impl<B, N, C> MptStateView<B, N, C> {
     pub const fn cost_model(&self) -> &C {
         &self.costs
     }
@@ -93,8 +136,24 @@ impl<B, C> MptStateView<B, C> {
         self.base.get_mut()
     }
 
-    pub fn into_base(self) -> B {
-        self.base.into_inner()
+    pub fn nodes_mut(&mut self) -> &mut N {
+        self.nodes.get_mut()
+    }
+
+    /// The database roots this view reads as its base.
+    pub const fn roots(&self) -> &DbRoots {
+        &self.roots
+    }
+
+    /// The database root as of the last commit, or the base's.
+    pub fn db_root(&self) -> B256 {
+        self.commitment
+            .map(B256::from)
+            .unwrap_or_else(|| self.roots.root())
+    }
+
+    pub fn into_parts(self) -> (B, N) {
+        (self.base.into_inner(), self.nodes.into_inner())
     }
 
     fn is_dirty(&self) -> bool {
@@ -106,25 +165,30 @@ impl<B, C> MptStateView<B, C> {
             || self.pruning.is_dirty()
     }
 
-    /// All store commitments are the same on this host: computed once, cached.
-    /// Zero stands in for the unified state root reth computes at seal time.
-    fn shared_commitment(&mut self) -> Commitment {
-        *self.commitment.get_or_insert_with(Commitment::default)
+    /// Every committed store answers with the database root: the one
+    /// commitment this host has. Before any commit, the base's root.
+    fn shared_commitment(&self) -> Commitment {
+        self.commitment.unwrap_or_else(|| self.roots.root().0)
     }
 }
 
-impl<B, C, E> MptStateView<B, C>
+impl<B, N, C> MptStateView<B, N, C>
 where
-    B: AccountCode<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess,
+    N: NodeReader,
 {
-    fn base_entity(&self, address: EntityAddress) -> Result<Option<Entity>, MptError<E>> {
-        RethEntityStore::new(CodeBackend::new(&mut *self.base.borrow_mut()))
-            .get(address)
-            .map_err(MptError::Entity)
+    fn base_entity(
+        &self,
+        address: EntityAddress,
+    ) -> Result<Option<Entity>, MptError<B::Error, N::Error>> {
+        let nodes = self.nodes.borrow();
+        Ok(DbView::at(&*nodes, self.roots).entity(&address)?)
     }
 
-    fn overlaid_entity(&self, updates: &EntityUpdates) -> Result<Option<Entity>, MptError<E>> {
+    fn overlaid_entity(
+        &self,
+        updates: &EntityUpdates,
+    ) -> Result<Option<Entity>, MptError<B::Error, N::Error>> {
         if updates.delete {
             return Ok(None);
         }
@@ -132,16 +196,13 @@ where
         updates.apply_to(&mut entity);
         Ok(Some(entity))
     }
-}
 
-impl<B, C, E> MptStateView<B, C>
-where
-    B: AccountCode<Error = E> + IndexStorage<Error = E>,
-    E: core::fmt::Debug,
-{
     /// Derive each update's delta against the base and stage it, replacing any
     /// earlier delta for the same entity. Shared by both index stores.
-    fn stage_index_deltas(&mut self, updates: &[EntityUpdates]) -> Result<(), MptError<E>> {
+    fn stage_index_deltas(
+        &mut self,
+        updates: &[EntityUpdates],
+    ) -> Result<(), MptError<B::Error, N::Error>> {
         for u in updates {
             let before = self.base_entity(u.entity)?;
             let after = self.overlaid_entity(u)?;
@@ -151,18 +212,6 @@ where
             };
         }
         Ok(())
-    }
-
-    /// Drains the staged map, so both index stores' `commit_store` share it and
-    /// the second call is a no-op.
-    fn flush_index(&mut self) -> Result<(), MptError<E>> {
-        let staged: Vec<AuxiliaryEntityDelta> = mem::take(&mut self.index).into_values().collect();
-        if staged.is_empty() {
-            return Ok(());
-        }
-        RethAuxStore::new(self.base.get_mut())
-            .apply_delta(&staged)
-            .map_err(MptError::Index)
     }
 
     fn adjust_with_staged(
@@ -184,14 +233,54 @@ where
     }
 }
 
+impl<B, N, C> MptStateView<B, N, C>
+where
+    B: AnchorAccess,
+    N: NodeReader + NodeSink,
+{
+    /// Flush every staged database write — entities, their index deltas and
+    /// the minting nonces — as one commit: new nodes into the store, the new
+    /// root into the anchor. The three `commit_store`s of the database-side
+    /// stores all come here, so the second and third find nothing to do.
+    fn flush_db(&mut self) -> Result<(), MptError<B::Error, N::Error>> {
+        let staged_entities = mem::take(&mut self.entities);
+        let staged_nonces = mem::take(&mut self.creation_nonces);
+        // The index is derived from the entity changes at commit; the staged
+        // deltas only served overlay reads.
+        self.index.clear();
+        if staged_entities.is_empty() && staged_nonces.is_empty() {
+            // Nothing to write, but the view now counts as committed.
+            self.commitment.get_or_insert(self.roots.root().0);
+            return Ok(());
+        }
+
+        let mut changes = DbChanges::default();
+        for (key, updates) in staged_entities {
+            let after = self.overlaid_entity(&updates)?;
+            changes.entities.insert(key, after);
+        }
+        changes.nonces = staged_nonces;
+
+        let new_roots = commit_changes(self.nodes.get_mut(), self.roots, &changes)?;
+        self.roots = new_roots;
+        let root = new_roots.root();
+        self.base
+            .get_mut()
+            .set_db_root(root)
+            .map_err(MptError::Backend)?;
+        self.commitment = Some(root.0);
+        Ok(())
+    }
+}
+
 // ── The committed stores ────────────────────────────────────────────────────
 
-impl<B, C, E> EntityStore for MptStateView<B, C>
+impl<B, N, C> EntityStore for MptStateView<B, N, C>
 where
-    B: AccountCode<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<B::Error, N::Error>;
 
     fn get_entity(
         &self,
@@ -256,32 +345,17 @@ where
     }
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
-        let staged = mem::take(&mut self.entities);
-        {
-            let mut store = RethEntityStore::new(CodeBackend::new(self.base.get_mut()));
-            for (key, updates) in staged {
-                if updates.delete {
-                    store.remove(key).map_err(MptError::Entity)?;
-                } else {
-                    let mut entity = store
-                        .get(key)
-                        .map_err(MptError::Entity)?
-                        .unwrap_or_default();
-                    updates.apply_to(&mut entity);
-                    store.put(&entity).map_err(MptError::Entity)?;
-                }
-            }
-        }
+        self.flush_db()?;
         Ok(self.shared_commitment())
     }
 }
 
-impl<B, C, E> EqualityIndexStore for MptStateView<B, C>
+impl<B, N, C> EqualityIndexStore for MptStateView<B, N, C>
 where
-    B: AccountCode<Error = E> + IndexStorage<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<B::Error, N::Error>;
 
     fn get_equal_entities(
         &self,
@@ -289,9 +363,10 @@ where
         value: &AttributeValue,
         read: ReadMode,
     ) -> Result<Vec<EntityAddress>, Self::Error> {
-        let keys = RethAuxStore::new(&mut *self.base.borrow_mut())
-            .equal_entities(attribute, value)
-            .map_err(MptError::Index)?;
+        let keys = {
+            let nodes = self.nodes.borrow();
+            DbView::at(&*nodes, self.roots).equal(attribute, value)?
+        };
         Ok(match read {
             ReadMode::ViewOnBase => keys,
             ReadMode::ViewWithOverlay => {
@@ -306,9 +381,11 @@ where
         prefix: &str,
         read: ReadMode,
     ) -> Result<Vec<EntityAddress>, Self::Error> {
-        let keys = RethAuxStore::new(&mut *self.base.borrow_mut())
-            .prefixed_entities(attribute, prefix)
-            .map_err(MptError::Index)?;
+        let mut keys = {
+            let nodes = self.nodes.borrow();
+            DbView::at(&*nodes, self.roots).prefixed(attribute, prefix)?
+        };
+        keys.sort_unstable();
         Ok(match read {
             ReadMode::ViewOnBase => keys,
             ReadMode::ViewWithOverlay => self.adjust_with_staged(keys, |e| {
@@ -323,16 +400,16 @@ where
     }
 
     fn commit_store(&mut self) -> Result<(), Self::Error> {
-        self.flush_index()
+        self.flush_db()
     }
 }
 
-impl<B, C, E> RangeIndexStore for MptStateView<B, C>
+impl<B, N, C> RangeIndexStore for MptStateView<B, N, C>
 where
-    B: AccountCode<Error = E> + IndexStorage<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<B::Error, N::Error>;
 
     fn get_within_range(
         &self,
@@ -353,14 +430,16 @@ where
                     "a range lookup needs at least one typed bound",
                 ));
             }
-            // Bounds of two types name disjoint bucket sets: nothing matches.
+            // Bounds of two types name disjoint indexes: nothing matches.
             (Some(a), Some(b)) if a.attr_type() != b.attr_type() => return Ok(Vec::new()),
             (Some(v), _) | (None, Some(v)) => v.attr_type(),
         };
 
-        let keys = RethAuxStore::new(&mut *self.base.borrow_mut())
-            .entities_in_range(attribute, low, high)
-            .map_err(MptError::Index)?;
+        let mut keys = {
+            let nodes = self.nodes.borrow();
+            DbView::at(&*nodes, self.roots).range(attribute, ty, low, high)?
+        };
+        keys.sort_unstable();
         match read {
             ReadMode::ViewOnBase => Ok(keys),
             ReadMode::ViewWithOverlay => {
@@ -390,16 +469,16 @@ where
     }
 
     fn commit_store(&mut self) -> Result<(), Self::Error> {
-        self.flush_index()
+        self.flush_db()
     }
 }
 
-impl<B, C, E> AccountBalancesStore for MptStateView<B, C>
+impl<B, N, C> AccountBalancesStore for MptStateView<B, N, C>
 where
-    B: BalanceAccess<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess + BalanceAccess<Error = <B as AnchorAccess>::Error>,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<<B as AnchorAccess>::Error, N::Error>;
 
     fn get_balance(
         &self,
@@ -411,7 +490,7 @@ where
         {
             return Ok(*balance);
         }
-        RethAccountBalancesStore::new(&mut *self.base.borrow_mut())
+        RethAccountBalancesStore(&mut *self.base.borrow_mut())
             .get_balance(account)
             .map_err(MptError::Backend)
     }
@@ -463,7 +542,7 @@ where
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
         let staged = mem::take(&mut self.balances);
         for (account, balance) in staged {
-            RethAccountBalancesStore::new(self.base.get_mut())
+            RethAccountBalancesStore(self.base.get_mut())
                 .set_balance(account, balance)
                 .map_err(MptError::Backend)?;
         }
@@ -471,12 +550,12 @@ where
     }
 }
 
-impl<B, C, E> AccountNoncesStore for MptStateView<B, C>
+impl<B, N, C> AccountNoncesStore for MptStateView<B, N, C>
 where
-    B: NonceAccess<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess + NonceAccess<Error = <B as AnchorAccess>::Error>,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<<B as AnchorAccess>::Error, N::Error>;
 
     fn get_acc_nonce(
         &self,
@@ -488,7 +567,7 @@ where
         {
             return Ok(*nonce);
         }
-        RethAccountNoncesStore::new(&mut *self.base.borrow_mut())
+        RethAccountNoncesStore(&mut *self.base.borrow_mut())
             .get_account_nonce(account)
             .map_err(MptError::Backend)
     }
@@ -505,7 +584,7 @@ where
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
         let staged = mem::take(&mut self.account_nonces);
         for (account, nonce) in staged {
-            RethAccountNoncesStore::new(self.base.get_mut())
+            RethAccountNoncesStore(self.base.get_mut())
                 .set_account_nonce(account, nonce)
                 .map_err(MptError::Backend)?;
         }
@@ -513,12 +592,12 @@ where
     }
 }
 
-impl<B, C, E> EntityCreationNoncesStore for MptStateView<B, C>
+impl<B, N, C> EntityCreationNoncesStore for MptStateView<B, N, C>
 where
-    B: IndexStorage<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<B::Error, N::Error>;
 
     fn get_entity_creation_nonce(
         &self,
@@ -530,9 +609,8 @@ where
         {
             return Ok(*nonce);
         }
-        RethEntityCreationNoncesStore::new(&mut *self.base.borrow_mut())
-            .get_entity_nonce(owner)
-            .map_err(MptError::Backend)
+        let nodes = self.nodes.borrow();
+        Ok(DbView::at(&*nodes, self.roots).creation_nonce(&owner)?)
     }
 
     fn fetch_increment_entity_creation_nonce(
@@ -545,24 +623,19 @@ where
     }
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
-        let staged = mem::take(&mut self.creation_nonces);
-        for (owner, nonce) in staged {
-            RethEntityCreationNoncesStore::new(self.base.get_mut())
-                .set_entity_nonce(owner, nonce)
-                .map_err(MptError::Backend)?;
-        }
+        self.flush_db()?;
         Ok(self.shared_commitment())
     }
 }
 
 // ── The uncommitted store ───────────────────────────────────────────────────
 
-impl<B, C, E> PruningStore for MptStateView<B, C>
+impl<B, N, C> PruningStore for MptStateView<B, N, C>
 where
-    B: BalanceAccess<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<B::Error, N::Error>;
 
     fn add_to_pruning_set(
         &mut self,
@@ -593,15 +666,14 @@ where
 
 // ── The view ────────────────────────────────────────────────────────────────
 
-impl<B, C, E> StateView for MptStateView<B, C>
+impl<B, N, C> StateView for MptStateView<B, N, C>
 where
-    B: AccountCode<Error = E>
-        + IndexStorage<Error = E>
-        + BalanceAccess<Error = E>
-        + NonceAccess<Error = E>,
-    E: core::fmt::Debug,
+    B: AnchorAccess
+        + BalanceAccess<Error = <B as AnchorAccess>::Error>
+        + NonceAccess<Error = <B as AnchorAccess>::Error>,
+    N: NodeReader + NodeSink,
 {
-    type Error = MptError<E>;
+    type Error = MptError<<B as AnchorAccess>::Error, N::Error>;
 
     fn base(&self) -> BlockRef {
         self.block
@@ -611,12 +683,12 @@ where
         self.session
     }
 
-    /// Always `true`: this host keeps every store in the one state trie.
+    /// Always `true`: every root this node has ever written stays readable.
     fn has_store(&self, _store: StoreKind) -> bool {
         true
     }
 
-    fn graduate(self, block: BlockRef) -> Result<StateCommit, MptError<E>> {
+    fn graduate(self, block: BlockRef) -> Result<StateCommit, <Self as StateView>::Error> {
         if self.is_dirty() {
             return Err(MptError::Graduate("staged writes remain uncommitted"));
         }
@@ -640,87 +712,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::convert::Infallible;
-    use std::collections::{HashMap, HashSet};
-
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::{Address, U256};
     use arkiv_interfaces::entity::annotations::OWNER;
-    use arkiv_reth_mpt_committed_store::entities::layout::{
-        SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address, nonce_slot,
-    };
+    use arkiv_store::SharedMemNodeStore;
 
-    /// An in-memory base implementing every raw seam.
-    #[derive(Debug, Default, Clone)]
-    struct MemState {
-        balances: HashMap<Address, U256>,
-        nonces: HashMap<Address, u64>,
-        code: HashMap<Address, Vec<u8>>,
-        slots: HashMap<(Address, B256), B256>,
-        persisted: HashSet<Address>,
-    }
-
-    impl AccountCode for MemState {
-        type Error = Infallible;
-        fn code(&mut self, addr: Address) -> Result<Vec<u8>, Infallible> {
-            Ok(self.code.get(&addr).cloned().unwrap_or_default())
-        }
-        fn set_code(&mut self, addr: Address, code: Vec<u8>) -> Result<(), Infallible> {
-            self.code.insert(addr, code);
-            Ok(())
-        }
-        fn clear_code(&mut self, addr: Address) -> Result<(), Infallible> {
-            self.code.remove(&addr);
-            Ok(())
-        }
-    }
-
-    impl IndexStorage for MemState {
-        type Error = Infallible;
-        fn storage(&mut self, addr: Address, slot: B256) -> Result<B256, Infallible> {
-            Ok(self.slots.get(&(addr, slot)).copied().unwrap_or(B256::ZERO))
-        }
-        fn set_storage(
-            &mut self,
-            addr: Address,
-            slot: B256,
-            value: B256,
-        ) -> Result<(), Infallible> {
-            self.slots.insert((addr, slot), value);
-            Ok(())
-        }
-        fn ensure_account_persists(&mut self, addr: Address) -> Result<(), Infallible> {
-            self.persisted.insert(addr);
-            Ok(())
-        }
-    }
-
-    impl BalanceAccess for MemState {
-        type Error = Infallible;
-        fn get_balance(&mut self, addr: Address) -> Result<U256, Infallible> {
-            Ok(self.balances.get(&addr).copied().unwrap_or_default())
-        }
-        fn set_balance(&mut self, addr: Address, balance: U256) -> Result<(), Infallible> {
-            self.balances.insert(addr, balance);
-            Ok(())
-        }
-    }
-
-    impl NonceAccess for MemState {
-        type Error = Infallible;
-        fn get_nonce(&mut self, addr: Address) -> Result<u64, Infallible> {
-            Ok(self.nonces.get(&addr).copied().unwrap_or_default())
-        }
-        fn set_nonce(&mut self, addr: Address, nonce: u64) -> Result<(), Infallible> {
-            self.nonces.insert(addr, nonce);
-            Ok(())
-        }
-    }
-
-    type View = MptStateView<MemState>;
-
-    fn view() -> View {
-        View::new(MemState::default(), BlockRef::new(10, [0xBB; 32]))
-    }
+    use crate::testing::{MemBase, MemView, mem_view, settle};
 
     fn key_of(byte: u8) -> EntityAddress {
         [byte; 32]
@@ -736,8 +732,7 @@ mod tests {
         }
     }
 
-    /// Create + index an entity through the view's store accessors.
-    fn stage_create(view: &mut View, byte: u8, owner: u8) {
+    fn stage_create(view: &mut MemView<'_>, byte: u8, owner: u8) {
         view.entities_mut()
             .update_entity(EntityUpdates::create(entity_of(byte, owner)))
             .unwrap();
@@ -746,15 +741,20 @@ mod tests {
         view.range_index_mut().apply_deltas(&deltas).unwrap();
     }
 
-    fn owned_by(view: &View, owner: u8, read: ReadMode) -> Vec<EntityAddress> {
+    fn owned_by(view: &MemView<'_>, owner: u8, read: ReadMode) -> Vec<EntityAddress> {
         view.equality_index()
             .get_equal_entities(OWNER, &AttributeValue::EthereumAddress([owner; 20]), read)
             .unwrap()
     }
 
+    fn block() -> BlockRef {
+        BlockRef::new(10, [0xBB; 32])
+    }
+
     #[test]
     fn overlay_writes_stay_off_the_base_until_commit() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         let key = key_of(7);
         view.update_entity(EntityUpdates::create(entity_of(7, 2)))
             .unwrap();
@@ -764,23 +764,32 @@ mod tests {
             Some(entity_of(7, 2))
         );
         assert_eq!(view.get_entity(key, ReadMode::ViewOnBase).unwrap(), None);
+        assert_eq!(view.db_root(), B256::ZERO);
 
         StateView::commit(&mut view).unwrap();
         assert_eq!(
             view.get_entity(key, ReadMode::ViewOnBase).unwrap(),
             Some(entity_of(7, 2))
         );
-        // The entity really multiplexes onto account code.
-        assert!(
-            view.backend_mut()
-                .code
-                .contains_key(&entity_leaf_address(key))
+        // The anchor now names the new root, and the nodes are staged.
+        let root = view.db_root();
+        assert_ne!(root, B256::ZERO);
+        assert_eq!(view.backend_mut().db_root, root);
+
+        // A fresh view over the settled base reads the same entity.
+        let base = settle(view, &nodes);
+        let next = mem_view(base, &nodes, block());
+        assert_eq!(
+            next.get_entity(key, ReadMode::ViewOnBase).unwrap(),
+            Some(entity_of(7, 2))
         );
+        assert_eq!(next.db_root(), root);
     }
 
     #[test]
     fn partial_updates_patch_only_what_they_set() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         view.update_entity(EntityUpdates::create(entity_of(7, 2)))
             .unwrap();
         StateView::commit(&mut view).unwrap();
@@ -798,13 +807,13 @@ mod tests {
             .unwrap();
         assert_eq!(overlaid.expires_at, 500);
         assert_eq!(overlaid.payload, b"hi", "unset fields read from the base");
-        // Coalesced: one net delta for the entity.
         assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
     }
 
     #[test]
     fn index_reads_honor_read_mode() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         stage_create(&mut view, 0xA0, 1);
 
         assert_eq!(
@@ -820,7 +829,8 @@ mod tests {
 
     #[test]
     fn range_and_prefix_lookups_answer_from_the_index() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         let mut with_attrs = entity_of(1, 1);
         with_attrs.attributes = vec![
             arkiv_interfaces::entity::Attribute::new(b"rank".to_vec(), AttributeValue::Int(5)),
@@ -857,7 +867,6 @@ mod tests {
             .unwrap()
             .is_empty()
         );
-        // Bounds of two types match nothing; no bounds is refused.
         assert!(
             view.get_within_range(
                 b"rank",
@@ -892,11 +901,11 @@ mod tests {
 
     #[test]
     fn staged_index_deltas_adjust_overlay_reads() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         stage_create(&mut view, 0xA0, 1);
         StateView::commit(&mut view).unwrap();
 
-        // Transfer: stage the owner swap, don't commit.
         view.update_entity(EntityUpdates {
             entity: key_of(0xA0),
             owner: Some([2; 20]),
@@ -911,13 +920,13 @@ mod tests {
             owned_by(&view, 2, ReadMode::ViewWithOverlay),
             vec![key_of(0xA0)]
         );
-        // The base still answers the old owner until commit.
         assert_eq!(owned_by(&view, 1, ReadMode::ViewOnBase), vec![key_of(0xA0)]);
     }
 
     #[test]
     fn balances_and_nonces_stage_then_flush() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         let alice: UserAddress = [0xAA; 20];
         view.backend_mut()
             .balances
@@ -963,11 +972,14 @@ mod tests {
             U256::from(50u64)
         );
         assert_eq!(view.backend_mut().nonces[&Address::from(alice)], 1);
+        // Nothing touched the database: the anchor stays empty.
+        assert_eq!(view.backend_mut().db_root, B256::ZERO);
     }
 
     #[test]
-    fn creation_nonces_stage_then_land_on_the_system_account() {
-        let mut view = view();
+    fn creation_nonces_stage_then_land_in_the_database() {
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         let alice: UserAddress = [0xAA; 20];
 
         assert_eq!(
@@ -985,18 +997,20 @@ mod tests {
         );
 
         StateView::commit(&mut view).unwrap();
-        let backend = view.backend_mut();
-        assert!(backend.persisted.contains(&SYSTEM_ACCOUNT_ADDRESS));
-        assert!(
-            backend
-                .slots
-                .contains_key(&(SYSTEM_ACCOUNT_ADDRESS, nonce_slot(Address::from(alice))))
+        assert_ne!(view.backend_mut().db_root, B256::ZERO);
+        let base = settle(view, &nodes);
+        let next = mem_view(base, &nodes, block());
+        assert_eq!(
+            next.get_entity_creation_nonce(alice, ReadMode::ViewOnBase)
+                .unwrap(),
+            EntityCreationNonce::new(2)
         );
     }
 
     #[test]
     fn graduate_needs_a_committed_view_extending_the_base() {
-        let mut dirty = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut dirty = mem_view(MemBase::default(), &nodes, block());
         dirty
             .update_entity(EntityUpdates::create(entity_of(1, 1)))
             .unwrap();
@@ -1005,29 +1019,30 @@ mod tests {
             Err(MptError::Graduate(_))
         ));
 
-        let uncommitted = view();
+        let uncommitted = mem_view(MemBase::default(), &nodes, block());
         assert!(matches!(
             uncommitted.graduate(BlockRef::new(11, [0x11; 32])),
             Err(MptError::Graduate(_))
         ));
 
-        let mut committed = view();
+        let mut committed = mem_view(MemBase::default(), &nodes, block());
         stage_create(&mut committed, 1, 1);
         StateView::commit(&mut committed).unwrap();
-        let wrong_height = MptStateView::new(
-            committed.backend_mut().clone(),
-            BlockRef::new(10, [0xBB; 32]),
-        );
+        let root = committed.db_root();
+        let base = settle(committed, &nodes);
+
+        let wrong_height = mem_view(base.clone(), &nodes, block());
         assert!(matches!(
             wrong_height.graduate(BlockRef::new(13, [0x13; 32])),
             Err(MptError::Graduate(_))
         ));
 
+        let mut committed = mem_view(base, &nodes, block());
         StateView::commit(&mut committed).unwrap();
         let commit = committed.graduate(BlockRef::new(11, [0x11; 32])).unwrap();
         assert_eq!(commit.parent, BlockRef::new(10, [0xBB; 32]));
         assert_eq!(commit.block.height, 11);
-        // All commitments are the one shared value on this host.
+        assert_eq!(commit.entities, root.0);
         assert_eq!(commit.entities, commit.balances);
         assert_eq!(commit.entities, commit.account_nonces);
         assert_eq!(commit.entities, commit.entity_creation_nonces);
@@ -1035,15 +1050,17 @@ mod tests {
 
     #[test]
     fn sessions_are_unique_per_view() {
-        let a = view();
-        let b = view();
+        let nodes = SharedMemNodeStore::new();
+        let a = mem_view(MemBase::default(), &nodes, block());
+        let b = mem_view(MemBase::default(), &nodes, block());
         assert_ne!(a.session(), b.session());
         assert_eq!(a.base(), b.base());
     }
 
     #[test]
     fn deletes_tombstone_and_unindex() {
-        let mut view = view();
+        let nodes = SharedMemNodeStore::new();
+        let mut view = mem_view(MemBase::default(), &nodes, block());
         stage_create(&mut view, 0xA0, 1);
         StateView::commit(&mut view).unwrap();
 
@@ -1065,5 +1082,7 @@ mod tests {
             None
         );
         assert!(owned_by(&view, 1, ReadMode::ViewOnBase).is_empty());
+        // Every entity gone: the database is empty again.
+        assert_eq!(view.db_root(), B256::ZERO);
     }
 }

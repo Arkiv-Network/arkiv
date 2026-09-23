@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use alloy_primitives::B256;
-use arkiv_trie::{MemNodeStore, NodeReader};
+use arkiv_trie::{MemNodeStore, NodeReader, NodeStore};
 use reth_libmdbx::{
     DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, SyncMode, WriteFlags,
 };
@@ -141,6 +141,12 @@ impl ArkivDb {
     }
 }
 
+impl NodeStore for ArkivDb {
+    fn flush(&self, staged: MemNodeStore) -> Result<(), DbError> {
+        Self::flush(self, staged)
+    }
+}
+
 impl NodeReader for ArkivDb {
     type Error = DbError;
 
@@ -161,7 +167,7 @@ impl NodeReader for ArkivDb {
 mod tests {
     use super::*;
     use crate::roots::DbRoots;
-    use crate::view::{DbChanges, DbView};
+    use crate::view::{DbChanges, DbView, commit_changes};
     use arkiv_interfaces::entity::Entity;
     use arkiv_trie::Staging;
 
@@ -183,15 +189,11 @@ mod tests {
                     ..Entity::default()
                 }),
             );
-            let roots = DbView::at(&db, DbRoots::EMPTY)
-                .commit(&mut staging, &changes)
-                .unwrap();
+            let roots = commit_changes(&mut staging, DbRoots::EMPTY, &changes).unwrap();
             db.flush(staging.into_staged()).unwrap();
             // Flushing the same nodes again is a no-op.
             let mut staging = Staging::new(&db);
-            DbView::at(&db, DbRoots::EMPTY)
-                .commit(&mut staging, &changes)
-                .unwrap();
+            commit_changes(&mut staging, DbRoots::EMPTY, &changes).unwrap();
             db.flush(staging.into_staged()).unwrap();
             assert!(db.node_count().unwrap() > 0);
             roots.root()
