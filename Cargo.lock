@@ -1689,6 +1689,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-trie"
+version = "0.5.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

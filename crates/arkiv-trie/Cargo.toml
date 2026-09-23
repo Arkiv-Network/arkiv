@@ -1,0 +1,17 @@
+[package]
+name = "arkiv-trie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A persistent (immutable, structurally shared) Merkle-Patricia trie over a
+# content-addressed node store. Every node is stored under keccak(rlp(node)),
+# a root is a hash, and an update copies only the path to each changed key.
+# Old roots stay readable for as long as their nodes are kept.
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-trie.workspace = true
+
