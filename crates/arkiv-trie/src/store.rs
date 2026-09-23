@@ -73,6 +73,22 @@ impl NodeSink for MemNodeStore {
     }
 }
 
+impl<T: NodeReader> NodeReader for std::sync::Arc<T> {
+    type Error = T::Error;
+
+    fn node(&self, hash: &B256) -> Result<Option<Vec<u8>>, T::Error> {
+        (**self).node(hash)
+    }
+}
+
+impl<T: NodeReader> NodeReader for &T {
+    type Error = T::Error;
+
+    fn node(&self, hash: &B256) -> Result<Option<Vec<u8>>, T::Error> {
+        (**self).node(hash)
+    }
+}
+
 /// A reader that consults `overlay` first, then `base`. This is how a batch of
 /// nodes written during a block is visible to the same block's later reads
 /// before the batch reaches the durable store.

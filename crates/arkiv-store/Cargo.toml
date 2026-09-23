@@ -1,0 +1,24 @@
+[package]
+name = "arkiv-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Arkiv's database state under its own root: the entities, the entity-creation
+# nonces and the query indexes, each a persistent trie (arkiv-trie) in one
+# content-addressed node store. The root of it all is what the Ethereum anchor
+# account's storage slot holds. Host-agnostic except for the MDBX node store.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+arkiv-trie.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp = { workspace = true, features = ["derive"] }
+# The durable node store.
+reth-libmdbx.workspace = true
+parking_lot = "0.12"
+lru = "0.12"
+
+[dev-dependencies]
+tempfile.workspace = true

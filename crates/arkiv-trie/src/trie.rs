@@ -3,12 +3,11 @@
 //! a node store; there is no trie object, because a root *is* the trie.
 
 use alloy_primitives::{B256, keccak256};
-use alloy_rlp::{Decodable, Encodable};
-use alloy_trie::nodes::{BranchNode, ExtensionNode, LeafNode, RlpNode, TrieNode};
-use alloy_trie::{EMPTY_ROOT_HASH, Nibbles, TrieMask};
+use alloy_trie::EMPTY_ROOT_HASH;
 use core::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::node::{Child, DecodeError, Node, Path};
 use crate::store::{NodeReader, NodeSink};
 
 #[derive(Debug)]
@@ -16,7 +15,7 @@ pub enum TrieError<E> {
     Store(E),
     /// A node the trie refers to is not in the store.
     MissingNode(B256),
-    Decode(alloy_rlp::Error),
+    Decode(DecodeError),
     /// The key is a prefix of another key in the trie.
     PrefixKey(Vec<u8>),
 }
@@ -28,7 +27,7 @@ pub type Changes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// One `(key, value)` entry of a walk.
 pub type Item<E> = Result<(Vec<u8>, Vec<u8>), TrieError<E>>;
 
-type Entry = (Nibbles, Option<Vec<u8>>);
+type Entry = (Path, Option<Vec<u8>>);
 
 /// The operations. See the module docs.
 pub struct Trie;
@@ -40,7 +39,7 @@ impl Trie {
         root: B256,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, TrieError<S::Error>> {
-        let key = Nibbles::unpack(key);
+        let key = Path::unpack(key);
         let mut depth = 0;
         let mut node = match load_root(store, root)? {
             Some(n) => n,
@@ -48,22 +47,21 @@ impl Trie {
         };
         loop {
             match node {
-                TrieNode::EmptyRoot => return Ok(None),
-                TrieNode::Leaf(leaf) => {
-                    return Ok((leaf.key == key.slice(depth..)).then_some(leaf.value));
+                Node::Leaf { path, value } => {
+                    return Ok((path.as_slice() == &key.as_slice()[depth..]).then_some(value));
                 }
-                TrieNode::Extension(ext) => {
-                    if !key.slice(depth..).starts_with(&ext.key) {
+                Node::Extension { path, child } => {
+                    if !key.as_slice()[depth..].starts_with(path.as_slice()) {
                         return Ok(None);
                     }
-                    depth += ext.key.len();
-                    node = load(store, &ext.child)?;
+                    depth += path.len();
+                    node = load(store, &child)?;
                 }
-                TrieNode::Branch(branch) => {
+                Node::Branch { children } => {
                     let Some(nibble) = key.get(depth) else {
                         return Ok(None);
                     };
-                    let Some(child) = child_at(&branch, nibble) else {
+                    let Some(child) = &children[nibble as usize] else {
                         return Ok(None);
                     };
                     depth += 1;
@@ -85,7 +83,7 @@ impl Trie {
         }
         let entries: Vec<Entry> = changes
             .iter()
-            .map(|(k, v)| (Nibbles::unpack(k), v.clone()))
+            .map(|(k, v)| (Path::unpack(k), v.clone()))
             .collect();
         let old = load_root(store, root)?;
         match update_node(store, old, 0, &entries)? {
@@ -102,11 +100,11 @@ impl Trie {
     ) -> Result<TrieIter<'a, S>, TrieError<S::Error>> {
         let mut stack = Vec::new();
         if let Some(node) = load_root(store, root)? {
-            stack.push(Frame::Node(Nibbles::new(), node));
+            stack.push(Frame::Node(Path::new(), node));
         }
         Ok(TrieIter {
             store,
-            lower: Nibbles::unpack(from),
+            lower: Path::unpack(from),
             stack,
         })
     }
@@ -132,14 +130,11 @@ impl Trie {
 // Loading and storing
 // ---------------------------------------------------------------------------
 
-fn decode<E>(mut rlp: &[u8]) -> Result<TrieNode, TrieError<E>> {
-    TrieNode::decode(&mut rlp).map_err(TrieError::Decode)
+fn decode<E>(rlp: &[u8]) -> Result<Node, TrieError<E>> {
+    Node::decode(rlp).map_err(TrieError::Decode)
 }
 
-fn load_root<S: NodeReader>(
-    store: &S,
-    root: B256,
-) -> Result<Option<TrieNode>, TrieError<S::Error>> {
+fn load_root<S: NodeReader>(store: &S, root: B256) -> Result<Option<Node>, TrieError<S::Error>> {
     if root == EMPTY_ROOT_HASH {
         return Ok(None);
     }
@@ -151,76 +146,44 @@ fn load_root<S: NodeReader>(
 }
 
 /// Resolve a child reference: a hash is looked up, a short node is inline.
-fn load<S: NodeReader>(store: &S, r: &RlpNode) -> Result<TrieNode, TrieError<S::Error>> {
-    match r.as_hash() {
-        Some(hash) => {
+fn load<S: NodeReader>(store: &S, child: &Child) -> Result<Node, TrieError<S::Error>> {
+    match child {
+        Child::Hash(hash) => {
             let rlp = store
-                .node(&hash)
+                .node(hash)
                 .map_err(TrieError::Store)?
-                .ok_or(TrieError::MissingNode(hash))?;
+                .ok_or(TrieError::MissingNode(*hash))?;
             decode(&rlp)
         }
-        None => decode(r.as_slice()),
+        Child::Inline(rlp) => decode(rlp),
     }
 }
 
 /// Encode `node` and store it if it is hash-referenced; return the reference
 /// a parent embeds.
-fn put<S: NodeSink>(store: &mut S, node: &TrieNode) -> RlpNode {
-    let mut rlp = Vec::new();
-    let r = node.rlp(&mut rlp);
-    if let Some(hash) = r.as_hash() {
-        store.put_node(hash, rlp);
+fn put<S: NodeSink>(store: &mut S, node: &Node) -> Child {
+    let rlp = node.encode();
+    let child = Child::of(&rlp);
+    if let Child::Hash(hash) = &child {
+        store.put_node(*hash, rlp);
     }
-    r
+    child
 }
 
 /// The root is always referenced by hash, even when its encoding is short.
-fn put_root<S: NodeSink>(store: &mut S, node: &TrieNode) -> B256 {
-    let mut rlp = Vec::new();
-    node.encode(&mut rlp);
+fn put_root<S: NodeSink>(store: &mut S, node: &Node) -> B256 {
+    let rlp = node.encode();
     let hash = keccak256(&rlp);
     store.put_node(hash, rlp);
     hash
-}
-
-fn child_at(branch: &BranchNode, nibble: u8) -> Option<&RlpNode> {
-    if !branch.state_mask.is_bit_set(nibble) {
-        return None;
-    }
-    let below = (branch.state_mask.get() & ((1u16 << nibble) - 1)).count_ones() as usize;
-    branch
-        .stack
-        .get(branch.as_ref().first_child_index() + below)
-}
-
-/// A branch's children as a 16-slot table.
-fn children_of(branch: &BranchNode) -> [Option<RlpNode>; 16] {
-    let mut out: [Option<RlpNode>; 16] = Default::default();
-    for (nibble, child) in branch.as_ref().children() {
-        out[nibble as usize] = child.cloned();
-    }
-    out
-}
-
-fn branch_from(children: [Option<RlpNode>; 16]) -> BranchNode {
-    let mut mask = TrieMask::default();
-    let mut stack = Vec::new();
-    for (i, child) in children.into_iter().enumerate() {
-        if let Some(c) = child {
-            mask.set_bit(i as u8);
-            stack.push(c);
-        }
-    }
-    BranchNode::new(stack, mask)
 }
 
 // ---------------------------------------------------------------------------
 // Update by path copying
 // ---------------------------------------------------------------------------
 
-fn prefix_key<E>(key: &Nibbles) -> TrieError<E> {
-    TrieError::PrefixKey(key.pack().to_vec())
+fn prefix_key<E>(key: &Path) -> TrieError<E> {
+    TrieError::PrefixKey(key.pack())
 }
 
 /// Rebuild the subtree `node` at `depth` under `entries`. Every entry key
@@ -229,30 +192,32 @@ fn prefix_key<E>(key: &Nibbles) -> TrieError<E> {
 /// one.
 fn update_node<S: NodeReader + NodeSink>(
     store: &mut S,
-    node: Option<TrieNode>,
+    node: Option<Node>,
     depth: usize,
     entries: &[Entry],
-) -> Result<Option<TrieNode>, TrieError<S::Error>> {
+) -> Result<Option<Node>, TrieError<S::Error>> {
     if entries.is_empty() {
         return Ok(node);
     }
     match node {
-        None | Some(TrieNode::EmptyRoot) => build(store, depth, entries),
-        Some(TrieNode::Leaf(leaf)) => {
-            let mut full = entries[0].0.slice(..depth);
-            full.extend(&leaf.key);
+        None => build(store, depth, entries),
+        Some(Node::Leaf { path, value }) => {
+            let mut full = entries[0].0.slice(0..depth);
+            full.extend(&path);
             let mut merged = entries.to_vec();
             if let Err(i) = merged.binary_search_by(|(k, _)| k.cmp(&full)) {
-                merged.insert(i, (full, Some(leaf.value)));
+                merged.insert(i, (full, Some(value)));
             }
             build(store, depth, &merged)
         }
-        Some(TrieNode::Extension(ext)) => update_extension(store, ext, depth, entries),
-        Some(TrieNode::Branch(branch)) => {
-            let mut children = children_of(&branch);
+        Some(Node::Extension { path, child }) => {
+            update_extension(store, path, child, depth, entries)
+        }
+        Some(Node::Branch { children }) => {
+            let mut children = *children;
             for (nibble, group) in group_by_nibble(depth, entries)? {
                 let existing = match &children[nibble as usize] {
-                    Some(r) => Some(load(store, r)?),
+                    Some(c) => Some(load(store, c)?),
                     None => None,
                 };
                 let updated = update_node(store, existing, depth + 1, group)?;
@@ -265,44 +230,50 @@ fn update_node<S: NodeReader + NodeSink>(
 
 fn update_extension<S: NodeReader + NodeSink>(
     store: &mut S,
-    ext: ExtensionNode,
+    ext_path: Path,
+    ext_child: Child,
     depth: usize,
     entries: &[Entry],
-) -> Result<Option<TrieNode>, TrieError<S::Error>> {
+) -> Result<Option<Node>, TrieError<S::Error>> {
     // A delete of a key outside this extension's subtree is a no-op.
     let relevant: Vec<Entry> = entries
         .iter()
-        .filter(|(k, v)| v.is_some() || k.slice(depth..).starts_with(&ext.key))
+        .filter(|(k, v)| v.is_some() || k.slice_from(depth).starts_with(&ext_path))
         .cloned()
         .collect();
     if relevant.is_empty() {
-        return Ok(Some(TrieNode::Extension(ext)));
+        return Ok(Some(Node::Extension {
+            path: ext_path,
+            child: ext_child,
+        }));
     }
     let shared = relevant
         .iter()
-        .map(|(k, _)| k.slice(depth..).common_prefix_length(&ext.key))
+        .map(|(k, _)| k.slice_from(depth).common_prefix_length(&ext_path))
         .min()
         .unwrap_or(0);
 
-    if shared == ext.key.len() {
+    if shared == ext_path.len() {
         // Everything lands below the extension: recurse and re-join.
-        let child = load(store, &ext.child)?;
+        let child = load(store, &ext_child)?;
         let updated = update_node(store, Some(child), depth + shared, &relevant)?;
-        return join(store, &ext.key, updated);
+        return join(store, &ext_path, updated);
     }
 
     // The paths diverge inside the extension: a branch at `depth + shared`.
     let fork = depth + shared;
-    let own_nibble = ext.key.get_unchecked(shared);
-    let own_rest = ext.key.slice(shared + 1..);
-    let mut children: [Option<RlpNode>; 16] = Default::default();
+    let own_nibble = ext_path.get(shared).expect("shared < len");
+    let own_rest = ext_path.slice_from(shared + 1);
+    let mut children: [Option<Child>; 16] = Default::default();
     // The extension's own continuation, as a node the recursion can update.
-    let own_node = if own_rest.is_empty() {
-        load(store, &ext.child)?
+    let mut own_node = Some(if own_rest.is_empty() {
+        load(store, &ext_child)?
     } else {
-        TrieNode::Extension(ExtensionNode::new(own_rest, ext.child))
-    };
-    let mut own_node = Some(own_node);
+        Node::Extension {
+            path: own_rest,
+            child: ext_child,
+        }
+    });
     for (nibble, group) in group_by_nibble(fork, &relevant)? {
         let updated = if nibble == own_nibble {
             update_node(store, own_node.take(), fork + 1, group)?
@@ -315,34 +286,33 @@ fn update_extension<S: NodeReader + NodeSink>(
         children[own_nibble as usize] = Some(put(store, &own));
     }
     let branch = normalize_branch(store, children)?;
-    join(store, &ext.key.slice(..shared), branch)
+    join(store, &ext_path.slice(0..shared), branch)
 }
 
 /// Prepend `prefix` to `node`: an extension over a branch, or a longer key on
 /// a leaf or extension.
 fn join<S: NodeSink, E>(
     store: &mut S,
-    prefix: &Nibbles,
-    node: Option<TrieNode>,
-) -> Result<Option<TrieNode>, TrieError<E>> {
+    prefix: &Path,
+    node: Option<Node>,
+) -> Result<Option<Node>, TrieError<E>> {
     if prefix.is_empty() {
         return Ok(node);
     }
-    let mut key = *prefix;
+    let mut key = prefix.clone();
     Ok(match node {
         None => None,
-        Some(TrieNode::EmptyRoot) => None,
-        Some(TrieNode::Leaf(leaf)) => {
-            key.extend(&leaf.key);
-            Some(TrieNode::Leaf(LeafNode::new(key, leaf.value)))
+        Some(Node::Leaf { path, value }) => {
+            key.extend(&path);
+            Some(Node::Leaf { path: key, value })
         }
-        Some(TrieNode::Extension(ext)) => {
-            key.extend(&ext.key);
-            Some(TrieNode::Extension(ExtensionNode::new(key, ext.child)))
+        Some(Node::Extension { path, child }) => {
+            key.extend(&path);
+            Some(Node::Extension { path: key, child })
         }
-        Some(branch @ TrieNode::Branch(_)) => {
+        Some(branch @ Node::Branch { .. }) => {
             let child = put(store, &branch);
-            Some(TrieNode::Extension(ExtensionNode::new(key, child)))
+            Some(Node::Extension { path: key, child })
         }
     })
 }
@@ -351,8 +321,8 @@ fn join<S: NodeSink, E>(
 /// that child, one nibble longer.
 fn normalize_branch<S: NodeReader + NodeSink>(
     store: &mut S,
-    children: [Option<RlpNode>; 16],
-) -> Result<Option<TrieNode>, TrieError<S::Error>> {
+    children: [Option<Child>; 16],
+) -> Result<Option<Node>, TrieError<S::Error>> {
     let mut present = children
         .iter()
         .enumerate()
@@ -361,10 +331,10 @@ fn normalize_branch<S: NodeReader + NodeSink>(
         return Ok(None);
     };
     if present.next().is_some() {
-        return Ok(Some(TrieNode::Branch(branch_from(children))));
+        return Ok(Some(Node::branch(children)));
     }
     let child = load(store, only)?;
-    let mut prefix = Nibbles::new();
+    let mut prefix = Path::new();
     prefix.push(nibble);
     join(store, &prefix, Some(child))
 }
@@ -374,8 +344,8 @@ fn build<S: NodeSink, E>(
     store: &mut S,
     depth: usize,
     entries: &[Entry],
-) -> Result<Option<TrieNode>, TrieError<E>> {
-    let inserts: Vec<(&Nibbles, &Vec<u8>)> = entries
+) -> Result<Option<Node>, TrieError<E>> {
+    let inserts: Vec<(&Path, &Vec<u8>)> = entries
         .iter()
         .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
         .collect();
@@ -385,21 +355,21 @@ fn build<S: NodeSink, E>(
 fn build_inserts<S: NodeSink, E>(
     store: &mut S,
     depth: usize,
-    inserts: &[(&Nibbles, &Vec<u8>)],
-) -> Result<Option<TrieNode>, TrieError<E>> {
+    inserts: &[(&Path, &Vec<u8>)],
+) -> Result<Option<Node>, TrieError<E>> {
     match inserts {
         [] => Ok(None),
-        [(key, value)] => Ok(Some(TrieNode::Leaf(LeafNode::new(
-            key.slice(depth..),
-            (*value).clone(),
-        )))),
+        [(key, value)] => Ok(Some(Node::Leaf {
+            path: key.slice_from(depth),
+            value: (*value).clone(),
+        })),
         _ => {
             // Sorted, so the common prefix of all is that of the first and last.
-            let first = inserts[0].0.slice(depth..);
-            let last = inserts[inserts.len() - 1].0.slice(depth..);
+            let first = inserts[0].0.slice_from(depth);
+            let last = inserts[inserts.len() - 1].0.slice_from(depth);
             let shared = first.common_prefix_length(&last);
             let branch = build_branch(store, depth + shared, inserts)?;
-            join(store, &first.slice(..shared), Some(branch))
+            join(store, &first.slice(0..shared), Some(branch))
         }
     }
 }
@@ -408,9 +378,9 @@ fn build_inserts<S: NodeSink, E>(
 fn build_branch<S: NodeSink, E>(
     store: &mut S,
     depth: usize,
-    inserts: &[(&Nibbles, &Vec<u8>)],
-) -> Result<TrieNode, TrieError<E>> {
-    let mut children: [Option<RlpNode>; 16] = Default::default();
+    inserts: &[(&Path, &Vec<u8>)],
+) -> Result<Node, TrieError<E>> {
+    let mut children: [Option<Child>; 16] = Default::default();
     let mut i = 0;
     while i < inserts.len() {
         let nibble = inserts[i]
@@ -425,7 +395,7 @@ fn build_branch<S: NodeSink, E>(
             .expect("a non-empty insert group builds a node");
         children[nibble as usize] = Some(put(store, &child));
     }
-    Ok(TrieNode::Branch(branch_from(children)))
+    Ok(Node::branch(children))
 }
 
 /// Split sorted `entries` into runs by their nibble at `depth`.
@@ -455,23 +425,23 @@ fn group_by_nibble<E>(
 
 enum Frame {
     /// A node already loaded, at this path.
-    Node(Nibbles, TrieNode),
+    Node(Path, Node),
     /// A child reference not yet loaded, at this path.
-    Ref(Nibbles, RlpNode),
+    Ref(Path, Child),
 }
 
 /// In-order walk from a lower bound. See [`Trie::iter_from`].
 pub struct TrieIter<'a, S> {
     store: &'a S,
-    lower: Nibbles,
+    lower: Path,
     stack: Vec<Frame>,
 }
 
 impl<S: NodeReader> TrieIter<'_, S> {
     /// Can the subtree at `path` hold a key `>= lower`?
-    fn may_reach(&self, path: &Nibbles) -> bool {
+    fn may_reach(&self, path: &Path) -> bool {
         let n = path.len().min(self.lower.len());
-        path.slice(..n).cmp(&self.lower.slice(..n)) != Ordering::Less
+        path.cmp_prefix(&self.lower, n) != Ordering::Less
     }
 }
 
@@ -488,27 +458,25 @@ impl<S: NodeReader> Iterator for TrieIter<'_, S> {
                 },
             };
             match node {
-                TrieNode::EmptyRoot => {}
-                TrieNode::Leaf(leaf) => {
+                Node::Leaf { path: rest, value } => {
                     let mut key = path;
-                    key.extend(&leaf.key);
+                    key.extend(&rest);
                     if key.cmp(&self.lower) != Ordering::Less {
-                        return Some(Ok((key.pack().to_vec(), leaf.value)));
+                        return Some(Ok((key.pack(), value)));
                     }
                 }
-                TrieNode::Extension(ext) => {
+                Node::Extension { path: rest, child } => {
                     let mut child_path = path;
-                    child_path.extend(&ext.key);
+                    child_path.extend(&rest);
                     if self.may_reach(&child_path) {
-                        self.stack.push(Frame::Ref(child_path, ext.child));
+                        self.stack.push(Frame::Ref(child_path, child));
                     }
                 }
-                TrieNode::Branch(branch) => {
+                Node::Branch { children } => {
                     // Push in reverse so the smallest nibble pops first.
-                    let children = children_of(&branch);
                     for (nibble, child) in children.into_iter().enumerate().rev() {
                         let Some(child) = child else { continue };
-                        let mut child_path = path;
+                        let mut child_path = path.clone();
                         child_path.push(nibble as u8);
                         if self.may_reach(&child_path) {
                             self.stack.push(Frame::Ref(child_path, child));
@@ -524,7 +492,7 @@ impl<S: NodeReader> Iterator for TrieIter<'_, S> {
 mod tests {
     use super::*;
     use crate::store::MemNodeStore;
-    use alloy_trie::HashBuilder;
+    use alloy_trie::{HashBuilder, Nibbles};
 
     /// A tiny deterministic generator, so the tests need no `rand`.
     struct Lcg(u64);
@@ -724,6 +692,43 @@ mod tests {
             .map(|r| u16::from_be_bytes(r.unwrap().0.try_into().unwrap()))
             .collect();
         assert_eq!(got, vec![101, 102]);
+    }
+
+    /// Keys longer than 32 bytes, which alloy-trie cannot represent, work
+    /// here: an index key is a value followed by a 32-byte entity key.
+    #[test]
+    fn long_keys_are_supported() {
+        let mut rng = Lcg(11);
+        let mut store = MemNodeStore::new();
+        let mut changes = Changes::new();
+        let mut model = Model::new();
+        for i in 0..300u32 {
+            let mut k = format!("team-{}", i % 7).into_bytes();
+            k.extend_from_slice(&[0, 0]);
+            k.extend_from_slice(&rng.bytes(32));
+            changes.insert(k.clone(), Some(vec![1]));
+            model.insert(k, vec![1]);
+        }
+        let root = Trie::update(&mut store, EMPTY_ROOT_HASH, &changes).unwrap();
+        let listed = collect_all(&store, root);
+        let expected: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(listed, expected);
+        let team3: Vec<_> = Trie::range(&store, root, b"team-3\0\0", Some(b"team-3\0\x01"))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(
+            team3.len(),
+            model.keys().filter(|k| k.starts_with(b"team-3")).count()
+        );
+        for (k, v) in &model {
+            assert_eq!(Trie::get(&store, root, k).unwrap().as_ref(), Some(v));
+        }
+        let deletes: Changes = model.keys().map(|k| (k.clone(), None)).collect();
+        assert_eq!(
+            Trie::update(&mut store, root, &deletes).unwrap(),
+            EMPTY_ROOT_HASH
+        );
     }
 
     #[test]
