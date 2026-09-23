@@ -236,20 +236,6 @@ The Ethereum state root still covers everything, through that slot.
 
 ![w:620](diagrams/after-query.svg)
 
----
-
-## No ids, no bitmaps
-
-- The index key ends with the entity key, so a walk yields keys directly.
-- Entities with the same value sit under one prefix, ascending by key.
-- `AND`, `OR`, `NOT` are merges of sorted key streams.
-- `NOT` and `*` walk the entities trie, which is the live set.
-
-The dense id, the two id maps, the counter, the roaring bitmaps and the
-hand-built B+ tree are gone.
-
----
-
 ## History and reorgs
 
 ![w:900](diagrams/after-history.svg)
