@@ -231,20 +231,25 @@ def before_query() -> None:
 
 def after_overview() -> None:
     write("after-overview", f"""
-  hdr [label="block header\\nstateRoot", fillcolor="{ROOT}"];
-  trie [label="Ethereum account trie\\nEOAs: balances and nonces"];
-  anchor [{rec("{{ anchor account 0x61726b69…7421 (’arkiv-database-root!’) | {{ nonce = 1 | slot 0 = database root }} }}")}, fillcolor="{SLOT}"];
-  top [label="top node\\nkeccak(rlp[entities root, nonces root, indexes root])", fillcolor="{ROOT}"];
-  ent [label="entities trie\\nkey (32 B) → record", fillcolor="{KV}"];
-  non [label="nonces trie\\nowner (20 B) → next nonce", fillcolor="{KV}"];
-  idx [label="index-of-indexes\\nname ‖ 0x00 ‖ type → index root", fillcolor="{KV}"];
-  i1 [label="index (team, str)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
-  i2 [label="index (rank, u256)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
-  store [{rec("{{ node store (turso, one table) | {{ keccak(rlp(node)) → rlp(node) }} }}")}, fillcolor="{OLD}"];
-  hdr -> trie -> anchor -> top;
-  top -> ent; top -> non; top -> idx;
-  idx -> i1; idx -> i2;
-  {{ent non i1 i2}} -> store [style=dashed];
+  subgraph cluster_reth {{ label="in reth (Ethereum state, MDBX)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
+    hdr [label="block header\\nstateRoot", fillcolor="{ROOT}"];
+    trie [label="Ethereum account trie\\nEOAs: balances and nonces"];
+    anchor [{rec("{{ anchor account 0x61726b69…7421 (’arkiv-database-root!’) | {{ nonce = 1 | slot 0 = database root }} }}")}, fillcolor="{SLOT}"];
+    hdr -> trie -> anchor;
+  }}
+  subgraph cluster_turso {{ label="in turso (the Arkiv node store, one table)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
+    top [label="top node\\nkeccak(rlp[entities root, nonces root, indexes root])", fillcolor="{ROOT}"];
+    ent [label="entities trie\\nkey (32 B) → record", fillcolor="{KV}"];
+    non [label="nonces trie\\nowner (20 B) → next nonce", fillcolor="{KV}"];
+    idx [label="index-of-indexes\\nname ‖ 0x00 ‖ type → index root", fillcolor="{KV}"];
+    i1 [label="index (team, str)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
+    i2 [label="index (rank, u256)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
+    store [{rec("{{ nodes table | {{ keccak(rlp(node)) → rlp(node) }} }}")}, fillcolor="{OLD}"];
+    top -> ent; top -> non; top -> idx;
+    idx -> i1; idx -> i2;
+    {{ent non i1 i2}} -> store [style=dashed];
+  }}
+  anchor -> top [label="names, by hash"];
 """)
 
 
