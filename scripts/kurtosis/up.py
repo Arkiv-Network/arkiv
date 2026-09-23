@@ -164,7 +164,9 @@ def seeded_args_file(count, payload_size):
         args.setdefault("extra_files", {})["arkiv-state.json"] = handle.read()
     for participant in args["participants"]:
         participant.setdefault("el_extra_mounts", {})["/arkiv-genesis"] = "arkiv-state.json"
-        participant.setdefault("el_extra_env_vars", {})["ARKIV_GENESIS_STATE"] = "/arkiv-genesis/arkiv-state.json"
+        participant.setdefault("el_extra_env_vars", {})[
+            "ARKIV_GENESIS_STATE"
+        ] = "/arkiv-genesis/arkiv-state.json"
 
     seeded_args = SEED_DIR / "arkiv-chain.seeded.yaml"
     with open(seeded_args, "w") as handle:
