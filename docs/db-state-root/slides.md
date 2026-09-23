@@ -183,9 +183,11 @@ accounts, so every structure had to be shaped like an account or a slot.
 ## The core idea
 
 Take the database out of the accounts. Keep it as its own persistent
-Merkle-Patricia tries in a content-addressed node store. Commit to it with
-one root, stored in one storage slot of one account.
+Merkle-Patricia tries in a content-addressed node store, completely
+independent of reth: our own trie code, our own node format, our own
+database file. reth never reads or writes a node.
 
+Commit to it with one root, stored in one storage slot of one account.
 The Ethereum state root still covers everything, through that slot.
 
 ---
