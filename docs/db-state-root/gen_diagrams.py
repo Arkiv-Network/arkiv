@@ -230,31 +230,48 @@ def before_query() -> None:
 # ----------------------------------------------------------------------------
 
 def after_overview() -> None:
+    """The layout, with fixed positions: two aligned boxes, reth on the left
+    and the Arkiv node store on the right, and the database-root edge routed
+    through the gap between them."""
+    def at(x: float, y: float) -> str:
+        return f'pos="{x},{y}!"'
+
     write("after-overview", f"""
-  subgraph cluster_reth {{ label="in reth (Ethereum state, MDBX)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
-    hdr [label="block header\\nstateRoot", fillcolor="{ROOT}"];
-    trie [label="Ethereum account trie\\nEOAs: balances and nonces"];
-    anchor [shape=plaintext, style="", label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="5" bgcolor="{SLOT}">
+  node [fixedsize=false];
+  // The two boxes, drawn first so everything else sits on top of them.
+  boxL [shape=box, style="rounded,dashed", color="#777777", fillcolor="#fafafa", style="rounded,dashed,filled",
+        label="in reth (Ethereum state, MDBX)", labelloc=t, width=5.0, height=3.9, {at(2.5, 1.95)}];
+  boxR [shape=box, color="#777777", fillcolor="#fafafa", style="rounded,dashed,filled",
+        label="external to reth (the Arkiv node store, one table)", labelloc=t, width=8.4, height=3.9, {at(10.2, 1.95)}];
+
+  hdr [label="block header\\nstateRoot", fillcolor="{ROOT}", {at(2.5, 3.2)}];
+  trie [label="Ethereum account trie\\nEOAs: balances and nonces", {at(2.5, 2.2)}];
+  anchor [shape=plaintext, style="", {at(2.5, 1.0)}, label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="5" bgcolor="{SLOT}">
       <tr><td colspan="2">anchor account 0x61726b69…7421 (‘arkiv-database-root!’)</td></tr>
       <tr><td>nonce = 1</td><td port="slot">slot 0 = database root</td></tr>
     </table>>];
-    hdr -> trie -> anchor;
-  }}
-  subgraph cluster_turso {{ label="external to reth (the Arkiv node store, one table)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
-    top [label="top node\\nkeccak(rlp[entities root, nonces root, indexes root])", fillcolor="{ROOT}"];
-    ent [label="entities trie\\nkey (32 B) → record", fillcolor="{KV}"];
-    non [label="nonces trie\\nowner (20 B) → next nonce", fillcolor="{KV}"];
-    idx [label="index-of-indexes\\nname ‖ 0x00 ‖ type → index root", fillcolor="{KV}"];
-    i1 [label="index (team, str)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
-    i2 [label="index (rank, u256)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
-    store [{rec("{{ nodes table | {{ keccak(rlp(node)) → rlp(node) }} }}")}, fillcolor="{OLD}"];
-    top -> ent; top -> non; top -> idx;
-    idx -> i1; idx -> i2;
-    {{ent non i1 i2}} -> store [style=dashed];
-  }}
-  {{ rank=same; anchor; top; }}
-  anchor:slot:e -> top:w;
-""", extra=" newrank=true;")
+
+  top [label="top node\\nkeccak(rlp[entities root, nonces root, indexes root])", fillcolor="{ROOT}", {at(10.2, 3.2)}];
+  ent [label="entities trie\\nkey (32 B) → record", fillcolor="{KV}", {at(7.4, 2.2)}];
+  non [label="nonces trie\\nowner (20 B) → next nonce", fillcolor="{KV}", {at(10.0, 2.2)}];
+  idx [label="index-of-indexes\\nname ‖ 0x00 ‖ type → index root", fillcolor="{KV}", {at(12.6, 2.2)}];
+  i1 [label="index (team, str)\\nenc(value) ‖ key → ()", fillcolor="{KV}", {at(11.3, 1.2)}];
+  i2 [label="index (rank, u256)\\nenc(value) ‖ key → ()", fillcolor="{KV}", {at(13.3, 1.2)}];
+  store [{rec("{{ nodes table | {{ keccak(rlp(node)) → rlp(node) }} }}")}, fillcolor="{OLD}", {at(8.4, 0.6)}];
+
+  hdr -> trie -> anchor;
+  top -> ent; top -> non; top -> idx;
+  idx -> i1; idx -> i2;
+  {{ent non i1 i2}} -> store [style=dashed];
+
+  // The database root: out of the anchor slot, up the gap, into the top node.
+  p2 [shape=point, style=invis, width=0.01, {at(5.5, 1.0)}];
+  p0 [shape=point, style=invis, width=0.01, {at(5.5, 3.2)}];
+  edge [color="#b8860b", penwidth=1.6];
+  anchor:slot:e -> p2 [arrowhead=none];
+  p2 -> p0 [arrowhead=none];
+  p0 -> top:w;
+""", extra=" layout=neato; splines=line;")
 
 
 def after_entities() -> None:
