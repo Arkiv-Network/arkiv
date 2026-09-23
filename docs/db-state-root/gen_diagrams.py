@@ -95,6 +95,32 @@ def merkle_tree() -> None:
 """)
 
 
+def patricia_trie() -> None:
+    """A plain trie next to its path-compressed (Patricia) form."""
+    write("patricia-trie", f"""
+  subgraph cluster_plain {{ label="plain trie: one node per character"; color="#999999"; style=dashed;
+    p0 [label="•", fillcolor="{ROOT}"];
+    pc [label="c"]; pa [label="a"]; pr [label="r", fillcolor="{KV}"]; pt [label="t", fillcolor="{KV}"];
+    prt [label="t", fillcolor="{KV}"];
+    pd [label="d"]; pdo [label="o"]; pdg [label="g", fillcolor="{KV}"];
+    p0 -> pc -> pa; pa -> pr; pa -> pt; pr -> prt;
+    p0 -> pd -> pdo -> pdg;
+  }}
+  subgraph cluster_patricia {{ label="Patricia trie: runs with one child are merged into the edge"; color="#999999"; style=dashed;
+    q0 [label="•", fillcolor="{ROOT}"];
+    qca [label="branch"];
+    qr [label="r  (car)", fillcolor="{KV}"];
+    qt [label="t  (cat)", fillcolor="{KV}"];
+    qrt [label="t  (cart)", fillcolor="{KV}"];
+    qdog [label="dog", fillcolor="{KV}"];
+    q0 -> qca [label="‘ca’"];
+    qca -> qr; qca -> qt; qr -> qrt;
+    q0 -> qdog [label="‘dog’"];
+  }}
+  note [shape=plaintext, label="keys: car, cart, cat, dog\ndepth follows where keys diverge, not key length\nlookups, inserts and ordered walks work the same way"];
+""", rankdir="TB")
+
+
 def merkle_patricia() -> None:
     """An Ethereum-style trie: branch, extension and leaf nodes, keys as nibbles."""
     write("merkle-patricia", f"""
@@ -349,7 +375,7 @@ def before_after_table() -> None:
 
 if __name__ == "__main__":
     for fn in [
-        persistent_tree, merkle_tree, merkle_patricia, reth_tables,
+        persistent_tree, merkle_tree, patricia_trie, merkle_patricia, reth_tables,
         before_entities, before_eq_index, before_range_index, before_insert, before_query,
         after_overview, after_entities, after_index, after_insert, after_commit, after_query,
         after_history, before_after_table,

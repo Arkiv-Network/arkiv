@@ -73,6 +73,16 @@ child references are hashes.
 
 ---
 
+## A Patricia trie
+
+A trie stores keys character by character: the path from the root spells the
+key, so lookup is one step per character and a walk visits keys in order. A
+Patricia trie compresses every run of single-child nodes into one edge.
+
+![w:900](diagrams/patricia-trie.svg)
+
+---
+
 ## Ethereum's Merkle-Patricia trie
 
 ![w:760](diagrams/merkle-patricia.svg)
