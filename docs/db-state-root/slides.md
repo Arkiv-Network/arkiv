@@ -324,3 +324,14 @@ format, so each is a follow-up, not a fork.
   every transaction rebuilds the upper trie nodes, the index-of-indexes path
   and the top node on its own. Batching a block's changes would rebuild the
   shared upper nodes once. The block's root is identical either way.
+
+---
+
+## Take-aways
+
+- reth stores a database state root: one storage slot of one account.
+- The database data, entities, nonces and indexes, is stored entirely
+  outside of reth, in a turso database.
+- Gas calculations and estimates still work.
+- The data in turso is reorg safe: every root ever written stays readable,
+  and the canonical anchor slot names the canonical root.
