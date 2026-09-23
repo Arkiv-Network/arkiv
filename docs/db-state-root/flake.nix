@@ -8,6 +8,7 @@
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       tools = pkgs: [ pkgs.python3 pkgs.graphviz pkgs.marp-cli ];
+      devTools = pkgs: tools pkgs ++ [ pkgs.watchexec ];
     in {
       packages = forAll (pkgs: {
         default = pkgs.stdenvNoCC.mkDerivation {
@@ -32,7 +33,7 @@
       });
 
       devShells = forAll (pkgs: {
-        default = pkgs.mkShell { packages = tools pkgs; };
+        default = pkgs.mkShell { packages = devTools pkgs; };
       });
     };
 }

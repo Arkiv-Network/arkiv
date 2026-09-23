@@ -10,8 +10,9 @@ persistent Merkle-Patricia tries committed by one root in an anchor slot.
 Build:
 
 ```sh
-nix build            # result/slides.html and result/diagrams/*.svg
-nix develop -c ./build.sh   # or in place, for editing
+nix build                   # result/slides.html and result/diagrams/*.svg
+nix develop -c ./build.sh   # or in place
+nix develop -c ./serve.sh   # live: http://localhost:8080/slides.md reloads on save
 ```
 
 `slides.html` is self-contained apart from the SVGs next to it.
