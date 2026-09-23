@@ -304,12 +304,16 @@ bound to a block.
 
 ---
 
-## Open items
+## Deliberately out of scope
 
-- Crash atomicity with reth through a shared transaction.
+Left out of the proof of concept on purpose. None of them change the root
+format, so each is a follow-up, not a fork.
+
+- Crash atomicity with reth through one shared MDBX transaction.
 - Pruning unreachable nodes.
 - Snap sync of the node store for followers.
 - Seeding at genesis on the new layout.
-- Incremental root cost per transaction versus once per block.
-
-None of these change the root format.
+- Committing the root once per block instead of once per transaction: today
+  every transaction rebuilds the upper trie nodes, the index-of-indexes path
+  and the top node on its own. Batching a block's changes would rebuild the
+  shared upper nodes once. The block's root is identical either way.
