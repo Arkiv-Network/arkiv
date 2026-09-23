@@ -64,6 +64,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Test network health checker
+        run: python3 -m unittest discover -s scripts/kurtosis -p 'test_*.py'
+
       # Only the from-source path compiles anything on the runner.
       - name: Install native build dependencies
         if: inputs.artifact == ''

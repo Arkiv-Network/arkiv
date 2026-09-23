@@ -53,8 +53,8 @@ def parse_args():
     parser.add_argument(
         "--wait",
         type=float,
-        default=30.0,
-        help="seconds to wait for block production and follower catch-up (default: 30)",
+        default=120.0,
+        help="seconds to wait for genesis, peer discovery, and follower catch-up (default: 120)",
     )
     parser.add_argument(
         "--max-follower-lag",
@@ -193,6 +193,7 @@ def check_network(args):
     sequencer_latest = sequencer_start
     follower_latest = follower_start
     samples = 0
+    last_sample_height = sequencer_start
 
     while time.monotonic() < deadline and samples < args.samples:
         # Poll both nodes together so the reported lag describes the same
@@ -200,31 +201,38 @@ def check_network(args):
         time.sleep(POLL_INTERVAL)
         sequencer_latest = block_number(args.sequencer_rpc)
         follower_latest = block_number(args.follower_rpc)
-        if sequencer_latest > sequencer_start:
-            lag = sequencer_latest - follower_latest
-            log(
-                f"INFO: sequencer advanced {sequencer_start} -> {sequencer_latest}; "
-                f"follower={follower_latest} (lag={lag})",
-                "cyan",
-            )
-            if lag > args.max_follower_lag:
-                fail(f"follower lag exceeded limit: lag={lag}, allowed={args.max_follower_lag}")
+        lag = sequencer_latest - follower_latest
+        log(
+            f"INFO: sequencer={sequencer_latest}; follower={follower_latest} (lag={lag})",
+            "cyan",
+        )
+        common_height = min(sequencer_latest, follower_latest)
+        if common_height > last_sample_height:
+            sequencer_block = block(args.sequencer_rpc, common_height)
+            follower_block = block(args.follower_rpc, common_height)
+            if sequencer_block["hash"] != follower_block["hash"]:
+                fail(f"nodes disagree at common height {common_height}")
 
-            common_height = min(sequencer_latest, follower_latest)
-            if common_height > 0:
-                sequencer_block = block(args.sequencer_rpc, common_height)
-                follower_block = block(args.follower_rpc, common_height)
-                if sequencer_block["hash"] != follower_block["hash"]:
-                    fail(f"nodes disagree at common height {common_height}")
-                samples += 1
-                log(
-                    f"OK: sample {samples}/{args.samples}; block {common_height} hash matches",
-                    "green",
-                )
-            sequencer_start = sequencer_latest
+        # Lighthouse may still be discovering peers when the sequencer starts
+        # producing blocks. Allow catch-up until the deadline, but require a
+        # fresh sequence of healthy samples after any excessive lag.
+        if lag > args.max_follower_lag:
+            samples = 0
+            continue
+        if common_height > last_sample_height:
+            samples += 1
+            last_sample_height = common_height
+            log(
+                f"OK: sample {samples}/{args.samples}; block {common_height} hash matches",
+                "green",
+            )
 
     if samples < args.samples:
-        fail(f"only collected {samples}/{args.samples} block samples in {args.wait:g}s")
+        fail(
+            f"only collected {samples}/{args.samples} block samples in {args.wait:g}s; "
+            f"sequencer={sequencer_latest}, follower={follower_latest}, "
+            f"lag={sequencer_latest - follower_latest}, allowed={args.max_follower_lag}"
+        )
     log("OK: block production, follower catch-up, and block hashes are consistent", "green")
 
 
