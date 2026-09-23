@@ -773,3 +773,6 @@ pub enum WriteOutcome {
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
+
+#[cfg(feature = "conformance")]
+pub mod reference;

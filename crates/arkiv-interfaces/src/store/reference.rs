@@ -1,34 +1,31 @@
-//! [`MemStore`] — the in-memory reference implementation of
-//! [`Store`](arkiv_interfaces::store::Store).
+//! [`MemStore`] — the reference [`Store`], and the oracle the conformance
+//! suite is proved against.
 //!
-//! Written to be **obviously correct**, not fast. It is the first thing the
-//! conformance suite is proved against, and the oracle any other
-//! implementation — a mock over another engine, or the real store — is
-//! compared to. Where the spec allows latitude, this picks the dullest option
-//! and says so.
+//! This is **test scaffolding, not a deliverable**. It exists so that
+//! [`conformance`](super::conformance) has a trivially correct implementation
+//! to run green against: without one, a failing assertion could as easily be
+//! the suite's bug as the implementation's. It is also the differential-test
+//! partner for a real backing store — drive both with the same operations and
+//! compare digests.
+//!
+//! Written to be **obviously correct**, not fast. Where the spec allows
+//! latitude it picks the dullest option and says so.
 //!
 //! Two deliberate simplifications, both safe because nothing here is
 //! consensus:
 //!
 //! - **`fork` copies the parent's state** instead of layering a diff over it.
-//!   The real store makes `fork` O(1); here O(n) buys a trivially correct read
+//!   A real store makes `fork` O(1); here O(n) buys a trivially correct read
 //!   path with no stack walking. Observable behaviour is identical.
 //! - **[`MemStore::branch_hash`] is a deterministic digest, not a
-//!   commitment.** It recomputes over the canonical encoding of the whole
-//!   branch and mixes with FNV-1a. That is enough to detect divergence between
-//!   two implementations, which is all the conformance suite asks. It is *not*
-//!   collision-resistant and proves nothing. Anything relying on a real
-//!   commitment must use the real store.
-
-#![no_std]
-#![forbid(unsafe_code)]
-
-extern crate alloc;
+//!   commitment.** FNV-1a over the canonical encoding — enough to detect
+//!   divergence between two implementations, which is all the suite asks. It
+//!   is *not* collision-resistant and proves nothing.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use arkiv_interfaces::store::{
+use super::{
     AndGroup, BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellKind, CellName,
     CommitId, CompareOp, CostUnits, Filter, Metered, Origin, Predicate, Query, QueryResult,
     ReadTarget, Receipt, Record, RecordChange, RecordKey, RecordVersion, ScheduleVersion, Sort,
@@ -782,13 +779,13 @@ mod tests {
     /// The reference implementation satisfies the whole spec contract.
     #[test]
     fn store_conformance() {
-        arkiv_interfaces::store::conformance::run_all(&MemStore::new);
+        crate::store::conformance::run_all(&MemStore::new);
     }
 
     /// And the host-facing extensions on top of it.
     #[test]
     fn store_ext_conformance() {
-        arkiv_interfaces::store::conformance::run_all_ext(&MemStore::new);
+        crate::store::conformance::run_all_ext(&MemStore::new);
     }
 
     /// A 20-byte address survives the trip into the 32-byte key space, and an

@@ -12,9 +12,13 @@
 //! ```ignore
 //! #[test]
 //! fn conformance() {
-//!     arkiv_interfaces::store::conformance::run_all(&MemStore::new);
+//!     arkiv_interfaces::store::conformance::run_all(&MyStore::new);
 //! }
 //! ```
+//!
+//! [`MemStore`](super::reference::MemStore) is the oracle this suite is proved
+//! against, so a green run there means a failure elsewhere is the
+//! implementation's and not the assertion's.
 //!
 //! Each assertion takes a **constructor** rather than a store, so every one
 //! starts from genesis and none can be polluted by an earlier failure.

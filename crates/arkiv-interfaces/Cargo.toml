@@ -17,6 +17,7 @@ license.workspace = true
 [dependencies]
 
 [features]
-# The store conformance suite. Off by default: it is test scaffolding, pulled
-# in by whoever is proving an implementation, not by production dependents.
+# The store conformance suite and the reference `MemStore` it is proved
+# against. Off by default: both are test scaffolding, pulled in by whoever is
+# proving a `Store` implementation, never by production dependents.
 conformance = []
