@@ -1,15 +1,16 @@
 //! Opaque pagination cursors for `arkiv_query`.
 //!
-//! A cursor is base64 of two little things: the entity id to resume below, and a
-//! **binding** — a hash of the query text, the block the page was evaluated
+//! A cursor is base64 of two little things: the number of matches to skip, and
+//! a **binding** — a hash of the query text, the block the page was evaluated
 //! against, and the projection. Resuming with a cursor whose binding doesn't
 //! match the current request is an error rather than a silently different page.
 //!
-//! That matters because the underlying position is just an entity id. Handed a
-//! bare id, a caller could pair page 2 of one query with page 1 of another and
-//! get a result set that never existed at any single moment. Binding makes that
-//! combination fail loudly, and keeps the encoding opaque so nobody builds a
-//! client that arithmetics on it.
+//! That matters because the underlying position is just an offset. Handed a
+//! bare offset, a caller could pair page 2 of one query with page 1 of another
+//! and get a result set that never existed at any single moment. Binding makes
+//! that combination fail loudly, and keeps the encoding opaque so nobody builds
+//! a client that arithmetics on it. The offset is stable because a page is
+//! always evaluated at one block, and the database at a block never changes.
 
 use alloy_primitives::keccak256;
 use base64::Engine;

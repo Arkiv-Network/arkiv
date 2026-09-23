@@ -5,11 +5,12 @@
 //! `arkiv_getEntity`, `arkiv_query`, `arkiv_getEntityCount` and
 //! `arkiv_getBlockTiming`.
 //!
-//! Each read takes a fresh [`SnapshotAccountCode`] of the requested state — the
-//! tip, or a past block. Because the Arkiv index lives in ordinary reth state
-//! rather than a sidecar database, a historical snapshot carries a historical
-//! index for free. Within one `arkiv_query` the *same* snapshot resolves the query
-//! and reads the matched entities, so a page is always internally consistent.
+//! Each read opens a [`SnapshotView`] of the requested state — the tip, or a
+//! past block: the reth snapshot's anchor slot names the database root, and
+//! the Arkiv node store still holds every root a block committed, so a
+//! historical snapshot carries a historical index for free. Within one
+//! `arkiv_query` the *same* view resolves the query and reads the matched
+//! entities, so a page is always internally consistent.
 //!
 //! Wire shapes are the client's too and live in [`arkiv_rpc_types`]; this crate
 //! holds only what a server decides.
@@ -23,22 +24,22 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{B256, hex};
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
-use arkiv_reth_mpt_committed_store::RethAuxStore;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
 use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
 use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
+use arkiv_store::{ArkivDb, evaluate_page};
 use jsonrpsee::RpcModule;
 use jsonrpsee::types::ErrorObjectOwned;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
+use std::sync::Arc;
 
 use crate::error::{block_unavailable, cursor_error, internal_error, invalid_params, query_error};
-use crate::snapshot::SnapshotAccountCode;
+use crate::snapshot::SnapshotView;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
 ///
 /// `provider` hands out a fresh state snapshot per call (`StateProviderFactory`) and
 /// answers block-header/number reads for `arkiv_getBlockTiming`.
-pub fn arkiv_module<Provider>(provider: Provider) -> eyre::Result<RpcModule<()>>
+pub fn arkiv_module<Provider>(provider: Provider, db: Arc<ArkivDb>) -> eyre::Result<RpcModule<()>>
 where
     Provider:
         StateProviderFactory + HeaderProvider + BlockNumReader + Clone + Send + Sync + 'static,
@@ -46,8 +47,10 @@ where
     let mut module = RpcModule::new(());
 
     let p = provider.clone();
+    let d = db.clone();
     module.register_async_method("arkiv_getEntity", move |params, _ctx, _ext| {
         let provider = p.clone();
+        let db = d.clone();
         async move {
             // `[key]` at the tip, or `[key, block]` as of a past block.
             let mut seq = params.sequence();
@@ -58,15 +61,17 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
             // The read hits MDBX, so run it off the async runtime.
-            tokio::task::spawn_blocking(move || read_entity(&provider, key, block))
+            tokio::task::spawn_blocking(move || read_entity(&provider, db, key, block))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
         }
     })?;
 
     let p = provider.clone();
+    let d = db.clone();
     module.register_async_method("arkiv_debugEntityExists", move |params, _ctx, _ext| {
         let provider = p.clone();
+        let db = d.clone();
         async move {
             let mut seq = params.sequence();
             let key: B256 = seq
@@ -75,15 +80,17 @@ where
             let block: Option<u64> = seq
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
-            tokio::task::spawn_blocking(move || entity_exists_unfiltered(&provider, key, block))
+            tokio::task::spawn_blocking(move || entity_exists_unfiltered(&provider, db, key, block))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
         }
     })?;
 
     let p = provider.clone();
+    let d = db.clone();
     module.register_async_method("arkiv_query", move |params, _ctx, _ext| {
         let provider = p.clone();
+        let db = d.clone();
         async move {
             // Positional `[q]` or `[q, options]` — the SDK's wire format.
             let mut seq = params.sequence();
@@ -96,15 +103,17 @@ where
                 .unwrap_or_default();
             // The parse is pure, but the evaluation hits MDBX — run it off the
             // async runtime.
-            tokio::task::spawn_blocking(move || run_query(&provider, &q, &options))
+            tokio::task::spawn_blocking(move || run_query(&provider, db, &q, &options))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
         }
     })?;
 
     let p = provider.clone();
+    let d = db;
     module.register_async_method("arkiv_getEntityCount", move |params, _ctx, _ext| {
         let provider = p.clone();
+        let db = d.clone();
         async move {
             // Optional `[{ query?, block? }]`; absent means "all, at the tip".
             let request: CountRequest = params
@@ -112,7 +121,7 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?
                 .unwrap_or_default();
-            tokio::task::spawn_blocking(move || entity_count(&provider, request))
+            tokio::task::spawn_blocking(move || entity_count(&provider, db, request))
                 .await
                 .map_err(|e| internal_error(format!("task join: {e}")))?
         }
@@ -182,6 +191,7 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
 /// SDK that reads through both methods decodes them the same way.
 fn read_entity<Provider>(
     provider: &Provider,
+    db: Arc<ArkivDb>,
     key: B256,
     block: Option<u64>,
 ) -> Result<Option<EntityData>, ErrorObjectOwned>
@@ -189,9 +199,10 @@ where
     Provider: StateProviderFactory + BlockNumReader,
 {
     let (state, block_number) = resolve_state(provider, block)?;
-    let mut store = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
-    let entity = store
-        .get(key.0)
+    let snapshot = open_snapshot(&state, db)?;
+    let entity = snapshot
+        .view()
+        .entity(&key.0)
         .map_err(|e| internal_error(format!("get entity: {e:?}")))?;
     Ok(entity
         .filter(|e| is_live(e.expires_at, block_number))
@@ -201,6 +212,7 @@ where
 /// Testing/debugging read that deliberately bypasses the logical expiry filter.
 fn entity_exists_unfiltered<Provider>(
     provider: &Provider,
+    db: Arc<ArkivDb>,
     key: B256,
     block: Option<u64>,
 ) -> Result<bool, ErrorObjectOwned>
@@ -208,11 +220,20 @@ where
     Provider: StateProviderFactory + BlockNumReader,
 {
     let (state, _) = resolve_state(provider, block)?;
-    let mut store = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
-    Ok(store
-        .get(key.0)
+    let snapshot = open_snapshot(&state, db)?;
+    Ok(snapshot
+        .view()
+        .entity(&key.0)
         .map_err(|e| internal_error(format!("get entity: {e:?}")))?
         .is_some())
+}
+
+/// The Arkiv database as of `state`.
+fn open_snapshot(
+    state: &StateProviderBox,
+    db: Arc<ArkivDb>,
+) -> Result<SnapshotView, ErrorObjectOwned> {
+    SnapshotView::open(state, db).map_err(|e| internal_error(format!("open snapshot: {e}")))
 }
 
 /// A state snapshot for `atBlock` plus the block number it answers for:
@@ -256,14 +277,14 @@ where
 /// Parse `q`, evaluate it against the index (at the tip or as of
 /// `options.atBlock`), and read the matched entities back.
 ///
-/// One snapshot backs both stores: the index's `evaluate` resolves the query to
-/// a page of keys, then the same snapshot is recovered (`into_backend`) and
-/// reused to read those entities' full bytes — so the keys and the entities are
-/// read from a single consistent state.
+/// One view backs both steps: the query resolves to a page of keys, then the
+/// same view reads those entities — so the keys and the entities come from a
+/// single consistent state.
 ///
 /// The query is bounded to entities still live at that block — see [`live_at`].
 fn run_query<Provider>(
     provider: &Provider,
+    db: Arc<ArkivDb>,
     q: &str,
     options: &QueryOptions,
 ) -> Result<QueryResponse, ErrorObjectOwned>
@@ -285,25 +306,24 @@ where
         Some(text) => Some(cursor::decode(text, binding).map_err(|e| cursor_error(e.message()))?),
     };
 
-    let mut index = RethAuxStore::new(SnapshotAccountCode::new(state));
-    let matches = index
-        .evaluate(
-            &live_at(query, block_number),
-            PageParams {
-                page_size,
-                cursor: resume_from,
-            },
-        )
-        .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
+    let snapshot = open_snapshot(&state, db)?;
+    let view = snapshot.view();
+    let matches = evaluate_page(
+        &view,
+        &live_at(query, block_number),
+        PageParams {
+            page_size,
+            cursor: resume_from,
+        },
+    )
+    .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
 
-    // Recover the same snapshot to read the matched entities' bytes.
-    let mut store = RethEntityStore::new(CodeBackend::new(index.into_backend()));
     let mut data = Vec::with_capacity(matches.keys.len());
     for key in &matches.keys {
-        // A key in the index but missing from the entity store is a store
+        // A key in the index but missing from the entity trie is a store
         // inconsistency, not a normal "no such entity" — surface it.
-        let entity = store
-            .get(*key)
+        let entity = view
+            .entity(key)
             .map_err(|e| internal_error(format!("get entity: {e:?}")))?
             .ok_or_else(|| {
                 internal_error(format!(
@@ -319,7 +339,7 @@ where
         block_number,
         cursor: matches
             .next_cursor
-            .map(|entity_id| cursor::encode(entity_id, binding)),
+            .map(|offset| cursor::encode(offset, binding)),
     })
 }
 
@@ -332,6 +352,7 @@ where
 /// [`live_at`].
 fn entity_count<Provider>(
     provider: &Provider,
+    db: Arc<ArkivDb>,
     request: CountRequest,
 ) -> Result<u64, ErrorObjectOwned>
 where
@@ -342,16 +363,16 @@ where
         None => Query::All,
     };
     let (state, block_number) = resolve_state(provider, request.block)?;
-    let mut index = RethAuxStore::new(SnapshotAccountCode::new(state));
-    let matches = index
-        .evaluate(
-            &live_at(query, block_number),
-            PageParams {
-                page_size: 1,
-                cursor: None,
-            },
-        )
-        .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
+    let snapshot = open_snapshot(&state, db)?;
+    let matches = evaluate_page(
+        &snapshot.view(),
+        &live_at(query, block_number),
+        PageParams {
+            page_size: 1,
+            cursor: None,
+        },
+    )
+    .map_err(|e| internal_error(format!("evaluate: {e:?}")))?;
     Ok(matches.stats.entities_scanned)
 }
 

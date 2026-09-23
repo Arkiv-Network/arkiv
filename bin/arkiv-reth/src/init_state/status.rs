@@ -100,11 +100,12 @@ mod tests {
     #[test]
     fn interrupted_import_record_survives_reopen_and_cannot_authorize_startup() {
         let dir = tempfile::tempdir().unwrap();
-        let genesis = arkiv_seed::export::genesis_with_state_hash(
-            arkiv_seed::export::dev_genesis(42),
-            B256::repeat_byte(7),
-        )
-        .unwrap()
+        // A minimal genesis whose `stateHash` names a state no import wrote.
+        let genesis = serde_json::json!({
+            "config": { "chainId": 42 },
+            "alloc": {},
+            "stateHash": B256::repeat_byte(7),
+        })
         .to_string();
         let command = InitStateCommand::<ArkivChainSpecParser>::parse_from([
             "init-state",

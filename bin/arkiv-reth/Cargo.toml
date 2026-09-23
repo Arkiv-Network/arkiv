@@ -48,6 +48,8 @@ arkiv-reth-executor.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true
+# The Arkiv database handle the RPC shares with the executor.
+arkiv-store.workspace = true
 # The RPC block type the debug launcher converts (`DebugNode::RpcBlock`).
 alloy-rpc-types.workspace = true
 eyre.workspace = true
@@ -60,8 +62,6 @@ tracing.workspace = true
 # the tests build calldata with arkiv-bindings and decode EntityOperation logs.
 arkiv-harness.workspace = true
 arkiv-bindings.workspace = true
-# The seeded-genesis tests build their block-0 state in-process.
-arkiv-seed.workspace = true
 arkiv-genesis.workspace = true
 alloy-provider.workspace = true
 alloy-signer-local.workspace = true

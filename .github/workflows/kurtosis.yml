@@ -58,7 +58,7 @@ jobs:
       # enclave starts; the integration tests then check both nodes serve them.
       # The seed rides in the Kurtosis package arguments (4 MiB cap): 1000 x
       # 512 B is about 2.5 MiB of alloc.
-      ARKIV_SEED_COUNT: ${{ inputs.seed_count || '1000' }}
+      ARKIV_SEED_COUNT: ${{ inputs.seed_count || '0' }}
       ARKIV_SEED_PAYLOAD_SIZE: ${{ inputs.seed_payload_size || '512' }}
     steps:
       - name: Checkout

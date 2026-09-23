@@ -23,11 +23,12 @@ arkiv/
 │   ├── arkiv-query                     # Parser for Arkiv DB query language
 │   ├── arkiv-reth-chainspec            # reth ChainSpec + the Arkiv minimum-base-fee rule, and the --chain parser
 │   ├── arkiv-reth-executor             # Main EVM integration with modifications (e.g: smart contracts not supported)
-│   ├── arkiv-reth-mpt-committed-store  # Implement storage
 │   ├── arkiv-reth-rpc                  # available JSON RPC endpoints (read-only)
-│   ├── arkiv-reth-statemanager
+│   ├── arkiv-reth-statemanager         # The StateView over Ethereum accounts + the Arkiv database
 │   ├── arkiv-reth-uncommitted-store
-│   └── arkiv-rpc-types                 # Shared request and response types for the JSON-RPC API
+│   ├── arkiv-rpc-types                 # Shared request and response types for the JSON-RPC API
+│   ├── arkiv-store                     # The Arkiv database: entities, nonces, indexes under one root
+│   └── arkiv-trie                      # Persistent Merkle-Patricia trie over a node store
 │
 ├── docker/                             # Dockerfiles for debian-slim
 │   ├── arkiv-reth-dev.Dockerfile
@@ -67,77 +68,21 @@ There is no L1/L2 or settlement-chain coordination.
 
 Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
 
-### Seeding the genesis state
+### Where the data lives
 
-A devnet can start with entities already in it. `arkiv-cli seed-genesis` builds
-the block-0 state offline — synthetic entities pushed through the node's own
-executor and store code, index included — and writes it in one of three shapes:
+Arkiv's database state is not in reth's account trie. Entities, entity-creation
+nonces and the query indexes are three persistent Merkle-Patricia tries in one
+content-addressed node store (`<datadir>/arkiv-db`, MDBX). Their roots hash
+into one **database root**, and that root is the only Arkiv state in Ethereum's
+state: storage slot 0 of the anchor account `0x61726b69762d64617461626173652d726f6f7421`
+(the ASCII string `arkiv-database-root!`). Every transaction reads the parent
+root from that slot, applies its operations by path copying, writes the new
+trie nodes to the node store, and writes the new root back to the slot as part
+of its Ethereum diff. Old roots stay readable, so a historical `arkiv_query`
+at block N is the database at the root block N's anchor slot names.
 
-```sh
-# A genesis file with the seeded accounts in `alloc` (dev chain id 1337, dev
-# accounts funded): run it with --chain, dev mode still auto-seals on it.
-arkiv-cli seed-genesis --count 2000 --payload-size 1024 --out seeded.json
-arkiv-reth node --dev --chain seeded.json --http
-
-# The ethereum-package shape: only the seeded accounts, as
-# network_params.additional_preloaded_contracts. up.py does this for you
-# (Kurtosis caps the package arguments at 4 MiB: ~1000 entities of 512 B):
-ARKIV_SEED_COUNT=1000 scripts/kurtosis/up.py
-
-# Beyond what a genesis file can hold in memory: a `reth init-state` dump and a
-# genesis whose `stateHash` names the imported state's root. The seeder streams
-# the dump and builds the root through an on-disk sort, so its memory is
-# bounded by its batch and sort buffers, not by the seed; reth's importer
-# streams too. (arkiv-reth's `init-state` is reth's, made to work at block 0:
-# reth v2.5.0 alone refuses a genesis import under its default storage layout.)
-arkiv-cli seed-genesis --count 1000000 --format jsonl --out state.jsonl
-arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jsonl && \
-arkiv-reth node --dev --chain state.jsonl.genesis.json --datadir /data --http
-```
-
-A genesis with a nonempty `stateHash` and empty `alloc` requires a successful
-`init-state` before the node can start. Completion is recorded in the database
-after the computed state root matches; the progress JSON is only for monitoring.
-Both storage layouts enforce this check before starting node services.
-
-Imports are one attempt per datadir. An unreadable dump or invalid first-line
-root is rejected before the attempt begins and can be corrected in place. Once
-an attempt is recorded, a failed or interrupted import requires a **fresh
-datadir**; the command does not resume it or erase it automatically. Keep the
-failed directory for diagnosis, import the original complete dump into a new
-directory, and point `node` at that directory only after the command succeeds.
-Retries against a successfully imported datadir are rejected without replacing
-its state or changesets. Do not delete or fabricate the database's import record.
-
-Datadirs seeded by older binaries have no completion record and are refused by
-this startup guard, even if they previously started. Re-provision them from the
-original dump into a fresh datadir. This is not an in-place migration for a
-seeded chain that has advanced beyond genesis. Ordinary alloc-based genesis
-startup is unchanged; later-block snapshot imports retain reth's existing path.
-
-Both long-running steps keep a progress file for a watcher, replaced whole
-about once a second: `seed-genesis --progress-file <path>`, and `init-state`
-always, at `<datadir>/init-state-progress.json` (or `$ARKIV_INIT_STATE_PROGRESS`).
-Each is one JSON document with `pid`, `phase`, `percent` of the current phase,
-`elapsed_s`, `updated_at` (unix seconds; stale for more than a few seconds
-means the process is gone), the counters behind the percent, and at the end
-`state_root` or `error`. The import's phases are `parsing` (bytes of the dump
-read), `writing` (accounts written of the total) and `hashing` (the root
-walk's position in the hashed key space), then `done` or `failed`.
-
-Every run writes a manifest next to its output (`<out>.manifest.json`): the
-chain id, counts, owners, the state root, the first entity keys, and each
-owner's minting nonce after genesis. Entities are dealt round-robin to the
-owners (`--owner 0x…`, repeatable; default the first dev account), keyed
-exactly as the node keys creates, so an owner's next create after genesis
-mints the next nonce's key. `--attribute name:type=expr` shapes the user
-attributes (default `rank:u256=mod(100)` and `team:str=cycle(red,green,blue)`),
-`--expires-at` sets one expiry block for all (default never); expired seeded
-entities are purged by the protocol like any other.
-
-The Kurtosis smoke test in CI runs on a seeded genesis of 1000 entities
-(`kurtosis.yml`'s `seed_count` input), and `kurtosis/integration` checks both
-nodes serve the seed from block 0.
+Genesis seeding (`arkiv-cli seed-genesis`, `init-state` with a seeded dump) is
+not available on this layout yet; a devnet starts from an empty database.
 
 ## Development
 

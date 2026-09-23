@@ -1446,7 +1446,6 @@ dependencies = [
  "arkiv-genesis",
  "arkiv-interfaces",
  "arkiv-rpc-types",
- "arkiv-seed",
  "clap",
  "eyre",
  "hex",
@@ -1519,7 +1518,7 @@ dependencies = [
  "arkiv-reth-executor",
  "arkiv-reth-payload-builder",
  "arkiv-reth-rpc",
- "arkiv-seed",
+ "arkiv-store",
  "clap",
  "eyre",
  "reth",
@@ -1579,16 +1578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arkiv-reth-mpt-committed-store"
-version = "0.5.1"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "arkiv-interfaces",
- "roaring",
-]
-
-[[package]]
 name = "arkiv-reth-payload-builder"
 version = "0.5.1"
 dependencies = [
@@ -1602,8 +1591,8 @@ dependencies = [
  "arkiv-bindings",
  "arkiv-interfaces",
  "arkiv-reth-executor",
- "arkiv-reth-mpt-committed-store",
  "arkiv-reth-rpc",
+ "arkiv-store",
  "eyre",
  "futures-util",
  "reth-basic-payload-builder",
@@ -1628,8 +1617,8 @@ dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
  "arkiv-query",
- "arkiv-reth-mpt-committed-store",
  "arkiv-rpc-types",
+ "arkiv-store",
  "base64 0.22.1",
  "eyre",
  "jsonrpsee",
@@ -1666,26 +1655,6 @@ dependencies = [
  "arkiv-interfaces",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "arkiv-seed"
-version = "0.5.1"
-dependencies = [
- "alloy-genesis",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "arkiv-bindings",
- "arkiv-interfaces",
- "arkiv-reth-executor",
- "arkiv-reth-mpt-committed-store",
- "arkiv-reth-statemanager",
- "eyre",
- "reth-ethereum",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

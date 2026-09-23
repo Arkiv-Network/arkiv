@@ -1,0 +1,5 @@
+- Use conventional commit messages (even in PR titles).
+- Branch names should be "{owner}/{issue number}/{short-description}". For example: "lemmih/80/expired-entity-purge".
+- Use ASD-STE100 in comments, commits, PR titles and descriptions.
+- Error on the side of being terse and concise over detailed and verbose.
+- Don't use markdown in PR description unnecessarily. Code tags are fine, section headers are usually not needed.

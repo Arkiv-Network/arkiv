@@ -78,13 +78,6 @@ alloy-evm = "0.38"
 # with. Same line reth v2.5.0 pins, so the root matches the chain spec's.
 alloy-trie = "0.9"
 
-# Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
-# pair account's bitmap bytes are consensus state (its codeHash =
-# keccak256(bitmap_bytes)), so the portable serialization must stay byte-for-byte
-# stable across nodes — even a patch bump could shift it. =0.11.4 is what v1
-# (arkiv-db-engine) used.
-roaring = "=0.11.4"
-
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
 # arkiv-genesis (mnemonic-derived dev signers). Kept on the same 2.3 line reth
 # v2.5.0 pins so cargo unifies these with reth's copies.
@@ -115,11 +108,9 @@ arkiv-interfaces = { path = "crates/arkiv-interfaces" }
 arkiv-rpc-types = { path = "crates/arkiv-rpc-types" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
-arkiv-seed = { path = "crates/arkiv-seed" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }
-arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store" }
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }

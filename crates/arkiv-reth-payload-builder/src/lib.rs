@@ -14,8 +14,8 @@ use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
 use arkiv_reth_executor::ARKIV_ADDRESS;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethAuxStore, RethEntityStore};
-use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
+use arkiv_reth_rpc::snapshot::SnapshotView;
+use arkiv_store::ArkivDb;
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
@@ -87,6 +87,9 @@ where
         let pruning_path = ctx.config().datadir().data_dir().join("arkiv-pruning.db");
         let pruning_map = ChainPruningMap::open(&pruning_path, Handle::current()).await?;
         info!(target: "arkiv-reth", path = %pruning_path.display(), "opened chain pruning map");
+        let db = ArkivDb::shared(&arkiv_reth_executor::arkiv_db_path(
+            ctx.config().datadir().data_dir(),
+        ))?;
         let payload_builder = ArkivPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
@@ -109,15 +112,17 @@ where
         spawn_catch_up(
             ctx.task_executor(),
             ctx.provider().clone(),
+            db.clone(),
             pruning_map.clone(),
         );
         let provider = ctx.provider().clone();
         let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
             move |notification| {
                 let provider = provider.clone();
+                let db = db.clone();
                 let pruning_map = pruning_map.clone();
                 async move {
-                    if let Err(error) = catch_up(provider, pruning_map).await {
+                    if let Err(error) = catch_up(provider, db, pruning_map).await {
                         warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
                     }
                     notification
@@ -137,6 +142,7 @@ where
 fn spawn_catch_up<P>(
     executor: &reth_ethereum::tasks::TaskExecutor,
     provider: P,
+    db: Arc<ArkivDb>,
     pruning_map: ChainPruningMap,
 ) where
     P: StateProviderFactory
@@ -148,13 +154,17 @@ fn spawn_catch_up<P>(
         + 'static,
 {
     executor.spawn_task(async move {
-        if let Err(error) = catch_up(provider, pruning_map).await {
+        if let Err(error) = catch_up(provider, db, pruning_map).await {
             warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
         }
     });
 }
 
-async fn catch_up<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
+async fn catch_up<P>(
+    provider: P,
+    db: Arc<ArkivDb>,
+    pruning_map: ChainPruningMap,
+) -> eyre::Result<()>
 where
     P: StateProviderFactory
         + BlockReader<Block = reth_ethereum::Block>
@@ -166,7 +176,7 @@ where
 {
     let _guard = pruning_map.update_guard().await;
     if !pruning_map.genesis_bootstrapped().await? {
-        bootstrap_genesis(provider.clone(), pruning_map.clone()).await?;
+        bootstrap_genesis(provider.clone(), db.clone(), pruning_map.clone()).await?;
     }
     loop {
         let watermark = pruning_map.watermark().await?;
@@ -178,8 +188,9 @@ where
         }
         let height = watermark + 1;
         let block_provider = provider.clone();
+        let db = db.clone();
         let (entries, removed) =
-            tokio::task::spawn_blocking(move || pruning_updates_at(&block_provider, height))
+            tokio::task::spawn_blocking(move || pruning_updates_at(&block_provider, db, height))
                 .await
                 .map_err(|error| {
                     eyre::eyre!("join pruning replay for block {height}: {error}")
@@ -197,15 +208,20 @@ where
 /// blocks after the watermark then keeps them current like any other. The map
 /// remembers that the walk ran, so a restart does not repeat it, and how far
 /// it got, so an interrupted walk resumes.
-async fn bootstrap_genesis<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
+async fn bootstrap_genesis<P>(
+    provider: P,
+    db: Arc<ArkivDb>,
+    pruning_map: ChainPruningMap,
+) -> eyre::Result<()>
 where
     P: StateProviderFactory + Clone + Send + Sync + 'static,
 {
     let watermark = pruning_map.watermark().await?;
     let map = pruning_map.clone();
-    let entities = tokio::task::spawn_blocking(move || bootstrap_genesis_blocking(&provider, &map))
-        .await
-        .map_err(|error| eyre::eyre!("join genesis pruning bootstrap: {error}"))??;
+    let entities =
+        tokio::task::spawn_blocking(move || bootstrap_genesis_blocking(&provider, db, &map))
+            .await
+            .map_err(|error| eyre::eyre!("join genesis pruning bootstrap: {error}"))??;
     pruning_map.mark_genesis_bootstrapped().await?;
     info!(target: "arkiv-reth", entities, watermark, "bootstrapped the chain pruning map from genesis");
     Ok(())
@@ -223,51 +239,58 @@ where
 /// walk (a restart, or such a failure) resume where it stopped; upserts make
 /// a repeated batch harmless. Chunks are resolved on a few threads at once,
 /// since each is independent provider reads.
-fn bootstrap_genesis_blocking<P>(provider: &P, pruning_map: &ChainPruningMap) -> eyre::Result<u64>
+fn bootstrap_genesis_blocking<P>(
+    provider: &P,
+    db: Arc<ArkivDb>,
+    pruning_map: &ChainPruningMap,
+) -> eyre::Result<u64>
 where
     P: StateProviderFactory + Sync,
 {
-    let all = {
+    // The genesis entity keys, ascending. The map's cursor counts how many of
+    // them an earlier attempt already wrote.
+    let keys: Vec<B256> = {
         let genesis = provider
             .history_by_block_number(0)
             .map_err(|error| eyre::eyre!("read genesis state: {error:?}"))?;
-        let mut index = RethAuxStore::new(SnapshotAccountCode::new(genesis));
-        index
-            .all_entities()
-            .map_err(|error| eyre::eyre!("read the genesis $all bucket: {error:?}"))?
+        let snapshot = SnapshotView::open(&genesis, db.clone())?;
+        let view = snapshot.view();
+        view.entity_keys()
+            .map_err(|error| eyre::eyre!("walk the genesis entities: {error:?}"))?
+            .map(|key| key.map(B256::from))
+            .collect::<Result<_, _>>()
+            .map_err(|error| eyre::eyre!("walk the genesis entities: {error:?}"))?
     };
-    if all.is_empty() {
+    if keys.is_empty() {
         return Ok(0);
     }
-    let total = all.len();
-    let next_id = pruning_map.genesis_cursor_blocking()?;
-    if next_id > 0 {
-        info!(target: "arkiv-reth", next_id, total, "resuming the genesis pruning bootstrap");
+    let total = keys.len() as u64;
+    let next = pruning_map.genesis_cursor_blocking()? as usize;
+    if next > 0 {
+        info!(target: "arkiv-reth", next, total, "resuming the genesis pruning bootstrap");
     }
     let mut writer = pruning_map.genesis_bootstrap_writer_blocking()?;
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, GENESIS_BOOTSTRAP_WORKERS);
 
-    let mut ids = all.iter().filter(|id| *id >= next_id).peekable();
     let mut inserted = 0u64;
     let mut pending: Vec<PruningEntry> = Vec::with_capacity(GENESIS_BOOTSTRAP_ROWS_PER_COMMIT);
     let mut resolving = std::time::Duration::ZERO;
-    while ids.peek().is_some() {
-        let chunks: Vec<Vec<u64>> = (0..workers)
-            .map(|_| ids.by_ref().take(GENESIS_BOOTSTRAP_BATCH).collect())
-            .filter(|chunk: &Vec<u64>| !chunk.is_empty())
+    let mut position = next.min(keys.len());
+    while position < keys.len() {
+        let window_end = (position + workers * GENESIS_BOOTSTRAP_BATCH).min(keys.len());
+        let chunks: Vec<&[B256]> = keys[position..window_end]
+            .chunks(GENESIS_BOOTSTRAP_BATCH)
             .collect();
-        // Ids come out ascending, so the window's last id bounds everything done.
-        let last = *chunks
-            .last()
-            .and_then(|chunk| chunk.last())
-            .expect("a non-empty window");
         let started = Instant::now();
         let resolved = std::thread::scope(|scope| {
             let handles: Vec<_> = chunks
                 .iter()
-                .map(|chunk| scope.spawn(move || resolve_genesis_entities(provider, chunk)))
+                .map(|chunk| {
+                    let db = db.clone();
+                    scope.spawn(move || resolve_genesis_entities(provider, db, chunk))
+                })
                 .collect();
             handles
                 .into_iter()
@@ -280,16 +303,17 @@ where
         })?;
         pending.extend(resolved.into_iter().flatten());
         resolving += started.elapsed();
-        if pending.len() < GENESIS_BOOTSTRAP_ROWS_PER_COMMIT && ids.peek().is_some() {
+        position = window_end;
+        if pending.len() < GENESIS_BOOTSTRAP_ROWS_PER_COMMIT && position < keys.len() {
             continue;
         }
         let started = Instant::now();
-        writer.write_blocking(&mut pending, last + 1)?;
+        writer.write_blocking(&mut pending, position as u64)?;
         inserted += pending.len() as u64;
         info!(
             target: "arkiv-reth",
             inserted,
-            next_id = last + 1,
+            next = position,
             total,
             resolve_ms = resolving.as_millis(),
             write_ms = started.elapsed().as_millis(),
@@ -301,46 +325,37 @@ where
     Ok(inserted)
 }
 
-/// The pruning entries of the genesis entities `ids` as they stand now, over
-/// a snapshot of the latest state opened for just this call. An id whose
+/// The pruning entries of the genesis entities `keys` as they stand now, over
+/// a snapshot of the latest state opened for just this call. A key whose
 /// entity is gone by then is skipped.
 ///
-/// The latest state, not the state at `watermark`: a historical read takes a
-/// `RocksDB` snapshot and reads the chain tip for every account and slot,
-/// which serialises the workers and costs more than the reads themselves.
-/// Reading past the watermark is harmless here. The blocks between it and the
-/// tip are replayed after the walk, and that replay records each entity's
-/// expiry as an absolute value and removals as removals, so whatever this
-/// walk saw is overwritten by the same facts. An entity the walk finds
-/// already gone is one the replay removes again, and an id whose key is gone
-/// was never allocated to anything else.
-fn resolve_genesis_entities<P>(provider: &P, ids: &[u64]) -> eyre::Result<Vec<PruningEntry>>
+/// The latest state, not the state at the watermark: reading past it is
+/// harmless. The blocks between it and the tip are replayed after the walk,
+/// and that replay records each entity's expiry as an absolute value and
+/// removals as removals, so whatever this walk saw is overwritten by the same
+/// facts.
+fn resolve_genesis_entities<P>(
+    provider: &P,
+    db: Arc<ArkivDb>,
+    keys: &[B256],
+) -> eyre::Result<Vec<PruningEntry>>
 where
     P: StateProviderFactory,
 {
     let latest = provider
         .latest()
         .map_err(|error| eyre::eyre!("read the latest state: {error:?}"))?;
-    let mut index = RethAuxStore::new(SnapshotAccountCode::new(latest));
-    let latest = provider
-        .latest()
-        .map_err(|error| eyre::eyre!("read the latest state: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(latest)));
+    let snapshot = SnapshotView::open(&latest, db)?;
+    let view = snapshot.view();
 
-    let mut entries = Vec::with_capacity(ids.len());
-    for &id in ids {
-        let Some(key) = index
-            .key_of_id(id)
-            .map_err(|error| eyre::eyre!("resolve genesis entity id {id}: {error:?}"))?
-        else {
-            continue;
-        };
-        if let Some(entity) = entities
-            .get(key)
-            .map_err(|error| eyre::eyre!("read genesis entity {}: {error:?}", B256::from(key)))?
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(entity) = view
+            .entity(&key.0)
+            .map_err(|error| eyre::eyre!("read genesis entity {key}: {error:?}"))?
         {
             entries.push(PruningEntry {
-                key: B256::from(key),
+                key: *key,
                 expires_at: entity.expires_at,
                 attribute_count: entity.attributes.len(),
             });
@@ -349,7 +364,11 @@ where
     Ok(entries)
 }
 
-fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
+fn pruning_updates_at<P>(
+    provider: &P,
+    db: Arc<ArkivDb>,
+    height: u64,
+) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
 where
     P: StateProviderFactory
         + BlockReader<Block = reth_ethereum::Block>
@@ -381,12 +400,13 @@ where
     let state = provider
         .history_by_block_number(height)
         .map_err(|error| eyre::eyre!("read state for block {height}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
+    let snapshot = SnapshotView::open(&state, db)?;
+    let view = snapshot.view();
     let mut entries = Vec::with_capacity(touched.len());
     let mut removed = Vec::new();
     for key in touched {
-        match entities
-            .get(key.0)
+        match view
+            .entity(&key.0)
             .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error:?}"))?
         {
             Some(entity) => entries.push(PruningEntry {

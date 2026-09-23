@@ -1,75 +1,45 @@
-//! [`SnapshotAccountCode`] — the reth **read-path** bridge.
+//! [`SnapshotView`] — the reth **read-path** bridge.
 //!
-//! The mirror of the write path's `WriteOverlay` (arkiv-reth-statemanager): it implements both the
-//! entity store's [`AccountCode`] seam (entity bytes + tier-1 pair bitmaps live in
-//! account code) and the query index's [`IndexStorage`] seam (tier-2 range
-//! structures + the id maps live in storage slots) over a committed reth state
-//! snapshot ([`StateProviderBox`]). That lets `RethEntityStore<CodeBackend<_>>` read
-//! entities *and* `RethAuxStore<_>` evaluate queries off the same snapshot. Reads
-//! only — the write halves (`set_*`) never run here.
+//! The mirror of the write path's `WriteOverlay` (arkiv-reth-statemanager):
+//! read the anchor slot from a committed reth state snapshot
+//! ([`StateProviderBox`]) to learn the database root as of that block, then
+//! open the Arkiv database at that root. Every root a block ever committed
+//! stays in the node store, so a historical snapshot answers historical reads
+//! and queries with nothing more than its anchor slot.
 
-use alloy_primitives::{Address, B256};
-use arkiv_reth_mpt_committed_store::AccountCode;
-use arkiv_reth_mpt_committed_store::IndexStorage;
+use std::sync::Arc;
+
+use arkiv_store::{ARKIV_ROOT_ACCOUNT, ARKIV_ROOT_SLOT, ArkivDb, B256, DbRoots, DbView};
 use reth_storage_api::StateProviderBox;
 
-/// [`AccountCode`] over a read-only reth state snapshot.
-pub struct SnapshotAccountCode {
-    state: StateProviderBox,
+/// The Arkiv database as of one reth state snapshot.
+pub struct SnapshotView {
+    db: Arc<ArkivDb>,
+    roots: DbRoots,
+    root: B256,
 }
 
-impl SnapshotAccountCode {
-    /// Read entities as of the state in `state` (typically the latest tip).
-    pub fn new(state: StateProviderBox) -> Self {
-        Self { state }
-    }
-}
-
-impl AccountCode for SnapshotAccountCode {
-    type Error = eyre::Report;
-
-    fn code(&mut self, address: Address) -> Result<Vec<u8>, Self::Error> {
-        let code = self
-            .state
-            .account_code(&address)
-            .map_err(|e| eyre::eyre!("account_code({address}): {e:?}"))?;
-        Ok(code
-            .map(|c| c.original_bytes().to_vec())
-            .unwrap_or_default())
+impl SnapshotView {
+    /// Open the database at the root `state`'s anchor slot names.
+    pub fn open(state: &StateProviderBox, db: Arc<ArkivDb>) -> eyre::Result<Self> {
+        let slot = state
+            .storage(ARKIV_ROOT_ACCOUNT, ARKIV_ROOT_SLOT.into())
+            .map_err(|e| eyre::eyre!("read the anchor slot: {e:?}"))?;
+        let root = slot
+            .map(|v| B256::from(v.to_be_bytes::<32>()))
+            .unwrap_or_default();
+        let roots = DbRoots::load(&db, root)
+            .map_err(|e| eyre::eyre!("read the database root {root}: {e}"))?
+            .ok_or_else(|| eyre::eyre!("database root {root} is not in the node store"))?;
+        Ok(Self { db, roots, root })
     }
 
-    fn set_code(&mut self, _address: Address, _code: Vec<u8>) -> Result<(), Self::Error> {
-        eyre::bail!("read-only snapshot: set_code is unsupported")
+    /// The database root this view answers for.
+    pub fn root(&self) -> B256 {
+        self.root
     }
 
-    fn clear_code(&mut self, _address: Address) -> Result<(), Self::Error> {
-        eyre::bail!("read-only snapshot: clear_code is unsupported")
-    }
-}
-
-impl IndexStorage for SnapshotAccountCode {
-    type Error = eyre::Report;
-
-    fn storage(&mut self, address: Address, slot: B256) -> Result<B256, Self::Error> {
-        // Absent slot → `None` → `B256::ZERO`, matching the index's "absent reads as
-        // zero" convention.
-        let value = self
-            .state
-            .storage(address, slot)
-            .map_err(|e| eyre::eyre!("storage({address}, {slot}): {e:?}"))?;
-        Ok(value.map(B256::from).unwrap_or(B256::ZERO))
-    }
-
-    fn set_storage(
-        &mut self,
-        _address: Address,
-        _slot: B256,
-        _value: B256,
-    ) -> Result<(), Self::Error> {
-        eyre::bail!("read-only snapshot: set_storage is unsupported")
-    }
-
-    fn ensure_account_persists(&mut self, _address: Address) -> Result<(), Self::Error> {
-        eyre::bail!("read-only snapshot: ensure_account_persists is unsupported")
+    pub fn view(&self) -> DbView<'_, Arc<ArkivDb>> {
+        DbView::at(&self.db, self.roots)
     }
 }
