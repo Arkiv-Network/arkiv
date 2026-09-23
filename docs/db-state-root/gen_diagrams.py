@@ -297,27 +297,31 @@ def after_index() -> None:
 
 
 def after_insert() -> None:
+    """Path copying in an index trie: the older root on the left, the newer on
+    the right, sharing every node off the changed path."""
     write("after-insert", f"""
-  subgraph cluster_old {{ label="root before"; color="#999999"; style=dashed;
-    r1 [label="team index root", fillcolor="{ROOT}"];
-    tb1 [label="branch", fillcolor="{SHARED}"];
-    er1 [label="ext \\"red\\"", fillcolor="{SHARED}"];
-  }}
-  subgraph cluster_new {{ label="root after: insert k5 with team = red"; color="#999999"; style=dashed;
-    r2 [label="team index root'", fillcolor="{NEW}"];
-    tb2 [label="branch'", fillcolor="{NEW}"];
-    er2 [label="ext \\"red\\"'", fillcolor="{NEW}"];
-    rb2 [label="branch'", fillcolor="{NEW}"];
-    l5 [label="leaf ‖ k5", fillcolor="{NEW}"];
-  }}
-  eb [label="ext \\"blue\\" → leaf ‖ k1", fillcolor="{SHARED}"];
+  lab1 [shape=plaintext, style="", label="root before (older)"];
+  lab2 [shape=plaintext, style="", label="root after: insert k5 with team = red (newer)"];
+  r1 [label="team index root", fillcolor="{ROOT}"];
+  tb1 [label="branch", fillcolor="{SHARED}"];
+  er1 [label="ext ‘red’", fillcolor="{SHARED}"];
+  r2 [label="team index root'", fillcolor="{NEW}"];
+  tb2 [label="branch'", fillcolor="{NEW}"];
+  er2 [label="ext ‘red’'", fillcolor="{NEW}"];
+  rb2 [label="branch'", fillcolor="{NEW}"];
+  l5 [label="leaf ‖ k5", fillcolor="{NEW}"];
+  eb [label="ext ‘blue’ → leaf ‖ k1", fillcolor="{SHARED}"];
   rb [label="branch", fillcolor="{SHARED}"];
   l0 [label="leaf ‖ k0", fillcolor="{SHARED}"]; l2 [label="leaf ‖ k2", fillcolor="{SHARED}"];
+  // time runs left to right: the older root stays left of the newer one
+  {{ rank=same; lab1; lab2; }}
+  lab1 -> lab2 [style=invis, weight=100];
+  lab1 -> r1 [style=invis]; lab2 -> r2 [style=invis];
   r1 -> tb1; tb1 -> eb; tb1 -> er1; er1 -> rb; rb -> l0; rb -> l2;
   r2 -> tb2 [color="#b8860b"]; tb2 -> eb [color="#b8860b"]; tb2 -> er2 [color="#b8860b"];
   er2 -> rb2 [color="#b8860b"]; rb2 -> l0 [color="#b8860b"]; rb2 -> l2 [color="#b8860b"]; rb2 -> l5 [color="#b8860b"];
-  note [shape=plaintext, label="new nodes: one per level on the changed path (≈ log n)\\neverything else is shared with the old root, which stays readable\\nthe old nodes are never modified or deleted"];
-""")
+  note [shape=plaintext, label="time runs left to right\\nnew nodes: one per level on the changed path (≈ log n)\\neverything else is shared with the old root, which stays readable\\nthe old nodes are never modified or deleted"];
+""", extra=" newrank=true;")
 
 
 def after_commit() -> None:
