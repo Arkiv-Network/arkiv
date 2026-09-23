@@ -1,19 +1,44 @@
 //! End-to-end write path with real reth types: ops → view → commit → the
 //! `EvmState` diff holds the entity as account code, byte-for-byte.
 
+use alloy_primitives::B256;
 use arkiv_interfaces::entity::{AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::statemanager::{BlockRef, EntityStore, ReadMode, StateView};
 use arkiv_reth_executor::ArkivExecutor;
-use arkiv_reth_mpt_committed_store::entities::layout::entity_leaf_address;
-use arkiv_reth_mpt_committed_store::{decode, encode};
 use arkiv_reth_statemanager::{WriteManager, write_manager};
+use arkiv_store::{ARKIV_ROOT_ACCOUNT, ARKIV_ROOT_SLOT, DbView, NodeStore, SharedMemNodeStore};
 use reth_ethereum::evm::revm::database_interface::EmptyDB;
+use reth_ethereum::evm::revm::state::EvmState;
 
-type Store<'a> = WriteManager<'a, EmptyDB>;
+type Store<'a> = WriteManager<'a, EmptyDB, SharedMemNodeStore>;
 
-fn store(db: &mut EmptyDB) -> Store<'_> {
-    write_manager(db, BlockRef::new(9, [0; 32]))
+fn store<'a>(db: &'a mut EmptyDB, nodes: &'a SharedMemNodeStore) -> Store<'a> {
+    write_manager(db, nodes, BlockRef::new(9, [0; 32])).unwrap()
+}
+
+/// Close the view as the executor does: flush its nodes, take the diff.
+fn finish(store: Store<'_>, nodes: &SharedMemNodeStore) -> EvmState {
+    let (overlay, staging) = store.into_parts();
+    nodes.flush(staging.into_staged()).unwrap();
+    overlay.into_state()
+}
+
+/// The database root the diff's anchor slot names, and its view.
+fn db_of<'a>(diff: &EvmState, nodes: &'a SharedMemNodeStore) -> DbView<'a, SharedMemNodeStore> {
+    let acc = diff
+        .get(&ARKIV_ROOT_ACCOUNT)
+        .expect("anchor account staged in the diff");
+    assert!(acc.is_touched());
+    assert_eq!(acc.info.nonce, 1, "the anchor is kept alive");
+    let root = B256::from(
+        acc.storage
+            .get(&ARKIV_ROOT_SLOT)
+            .unwrap()
+            .present_value
+            .to_be_bytes::<32>(),
+    );
+    DbView::open(nodes, root).unwrap()
 }
 
 fn env(caller: [u8; 20], block: u64) -> ExecEnv {
@@ -39,12 +64,13 @@ fn run<'a>(
 }
 
 #[test]
-fn create_commits_the_entity_as_account_code() {
+fn create_commits_the_entity_to_the_database() {
     let alice = [0xAA; 20];
     let key = [1u8; 32];
 
     let mut db = EmptyDB::default();
-    let mut store = store(&mut db);
+    let nodes = SharedMemNodeStore::new();
+    let mut store = store(&mut db, &nodes);
     let exec = ArkivExecutor::new();
 
     // 1) Run the STF — the entity stages into the view's overlay.
@@ -91,25 +117,13 @@ fn create_commits_the_entity_as_account_code() {
 
     // 4) The recovered EvmState diff is what reth would commit: the entity
     //    account exists, is touched, survives EIP-161, and holds the record.
-    let diff = store.into_base().into_state();
-    let acc = diff
-        .get(&entity_leaf_address(key))
-        .expect("entity account staged in the diff");
-    assert!(acc.is_touched());
-    assert_eq!(acc.info.nonce, 1);
-
-    let code = acc
-        .info
-        .code
-        .as_ref()
-        .expect("account has code")
-        .original_bytes();
+    let diff = finish(store, &nodes);
+    let view = db_of(&diff, &nodes);
     assert_eq!(
-        code.as_ref(),
-        encode(&staged),
-        "code is the record, verbatim"
+        view.entity(&key).unwrap().as_ref(),
+        Some(&staged),
+        "the database at the anchored root holds the record"
     );
-    assert_eq!(decode(&code).unwrap(), staged, "and still decodes");
 }
 
 #[test]
@@ -118,7 +132,8 @@ fn update_recommits_the_entity_as_new_code() {
     let key = [5u8; 32];
 
     let mut db = EmptyDB::default();
-    let mut store = store(&mut db);
+    let nodes = SharedMemNodeStore::new();
+    let mut store = store(&mut db, &nodes);
     let exec = ArkivExecutor::new();
 
     // Create at block 10, then update the payload at block 11 — two commit
@@ -162,13 +177,13 @@ fn update_recommits_the_entity_as_new_code() {
         got.last_modified_at_block, 11,
         "patch advances lastModified"
     );
-    let diff = store.into_base().into_state();
-    let code = diff
-        .get(&entity_leaf_address(key))
-        .and_then(|a| a.info.code.as_ref())
-        .expect("entity code")
-        .original_bytes();
-    assert_eq!(decode(&code).unwrap(), got, "code is the updated record");
+    let diff = finish(store, &nodes);
+    let view = db_of(&diff, &nodes);
+    assert_eq!(
+        view.entity(&key).unwrap(),
+        Some(got),
+        "the anchored database holds the update"
+    );
 }
 
 #[test]
@@ -178,7 +193,8 @@ fn transfer_recommits_with_the_new_owner() {
     let key = [6u8; 32];
 
     let mut db = EmptyDB::default();
-    let mut store = store(&mut db);
+    let nodes = SharedMemNodeStore::new();
+    let mut store = store(&mut db, &nodes);
     let exec = ArkivExecutor::new();
 
     run(
@@ -220,7 +236,8 @@ fn extend_recommits_with_a_higher_expiry() {
     let key = [7u8; 32];
 
     let mut db = EmptyDB::default();
-    let mut store = store(&mut db);
+    let nodes = SharedMemNodeStore::new();
+    let mut store = store(&mut db, &nodes);
     let exec = ArkivExecutor::new();
 
     run(
@@ -269,7 +286,8 @@ fn delete_commits_a_tombstone() {
     let key = [3u8; 32];
 
     let mut db = EmptyDB::default();
-    let mut store = store(&mut db);
+    let nodes = SharedMemNodeStore::new();
+    let mut store = store(&mut db, &nodes);
     let exec = ArkivExecutor::new();
 
     // Create-then-delete in one batch nets to nothing at all.
@@ -318,10 +336,11 @@ fn delete_commits_a_tombstone() {
             .unwrap()
             .is_none()
     );
-    let diff = store.into_base().into_state();
-    let acc = diff
-        .get(&entity_leaf_address(key))
-        .expect("tombstoned account staged in the diff");
-    assert!(acc.info.code.as_ref().is_none_or(|c| c.is_empty()));
-    assert_eq!(acc.info.nonce, 1);
+    let diff = finish(store, &nodes);
+    let view = db_of(&diff, &nodes);
+    assert_eq!(
+        view.entity(&key).unwrap(),
+        None,
+        "deleted from the anchored database"
+    );
 }

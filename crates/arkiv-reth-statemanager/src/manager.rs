@@ -712,11 +712,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{MemBase, MemView, mem_nodes, mem_view, settle};
     use alloy_primitives::{Address, U256};
     use arkiv_interfaces::entity::annotations::OWNER;
-    use arkiv_store::SharedMemNodeStore;
-
-    use crate::testing::{MemBase, MemView, mem_view, settle};
 
     fn key_of(byte: u8) -> EntityAddress {
         [byte; 32]
@@ -732,7 +730,7 @@ mod tests {
         }
     }
 
-    fn stage_create(view: &mut MemView<'_>, byte: u8, owner: u8) {
+    fn stage_create(view: &mut MemView, byte: u8, owner: u8) {
         view.entities_mut()
             .update_entity(EntityUpdates::create(entity_of(byte, owner)))
             .unwrap();
@@ -741,7 +739,7 @@ mod tests {
         view.range_index_mut().apply_deltas(&deltas).unwrap();
     }
 
-    fn owned_by(view: &MemView<'_>, owner: u8, read: ReadMode) -> Vec<EntityAddress> {
+    fn owned_by(view: &MemView, owner: u8, read: ReadMode) -> Vec<EntityAddress> {
         view.equality_index()
             .get_equal_entities(OWNER, &AttributeValue::EthereumAddress([owner; 20]), read)
             .unwrap()
@@ -753,8 +751,8 @@ mod tests {
 
     #[test]
     fn overlay_writes_stay_off_the_base_until_commit() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         let key = key_of(7);
         view.update_entity(EntityUpdates::create(entity_of(7, 2)))
             .unwrap();
@@ -777,8 +775,8 @@ mod tests {
         assert_eq!(view.backend_mut().db_root, root);
 
         // A fresh view over the settled base reads the same entity.
-        let base = settle(view, &nodes);
-        let next = mem_view(base, &nodes, block());
+        let (base, nodes) = settle(view);
+        let next = mem_view(base, nodes, block());
         assert_eq!(
             next.get_entity(key, ReadMode::ViewOnBase).unwrap(),
             Some(entity_of(7, 2))
@@ -788,8 +786,8 @@ mod tests {
 
     #[test]
     fn partial_updates_patch_only_what_they_set() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         view.update_entity(EntityUpdates::create(entity_of(7, 2)))
             .unwrap();
         StateView::commit(&mut view).unwrap();
@@ -812,8 +810,8 @@ mod tests {
 
     #[test]
     fn index_reads_honor_read_mode() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         stage_create(&mut view, 0xA0, 1);
 
         assert_eq!(
@@ -829,8 +827,8 @@ mod tests {
 
     #[test]
     fn range_and_prefix_lookups_answer_from_the_index() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         let mut with_attrs = entity_of(1, 1);
         with_attrs.attributes = vec![
             arkiv_interfaces::entity::Attribute::new(b"rank".to_vec(), AttributeValue::Int(5)),
@@ -901,8 +899,8 @@ mod tests {
 
     #[test]
     fn staged_index_deltas_adjust_overlay_reads() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         stage_create(&mut view, 0xA0, 1);
         StateView::commit(&mut view).unwrap();
 
@@ -925,8 +923,8 @@ mod tests {
 
     #[test]
     fn balances_and_nonces_stage_then_flush() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         let alice: UserAddress = [0xAA; 20];
         view.backend_mut()
             .balances
@@ -978,8 +976,8 @@ mod tests {
 
     #[test]
     fn creation_nonces_stage_then_land_in_the_database() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         let alice: UserAddress = [0xAA; 20];
 
         assert_eq!(
@@ -998,8 +996,8 @@ mod tests {
 
         StateView::commit(&mut view).unwrap();
         assert_ne!(view.backend_mut().db_root, B256::ZERO);
-        let base = settle(view, &nodes);
-        let next = mem_view(base, &nodes, block());
+        let (base, nodes) = settle(view);
+        let next = mem_view(base, nodes, block());
         assert_eq!(
             next.get_entity_creation_nonce(alice, ReadMode::ViewOnBase)
                 .unwrap(),
@@ -1009,8 +1007,8 @@ mod tests {
 
     #[test]
     fn graduate_needs_a_committed_view_extending_the_base() {
-        let nodes = SharedMemNodeStore::new();
-        let mut dirty = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut dirty = mem_view(MemBase::default(), nodes.clone(), block());
         dirty
             .update_entity(EntityUpdates::create(entity_of(1, 1)))
             .unwrap();
@@ -1019,25 +1017,25 @@ mod tests {
             Err(MptError::Graduate(_))
         ));
 
-        let uncommitted = mem_view(MemBase::default(), &nodes, block());
+        let uncommitted = mem_view(MemBase::default(), nodes.clone(), block());
         assert!(matches!(
             uncommitted.graduate(BlockRef::new(11, [0x11; 32])),
             Err(MptError::Graduate(_))
         ));
 
-        let mut committed = mem_view(MemBase::default(), &nodes, block());
+        let mut committed = mem_view(MemBase::default(), nodes.clone(), block());
         stage_create(&mut committed, 1, 1);
         StateView::commit(&mut committed).unwrap();
         let root = committed.db_root();
-        let base = settle(committed, &nodes);
+        let (base, nodes) = settle(committed);
 
-        let wrong_height = mem_view(base.clone(), &nodes, block());
+        let wrong_height = mem_view(base.clone(), nodes.clone(), block());
         assert!(matches!(
             wrong_height.graduate(BlockRef::new(13, [0x13; 32])),
             Err(MptError::Graduate(_))
         ));
 
-        let mut committed = mem_view(base, &nodes, block());
+        let mut committed = mem_view(base, nodes, block());
         StateView::commit(&mut committed).unwrap();
         let commit = committed.graduate(BlockRef::new(11, [0x11; 32])).unwrap();
         assert_eq!(commit.parent, BlockRef::new(10, [0xBB; 32]));
@@ -1050,17 +1048,17 @@ mod tests {
 
     #[test]
     fn sessions_are_unique_per_view() {
-        let nodes = SharedMemNodeStore::new();
-        let a = mem_view(MemBase::default(), &nodes, block());
-        let b = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let a = mem_view(MemBase::default(), nodes.clone(), block());
+        let b = mem_view(MemBase::default(), nodes.clone(), block());
         assert_ne!(a.session(), b.session());
         assert_eq!(a.base(), b.base());
     }
 
     #[test]
     fn deletes_tombstone_and_unindex() {
-        let nodes = SharedMemNodeStore::new();
-        let mut view = mem_view(MemBase::default(), &nodes, block());
+        let nodes = mem_nodes();
+        let mut view = mem_view(MemBase::default(), nodes.clone(), block());
         stage_create(&mut view, 0xA0, 1);
         StateView::commit(&mut view).unwrap();
 

@@ -22,7 +22,7 @@ use reth_ethereum::evm::primitives::Database;
 /// The write-path view: a transaction's Ethereum effects land in a single
 /// `EvmState` (`view.into_parts().0.into_state()`) once committed, and its
 /// database effects in the staging set beside it.
-pub type WriteManager<'a, DB, N> = MptStateView<WriteOverlay<'a, DB>, Staging<'a, N>>;
+pub type WriteManager<'a, DB, N> = MptStateView<WriteOverlay<'a, DB>, Staging<&'a N>>;
 
 /// The error of a [`WriteManager`] over `N`.
 pub type WriteError<N> = MptError<eyre::Report, <N as NodeReader>::Error>;

@@ -185,20 +185,21 @@ pub enum LayeredError<O, B> {
 /// first, then `base`; writes land in the staged set. When the batch is done,
 /// [`into_staged`](Staging::into_staged) hands the new nodes to the backend.
 #[derive(Debug)]
-pub struct Staging<'a, B> {
+pub struct Staging<B> {
     staged: MemNodeStore,
-    base: &'a B,
+    base: B,
 }
 
-impl<'a, B> Staging<'a, B> {
-    pub fn new(base: &'a B) -> Self {
+impl<B> Staging<B> {
+    /// Stage over `base`: a `&Store`, an `Arc<Store>`, or any other reader.
+    pub fn new(base: B) -> Self {
         Self {
             staged: MemNodeStore::new(),
             base,
         }
     }
 
-    pub fn with_staged(staged: MemNodeStore, base: &'a B) -> Self {
+    pub fn with_staged(staged: MemNodeStore, base: B) -> Self {
         Self { staged, base }
     }
 
@@ -206,12 +207,20 @@ impl<'a, B> Staging<'a, B> {
         &self.staged
     }
 
+    pub fn base(&self) -> &B {
+        &self.base
+    }
+
     pub fn into_staged(self) -> MemNodeStore {
         self.staged
     }
+
+    pub fn into_parts(self) -> (MemNodeStore, B) {
+        (self.staged, self.base)
+    }
 }
 
-impl<B: NodeReader> NodeReader for Staging<'_, B> {
+impl<B: NodeReader> NodeReader for Staging<B> {
     type Error = B::Error;
 
     fn node(&self, hash: &B256) -> Result<Option<Vec<u8>>, B::Error> {
@@ -222,7 +231,7 @@ impl<B: NodeReader> NodeReader for Staging<'_, B> {
     }
 }
 
-impl<B> NodeSink for Staging<'_, B> {
+impl<B> NodeSink for Staging<B> {
     fn put_node(&mut self, hash: B256, rlp: Vec<u8>) {
         self.staged.put_node(hash, rlp);
     }

@@ -2,6 +2,7 @@
 //! slot, and the view over it with an in-memory node store.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, U256};
 use arkiv_interfaces::statemanager::BlockRef;
@@ -57,19 +58,26 @@ impl AnchorAccess for MemBase {
     }
 }
 
+/// The shared in-memory node store a test's views write into.
+pub type MemNodes = Arc<SharedMemNodeStore>;
+
+pub fn mem_nodes() -> MemNodes {
+    Arc::new(SharedMemNodeStore::new())
+}
+
 /// A view over a [`MemBase`] with its nodes staged over an in-memory store.
-pub type MemView<'a> = MptStateView<MemBase, Staging<'a, SharedMemNodeStore>>;
+pub type MemView = MptStateView<MemBase, Staging<MemNodes>>;
 
 /// Open a view over `base` and `nodes` at `block`.
-pub fn mem_view(base: MemBase, nodes: &SharedMemNodeStore, block: BlockRef) -> MemView<'_> {
+pub fn mem_view(base: MemBase, nodes: MemNodes, block: BlockRef) -> MemView {
     MptStateView::new(base, Staging::new(nodes), block).expect("in-memory view opens")
 }
 
-/// Commit the view's staged nodes into `nodes` and hand back the base, so the
-/// next view sees what this one wrote.
-pub fn settle(view: MemView<'_>, nodes: &SharedMemNodeStore) -> MemBase {
+/// Commit the view's staged nodes into its store and hand back the base and
+/// the store, so the next view sees what this one wrote.
+pub fn settle(view: MemView) -> (MemBase, MemNodes) {
     let (base, staging) = view.into_parts();
-    let staged: MemNodeStore = staging.into_staged();
-    arkiv_store::NodeStore::flush(nodes, staged).expect("in-memory flush");
-    base
+    let (staged, nodes): (MemNodeStore, MemNodes) = staging.into_parts();
+    arkiv_store::NodeStore::flush(&nodes, staged).expect("in-memory flush");
+    (base, nodes)
 }

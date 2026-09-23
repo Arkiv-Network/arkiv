@@ -499,87 +499,18 @@ mod tests {
     use arkiv_interfaces::constants::OP_MAX_ATTRIBUTES;
     use arkiv_interfaces::entity::AttributeValue;
     use arkiv_interfaces::statemanager::{BlockRef, EntityStore, StateView};
-    use arkiv_reth_statemanager::MptStateView;
-    use core::convert::Infallible;
-    use std::collections::{HashMap, HashSet};
+    use arkiv_reth_statemanager::testing::{MemBase, MemView, mem_nodes, mem_view, settle};
 
-    use alloy_primitives::{Address, B256, U256};
-    use arkiv_reth_mpt_committed_store::{AccountCode, BalanceAccess, IndexStorage, NonceAccess};
-
-    /// An in-memory base implementing every raw seam the view needs.
-    #[derive(Debug, Default, Clone)]
-    struct MemState {
-        balances: HashMap<Address, U256>,
-        nonces: HashMap<Address, u64>,
-        code: HashMap<Address, Vec<u8>>,
-        slots: HashMap<(Address, B256), B256>,
-        persisted: HashSet<Address>,
-    }
-
-    impl AccountCode for MemState {
-        type Error = Infallible;
-        fn code(&mut self, addr: Address) -> Result<Vec<u8>, Infallible> {
-            Ok(self.code.get(&addr).cloned().unwrap_or_default())
-        }
-        fn set_code(&mut self, addr: Address, code: Vec<u8>) -> Result<(), Infallible> {
-            self.code.insert(addr, code);
-            Ok(())
-        }
-        fn clear_code(&mut self, addr: Address) -> Result<(), Infallible> {
-            self.code.remove(&addr);
-            Ok(())
-        }
-    }
-
-    impl IndexStorage for MemState {
-        type Error = Infallible;
-        fn storage(&mut self, addr: Address, slot: B256) -> Result<B256, Infallible> {
-            Ok(self.slots.get(&(addr, slot)).copied().unwrap_or(B256::ZERO))
-        }
-        fn set_storage(
-            &mut self,
-            addr: Address,
-            slot: B256,
-            value: B256,
-        ) -> Result<(), Infallible> {
-            self.slots.insert((addr, slot), value);
-            Ok(())
-        }
-        fn ensure_account_persists(&mut self, addr: Address) -> Result<(), Infallible> {
-            self.persisted.insert(addr);
-            Ok(())
-        }
-    }
-
-    impl BalanceAccess for MemState {
-        type Error = Infallible;
-        fn get_balance(&mut self, addr: Address) -> Result<U256, Infallible> {
-            Ok(self.balances.get(&addr).copied().unwrap_or_default())
-        }
-        fn set_balance(&mut self, addr: Address, balance: U256) -> Result<(), Infallible> {
-            self.balances.insert(addr, balance);
-            Ok(())
-        }
-    }
-
-    impl NonceAccess for MemState {
-        type Error = Infallible;
-        fn get_nonce(&mut self, addr: Address) -> Result<u64, Infallible> {
-            Ok(self.nonces.get(&addr).copied().unwrap_or_default())
-        }
-        fn set_nonce(&mut self, addr: Address, nonce: u64) -> Result<(), Infallible> {
-            self.nonces.insert(addr, nonce);
-            Ok(())
-        }
-    }
-
-    type View = MptStateView<MemState>;
+    type View = MemView;
 
     fn fresh_view() -> View {
-        View::new(MemState::default(), BlockRef::new(9, [0xBB; 32]))
+        mem_view(
+            MemBase::default(),
+            mem_nodes(),
+            BlockRef::new(9, [0xBB; 32]),
+        )
     }
 
-    /// A view whose base already holds `entities`.
     fn seeded_view(entities: &[Entity]) -> View {
         let mut view = fresh_view();
         for entity in entities {
@@ -587,7 +518,8 @@ mod tests {
                 .unwrap();
         }
         StateView::commit(&mut view).unwrap();
-        View::new(view.into_base(), BlockRef::new(9, [0xBB; 32]))
+        let (base, nodes) = settle(view);
+        mem_view(base, nodes, BlockRef::new(9, [0xBB; 32]))
     }
 
     fn staged(view: &View, key: EntityAddress) -> Option<Entity> {

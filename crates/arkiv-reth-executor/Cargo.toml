@@ -15,10 +15,8 @@ license.workspace = true
 [dependencies]
 # The host-agnostic executor interface this crate implements (see arkiv.rs).
 arkiv-interfaces.workspace = true
-# The index's annotation encoder: `apply` diffs an entity's annotations to build
-# the auxiliary delta, and this is the one place that maps an entity to its
-# `(attr, value)` index pairs (shared with the query read path).
-arkiv-reth-mpt-committed-store.workspace = true
+# The Arkiv database: the node store a transaction's trie writes land in.
+arkiv-store.workspace = true
 # The state manager: lib.rs drives all state (entities, index, balances, nonces)
 # through one write_manager (MptStateManager over the WriteOverlay).
 arkiv-reth-statemanager.workspace = true
@@ -33,9 +31,10 @@ eyre.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# Integration tests wire calldata → decode_ops → apply → RethEntityStore →
-# CodeBackend → WriteOverlay → EvmState, and build calldata via the SDK bindings.
+# Integration tests wire calldata → decode_ops → apply → the view → the
+# database and the EvmState diff, and build calldata via the SDK bindings.
 arkiv-interfaces.workspace = true
+arkiv-store.workspace = true
 arkiv-bindings.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true

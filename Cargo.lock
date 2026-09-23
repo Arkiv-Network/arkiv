@@ -1571,8 +1571,8 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-interfaces",
- "arkiv-reth-mpt-committed-store",
  "arkiv-reth-statemanager",
+ "arkiv-store",
  "eyre",
  "reth-ethereum",
  "tracing",
@@ -1644,8 +1644,8 @@ version = "0.5.1"
 dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
- "arkiv-reth-mpt-committed-store",
  "arkiv-reth-uncommitted-store",
+ "arkiv-store",
  "eyre",
  "reth-ethereum",
 ]
