@@ -214,23 +214,6 @@ The Ethereum state root still covers everything, through that slot.
 
 ![w:820](diagrams/after-index.svg)
 
----
-
-## Index keys
-
-`order-preserving value ‖ entity key`, with a marker byte as the value.
-
-| type | encoding |
-|---|---|
-| u64, u256, bool, bytes32, address, key | as is |
-| int, decimal | sign bit flipped, so bytes sort numerically |
-| str | `0x00` escaped as `0x00 0x01`, terminated by `0x00 0x00` |
-
-The terminator keeps `"ab" < "abc"` regardless of the entity key that follows,
-and a prefix of the escaped bytes is exactly a `STARTSWITH` match.
-
----
-
 ## Inserting one entity: path copying
 
 ![w:1000](diagrams/after-insert.svg)
