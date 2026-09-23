@@ -253,7 +253,7 @@ def after_overview() -> None:
     {{ent non i1 i2}} -> store [style=dashed];
   }}
   {{ rank=same; anchor; top; }}
-  anchor:slot:e -> top:w [label="names, by hash"];
+  anchor:slot:e -> top:w;
 """, extra=" newrank=true;")
 
 
