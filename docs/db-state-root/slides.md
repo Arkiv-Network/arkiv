@@ -214,6 +214,8 @@ The Ethereum state root still covers everything, through that slot.
 
 ![w:820](diagrams/after-index.svg)
 
+---
+
 ## Inserting one entity: path copying
 
 ![w:1000](diagrams/after-insert.svg)
