@@ -771,6 +771,116 @@ pub enum WriteOutcome {
     Deleted,
 }
 
+// ---------------------------------------------------------------------------
+// Matching — shared, because it is spec
+// ---------------------------------------------------------------------------
+
+/// The spec's `enc`: an encoding whose lexicographic byte order equals the
+/// type's domain order.
+///
+/// Unsigned big-endian types already satisfy it. Signed ones do not — two's
+/// complement puts negatives above positives bytewise — so their sign bit is
+/// flipped, which is what makes range scans and sorting meaningful on a plain
+/// sorted key-value store.
+pub fn order_encoding(value: &[u8], type_id: TypeId) -> Vec<u8> {
+    let mut encoded = value.to_vec();
+    let signed = type_id == TypeId::I32 || type_id == TypeId::DEC;
+    if signed && !encoded.is_empty() {
+        encoded[0] ^= 0x80;
+    }
+    encoded
+}
+
+impl Predicate {
+    /// Whether this predicate holds for `record`.
+    ///
+    /// A predicate only ever sees an **attribute of its own type**: fields are
+    /// invisible to queries, and the type is part of the index bucket, so an
+    /// attribute of some other type is a miss rather than a coercion.
+    ///
+    /// Returns [`StoreError::InvalidQuery`] if the operation is not one the
+    /// type can be indexed for — checked before the record is consulted, so
+    /// an invalid query fails the same way against any state.
+    pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
+        if !self.op.permitted_by(self.type_id.index_class()) {
+            return Err(StoreError::InvalidQuery);
+        }
+
+        let hit = match record.cell(&self.cell) {
+            Some(cell)
+                if matches!(cell.kind, CellKind::Attribute) && cell.type_id == self.type_id =>
+            {
+                self.compare(&cell.value)
+            }
+            _ => false,
+        };
+        Ok(hit != self.negated)
+    }
+
+    /// Compare a stored value against this predicate's operand.
+    ///
+    /// Equality and prefix work on the canonical bytes directly; ordering
+    /// works on [`order_encoding`], which for signed types is not the same.
+    fn compare(&self, stored: &[u8]) -> bool {
+        match self.op {
+            CompareOp::Prefix => stored.starts_with(&self.value),
+            CompareOp::Eq => stored == self.value.as_slice(),
+            CompareOp::Lt | CompareOp::Lte | CompareOp::Gt | CompareOp::Gte => {
+                let left = order_encoding(stored, self.type_id);
+                let right = order_encoding(&self.value, self.type_id);
+                match self.op {
+                    CompareOp::Lt => left < right,
+                    CompareOp::Lte => left <= right,
+                    CompareOp::Gt => left > right,
+                    CompareOp::Gte => left >= right,
+                    CompareOp::Eq | CompareOp::Prefix => unreachable!("handled above"),
+                }
+            }
+        }
+    }
+}
+
+impl AndGroup {
+    /// Whether every predicate in the group holds for `record`.
+    ///
+    /// Predicates are intersected in submitted order and the group stops at
+    /// the first miss — the early exit the spec makes the caller's cost lever.
+    pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
+        for predicate in &self.0 {
+            if !predicate.matches(record)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Filter {
+    /// Whether any group matches `record` — the OR half of the DNF.
+    ///
+    /// An empty filter matches every record.
+    pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
+        if self.0.is_empty() {
+            return Ok(true);
+        }
+        for group in &self.0 {
+            if group.matches(record)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl Record {
+    /// This record's value for a sort key, in [`order_encoding`] form.
+    /// `None` when the record has no such cell, which sorts it last.
+    pub fn sort_key(&self, cell: &str) -> Option<Vec<u8>> {
+        self.cell(cell)
+            .map(|cell| order_encoding(&cell.value, cell.type_id))
+    }
+}
+
 #[cfg(feature = "conformance")]
 pub mod conformance;
 

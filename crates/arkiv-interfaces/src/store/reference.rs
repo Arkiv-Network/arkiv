@@ -26,10 +26,10 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::{
-    AndGroup, BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellKind, CellName,
-    CommitId, CompareOp, CostUnits, Filter, Metered, Origin, Predicate, Query, QueryResult,
-    ReadTarget, Receipt, Record, RecordChange, RecordKey, RecordVersion, ScheduleVersion, Sort,
-    SortDirection, Store, StoreError, StoreExt, TypeId, WriteOp, WriteOutcome, validate_cell_name,
+    BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
+    Filter, Metered, Origin, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange,
+    RecordKey, RecordVersion, ScheduleVersion, Sort, SortDirection, Store, StoreError, StoreExt,
+    WriteOp, WriteOutcome, validate_cell_name,
 };
 
 /// One record's stored form: its cells, plus the `#version` meta entry the
@@ -550,113 +550,25 @@ impl StoreExt for MemStore {
 // query evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate an ordered DNF and return the matching keys, ascending.
+/// Evaluate a filter and return the matching keys, ascending.
 ///
-/// Groups are evaluated in submitted order and unioned; a record matching
-/// several groups appears once. Ascending key order falls out of the ordered
-/// map, and is both the default result order and the tie-break under a sort.
-///
-/// An empty filter matches every record.
+/// The matching itself is [`Filter::matches`] — shared with every other
+/// implementation, because filter semantics are spec and must not be able to
+/// diverge between backends. All this adds is the scan and the ordering:
+/// ascending key order falls out of the ordered map, and is both the default
+/// result order and the tie-break under a sort. A record matching several
+/// groups is visited once, so it appears once.
 fn evaluate_filter(
     state: &BTreeMap<RecordKey, RecordData>,
     filter: &Filter,
 ) -> Result<Vec<RecordKey>, StoreError> {
-    if filter.0.is_empty() {
-        return Ok(state.keys().copied().collect());
-    }
-
-    let mut matched: BTreeMap<RecordKey, ()> = BTreeMap::new();
-    for group in &filter.0 {
-        for (key, record) in state {
-            if record_matches_group(record, group)? {
-                matched.insert(*key, ());
-            }
+    let mut matched = Vec::new();
+    for (key, data) in state {
+        if filter.matches(&data.to_record(*key, None))? {
+            matched.push(*key);
         }
     }
-    Ok(matched.into_keys().collect())
-}
-
-/// Whether every predicate in one AND-group holds for `record`.
-///
-/// Predicates are intersected in submitted order and the group stops at the
-/// first miss — the early exit the spec makes the caller's cost lever.
-fn record_matches_group(record: &RecordData, group: &AndGroup) -> Result<bool, StoreError> {
-    for predicate in &group.0 {
-        if !record_matches_predicate(record, predicate)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Whether one predicate holds for `record`.
-///
-/// A predicate only ever sees an **attribute of its own type**: fields are
-/// invisible to queries, and the type is part of the index bucket, so an
-/// attribute of some other type is a miss rather than a coercion.
-///
-/// Returns [`StoreError::InvalidQuery`] if the operation is not one the
-/// attribute's type can be indexed for.
-fn record_matches_predicate(
-    record: &RecordData,
-    predicate: &Predicate,
-) -> Result<bool, StoreError> {
-    if !predicate.op.permitted_by(predicate.type_id.index_class()) {
-        return Err(StoreError::InvalidQuery);
-    }
-
-    let hit = match record.cells.get(&predicate.cell) {
-        Some(cell)
-            if matches!(cell.kind, CellKind::Attribute) && cell.type_id == predicate.type_id =>
-        {
-            compare_values(
-                &cell.value,
-                &predicate.value,
-                predicate.op,
-                predicate.type_id,
-            )
-        }
-        _ => false,
-    };
-    Ok(hit != predicate.negated)
-}
-
-/// Compare a stored value against a predicate's operand.
-///
-/// Equality and prefix work on the canonical bytes directly; ordering works on
-/// the type's order encoding, which for signed types is not the same thing.
-fn compare_values(stored: &[u8], operand: &[u8], op: CompareOp, type_id: TypeId) -> bool {
-    match op {
-        CompareOp::Prefix => stored.starts_with(operand),
-        CompareOp::Eq => stored == operand,
-        CompareOp::Lt | CompareOp::Lte | CompareOp::Gt | CompareOp::Gte => {
-            let left = order_encoding(stored, type_id);
-            let right = order_encoding(operand, type_id);
-            match op {
-                CompareOp::Lt => left < right,
-                CompareOp::Lte => left <= right,
-                CompareOp::Gt => left > right,
-                CompareOp::Gte => left >= right,
-                CompareOp::Eq | CompareOp::Prefix => unreachable!("handled above"),
-            }
-        }
-    }
-}
-
-/// The spec's `enc`: an encoding whose lexicographic byte order equals the
-/// type's domain order.
-///
-/// Unsigned big-endian types already satisfy it. Signed ones do not — two's
-/// complement puts negatives above positives bytewise — so their sign bit is
-/// flipped, which is what makes range scans and sorting meaningful on a plain
-/// sorted key-value store.
-fn order_encoding(value: &[u8], type_id: TypeId) -> Vec<u8> {
-    let mut encoded = value.to_vec();
-    let signed = type_id == TypeId::I32 || type_id == TypeId::DEC;
-    if signed && !encoded.is_empty() {
-        encoded[0] ^= 0x80;
-    }
-    encoded
+    Ok(matched)
 }
 
 /// Sort matched keys by one cell, in the requested direction.
@@ -665,12 +577,7 @@ fn order_encoding(value: &[u8], type_id: TypeId) -> Vec<u8> {
 /// tie-break — so the ordering is total and two implementations agreeing on
 /// the match set also agree on the page.
 fn sort_keys_by_cell(state: &BTreeMap<RecordKey, RecordData>, keys: &mut [RecordKey], sort: &Sort) {
-    let sort_value = |key: &RecordKey| {
-        state[key]
-            .cells
-            .get(&sort.cell)
-            .map(|cell| order_encoding(&cell.value, cell.type_id))
-    };
+    let sort_value = |key: &RecordKey| state[key].to_record(*key, None).sort_key(&sort.cell);
 
     keys.sort_by(|left, right| {
         let ordering = match (sort_value(left), sort_value(right)) {
@@ -775,6 +682,7 @@ fn content_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::TypeId;
 
     /// The reference implementation satisfies the whole spec contract.
     #[test]
