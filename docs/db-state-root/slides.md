@@ -254,22 +254,6 @@ turso, driven from synchronous code through a runtime handle like the pruning
 map, without touching the trie, the store or the executor. Same roots, same
 tests.
 
----
-
-## Crash safety
-
-A transaction flushes its new nodes to the node store, durably, before it
-returns its Ethereum diff. reth persists the block later.
-
-So the node store is always ahead of or equal to reth's database, never
-behind. A crash leaves unreachable nodes at worst. Re-executing a block
-writes the same hashes again.
-
-Deferred: one shared database transaction with reth, and pruning of unreachable
-nodes.
-
----
-
 ## Before and after
 
 ![w:1100](diagrams/before-after.svg)
