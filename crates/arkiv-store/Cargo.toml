@@ -15,8 +15,10 @@ arkiv-interfaces.workspace = true
 arkiv-trie.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp = { workspace = true, features = ["derive"] }
-# The durable node store.
-reth-libmdbx.workspace = true
+# The durable node store: turso (SQLite-style), driven from synchronous code
+# through a runtime handle.
+turso.workspace = true
+tokio.workspace = true
 parking_lot = "0.12"
 lru = "0.12"
 

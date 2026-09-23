@@ -1139,7 +1139,10 @@ where
             arkiv_address = %ARKIV_ADDRESS,
             "Assembling Arkiv no-EVM executor over reth host (interpreter bypassed)",
         );
-        let nodes = ArkivDb::shared(&arkiv_db_path(ctx.config().datadir().data_dir()))?;
+        let nodes = ArkivDb::shared(
+            &arkiv_db_path(ctx.config().datadir().data_dir()),
+            tokio::runtime::Handle::current(),
+        )?;
         tracing::info!(target: "arkiv::executor", path = %nodes.path().display(), "opened the Arkiv database");
         Ok(EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec(),

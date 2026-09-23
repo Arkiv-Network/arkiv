@@ -122,7 +122,7 @@ def reth_tables() -> None:
   trie [label="account trie over keccak(address)\\nleaf = rlp(nonce, balance, storageRoot, codeHash)\\nstorageRoot = trie over keccak(slot)", fillcolor="{OLD}"];
   hdr:sr -> trie [label="commits to"];
   trie -> acct; trie -> stor; trie -> code [style=dashed, label="by codeHash"];
-  note [shape=plaintext, label="MDBX tables, flat key → value.\\nThe trie is recomputed from the changed keys after every block."];
+  note [shape=plaintext, label="MDBX tables, flat key → value (reth's own store).\\nThe trie is recomputed from the changed keys after every block."];
 """, rankdir="LR")
 
 
@@ -214,7 +214,7 @@ def after_overview() -> None:
   idx [label="index-of-indexes\\nname ‖ 0x00 ‖ type → index root", fillcolor="{KV}"];
   i1 [label="index (team, str)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
   i2 [label="index (rank, u256)\\nenc(value) ‖ key → ()", fillcolor="{KV}"];
-  store [{rec("{{ node store (MDBX, one table) | {{ keccak(rlp(node)) → rlp(node) }} }}")}, fillcolor="{OLD}"];
+  store [{rec("{{ node store (turso, one table) | {{ keccak(rlp(node)) → rlp(node) }} }}")}, fillcolor="{OLD}"];
   hdr -> trie -> anchor -> top;
   top -> ent; top -> non; top -> idx;
   idx -> i1; idx -> i2;

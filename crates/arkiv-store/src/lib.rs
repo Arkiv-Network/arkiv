@@ -21,19 +21,19 @@
 
 pub mod annotations;
 pub mod encoding;
-pub mod mdbx;
 pub mod query;
 pub mod record;
 pub mod roots;
+pub mod turso;
 pub mod view;
 
 pub use alloy_primitives::{Address, B256, U256};
 pub use annotations::{AttrEntry, EntityDelta, annotation_delta, entity_annotations};
 pub use arkiv_trie::{MemNodeStore, NodeReader, NodeSink, NodeStore, SharedMemNodeStore, Staging};
-pub use mdbx::ArkivDb;
 pub use query::{evaluate, evaluate_page};
 pub use record::{RecordError, decode, encode};
 pub use roots::{DbRoots, EMPTY_DB_ROOT};
+pub use turso::{ArkivDb, DbError};
 pub use view::{DbChanges, DbView, StoreError, commit_changes};
 
 /// The Ethereum account whose storage slot 0 holds the database root. The

@@ -257,6 +257,18 @@ hand-built B+ tree are gone.
 
 ---
 
+## The node store is replaceable
+
+The trie reads through two small traits: `hash → bytes`, and "make this
+batch durable". The engine behind them is one file.
+
+The first version used MDBX, the engine reth links. It was then swapped for
+turso, driven from synchronous code through a runtime handle like the pruning
+map, without touching the trie, the store or the executor. Same roots, same
+tests.
+
+---
+
 ## Crash safety
 
 A transaction flushes its new nodes to the node store, durably, before it
@@ -266,7 +278,7 @@ So the node store is always ahead of or equal to reth's database, never
 behind. A crash leaves unreachable nodes at worst. Re-executing a block
 writes the same hashes again.
 
-Deferred: one shared MDBX transaction with reth, and pruning of unreachable
+Deferred: one shared database transaction with reth, and pruning of unreachable
 nodes.
 
 ---
@@ -282,7 +294,7 @@ nodes.
 | crate | what |
 |---|---|
 | `arkiv-trie` | persistent Merkle-Patricia trie over a node store, own path type (keys longer than 32 bytes) |
-| `arkiv-store` | the three tries, key encodings, query evaluator, MDBX node store |
+| `arkiv-store` | the three tries, key encodings, query evaluator, turso node store |
 | `arkiv-reth-statemanager` | base shrank to balances, nonces and the anchor slot |
 | `arkiv-reth-executor` | reads the parent root, flushes nodes, writes the new root |
 | `arkiv-reth-rpc` | reads through the anchor slot of any block's snapshot |
@@ -309,7 +321,7 @@ bound to a block.
 Left out of the proof of concept on purpose. None of them change the root
 format, so each is a follow-up, not a fork.
 
-- Crash atomicity with reth through one shared MDBX transaction.
+- Crash atomicity with reth through one shared database transaction.
 - Pruning unreachable nodes.
 - Snap sync of the node store for followers.
 - Seeding at genesis on the new layout.

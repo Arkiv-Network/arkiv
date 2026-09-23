@@ -48,8 +48,10 @@ arkiv-reth-executor.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true
-# The Arkiv database handle the RPC shares with the executor.
+# The Arkiv database handle the RPC shares with the executor, and the runtime
+# handle it is opened with.
 arkiv-store.workspace = true
+tokio.workspace = true
 # The RPC block type the debug launcher converts (`DebugNode::RpcBlock`).
 alloy-rpc-types.workspace = true
 eyre.workspace = true

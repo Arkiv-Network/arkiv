@@ -29,6 +29,8 @@ alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+# The runtime handle the Arkiv node store is opened with.
+tokio.workspace = true
 
 [dev-dependencies]
 # Integration tests wire calldata → decode_ops → apply → the view → the

@@ -87,9 +87,10 @@ where
         let pruning_path = ctx.config().datadir().data_dir().join("arkiv-pruning.db");
         let pruning_map = ChainPruningMap::open(&pruning_path, Handle::current()).await?;
         info!(target: "arkiv-reth", path = %pruning_path.display(), "opened chain pruning map");
-        let db = ArkivDb::shared(&arkiv_reth_executor::arkiv_db_path(
-            ctx.config().datadir().data_dir(),
-        ))?;
+        let db = ArkivDb::shared(
+            &arkiv_reth_executor::arkiv_db_path(ctx.config().datadir().data_dir()),
+            Handle::current(),
+        )?;
         let payload_builder = ArkivPayloadBuilder {
             client: ctx.provider().clone(),
             pool,

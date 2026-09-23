@@ -50,8 +50,6 @@ reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
-# The MDBX binding behind arkiv-store's node table.
-reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 # `Layers`, to hang `init-state`'s progress layer onto reth's tracing setup.
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }

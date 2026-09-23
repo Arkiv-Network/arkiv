@@ -1574,6 +1574,7 @@ dependencies = [
  "arkiv-store",
  "eyre",
  "reth-ethereum",
+ "tokio",
  "tracing",
 ]
 
@@ -1667,8 +1668,9 @@ dependencies = [
  "arkiv-trie",
  "lru 0.12.5",
  "parking_lot",
- "reth-libmdbx",
  "tempfile",
+ "tokio",
+ "turso",
 ]
 
 [[package]]

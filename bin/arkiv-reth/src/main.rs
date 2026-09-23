@@ -85,9 +85,10 @@ fn main() {
                     .node(ArkivNode)
                     // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
                     .extend_rpc_modules(|ctx| {
-                        let db = arkiv_store::ArkivDb::shared(&arkiv_reth_executor::arkiv_db_path(
-                            ctx.config().datadir().data_dir(),
-                        ))?;
+                        let db = arkiv_store::ArkivDb::shared(
+                            &arkiv_reth_executor::arkiv_db_path(ctx.config().datadir().data_dir()),
+                            tokio::runtime::Handle::current(),
+                        )?;
                         let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone(), db)?;
                         ctx.modules.merge_configured(module)?;
                         info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");

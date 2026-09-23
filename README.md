@@ -72,7 +72,7 @@ Scaffold only — the workspace builds and the devnet is wired; real harness log
 
 Arkiv's database state is not in reth's account trie. Entities, entity-creation
 nonces and the query indexes are three persistent Merkle-Patricia tries in one
-content-addressed node store (`<datadir>/arkiv-db`, MDBX). Their roots hash
+content-addressed node store (`<datadir>/arkiv-db`, a turso table). Their roots hash
 into one **database root**, and that root is the only Arkiv state in Ethereum's
 state: storage slot 0 of the anchor account `0x61726b69762d64617461626173652d726f6f7421`
 (the ASCII string `arkiv-database-root!`). Every transaction reads the parent
