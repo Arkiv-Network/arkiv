@@ -26,9 +26,9 @@ CODE = '#ffd8d8'     # account code
 SLOT = '#ffe9a8'     # storage slot
 
 
-def write(name: str, body: str, rankdir: str = "TB") -> None:
+def write(name: str, body: str, rankdir: str = "TB", extra: str = "") -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    text = f'digraph "{name}" {{\n  rankdir={rankdir};{HEAD}{body}\n}}\n'
+    text = f'digraph "{name}" {{\n  rankdir={rankdir};{extra}{HEAD}{body}\n}}\n'
     (OUT / f"{name}.dot").write_text(text)
 
 
@@ -234,10 +234,13 @@ def after_overview() -> None:
   subgraph cluster_reth {{ label="in reth (Ethereum state, MDBX)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
     hdr [label="block header\\nstateRoot", fillcolor="{ROOT}"];
     trie [label="Ethereum account trie\\nEOAs: balances and nonces"];
-    anchor [{rec("{{ anchor account 0x61726b69…7421 (’arkiv-database-root!’) | {{ nonce = 1 | slot 0 = database root }} }}")}, fillcolor="{SLOT}"];
+    anchor [shape=plaintext, style="", label=<<table border="0" cellborder="1" cellspacing="0" cellpadding="5" bgcolor="{SLOT}">
+      <tr><td colspan="2">anchor account 0x61726b69…7421 (‘arkiv-database-root!’)</td></tr>
+      <tr><td>nonce = 1</td><td port="slot">slot 0 = database root</td></tr>
+    </table>>];
     hdr -> trie -> anchor;
   }}
-  subgraph cluster_turso {{ label="in turso (the Arkiv node store, one table)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
+  subgraph cluster_turso {{ label="external to reth (the Arkiv node store, one table)"; color="#777777"; style="dashed,rounded"; bgcolor="#fafafa";
     top [label="top node\\nkeccak(rlp[entities root, nonces root, indexes root])", fillcolor="{ROOT}"];
     ent [label="entities trie\\nkey (32 B) → record", fillcolor="{KV}"];
     non [label="nonces trie\\nowner (20 B) → next nonce", fillcolor="{KV}"];
@@ -249,8 +252,9 @@ def after_overview() -> None:
     idx -> i1; idx -> i2;
     {{ent non i1 i2}} -> store [style=dashed];
   }}
-  anchor -> top [label="names, by hash"];
-""")
+  {{ rank=same; anchor; top; }}
+  anchor:slot:e -> top:w [label="names, by hash"];
+""", extra=" newrank=true;")
 
 
 def after_entities() -> None:
