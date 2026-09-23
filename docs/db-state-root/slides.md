@@ -104,7 +104,8 @@ Anything Arkiv stores in reth must be an account field, a storage slot, or
 account code. The state root then commits to it, and every write is one more
 account or slot for reth to rehash.
 
-The rest of this deck is about what Arkiv put there, and what it puts there now.
+The next section shows how Arkiv used all three of those places. The section
+after shows how it now uses one storage slot.
 
 ---
 
