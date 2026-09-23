@@ -160,16 +160,19 @@ bitmaps, and a bitmap needs small integers.
 
 ---
 
-## What was awkward
+## What was awkward, and why
 
-- Two representations of one fact: the bitmap knows which entities, the
-  B+ tree knows which values.
+All of it follows from one decision: the database was crammed into Ethereum
+accounts, so every structure had to be shaped like an account or a slot.
+
 - Every write touched a dozen accounts and dozens of slots, each rehashed by
   reth's account trie.
-- The id maps, the counter, the enumeration lists: bookkeeping that existed
-  only to serve the layout.
 - Consensus-critical byte formats scattered across bitmap serialization,
   slot packing and address derivations.
+- Two representations of one fact: the bitmap knows which entities, the
+  B+ tree knows which values.
+- The id maps, the counter, the enumeration lists: bookkeeping that existed
+  only to serve the layout.
 
 ---
 
