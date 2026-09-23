@@ -236,6 +236,8 @@ The Ethereum state root still covers everything, through that slot.
 
 ![w:620](diagrams/after-query.svg)
 
+---
+
 ## History and reorgs
 
 ![w:900](diagrams/after-history.svg)
