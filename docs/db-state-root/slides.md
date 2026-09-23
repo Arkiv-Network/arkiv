@@ -201,7 +201,7 @@ The Ethereum state root still covers everything, through that slot.
 - Address `0x61726b69762d64617461626173652d726f6f7421`, the ASCII string
   `arkiv-database-root!`, exactly 20 bytes.
 - Slot 0 holds the database root. Nonce 1 keeps the account alive.
-- A zero slot reads as the empty database, so genesis needs no entry.
+- A zero slot reads as the empty database.
 - The database root is `keccak(rlp[entities root, nonces root, indexes root])`
   and the top node is stored in the node store too, so it can be read back.
 
