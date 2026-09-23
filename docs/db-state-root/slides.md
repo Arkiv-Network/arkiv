@@ -254,6 +254,8 @@ turso, driven from synchronous code through a runtime handle like the pruning
 map, without touching the trie, the store or the executor. Same roots, same
 tests.
 
+---
+
 ## Before and after
 
 ![w:1100](diagrams/before-after.svg)
