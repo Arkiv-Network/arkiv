@@ -370,7 +370,7 @@ mod tests {
     use super::*;
 
     fn owners(n: u8) -> Vec<Address> {
-        (1..=n).map(|b| Address::repeat_byte(b)).collect()
+        (1..=n).map(Address::repeat_byte).collect()
     }
 
     #[test]

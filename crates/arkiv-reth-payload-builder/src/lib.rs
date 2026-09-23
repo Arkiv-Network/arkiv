@@ -1,23 +1,15 @@
 //! Arkiv payload builder: prepend a bounded, protocol-generated purge transaction.
 
-mod chain_pruning_map;
-
-use alloy_consensus::{
-    SignableTransaction, Transaction, TxEip1559, TxEnvelope, transaction::SignerRecoverable,
-};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, transaction::SignerRecoverable};
 use alloy_network::TxSignerSync;
-use alloy_primitives::{B256, Bytes, TxKind, U256};
+use alloy_primitives::{Bytes, TxKind, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, SolEvent};
-use arkiv_bindings::{
-    IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
-};
+use alloy_sol_types::SolCall;
+use arkiv_authenticated_store::Store;
+use arkiv_bindings::{MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall};
 use arkiv_reth_executor::ARKIV_ADDRESS;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethAuxStore, RethEntityStore};
-use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
-use chain_pruning_map::{ChainPruningMap, PruningEntry};
-use futures_util::StreamExt;
+use arkiv_reth_rpc::snapshot::authenticated_snapshot;
 use reth_basic_payload_builder::{
     BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
     PayloadBuilder,
@@ -40,25 +32,10 @@ use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payl
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
 use reth_storage_api::{BlockReader, ReceiptProvider, StateProviderFactory};
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
-use tokio::runtime::Handle;
-use tracing::{debug, info, warn};
+use std::{sync::Arc, time::Instant};
 
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
-
-/// Genesis entities folded into the pruning map per transaction during the
-/// one-time bootstrap walk.
-const GENESIS_BOOTSTRAP_BATCH: usize = 10_000;
-/// Chunks resolved at once, each on its own thread with its own snapshots.
-/// The reads are random pages of a state far larger than memory, so a worker
-/// mostly waits on one page fault at a time; the count is what keeps the disk
-/// busy, not the cores (capped by the cores available all the same).
-const GENESIS_BOOTSTRAP_WORKERS: usize = 32;
-/// Entries committed to the map per transaction. Genesis keys are hashes, so
-/// a commit rewrites about one leaf page per row up to the whole table
-/// however small the batch; large batches keep that amplification down.
-const GENESIS_BOOTSTRAP_ROWS_PER_COMMIT: usize = 1_000_000;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ArkivPayloadServiceBuilder;
@@ -84,15 +61,13 @@ where
         pool: Pool,
         evm: Evm,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let pruning_path = ctx.config().datadir().data_dir().join("arkiv-pruning.db");
-        let pruning_map = ChainPruningMap::open(&pruning_path, Handle::current()).await?;
-        info!(target: "arkiv-reth", path = %pruning_path.display(), "opened chain pruning map");
+        let records = Store::open(ctx.config().datadir().data_dir().join("arkiv-state"))?;
         let payload_builder = ArkivPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
             evm,
             chain_id: ctx.chain_spec().chain().id(),
-            pruning_map: pruning_map.clone(),
+            records,
             config: EthereumBuilderConfig::new()
                 .with_extra_data(ctx.payload_builder_config().extra_data()),
         };
@@ -106,24 +81,7 @@ where
                 .max_payload_tasks(conf.max_payload_tasks),
             payload_builder,
         );
-        spawn_catch_up(
-            ctx.task_executor(),
-            ctx.provider().clone(),
-            pruning_map.clone(),
-        );
-        let provider = ctx.provider().clone();
-        let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
-            move |notification| {
-                let provider = provider.clone();
-                let pruning_map = pruning_map.clone();
-                async move {
-                    if let Err(error) = catch_up(provider, pruning_map).await {
-                        warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
-                    }
-                    notification
-                }
-            },
-        ));
+        let notifications = Box::pin(ctx.provider().canonical_state_stream());
         let (service, handle) = PayloadBuilderService::new(generator, notifications);
         ctx.task_executor().spawn_critical_os_thread(
             "payload-service",
@@ -134,291 +92,6 @@ where
     }
 }
 
-fn spawn_catch_up<P>(
-    executor: &reth_ethereum::tasks::TaskExecutor,
-    provider: P,
-    pruning_map: ChainPruningMap,
-) where
-    P: StateProviderFactory
-        + BlockReader<Block = reth_ethereum::Block>
-        + ReceiptProvider<Receipt = reth_ethereum::Receipt>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    executor.spawn_task(async move {
-        if let Err(error) = catch_up(provider, pruning_map).await {
-            warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
-        }
-    });
-}
-
-async fn catch_up<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
-where
-    P: StateProviderFactory
-        + BlockReader<Block = reth_ethereum::Block>
-        + ReceiptProvider<Receipt = reth_ethereum::Receipt>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    let _guard = pruning_map.update_guard().await;
-    if !pruning_map.genesis_bootstrapped().await? {
-        bootstrap_genesis(provider.clone(), pruning_map.clone()).await?;
-    }
-    loop {
-        let watermark = pruning_map.watermark().await?;
-        let tip = provider
-            .best_block_number()
-            .map_err(|error| eyre::eyre!("read chain tip: {error:?}"))?;
-        if watermark >= tip {
-            return Ok(());
-        }
-        let height = watermark + 1;
-        let block_provider = provider.clone();
-        let (entries, removed) =
-            tokio::task::spawn_blocking(move || pruning_updates_at(&block_provider, height))
-                .await
-                .map_err(|error| {
-                    eyre::eyre!("join pruning replay for block {height}: {error}")
-                })??;
-        pruning_map.apply_next(height, &entries, &removed).await?;
-    }
-}
-
-/// Fold the entities present at block 0 into the map.
-///
-/// A seeded genesis holds entities no block ever created, so the replay in
-/// [`catch_up`] — which learns about entities from their operation logs —
-/// would never schedule them for purging. Walk the genesis `$all` bucket once
-/// and record every entity that still exists, as it stands; the replay of the
-/// blocks after the watermark then keeps them current like any other. The map
-/// remembers that the walk ran, so a restart does not repeat it, and how far
-/// it got, so an interrupted walk resumes.
-async fn bootstrap_genesis<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
-where
-    P: StateProviderFactory + Clone + Send + Sync + 'static,
-{
-    let watermark = pruning_map.watermark().await?;
-    let map = pruning_map.clone();
-    let entities = tokio::task::spawn_blocking(move || bootstrap_genesis_blocking(&provider, &map))
-        .await
-        .map_err(|error| eyre::eyre!("join genesis pruning bootstrap: {error}"))??;
-    pruning_map.mark_genesis_bootstrapped().await?;
-    info!(target: "arkiv-reth", entities, watermark, "bootstrapped the chain pruning map from genesis");
-    Ok(())
-}
-
-/// The synchronous half of [`bootstrap_genesis`]: read the genesis `$all`
-/// bucket, then resolve the entities as they stand now in chunks and upsert
-/// them batch by batch, moving the map's cursor with each batch (see
-/// [`resolve_genesis_entities`] for why now rather than at the watermark).
-///
-/// Every chunk opens its own state snapshots. reth aborts a read transaction
-/// held open past its limit (five minutes by default), and one snapshot over
-/// a walk of tens of millions of entities would take hours, failing part-way
-/// and starting over on the next attempt. The cursor makes an interrupted
-/// walk (a restart, or such a failure) resume where it stopped; upserts make
-/// a repeated batch harmless. Chunks are resolved on a few threads at once,
-/// since each is independent provider reads.
-fn bootstrap_genesis_blocking<P>(provider: &P, pruning_map: &ChainPruningMap) -> eyre::Result<u64>
-where
-    P: StateProviderFactory + Sync,
-{
-    let all = {
-        let genesis = provider
-            .history_by_block_number(0)
-            .map_err(|error| eyre::eyre!("read genesis state: {error:?}"))?;
-        let mut index = RethAuxStore::new(SnapshotAccountCode::new(genesis));
-        index
-            .all_entities()
-            .map_err(|error| eyre::eyre!("read the genesis $all bucket: {error:?}"))?
-    };
-    if all.is_empty() {
-        return Ok(0);
-    }
-    let total = all.len();
-    let next_id = pruning_map.genesis_cursor_blocking()?;
-    if next_id > 0 {
-        info!(target: "arkiv-reth", next_id, total, "resuming the genesis pruning bootstrap");
-    }
-    let mut writer = pruning_map.genesis_bootstrap_writer_blocking()?;
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .clamp(1, GENESIS_BOOTSTRAP_WORKERS);
-
-    let mut ids = all.iter().filter(|id| *id >= next_id).peekable();
-    let mut inserted = 0u64;
-    let mut pending: Vec<PruningEntry> = Vec::with_capacity(GENESIS_BOOTSTRAP_ROWS_PER_COMMIT);
-    let mut resolving = std::time::Duration::ZERO;
-    while ids.peek().is_some() {
-        let chunks: Vec<Vec<u64>> = (0..workers)
-            .map(|_| ids.by_ref().take(GENESIS_BOOTSTRAP_BATCH).collect())
-            .filter(|chunk: &Vec<u64>| !chunk.is_empty())
-            .collect();
-        // Ids come out ascending, so the window's last id bounds everything done.
-        let last = *chunks
-            .last()
-            .and_then(|chunk| chunk.last())
-            .expect("a non-empty window");
-        let started = Instant::now();
-        let resolved = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunks
-                .iter()
-                .map(|chunk| scope.spawn(move || resolve_genesis_entities(provider, chunk)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .map_err(|_| eyre::eyre!("a genesis pruning bootstrap worker panicked"))?
-                })
-                .collect::<eyre::Result<Vec<Vec<PruningEntry>>>>()
-        })?;
-        pending.extend(resolved.into_iter().flatten());
-        resolving += started.elapsed();
-        if pending.len() < GENESIS_BOOTSTRAP_ROWS_PER_COMMIT && ids.peek().is_some() {
-            continue;
-        }
-        let started = Instant::now();
-        writer.write_blocking(&mut pending, last + 1)?;
-        inserted += pending.len() as u64;
-        info!(
-            target: "arkiv-reth",
-            inserted,
-            next_id = last + 1,
-            total,
-            resolve_ms = resolving.as_millis(),
-            write_ms = started.elapsed().as_millis(),
-            "genesis pruning bootstrap in progress"
-        );
-        pending.clear();
-        resolving = std::time::Duration::ZERO;
-    }
-    Ok(inserted)
-}
-
-/// The pruning entries of the genesis entities `ids` as they stand now, over
-/// a snapshot of the latest state opened for just this call. An id whose
-/// entity is gone by then is skipped.
-///
-/// The latest state, not the state at `watermark`: a historical read takes a
-/// `RocksDB` snapshot and reads the chain tip for every account and slot,
-/// which serialises the workers and costs more than the reads themselves.
-/// Reading past the watermark is harmless here. The blocks between it and the
-/// tip are replayed after the walk, and that replay records each entity's
-/// expiry as an absolute value and removals as removals, so whatever this
-/// walk saw is overwritten by the same facts. An entity the walk finds
-/// already gone is one the replay removes again, and an id whose key is gone
-/// was never allocated to anything else.
-fn resolve_genesis_entities<P>(provider: &P, ids: &[u64]) -> eyre::Result<Vec<PruningEntry>>
-where
-    P: StateProviderFactory,
-{
-    let latest = provider
-        .latest()
-        .map_err(|error| eyre::eyre!("read the latest state: {error:?}"))?;
-    let mut index = RethAuxStore::new(SnapshotAccountCode::new(latest));
-    let latest = provider
-        .latest()
-        .map_err(|error| eyre::eyre!("read the latest state: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(latest)));
-
-    let mut entries = Vec::with_capacity(ids.len());
-    for &id in ids {
-        let Some(key) = index
-            .key_of_id(id)
-            .map_err(|error| eyre::eyre!("resolve genesis entity id {id}: {error:?}"))?
-        else {
-            continue;
-        };
-        if let Some(entity) = entities
-            .get(key)
-            .map_err(|error| eyre::eyre!("read genesis entity {}: {error:?}", B256::from(key)))?
-        {
-            entries.push(PruningEntry {
-                key: B256::from(key),
-                expires_at: entity.expires_at,
-                attribute_count: entity.attributes.len(),
-            });
-        }
-    }
-    Ok(entries)
-}
-
-fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
-where
-    P: StateProviderFactory
-        + BlockReader<Block = reth_ethereum::Block>
-        + ReceiptProvider<Receipt = reth_ethereum::Receipt>,
-{
-    let block = provider
-        .block_by_number(height)
-        .map_err(|error| eyre::eyre!("read block {height}: {error:?}"))?
-        .ok_or_else(|| eyre::eyre!("block {height} is unavailable"))?;
-    let receipts = provider
-        .receipts_by_block(height.into())
-        .map_err(|error| eyre::eyre!("read receipts for block {height}: {error:?}"))?
-        .ok_or_else(|| eyre::eyre!("receipts for block {height} are unavailable"))?;
-    let mut touched = BTreeSet::new();
-    for log in receipts.iter().flat_map(|receipt| &receipt.logs) {
-        collect_log_key(log, &mut touched);
-    }
-    for transaction in block.body.transactions() {
-        if transaction.to() != Some(ARKIV_ADDRESS)
-            || !transaction.input().starts_with(&purgeExpiredCall::SELECTOR)
-        {
-            continue;
-        }
-        if let Ok(call) = purgeExpiredCall::abi_decode(transaction.input()) {
-            touched.extend(call.entityKeys);
-        }
-    }
-
-    let state = provider
-        .history_by_block_number(height)
-        .map_err(|error| eyre::eyre!("read state for block {height}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
-    let mut entries = Vec::with_capacity(touched.len());
-    let mut removed = Vec::new();
-    for key in touched {
-        match entities
-            .get(key.0)
-            .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error:?}"))?
-        {
-            Some(entity) => entries.push(PruningEntry {
-                key,
-                expires_at: entity.expires_at,
-                attribute_count: entity.attributes.len(),
-            }),
-            None => removed.push(key),
-        }
-    }
-    Ok((entries, removed))
-}
-
-fn collect_log_key(log: &alloy_primitives::Log, keys: &mut BTreeSet<B256>) {
-    if log.address != ARKIV_ADDRESS {
-        return;
-    }
-    let topics = log.topics();
-    if topics.len() > 1
-        && matches!(
-            topics[0],
-            IEntityRegistry::EntityCreated::SIGNATURE_HASH
-                | IEntityRegistry::EntityPatched::SIGNATURE_HASH
-                | IEntityRegistry::ExpiryExtended::SIGNATURE_HASH
-                | IEntityRegistry::OwnershipTransferred::SIGNATURE_HASH
-                | IEntityRegistry::EntityDeleted::SIGNATURE_HASH
-        )
-    {
-        keys.insert(topics[1]);
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ArkivPayloadBuilder<Pool, Client, Evm> {
     client: Client,
@@ -426,7 +99,7 @@ pub struct ArkivPayloadBuilder<Pool, Client, Evm> {
     evm: Evm,
     config: EthereumBuilderConfig,
     chain_id: u64,
-    pruning_map: ChainPruningMap,
+    records: Store,
 }
 
 impl<Pool, Client, Evm> PayloadBuilder for ArkivPayloadBuilder<Pool, Client, Evm>
@@ -448,18 +121,15 @@ where
         reth_payload_builder_primitives::PayloadBuilderError,
     > {
         let block = args.config.parent_header.number + 1;
-        let keys = self
-            .pruning_map
-            .select_expired(
-                args.config.parent_header.number,
-                block,
-                MAX_PURGE_KEYS,
-                PURGE_GAS_LIMIT,
-            )
-            .unwrap_or_else(|error| {
-                debug!(target: "arkiv-reth", %error, block, "skip pruning for payload");
-                Vec::new()
-            });
+        let parent = self
+            .client
+            .state_by_block_hash(args.config.parent_header.hash())
+            .map_err(|e| reth_payload_builder_primitives::PayloadBuilderError::Other(e.into()))?;
+        let state = authenticated_snapshot(parent, self.records.clone())
+            .map_err(|e| reth_payload_builder_primitives::PayloadBuilderError::Other(e.into()))?;
+        let keys = state
+            .expired(block, MAX_PURGE_KEYS, PURGE_GAS_LIMIT)
+            .map_err(|e| reth_payload_builder_primitives::PayloadBuilderError::Other(e.into()))?;
         let purge = protocol_transaction(self.chain_id, block, keys);
         default_ethereum_payload(
             self.evm.clone(),

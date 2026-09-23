@@ -12,10 +12,10 @@ Set ARKIV_SEED_COUNT to a positive number to start the chain with that many
 entities already in its genesis state: `arkiv-cli seed-genesis` builds them
 (ARKIV_SEED_PAYLOAD_SIZE bytes of payload each, default 512) and the accounts
 go to ethereum-package as `additional_preloaded_contracts`, so the sequencer
-and the follower both compute the same seeded genesis. The accounts travel in
-the package arguments, which Kurtosis caps at 4 MiB: about 1000 entities of
-512 B, or 2000 of 256 B; bigger seeds take the genesis-file or init-state
-route (see the README) rather than ethereum-package. ARKIV_CLI_BINARY names
+and the follower both compute the same seeded genesis. Authenticated records
+are mounted on every EL participant as an extra file. Accounts plus records
+travel in package arguments, which Kurtosis caps at 4 MiB; bigger seeds use
+the genesis-file or init-state route (see the README) rather than ethereum-package. ARKIV_CLI_BINARY names
 the arkiv-cli to use (default: next to ARKIV_RETH_BINARY, else a cargo build).
 The manifest lands in kurtosis/.seed/manifest.json for the integration tests.
 
@@ -46,7 +46,7 @@ prebuilt = os.environ.get("ARKIV_RETH_BINARY")
 seed_count = int(os.environ.get("ARKIV_SEED_COUNT", "0"))
 seed_payload_size = int(os.environ.get("ARKIV_SEED_PAYLOAD_SIZE", "512"))
 # Kurtosis sends the package arguments in one gRPC message and refuses one
-# over 4 MiB ("received message larger than max"); the seeded alloc is most of
+# over 4 MiB ("received message larger than max"); authenticated records are most of
 # that message. Checked before `kurtosis run`, for a message that names the fix.
 KURTOSIS_ARGS_LIMIT = 4 * 1024 * 1024
 
@@ -157,6 +157,15 @@ def seeded_args_file(count, payload_size):
 
     with open(alloc_path) as handle:
         network_params["additional_preloaded_contracts"] = json.load(handle)
+    # Native genesis carries only the root. Mount its authenticated records in
+    # every EL participant using ethereum-package's extra_files facility:
+    # https://github.com/ethpandaops/ethereum-package#extra-files-and-mounts
+    with open(str(alloc_path) + ".arkiv.json") as handle:
+        args.setdefault("extra_files", {})["arkiv-state.json"] = handle.read()
+    for participant in args["participants"]:
+        participant.setdefault("el_extra_mounts", {})["/arkiv-genesis"] = "arkiv-state.json"
+        participant.setdefault("el_extra_env_vars", {})["ARKIV_GENESIS_STATE"] = "/arkiv-genesis/arkiv-state.json"
+
     seeded_args = SEED_DIR / "arkiv-chain.seeded.yaml"
     with open(seeded_args, "w") as handle:
         handle.write(

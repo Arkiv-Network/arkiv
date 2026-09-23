@@ -1,12 +1,9 @@
 //! End-to-end index write path: ops → deltas → index stores → commit → query
-//! back through the view's index primitives, all over the one [`MptStateView`].
+//! back through the view's index primitives, all over the one `ChainView`.
 
 use core::ops::Bound;
-use std::collections::HashMap;
-use std::convert::Infallible;
 
-use alloy_primitives::{Address, B256, U256};
-
+use arkiv_authenticated_store::Store;
 use arkiv_interfaces::entity::annotations::{ALL, EXPIRATION, OWNER};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags};
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, ExecStatus, Op};
@@ -15,74 +12,9 @@ use arkiv_interfaces::statemanager::{
     BlockRef, EntityStore, EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
 };
 use arkiv_reth_executor::ArkivExecutor;
-use arkiv_reth_mpt_committed_store::{AccountCode, BalanceAccess, IndexStorage, NonceAccess};
-use arkiv_reth_statemanager::MptStateView;
-
-/// The one handle everything goes through.
-type Mgr = MptStateView<MemIndex>;
-
-// ── In-memory base (stand-in for the reth bridge) ──────────────────────────
-
-#[derive(Default, Clone)]
-struct MemIndex {
-    code: HashMap<Address, Vec<u8>>,
-    slots: HashMap<(Address, B256), B256>,
-    balances: HashMap<Address, U256>,
-    nonces: HashMap<Address, u64>,
-}
-
-impl BalanceAccess for MemIndex {
-    type Error = Infallible;
-    fn get_balance(&mut self, addr: Address) -> Result<U256, Infallible> {
-        Ok(self.balances.get(&addr).copied().unwrap_or_default())
-    }
-    fn set_balance(&mut self, addr: Address, balance: U256) -> Result<(), Infallible> {
-        self.balances.insert(addr, balance);
-        Ok(())
-    }
-}
-
-impl NonceAccess for MemIndex {
-    type Error = Infallible;
-    fn get_nonce(&mut self, addr: Address) -> Result<u64, Infallible> {
-        Ok(self.nonces.get(&addr).copied().unwrap_or_default())
-    }
-    fn set_nonce(&mut self, addr: Address, nonce: u64) -> Result<(), Infallible> {
-        self.nonces.insert(addr, nonce);
-        Ok(())
-    }
-}
-
-impl AccountCode for MemIndex {
-    type Error = Infallible;
-    fn code(&mut self, addr: Address) -> Result<Vec<u8>, Infallible> {
-        Ok(self.code.get(&addr).cloned().unwrap_or_default())
-    }
-    fn set_code(&mut self, addr: Address, code: Vec<u8>) -> Result<(), Infallible> {
-        self.code.insert(addr, code);
-        Ok(())
-    }
-    fn clear_code(&mut self, addr: Address) -> Result<(), Infallible> {
-        self.code.remove(&addr);
-        Ok(())
-    }
-}
-
-impl IndexStorage for MemIndex {
-    type Error = Infallible;
-    fn storage(&mut self, addr: Address, slot: B256) -> Result<B256, Infallible> {
-        Ok(self.slots.get(&(addr, slot)).copied().unwrap_or(B256::ZERO))
-    }
-    fn set_storage(&mut self, addr: Address, slot: B256, value: B256) -> Result<(), Infallible> {
-        self.slots.insert((addr, slot), value);
-        Ok(())
-    }
-    fn ensure_account_persists(&mut self, _addr: Address) -> Result<(), Infallible> {
-        Ok(())
-    }
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
+use arkiv_reth_statemanager::chain::{ChainView, chain_manager};
+use reth_ethereum::evm::revm::database_interface::EmptyDB;
+type Mgr<'a> = ChainView<'a, EmptyDB>;
 
 fn env(caller: [u8; 20], block: u64) -> ExecEnv {
     ExecEnv {
@@ -99,34 +31,38 @@ fn uint(n: u64) -> AttributeValue {
 }
 
 /// Run `ops`, fold the staged deltas into the index stores, commit the view.
-fn run(exec: &ArkivExecutor<Mgr>, mgr: &mut Mgr, caller: [u8; 20], block: u64, ops: &[Op]) {
+fn run<'a>(
+    exec: &ArkivExecutor<Mgr<'a>>,
+    mgr: &mut Mgr<'a>,
+    caller: [u8; 20],
+    block: u64,
+    ops: &[Op],
+) {
     let out = exec.apply(&env(caller, block), mgr, ops).unwrap();
     assert_eq!(out.status, ExecStatus::Ok);
     let deltas = mgr.get_uncommitted_deltas().unwrap();
-    mgr.equality_index_mut().apply_deltas(&deltas).unwrap();
-    mgr.range_index_mut().apply_deltas(&deltas).unwrap();
+    EqualityIndexStore::apply_deltas(mgr, &deltas).unwrap();
+    RangeIndexStore::apply_deltas(mgr, &deltas).unwrap();
     StateView::commit(mgr).unwrap();
 }
 
 fn owned_by(mgr: &Mgr, owner: [u8; 20]) -> Vec<EntityAddress> {
-    mgr.equality_index()
-        .get_equal_entities(
-            OWNER,
-            &AttributeValue::EthereumAddress(owner),
-            ReadMode::ViewOnBase,
-        )
-        .unwrap()
+    mgr.get_equal_entities(
+        OWNER,
+        &AttributeValue::EthereumAddress(owner),
+        ReadMode::ViewOnBase,
+    )
+    .unwrap()
 }
 
 /// Every live entity — the `$all` marker's bucket.
 fn all_entities(mgr: &Mgr) -> Vec<EntityAddress> {
-    mgr.equality_index()
-        .get_equal_entities(
-            ALL,
-            &AttributeValue::Str(String::new()),
-            ReadMode::ViewOnBase,
-        )
-        .unwrap()
+    mgr.get_equal_entities(
+        ALL,
+        &AttributeValue::Str(String::new()),
+        ReadMode::ViewOnBase,
+    )
+    .unwrap()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -137,7 +73,8 @@ fn all_entities(mgr: &Mgr) -> Vec<EntityAddress> {
 #[test]
 fn create_is_queryable_by_its_attributes() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
+    let mut db = EmptyDB::default();
+    let mut mgr = chain_manager(&mut db, BlockRef::new(9, [0; 32]), Store::default()).unwrap();
     let alice = [0xAA; 20];
     let key: EntityAddress = [1u8; 32];
 
@@ -191,7 +128,8 @@ fn create_is_queryable_by_its_attributes() {
 #[test]
 fn transfer_moves_the_entity_between_owner_queries() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
+    let mut db = EmptyDB::default();
+    let mut mgr = chain_manager(&mut db, BlockRef::new(9, [0; 32]), Store::default()).unwrap();
     let alice = [0xAA; 20];
     let bob = [0xBB; 20];
     let key: EntityAddress = [1u8; 32];
@@ -232,7 +170,8 @@ fn transfer_moves_the_entity_between_owner_queries() {
 #[test]
 fn delete_removes_the_entity_from_queries() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
+    let mut db = EmptyDB::default();
+    let mut mgr = chain_manager(&mut db, BlockRef::new(9, [0; 32]), Store::default()).unwrap();
     let alice = [0xAA; 20];
     let key: EntityAddress = [1u8; 32];
 
@@ -261,7 +200,8 @@ fn delete_removes_the_entity_from_queries() {
 #[test]
 fn update_reindexes_attributes() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
+    let mut db = EmptyDB::default();
+    let mut mgr = chain_manager(&mut db, BlockRef::new(9, [0; 32]), Store::default()).unwrap();
     let alice = [0xAA; 20];
     let key: EntityAddress = [1u8; 32];
 
@@ -303,7 +243,8 @@ fn update_reindexes_attributes() {
 #[test]
 fn expiration_is_range_queryable() {
     let exec = ArkivExecutor::<Mgr>::new();
-    let mut mgr = Mgr::new(MemIndex::default(), BlockRef::new(9, [0; 32]));
+    let mut db = EmptyDB::default();
+    let mut mgr = chain_manager(&mut db, BlockRef::new(9, [0; 32]), Store::default()).unwrap();
     let alice = [0xAA; 20];
 
     let mut make = |key_byte: u8, expires_at: u64| {

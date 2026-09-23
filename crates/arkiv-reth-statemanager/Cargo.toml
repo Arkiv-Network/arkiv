@@ -18,8 +18,11 @@ arkiv-interfaces.workspace = true
 arkiv-reth-mpt-committed-store.workspace = true
 # The uncommitted lane(s): the pruning map.
 arkiv-reth-uncommitted-store.workspace = true
+arkiv-authenticated-store.workspace = true
 
 alloy-primitives.workspace = true
 # WriteOverlay reads through revm's Database and stages an EvmState diff.
 reth-ethereum = { workspace = true, features = ["evm"] }
 eyre.workspace = true
+alloy-genesis.workspace = true
+serde_json.workspace = true

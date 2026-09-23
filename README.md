@@ -65,9 +65,14 @@ network in one enclave via `ethereum-package`: one Lighthouse participant with
 one validator (the sequencer) and one with zero validators (the follower).
 There is no L1/L2 or settlement-chain coordination.
 
-Scaffold only — the workspace builds and the devnet is wired; real harness logic comes next.
+The live node uses an ordered authenticated Arkiv store, anchored by one Ethereum
+account. Native balances and transaction nonces remain in Ethereum state.
 
 ### Seeding the genesis state
+
+For the live storage layout, genesis format, replay and backup requirements, see
+[authenticated chain state](crates/arkiv-authenticated-store/README.md). This is a
+new chain layout: use a fresh datadir; there is no account-backed state migration.
 
 A devnet can start with entities already in it. `arkiv-cli seed-genesis` builds
 the block-0 state offline — synthetic entities pushed through the node's own
@@ -81,16 +86,12 @@ arkiv-reth node --dev --chain seeded.json --http
 
 # The ethereum-package shape: only the seeded accounts, as
 # network_params.additional_preloaded_contracts. up.py does this for you
-# (Kurtosis caps the package arguments at 4 MiB: ~1000 entities of 512 B):
-ARKIV_SEED_COUNT=1000 scripts/kurtosis/up.py
+# (Kurtosis caps accounts plus authenticated records at 4 MiB):
+ARKIV_SEED_COUNT=100 scripts/kurtosis/up.py
 
-# Beyond what a genesis file can hold in memory: a `reth init-state` dump and a
-# genesis whose `stateHash` names the imported state's root. The seeder streams
-# the dump and builds the root through an on-disk sort, so its memory is
-# bounded by its batch and sort buffers, not by the seed; reth's importer
-# streams too. (arkiv-reth's `init-state` is reth's, made to work at block 0:
-# reth v2.5.0 alone refuses a genesis import under its default storage layout.)
-arkiv-cli seed-genesis --count 1000000 --format jsonl --out state.jsonl
+# A native `init-state` dump plus a genesis containing the custom records.
+# Native accounts are streamed; custom snapshots currently reside in memory.
+arkiv-cli seed-genesis --count 1000 --format jsonl --out state.jsonl
 arkiv-reth init-state --chain state.jsonl.genesis.json --datadir /data state.jsonl && \
 arkiv-reth node --dev --chain state.jsonl.genesis.json --datadir /data --http
 ```

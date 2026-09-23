@@ -13,6 +13,7 @@ license.workspace = true
 # this seam in later steps (see experiments/post-evm-execution-report.md §3).
 
 [dependencies]
+arkiv-authenticated-store.workspace = true
 # The host-agnostic executor interface this crate implements (see arkiv.rs).
 arkiv-interfaces.workspace = true
 # The index's annotation encoder: `apply` diffs an entity's annotations to build

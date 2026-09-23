@@ -50,22 +50,11 @@
 //! hashes) in pre-execution still delegate to revm — they are protocol
 //! housekeeping, not user execution. Both can be neutered later.
 //!
-//! The state boundary is fixed by reth regardless: we read through revm's
-//! `Database` and write a `BundleState` in Ethereum's account model, committed
-//! by the keccak-MPT (see the report, §3 and Appendix A): any execution *logic*,
-//! not any state engine.
-//!
-//! ## Where the business logic lives
-//!
-//! This file is the **exact executor** — the reth-specific wiring (the [`Evm`],
-//! [`EvmFactory`] and [`ExecutorBuilder`] reth injects). The **entity business
-//! logic** is not here: it lives in [`arkiv`], written against the host-agnostic
-//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. And the
-//! **state machinery** is not here either: all state — entities, the query
-//! index, minting nonces, sender balances and EOA nonces — is reached through
-//! one [`write_manager`] view (arkiv-reth-statemanager's `MptStateView` over
-//! its `WriteOverlay`), so a transaction's every effect lands in a single
-//! `EvmState` diff for reth to commit.
+//! Arkiv entities, indexes, ID maps and creation nonces use an ordered authenticated
+//! store. `ChainView` publishes its root through the Ethereum account diff while
+//! balances, transaction nonces and protocol accounts remain in native state.
+//! The business logic lives in [`arkiv`]; the state adapter is supplied by
+//! `arkiv-reth-statemanager`.
 
 /// Entity business logic, implementing the `arkiv-interfaces` executor interface.
 pub mod arkiv;
@@ -114,13 +103,14 @@ use reth_ethereum::{
 
 use core::cmp::Ordering;
 
+use arkiv_authenticated_store::Store;
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::primitives::{Hash, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
     EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_reth_statemanager::{WriteManager, write_manager};
+use arkiv_reth_statemanager::chain::{ChainView as WriteManager, chain_manager};
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
@@ -287,6 +277,7 @@ impl FeeChecks {
 /// never invoked.
 pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     inner: EthEvm<DB, I, PrecompilesMap>,
+    store: Store,
 }
 
 impl<DB, I> Evm for ArkivEvm<DB, I>
@@ -336,6 +327,7 @@ where
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
+        let store = &self.store;
         let db = self.inner.db_mut();
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
             && tx.data.starts_with(&purgeExpiredCall::SELECTOR);
@@ -349,7 +341,7 @@ where
             }
             validate_fees(db, &tx, fees.base_fee, fee_checks)?;
         }
-        arkiv_transact(db, block_number, fees, tx)
+        arkiv_transact(store, db, block_number, fees, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -503,6 +495,7 @@ fn validate_fees<DB: Database>(
 /// diff). The caller (`EthBlockExecutor::commit_transaction`) commits the diff
 /// into the `State`, producing the `BundleState` reth hashes into the state root.
 fn arkiv_transact<DB: Database>(
+    store: &Store,
     db: &mut DB,
     block_number: u64,
     fees: FeeEnv,
@@ -529,18 +522,18 @@ fn arkiv_transact<DB: Database>(
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
-            return arkiv_entity_nonce_call(db, &tx, block_number, &fees);
+            return arkiv_entity_nonce_call(store, db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::customAttributeNamesCall::SELECTOR {
-            return arkiv_custom_attribute_names_call(db, &tx, block_number, &fees);
+            return arkiv_custom_attribute_names_call(store, db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
-            return arkiv_attribute_type_id_call(db, &tx, block_number, &fees);
+            return arkiv_attribute_type_id_call(store, db, &tx, block_number, &fees);
         }
         if selector == purgeExpiredCall::SELECTOR {
-            return arkiv_purge_expired(db, block_number, &tx);
+            return arkiv_purge_expired(store, db, block_number, &tx);
         }
-        return arkiv_entity_transact(db, block_number, &fees, &tx);
+        return arkiv_entity_transact(store, db, block_number, &fees, &tx);
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
@@ -554,7 +547,8 @@ fn arkiv_transact<DB: Database>(
 
     // Sender debit + nonce bump and recipient credit, through one view — a
     // transfer stages the same way every other state change does.
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view = chain_manager(db, parent_ref(block_number), store.clone())
+        .map_err(state_fault("open authenticated state"))?;
     charge_sender(&mut view, &fees, tx.caller, value_out, gas_used, &tx)?;
     if to != tx.caller {
         view.fetch_add_balance(to.into_array(), as_balance(tx.value))
@@ -574,6 +568,7 @@ fn arkiv_transact<DB: Database>(
 }
 
 fn arkiv_purge_expired<DB: Database>(
+    store: &Store,
     db: &mut DB,
     block_number: u64,
     tx: &TxEnv,
@@ -592,7 +587,8 @@ fn arkiv_purge_expired<DB: Database>(
         )));
     }
     let purge_keys = call.entityKeys;
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view = chain_manager(db, parent_ref(block_number), store.clone())
+        .map_err(state_fault("open authenticated state"))?;
     let mut modeled_gas = 0u64;
     for key in &purge_keys {
         let key_bytes = key.0;
@@ -654,6 +650,7 @@ fn out_of_gas() -> ResultAndState<HaltReason> {
 /// the sender's gas charge and nonce bump. A business-rule revert charges gas but
 /// stages no entity changes; a decode fault reverts likewise.
 fn arkiv_entity_transact<DB: Database>(
+    store: &Store,
     db: &mut DB,
     block_number: u64,
     fees: &FeeEnv,
@@ -687,7 +684,8 @@ fn arkiv_entity_transact<DB: Database>(
     // One view for the whole transaction: the entity phase and the sender
     // phase stage into the same overlay; a revert stages no entity changes, so
     // the one commit at the end flushes exactly what should land.
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view = chain_manager(db, parent_ref(block_number), store.clone())
+        .map_err(state_fault("open authenticated state"))?;
     let start_nonce = view
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;
@@ -735,6 +733,7 @@ fn arkiv_entity_transact<DB: Database>(
 /// meaningless for an `eth_call` (the diff is discarded), but it keeps reth's
 /// sender invariants intact if the call ever arrives as a mined transaction.
 fn arkiv_view_call<DB: Database>(
+    store: &Store,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
@@ -744,7 +743,8 @@ fn arkiv_view_call<DB: Database>(
     let output = answer(db)?;
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view = chain_manager(db, parent_ref(block_number), store.clone())
+        .map_err(state_fault("open authenticated state"))?;
     charge_sender(&mut view, fees, tx.caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit view call"))?;
     let state = view.into_base().into_state();
@@ -773,11 +773,13 @@ fn bad_view_args(view: &str, e: impl core::fmt::Display) -> Vec<u8> {
 
 /// Read a committed entity for a view call.
 fn view_entity<DB: Database>(
+    store: &Store,
     db: &mut DB,
     key: B256,
     block_number: u64,
 ) -> Result<Option<arkiv_interfaces::entity::Entity>, EVMError<DB::Error>> {
-    write_manager(db, parent_ref(block_number))
+    chain_manager(db, parent_ref(block_number), store.clone())
+        .map_err(state_fault("open authenticated state"))?
         .get_entity(key.0, ReadMode::ViewOnBase)
         .map_err(state_fault("read entity"))
 }
@@ -788,17 +790,19 @@ fn view_entity<DB: Database>(
 /// will mint (`derive_entity_address(chain_id, owner, nonce + i, salt)`), so it
 /// reads the same system-account slot the execute path mints from.
 fn arkiv_entity_nonce_call<DB: Database>(
+    store: &Store,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
         };
-        let nonce = write_manager(db, parent_ref(block_number))
+        let nonce = chain_manager(db, parent_ref(block_number), store.clone())
+            .map_err(state_fault("open authenticated state"))?
             .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
             .map_err(state_fault("read minting nonce"))?;
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
@@ -815,18 +819,21 @@ fn arkiv_entity_nonce_call<DB: Database>(
 /// with an empty list rather than reverting — "no attributes" is the truthful
 /// answer to "what does this entity have", and it keeps the view total.
 fn arkiv_custom_attribute_names_call<DB: Database>(
+    store: &Store,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
         };
-        let names = match live_entity(view_entity(db, call.entityKey, block_number)?, block_number)
-        {
+        let names = match live_entity(
+            view_entity(store, db, call.entityKey, block_number)?,
+            block_number,
+        ) {
             Some(e) => e.attributes.iter().map(|a| ident32_of(&a.key)).collect(),
             None => Vec::new(),
         };
@@ -843,25 +850,29 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
 /// tag that means "unset" on the wire — so "absent" reads the same here as it
 /// does in a patch. No type ever has id 0, so the answer stays unambiguous.
 fn arkiv_attribute_type_id_call<DB: Database>(
+    store: &Store,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
         };
         let wanted = strip_trailing_zeros(call.name.0.to_vec());
-        let type_id = live_entity(view_entity(db, call.entityKey, block_number)?, block_number)
-            .and_then(|e| {
-                e.attributes
-                    .iter()
-                    .find(|a| a.key == wanted)
-                    .map(|a| a.value.type_id())
-            })
-            .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
+        let type_id = live_entity(
+            view_entity(store, db, call.entityKey, block_number)?,
+            block_number,
+        )
+        .and_then(|e| {
+            e.attributes
+                .iter()
+                .find(|a| a.key == wanted)
+                .map(|a| a.value.type_id())
+        })
+        .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
         Ok(Ok(
             IEntityRegistry::attributeTypeIdCall::abi_encode_returns(&type_id),
         ))
@@ -1006,7 +1017,15 @@ fn entity_operation_log(effect: &OpEffect) -> Log {
 /// of reth's stock EVM context.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-pub struct ArkivEvmFactory;
+pub struct ArkivEvmFactory {
+    pub store: Store,
+}
+
+impl ArkivEvmFactory {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
 
 impl EvmFactory for ArkivEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>, EthInterpreter>> = ArkivEvm<DB, I>;
@@ -1029,6 +1048,7 @@ impl EvmFactory for ArkivEvmFactory {
 
         ArkivEvm {
             inner: EthEvm::new(inner, false),
+            store: self.store.clone(),
         }
     }
 
@@ -1045,6 +1065,7 @@ impl EvmFactory for ArkivEvmFactory {
             .with_inspector(inspector);
         ArkivEvm {
             inner: EthEvm::new(inner, true),
+            store: self.store.clone(),
         }
     }
 }
@@ -1079,22 +1100,30 @@ where
         );
         Ok(EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec(),
-            ArkivEvmFactory::default(),
+            ArkivEvmFactory::new(Store::open(
+                ctx.config().datadir().data_dir().join("arkiv-state"),
+            )?),
         ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    fn test_store() -> Store {
+        static STORE: std::sync::OnceLock<Store> = std::sync::OnceLock::new();
+        STORE.get_or_init(Store::default).clone()
+    }
+
     use super::*;
     use alloy_primitives::Bytes;
     use alloy_sol_types::SolCall;
     use arkiv_bindings::{IEntityRegistry, Operation};
     use arkiv_interfaces::primitives::EntityCreationNonce;
-    use arkiv_reth_mpt_committed_store::decode;
-    use arkiv_reth_mpt_committed_store::entities::layout::{
-        SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address, nonce_slot,
-    };
+    use arkiv_reth_statemanager::authenticated::{ROOT_ACCOUNT, root_slot};
+    fn custom_state(state: &EvmState) -> arkiv_authenticated_store::State<Store> {
+        let root = state[&ROOT_ACCOUNT].storage[&root_slot()].present_value;
+        arkiv_authenticated_store::State::open(test_store(), B256::from(root)).unwrap()
+    }
     use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
     /// A create with a purely relative lifetime of `min_lifetime` blocks,
@@ -1174,7 +1203,7 @@ mod tests {
         let mut db = EmptyDB::default();
         let mut malformed = protocol_purge_tx(10, Vec::new());
         malformed.data = purgeExpiredCall::SELECTOR.into();
-        let error = arkiv_purge_expired(&mut db, 10, &malformed).unwrap_err();
+        let error = arkiv_purge_expired(&test_store(), &mut db, 10, &malformed).unwrap_err();
         assert!(error.try_into_invalid_tx_err().is_ok());
 
         let oversized = protocol_purge_tx(
@@ -1183,7 +1212,7 @@ mod tests {
                 .map(|i| B256::repeat_byte(i as u8))
                 .collect(),
         );
-        let error = arkiv_purge_expired(&mut db, 10, &oversized).unwrap_err();
+        let error = arkiv_purge_expired(&test_store(), &mut db, 10, &oversized).unwrap_err();
         assert!(error.try_into_invalid_tx_err().is_ok());
     }
 
@@ -1194,6 +1223,7 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         let created = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1208,10 +1238,16 @@ mod tests {
             0,
         ));
 
-        let purged = arkiv_purge_expired(&mut db, 11, &protocol_purge_tx(11, vec![key])).unwrap();
+        let purged = arkiv_purge_expired(
+            &test_store(),
+            &mut db,
+            11,
+            &protocol_purge_tx(11, vec![key]),
+        )
+        .unwrap();
         assert!(purged.result.is_success());
         assert!(
-            !purged.state.contains_key(&entity_leaf_address(key.0)),
+            !purged.state.contains_key(&ROOT_ACCOUNT),
             "a live entity must not be staged for deletion"
         );
     }
@@ -1224,6 +1260,7 @@ mod tests {
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1235,22 +1272,18 @@ mod tests {
 
         // The entity landed at the derived key, decodable, with env-resolved fields.
         let key = derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(0), 0);
-        let acc = rs
-            .state
-            .get(&entity_leaf_address(key))
-            .expect("entity account in the diff");
-        let entity = decode(&acc.info.code.as_ref().unwrap().original_bytes()).unwrap();
+        let custom = custom_state(&rs.state);
+        let entity = custom.entity(key).unwrap().unwrap();
+        assert_eq!(
+            rs.state.len(),
+            2,
+            "only the root and sender are Ethereum accounts"
+        );
         assert_eq!(entity.owner, [0xAA; 20]);
         assert_eq!(entity.expires_at, 60); // block 10 + minLifetime 50
         assert_eq!(entity.payload, b"hello");
 
-        // The minting nonce advanced to 1 in the system account.
-        let sys = rs
-            .state
-            .get(&SYSTEM_ACCOUNT_ADDRESS)
-            .expect("system account");
-        let slot = U256::from_be_bytes(nonce_slot(alice).0);
-        assert_eq!(sys.storage.get(&slot).unwrap().present_value, U256::from(1));
+        assert_eq!(custom.creation_nonce(alice.into_array()).unwrap(), 1);
 
         // The sender is touched with its EOA nonce bumped.
         let sender = rs.state.get(&alice).expect("sender account");
@@ -1286,7 +1319,7 @@ mod tests {
 
         // First submission: valid at nonce 0, and it advances the sender to 1.
         validate_nonce(&mut db, &tx).expect("a fresh account's nonce 0 is valid");
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx.clone()).unwrap();
+        let rs = arkiv_transact(&test_store(), &mut db, 10, NO_FEES, tx.clone()).unwrap();
         assert!(rs.result.is_success());
         assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
         db.commit(rs.state);
@@ -1339,7 +1372,7 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         let tx = arkiv_tx(alice, create_calldata(50, b"hello"));
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx.clone()).unwrap();
+        let rs = arkiv_transact(&test_store(), &mut db, 10, NO_FEES, tx.clone()).unwrap();
         db.commit(rs.state);
 
         let err = validate_nonce(&mut db, &tx).expect_err("a replay must be rejected");
@@ -1371,7 +1404,8 @@ mod tests {
             ..arkiv_tx(alice, Bytes::from_static(&[0x00]))
         };
 
-        let err = arkiv_transact(&mut db, 10, NO_FEES, tx).expect_err("creates must be rejected");
+        let err = arkiv_transact(&test_store(), &mut db, 10, NO_FEES, tx)
+            .expect_err("creates must be rejected");
         let invalid = err.try_into_invalid_tx_err().expect(
             "must convert to an invalid-tx error, or reth aborts the build instead of skipping",
         );
@@ -1391,13 +1425,13 @@ mod tests {
     /// the first ever) lands in both the `$all` bucket and its `$owner` bucket, as
     /// roaring bitmaps stored in those accounts' code — all in the one returned diff.
     #[test]
-    fn entity_create_commits_index_accounts() {
-        use arkiv_interfaces::entity::{AttributeType, annotations};
-        use arkiv_reth_mpt_committed_store::{Bitmap, all_entities_bucket, pair_address};
+    fn entity_create_commits_authenticated_index() {
+        use arkiv_interfaces::entity::{AttributeValue, annotations};
 
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1406,32 +1440,23 @@ mod tests {
         .unwrap();
         assert!(rs.result.is_success());
 
-        // Reads the bitmap stored as an index account's code and checks it holds id 0.
-        let bitmap_at = |addr: Address| -> Bitmap {
-            let acc = rs
-                .state
-                .get(&addr)
-                .expect("index bucket account in the diff");
-            let code = acc
-                .info
-                .code
-                .as_ref()
-                .expect("bucket has code")
-                .original_bytes();
-            Bitmap::from_bytes(code.as_ref()).expect("valid bitmap bytes")
-        };
-
-        // Every live entity is in the $all bucket.
-        assert!(bitmap_at(all_entities_bucket()).contains(0));
-        // And in its owner's bucket (owner value = the 20-byte caller address).
+        let custom = custom_state(&rs.state);
         assert!(
-            bitmap_at(pair_address(
-                annotations::OWNER,
-                AttributeType::EthereumAddress,
-                alice.as_slice()
-            ))
-            .contains(0)
+            custom
+                .evaluate(&arkiv_interfaces::query::Query::All)
+                .unwrap()
+                .contains(0)
         );
+        assert!(
+            custom
+                .equal(
+                    annotations::OWNER,
+                    &AttributeValue::EthereumAddress(alice.into_array())
+                )
+                .unwrap()
+                .contains(0)
+        );
+        assert_eq!(rs.state.len(), 2);
     }
 
     fn nonces_calldata(owner: Address) -> Bytes {
@@ -1454,8 +1479,14 @@ mod tests {
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
         let bob = Address::repeat_byte(0xBB);
-        let rs =
-            arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(bob, nonces_calldata(alice)),
+        )
+        .unwrap();
 
         assert_eq!(nonce_from(&rs), 0);
         // Only the sender (charged/bumped) is in the diff.
@@ -1528,6 +1559,7 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1543,8 +1575,14 @@ mod tests {
             EntityCreationNonce::new(0),
             0,
         ));
-        let rs =
-            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            11,
+            NO_FEES,
+            arkiv_tx(alice, names_calldata(key)),
+        )
+        .unwrap();
         assert_eq!(names_from(&rs), vec!["color", "rank"]);
     }
 
@@ -1559,6 +1597,7 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1576,6 +1615,7 @@ mod tests {
         ));
 
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             11,
             NO_FEES,
@@ -1584,6 +1624,7 @@ mod tests {
         .unwrap();
         assert_eq!(type_id_from(&rs), AttributeType::U256.id());
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             11,
             NO_FEES,
@@ -1594,6 +1635,7 @@ mod tests {
 
         // Never set on this entity.
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             11,
             NO_FEES,
@@ -1612,10 +1654,17 @@ mod tests {
         let alice = Address::repeat_byte(0xAA);
         let ghost = B256::repeat_byte(0xEE);
 
-        let rs =
-            arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(alice, names_calldata(ghost))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, names_calldata(ghost)),
+        )
+        .unwrap();
         assert!(names_from(&rs).is_empty());
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1636,6 +1685,7 @@ mod tests {
         let alice = Address::repeat_byte(0xAA);
         // Created at block 10 with a 50-block lifetime → expires_at 60.
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1652,14 +1702,27 @@ mod tests {
         ));
 
         // Last live block is 59.
-        let rs =
-            arkiv_transact(&mut db, 59, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            59,
+            NO_FEES,
+            arkiv_tx(alice, names_calldata(key)),
+        )
+        .unwrap();
         assert_eq!(names_from(&rs).len(), 2, "live at 59");
 
-        let rs =
-            arkiv_transact(&mut db, 60, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            60,
+            NO_FEES,
+            arkiv_tx(alice, names_calldata(key)),
+        )
+        .unwrap();
         assert!(names_from(&rs).is_empty(), "expired at 60");
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             60,
             NO_FEES,
@@ -1680,6 +1743,7 @@ mod tests {
         let bob = Address::repeat_byte(0xBB);
 
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1689,11 +1753,23 @@ mod tests {
         assert!(rs.result.is_success());
         db.commit(rs.state);
 
-        let rs =
-            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            11,
+            NO_FEES,
+            arkiv_tx(bob, nonces_calldata(alice)),
+        )
+        .unwrap();
         assert_eq!(nonce_from(&rs), 1);
-        let rs =
-            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, nonces_calldata(bob))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            11,
+            NO_FEES,
+            arkiv_tx(alice, nonces_calldata(bob)),
+        )
+        .unwrap();
         assert_eq!(nonce_from(&rs), 0);
     }
 
@@ -1704,7 +1780,14 @@ mod tests {
         let alice = Address::repeat_byte(0xAA);
         let mut data = IEntityRegistry::entityNonceCall::SELECTOR.to_vec();
         data.extend_from_slice(&[0x01, 0x02]);
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(alice, data.into())).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            10,
+            NO_FEES,
+            arkiv_tx(alice, data.into()),
+        )
+        .unwrap();
         assert!(!rs.result.is_success());
     }
 
@@ -1719,6 +1802,7 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let alice = Address::repeat_byte(0xAA);
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1746,7 +1830,14 @@ mod tests {
         }
         .abi_encode();
         let floor = intrinsic_gas(&update);
-        let rs = arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, update.into())).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            11,
+            NO_FEES,
+            arkiv_tx(alice, update.into()),
+        )
+        .unwrap();
 
         assert!(rs.result.is_success());
         assert!(
@@ -1766,7 +1857,7 @@ mod tests {
         let data = create_calldata(50, b"hello");
         let mut tx = arkiv_tx(alice, data.clone());
         tx.gas_limit = intrinsic_gas(&data) - 1;
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx).unwrap();
+        let rs = arkiv_transact(&test_store(), &mut db, 10, NO_FEES, tx).unwrap();
 
         assert!(matches!(
             rs.result,
@@ -1785,6 +1876,7 @@ mod tests {
         let mut db = EmptyDB::default();
         let alice = Address::repeat_byte(0xAA);
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             NO_FEES,
@@ -1873,7 +1965,7 @@ mod tests {
         };
         let tx = transfer_tx(alice, carol, 100, 10, Some(3));
         validate_fees(&mut db, &tx, fees.base_fee, ALL_CHECKS).unwrap();
-        let rs = arkiv_transact(&mut db, 10, fees, tx).unwrap();
+        let rs = arkiv_transact(&test_store(), &mut db, 10, fees, tx).unwrap();
         assert!(rs.result.is_success());
 
         // effective = min(10, 5 + 3) = 8 per gas; tip = 8 - 5 = 3 per gas.
@@ -1898,8 +1990,14 @@ mod tests {
             beneficiary: bob,
             charge: true,
         };
-        let rs =
-            arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 6, Some(3))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            10,
+            fees,
+            transfer_tx(alice, carol, 0, 6, Some(3)),
+        )
+        .unwrap();
 
         let gas = u128::from(ARKIV_TX_GAS);
         assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 6));
@@ -1921,7 +2019,14 @@ mod tests {
             beneficiary: bob,
             charge: true,
         };
-        let rs = arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 9, None)).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            10,
+            fees,
+            transfer_tx(alice, carol, 0, 9, None),
+        )
+        .unwrap();
 
         let gas = u128::from(ARKIV_TX_GAS);
         assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 9));
@@ -1943,8 +2048,14 @@ mod tests {
             beneficiary: bob,
             charge: true,
         };
-        let rs =
-            arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 5, Some(0))).unwrap();
+        let rs = arkiv_transact(
+            &test_store(),
+            &mut db,
+            10,
+            fees,
+            transfer_tx(alice, carol, 0, 5, Some(0)),
+        )
+        .unwrap();
 
         assert_eq!(
             balance_in(&rs, alice),
@@ -1973,7 +2084,7 @@ mod tests {
             gas_priority_fee: Some(3),
             ..arkiv_tx(alice, create_calldata(50, b"hello"))
         };
-        let rs = arkiv_transact(&mut db, 10, fees, tx).unwrap();
+        let rs = arkiv_transact(&test_store(), &mut db, 10, fees, tx).unwrap();
         assert!(rs.result.is_success());
 
         let gas = u128::from(rs.result.tx_gas_used());
@@ -2109,6 +2220,7 @@ mod tests {
             charge: false,
         };
         let rs = arkiv_transact(
+            &test_store(),
             &mut db,
             10,
             fees,

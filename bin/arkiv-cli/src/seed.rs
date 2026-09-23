@@ -402,13 +402,22 @@ fn build(
     let manifest = match args.format {
         SeedFormat::Genesis => {
             let state = arkiv_seed::build_in_memory(spec, base_alloc, progress)?;
-            let genesis = export::genesis_with_alloc(base, state.alloc);
+            let genesis = export::genesis_with_alloc(
+                export::with_snapshot(base, &state.manifest.authenticated_state)?,
+                state.alloc,
+            );
             write_json(&args.out, &genesis, pretty)?;
             state.manifest
         }
         SeedFormat::Alloc => {
             let state = arkiv_seed::build_in_memory(spec, base_alloc, progress)?;
             write_json(&args.out, &state.alloc, pretty)?;
+            let records_out = sibling(&args.out, ".arkiv.json");
+            write_json(&records_out, &state.manifest.authenticated_state, false)?;
+            eprintln!(
+                "wrote authenticated records to {}; mount with ARKIV_GENESIS_STATE",
+                records_out.display()
+            );
             state.manifest
         }
         SeedFormat::Jsonl => {
@@ -420,7 +429,10 @@ fn build(
                 .genesis_out
                 .clone()
                 .unwrap_or_else(|| sibling(&args.out, ".genesis.json"));
-            let genesis = export::genesis_with_state_hash(base, manifest.state_root)?;
+            let genesis = export::genesis_with_state_hash(
+                export::with_snapshot(base, &manifest.authenticated_state)?,
+                manifest.state_root,
+            )?;
             write_json(&genesis_out, &genesis, true)?;
             eprintln!("wrote stateHash genesis to {}", genesis_out.display());
             manifest

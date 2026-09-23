@@ -403,7 +403,7 @@ mod tests {
             GenesisAccount {
                 nonce: Some(byte as u64),
                 balance: U256::from(byte as u64 * 1000),
-                code: (byte % 2 == 0).then(|| Bytes::from(vec![byte; 40])),
+                code: byte.is_multiple_of(2).then(|| Bytes::from(vec![byte; 40])),
                 storage: (!storage.is_empty()).then_some(storage),
                 private_key: None,
             },

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeedManifest {
+    /// Portable custom records authenticated by the genesis root account.
+    pub authenticated_state: arkiv_authenticated_store::Snapshot,
     /// The chain id the entity keys were derived under.
     pub chain_id: u64,
     /// How many entities were seeded.
@@ -29,8 +31,7 @@ pub struct SeedManifest {
     pub seed: u64,
     /// The state root of the whole alloc — what the genesis header carries.
     pub state_root: B256,
-    /// How many accounts the alloc holds: entities, index buckets, the system
-    /// account, plus any base funding merged in.
+    /// Native account count: the root account, funding and predeploys.
     pub accounts: u64,
     /// The keys of the first entities, in seed order.
     pub sample_keys: Vec<B256>,

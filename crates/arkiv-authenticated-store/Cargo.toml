@@ -1,0 +1,19 @@
+[package]
+name = "arkiv-authenticated-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+arkiv-interfaces.workspace = true
+# Reuse entity serialization and the protocol's annotation/type classification.
+arkiv-reth-mpt-committed-store.workspace = true
+eyre.workspace = true
+serde.workspace = true
+reth-db.workspace = true
+reth-db-api.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

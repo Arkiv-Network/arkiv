@@ -203,7 +203,7 @@ async fn pruning_schedule_survives_kill_and_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pruning_schedule_rebuilds_from_chain_history() {
+async fn pruning_needs_no_separate_schedule() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
@@ -232,11 +232,10 @@ async fn pruning_schedule_rebuilds_from_chain_history() {
 
     node.kill();
     let map_files = pruning_map_files(node.datadir());
-    assert!(!map_files.is_empty(), "the pruning map exists before loss");
-    for path in map_files {
-        std::fs::remove_file(&path)
-            .unwrap_or_else(|error| panic!("remove {}: {error}", path.display()));
-    }
+    assert!(
+        map_files.is_empty(),
+        "expiration is selected from authenticated state"
+    );
     tokio::time::sleep(Duration::from_secs(1)).await;
     node.restart();
     node.wait_ready(&client, READY).await;

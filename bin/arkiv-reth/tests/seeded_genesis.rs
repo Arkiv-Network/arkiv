@@ -4,9 +4,8 @@
 //! Black-box over the real binary, two ways in: a genesis file with the seeded
 //! `alloc` (`--chain <file>`), and a `reth init-state` dump imported behind a
 //! genesis carrying `stateHash`. Both must serve the seed from block 0, keep
-//! minting nonces continuous for the seeded owners, and — because the pruning
-//! map learns about genesis entities from a bootstrap walk rather than from
-//! logs — purge seeded entities once they expire.
+//! minting nonces continuous for the seeded owners, and purge seeded entities
+//! directly from the authenticated expiration index.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -70,7 +69,14 @@ fn seeded_genesis_file(
     expires_at: u64,
 ) -> (PathBuf, SeedManifest) {
     let (_, state) = seed(count, payload_size, expires_at);
-    let genesis = export::genesis_with_alloc(export::dev_genesis(DEV_CHAIN_ID), state.alloc);
+    let genesis = export::genesis_with_alloc(
+        export::with_snapshot(
+            export::dev_genesis(DEV_CHAIN_ID),
+            &state.manifest.authenticated_state,
+        )
+        .unwrap(),
+        state.alloc,
+    );
     let path = scratch("genesis.json");
     std::fs::write(&path, serde_json::to_string(&genesis).unwrap()).expect("write genesis");
     (path, state.manifest)
@@ -296,13 +302,20 @@ async fn seeded_genesis_serves_entities_from_block_zero() {
 
 /// Seeded entities expire like any other: hidden from reads at their expiry
 /// block, then physically purged by the protocol's per-block purge — which
-/// only knows about them because the pruning map bootstraps from genesis.
+/// finds them through the authenticated expiration buckets at the parent root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_entities_expire_and_are_purged() {
     const COUNT: u64 = 25;
     const EXPIRES_AT: u64 = 15;
     let (spec, state) = seed(COUNT, 64, EXPIRES_AT);
-    let genesis = export::genesis_with_alloc(export::dev_genesis(DEV_CHAIN_ID), state.alloc);
+    let genesis = export::genesis_with_alloc(
+        export::with_snapshot(
+            export::dev_genesis(DEV_CHAIN_ID),
+            &state.manifest.authenticated_state,
+        )
+        .unwrap(),
+        state.alloc,
+    );
     let path = scratch("expiring-genesis.json");
     std::fs::write(&path, serde_json::to_string(&genesis).unwrap()).unwrap();
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
@@ -329,14 +342,14 @@ async fn seeded_entities_expire_and_are_purged() {
     wait_until_purged(&client, &keys).await;
 }
 
-/// The unlimited route: the seed as a `reth init-state` dump behind a genesis
+/// The native dump route: a `reth init-state` dump behind a genesis
 /// that names its state root, imported before the node starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn init_state_imports_a_seeded_dump_at_genesis() {
     const COUNT: u64 = 300;
     let spec = seed_spec(COUNT, 512, 1_000_000);
-    // The dump streams out of the builder, as it would for a seed too big to
-    // hold: the root in its first line is the one the genesis names.
+    // The native dump streams separately from the custom snapshot. The root
+    // in its first line is the one the genesis names.
     let dump = scratch("state.jsonl");
     let mut sink = StreamSink::create(&dump, scratch("state.sort")).unwrap();
     let manifest = arkiv_seed::build(
@@ -346,9 +359,15 @@ async fn init_state_imports_a_seeded_dump_at_genesis() {
         |_| {},
     )
     .expect("seed streams");
-    let genesis =
-        export::genesis_with_state_hash(export::dev_genesis(DEV_CHAIN_ID), manifest.state_root)
-            .unwrap();
+    let genesis = export::genesis_with_state_hash(
+        export::with_snapshot(
+            export::dev_genesis(DEV_CHAIN_ID),
+            &manifest.authenticated_state,
+        )
+        .unwrap(),
+        manifest.state_root,
+    )
+    .unwrap();
     let genesis_path = scratch("state-hash-genesis.json");
     std::fs::write(&genesis_path, genesis.to_string()).unwrap();
 
@@ -372,10 +391,10 @@ async fn init_state_imports_a_seeded_dump_at_genesis() {
     assert_eq!(progress["percent"], 100.0);
     assert_eq!(progress["state_root"], manifest.state_root.to_string());
     assert_eq!(progress["write"]["accounts_total"], manifest.accounts);
-    // The system account's line (two slots per entity) is past the streaming
-    // threshold at this size: its slots went through the slot collector.
+    // All custom records are committed by one native storage slot, independent
+    // of the entity count.
     let slots_total = progress["write"]["slots_total"].as_u64().unwrap();
-    assert!(slots_total >= 2 * COUNT, "{slots_total}");
+    assert_eq!(slots_total, 1);
     assert_eq!(progress["write"]["slots_written"], slots_total);
     assert_eq!(progress["dump"]["slots_parsed"], slots_total);
     assert!(progress["error"].is_null());

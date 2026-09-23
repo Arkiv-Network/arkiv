@@ -15,6 +15,7 @@ path = "src/main.rs"
 # sense next to the CLI dispatch.
 
 [dependencies]
+arkiv-authenticated-store.workspace = true
 reth.workspace = true
 # Only for the `#[global_allocator]` declaration in main.rs.
 reth-cli-util.workspace = true
@@ -45,6 +46,7 @@ alloy-primitives.workspace = true
 arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
+arkiv-reth-statemanager.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true

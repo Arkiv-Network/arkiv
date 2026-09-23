@@ -1,19 +1,40 @@
 //! End-to-end write path with real reth types: ops → view → commit → the
-//! `EvmState` diff holds the entity as account code, byte-for-byte.
+//! `EvmState` commits the authenticated root, with entity bytes outside accounts.
 
+use alloy_primitives::B256;
+use arkiv_authenticated_store::{State, Store as Records};
 use arkiv_interfaces::entity::{AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, ExecStatus, Op};
 use arkiv_interfaces::statemanager::{BlockRef, EntityStore, ReadMode, StateView};
 use arkiv_reth_executor::ArkivExecutor;
-use arkiv_reth_mpt_committed_store::entities::layout::entity_leaf_address;
-use arkiv_reth_mpt_committed_store::{decode, encode};
-use arkiv_reth_statemanager::{WriteManager, write_manager};
-use reth_ethereum::evm::revm::database_interface::EmptyDB;
+use arkiv_reth_statemanager::{
+    authenticated::{ROOT_ACCOUNT, root_slot},
+    chain::{ChainView, chain_manager},
+};
+use reth_ethereum::evm::revm::{database_interface::EmptyDB, state::EvmState};
 
-type Store<'a> = WriteManager<'a, EmptyDB>;
-
+type Store<'a> = ChainView<'a, EmptyDB>;
+fn records() -> Records {
+    static RECORDS: std::sync::OnceLock<Records> = std::sync::OnceLock::new();
+    RECORDS.get_or_init(Records::default).clone()
+}
 fn store(db: &mut EmptyDB) -> Store<'_> {
-    write_manager(db, BlockRef::new(9, [0; 32]))
+    chain_manager(db, BlockRef::new(9, [0; 32]), records()).unwrap()
+}
+fn committed(diff: &EvmState) -> State<Records> {
+    assert_eq!(
+        diff.len(),
+        1,
+        "entity operations only write the root account"
+    );
+    let account = &diff[&ROOT_ACCOUNT];
+    assert_eq!(account.info.nonce, 1);
+    assert!(account.info.code.as_ref().is_none_or(|c| c.is_empty()));
+    State::open(
+        records(),
+        B256::from(account.storage[&root_slot()].present_value),
+    )
+    .unwrap()
 }
 
 fn env(caller: [u8; 20], block: u64) -> ExecEnv {
@@ -39,7 +60,7 @@ fn run<'a>(
 }
 
 #[test]
-fn create_commits_the_entity_as_account_code() {
+fn create_commits_the_authenticated_entity() {
     let alice = [0xAA; 20];
     let key = [1u8; 32];
 
@@ -77,7 +98,7 @@ fn create_commits_the_entity_as_account_code() {
         "nothing reaches the base before commit"
     );
 
-    // 2) Commit — flows through CodeBackend → WriteOverlay → EvmState.
+    // 2) Persist records and commit the root through WriteOverlay.
     StateView::commit(&mut store).unwrap();
 
     // 3) Read-your-own-writes: the committed entity reads back from the base.
@@ -89,31 +110,13 @@ fn create_commits_the_entity_as_account_code() {
         Some(&staged)
     );
 
-    // 4) The recovered EvmState diff is what reth would commit: the entity
-    //    account exists, is touched, survives EIP-161, and holds the record.
+    // 4) The native diff contains only the authenticated root account.
     let diff = store.into_base().into_state();
-    let acc = diff
-        .get(&entity_leaf_address(key))
-        .expect("entity account staged in the diff");
-    assert!(acc.is_touched());
-    assert_eq!(acc.info.nonce, 1);
-
-    let code = acc
-        .info
-        .code
-        .as_ref()
-        .expect("account has code")
-        .original_bytes();
-    assert_eq!(
-        code.as_ref(),
-        encode(&staged),
-        "code is the record, verbatim"
-    );
-    assert_eq!(decode(&code).unwrap(), staged, "and still decodes");
+    assert_eq!(committed(&diff).entity(key).unwrap(), Some(staged));
 }
 
 #[test]
-fn update_recommits_the_entity_as_new_code() {
+fn update_recommits_the_authenticated_entity() {
     let alice = [0xAA; 20];
     let key = [5u8; 32];
 
@@ -163,12 +166,7 @@ fn update_recommits_the_entity_as_new_code() {
         "patch advances lastModified"
     );
     let diff = store.into_base().into_state();
-    let code = diff
-        .get(&entity_leaf_address(key))
-        .and_then(|a| a.info.code.as_ref())
-        .expect("entity code")
-        .original_bytes();
-    assert_eq!(decode(&code).unwrap(), got, "code is the updated record");
+    assert_eq!(committed(&diff).entity(key).unwrap(), Some(got));
 }
 
 #[test]
@@ -264,7 +262,7 @@ fn extend_recommits_with_a_higher_expiry() {
 }
 
 #[test]
-fn delete_commits_a_tombstone() {
+fn delete_removes_the_authenticated_entity() {
     let alice = [0xAA; 20];
     let key = [3u8; 32];
 
@@ -319,9 +317,5 @@ fn delete_commits_a_tombstone() {
             .is_none()
     );
     let diff = store.into_base().into_state();
-    let acc = diff
-        .get(&entity_leaf_address(key))
-        .expect("tombstoned account staged in the diff");
-    assert!(acc.info.code.as_ref().is_none_or(|c| c.is_empty()));
-    assert_eq!(acc.info.nonce, 1);
+    assert!(committed(&diff).entity(key).unwrap().is_none());
 }

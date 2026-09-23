@@ -16,10 +16,11 @@ license.workspace = true
 # The spec's entity/op types, the store seams, and the executor that turns
 # `Op::Create`s into entity records.
 arkiv-interfaces.workspace = true
+arkiv-authenticated-store.workspace = true
 arkiv-reth-executor.workspace = true
-# `write_manager`: the production write path (MptStateView over WriteOverlay).
+# The live ChainView over the native WriteOverlay.
 arkiv-reth-statemanager.workspace = true
-# The index's bulk insert path and the annotation encoder.
+# Existing protocol codecs shared with authenticated storage.
 arkiv-reth-mpt-committed-store.workspace = true
 # `Ident32` — attribute-name validation, so a seed never writes a name the
 # node's decoder would have refused.

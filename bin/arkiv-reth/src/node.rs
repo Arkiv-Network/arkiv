@@ -55,6 +55,15 @@ impl<N: FullNodeTypes<Types = ArkivNode>> NodeComponentsBuilder<N> for ArkivComp
 
     async fn build_components(self, ctx: &BuilderContext<N>) -> eyre::Result<Self::Components> {
         crate::init_state::status::ensure_complete(ctx.provider(), &ctx.chain_spec())?;
+        use reth_ethereum::chainspec::EthChainSpec;
+        use reth_storage_api::StateProviderFactory;
+        let records = arkiv_authenticated_store::Store::open(
+            ctx.config().datadir().data_dir().join("arkiv-state"),
+        )?;
+        arkiv_reth_statemanager::genesis::initialize(ctx.chain_spec().genesis(), records.clone())?;
+        // Fail before serving requests if the execution database was copied without
+        // its authenticated records. Never silently start a second, empty state.
+        arkiv_reth_rpc::snapshot::authenticated_snapshot(ctx.provider().latest()?, records)?;
         self.0.build_components(ctx).await
     }
 }

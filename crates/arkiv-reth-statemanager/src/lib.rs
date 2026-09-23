@@ -3,6 +3,8 @@
 //! `Database` to the raw seams, accumulating committed writes into the one
 //! `EvmState` diff reth commits. [`write_manager`] composes the two.
 
+pub mod authenticated;
+pub mod chain;
 pub mod manager;
 pub mod overlay;
 
@@ -19,3 +21,5 @@ pub type WriteManager<'a, DB> = MptStateView<WriteOverlay<'a, DB>>;
 pub fn write_manager<DB: Database>(db: &mut DB, parent: BlockRef) -> WriteManager<'_, DB> {
     MptStateView::new(WriteOverlay::new(db), parent)
 }
+
+pub mod genesis;

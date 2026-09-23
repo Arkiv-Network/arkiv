@@ -9,10 +9,11 @@ license.workspace = true
 # of what arkiv-reth-executor is for writes; the binary just merges the module.
 
 [dependencies]
+arkiv-reth-statemanager.workspace = true
+arkiv-authenticated-store.workspace = true
 # The wire contract this crate implements.
 arkiv-rpc-types.workspace = true
 # The committed stores a read goes through, plus the query-language parser.
-arkiv-reth-mpt-committed-store.workspace = true
 arkiv-query.workspace = true
 arkiv-interfaces.workspace = true
 # The `StateProvider` snapshot each call is served from.

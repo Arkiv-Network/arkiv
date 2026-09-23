@@ -38,14 +38,35 @@ impl ChainSpecParser for ArkivChainSpecParser {
     const SUPPORTED_CHAINS: &'static [&'static str] = SUPPORTED_CHAINS;
 
     fn parse(s: &str) -> eyre::Result<Arc<ArkivChainSpec>> {
-        if SUPPORTED_CHAINS.contains(&s) {
+        let mut spec = if SUPPORTED_CHAINS.contains(&s) {
             let inner = chain_value_parser(s)?;
-            return Ok(Arc::new(ArkivChainSpec::new(
-                Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone()),
-            )));
+            Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone())
+        } else {
+            parse_genesis_spec(s)?
+        };
+        // Packaging tools may only accept native genesis accounts. Carry the
+        // same snapshot as a mounted file; it is still checked against the
+        // system account's committed root before node services start.
+        if let Some(path) = std::env::var_os("ARKIV_GENESIS_STATE") {
+            attach_snapshot(&mut spec, std::path::Path::new(&path))?;
         }
-        Ok(Arc::new(ArkivChainSpec::new(parse_genesis_spec(s)?)))
+        Ok(Arc::new(ArkivChainSpec::new(spec)))
     }
+}
+
+fn attach_snapshot(spec: &mut ChainSpec, path: &std::path::Path) -> eyre::Result<()> {
+    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    if let Some(existing) = spec.genesis.config.extra_fields.get("arkivState") {
+        eyre::ensure!(
+            *existing == snapshot,
+            "embedded and external Arkiv genesis snapshots differ"
+        );
+    }
+    spec.genesis
+        .config
+        .extra_fields
+        .insert("arkivState".into(), snapshot);
+    Ok(())
 }
 
 /// The one genesis field read past the `Genesis` type: [`STATE_HASH_FIELD`].
@@ -101,6 +122,25 @@ mod tests {
                    "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0},
         "gasLimit": "0x3938700", "difficulty": "0x0", "baseFeePerGas": "0xa", "alloc": {}
     }"#;
+
+    #[test]
+    fn external_snapshot_keeps_the_native_genesis_hash_and_rejects_conflicts() {
+        let mut spec = parse_genesis_spec(GENESIS).unwrap();
+        let hash = spec.genesis_hash();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "arkiv-external-snapshot-{}.json",
+            std::process::id()
+        ));
+        let snapshot = serde_json::json!({ "root": B256::ZERO, "records": {} });
+        std::fs::write(&path, snapshot.to_string()).unwrap();
+        attach_snapshot(&mut spec, &path).unwrap();
+        assert_eq!(spec.genesis_hash(), hash);
+        assert_eq!(spec.genesis.config.extra_fields["arkivState"], snapshot);
+        std::fs::write(&path, "{}").unwrap();
+        assert!(attach_snapshot(&mut spec, &path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn named_chains_parse() {

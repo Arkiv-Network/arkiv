@@ -61,6 +61,9 @@ pub fn genesis_with_state_hash(genesis: Genesis, root: B256) -> Result<serde_jso
     Ok(value)
 }
 
+/// Attach the authenticated state that accompanies a native genesis alloc.
+pub use arkiv_reth_statemanager::genesis::with_snapshot;
+
 #[cfg(test)]
 mod tests {
     use super::*;

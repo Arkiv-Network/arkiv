@@ -36,12 +36,13 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
 use arkiv_reth_chainspec::ArkivChainSpecParser;
 use arkiv_reth_executor::ArkivEvmFactory;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use node::ArkivNode;
 use reth::{
     beacon_consensus::EthBeaconConsensus,
     cli::{Cli, Commands},
 };
+use reth_ethereum::chainspec::EthChainSpec;
 use reth_node_ethereum::EthEvmConfig;
 use std::sync::Arc;
 use tracing::info;
@@ -52,16 +53,47 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    // reth's log file records `debug` from every crate. turso, the SQLite
-    // behind the chain pruning map, traces every page read and B-tree step at
-    // that level: some forty lines per row written, which made the genesis
-    // pruning bootstrap ten times slower than the database itself. The file
-    // stays at debug for everything else; `--log.file.filter` still overrides.
-    let _ = reth::args::DefaultLogArgs::default()
-        .with_log_file_filter("debug,turso_core=info,turso=info".to_owned())
-        .try_init();
+    let result = run();
+    if let Err(err) = result {
+        eprintln!("Error: {err:?}");
+        std::process::exit(1);
+    }
+}
 
-    let result = match Cli::<ArkivChainSpecParser>::parse() {
+fn run() -> eyre::Result<()> {
+    let matches = Cli::<ArkivChainSpecParser>::command().get_matches();
+    let cli = Cli::<ArkivChainSpecParser>::from_arg_matches(&matches)?;
+    // Reth's offline component callback only receives a chainspec. Resolve the
+    // same datadir from clap before moving the command into its runner.
+    let mut command_matches = &matches;
+    let mut datadir = None;
+    loop {
+        if command_matches.try_contains_id("datadir").unwrap_or(false) {
+            datadir = Some(reth::args::DatadirArgs::from_arg_matches(command_matches)?);
+        }
+        match command_matches.subcommand() {
+            Some((_, next)) => command_matches = next,
+            None => break,
+        }
+    }
+    let offline_store = if matches!(
+        &cli.command,
+        Commands::Import(_) | Commands::Stage(_) | Commands::ReExecute(_)
+    ) {
+        let spec = cli
+            .command
+            .chain_spec()
+            .expect("execution commands have a chain");
+        let dir = datadir
+            .ok_or_else(|| eyre::eyre!("execution command has no datadir"))?
+            .resolve_datadir(spec.chain());
+        let store = arkiv_authenticated_store::Store::open(dir.data_dir().join("arkiv-state"))?;
+        arkiv_reth_statemanager::genesis::initialize(spec.genesis(), store.clone())?;
+        Some(store)
+    } else {
+        None
+    };
+    match cli {
         // The genesis-aware `init-state`; every other command is reth's.
         Cli {
             command: Commands::InitState(command),
@@ -72,9 +104,9 @@ fn main() {
         // `ChainSpec`. The components closure gives the non-`node` subcommands
         // (`init`, `import`, `db`, ...) the same executor and consensus the node uses.
         cli => cli.run_with_components::<ArkivNode>(
-            |spec| {
+            move |spec| {
                 (
-                    EthEvmConfig::new_with_evm_factory(spec.clone(), ArkivEvmFactory::default()),
+                    EthEvmConfig::new_with_evm_factory(spec.clone(), ArkivEvmFactory::new(offline_store.expect("offline execution store initialized"))),
                     Arc::new(EthBeaconConsensus::new(spec)),
                 )
             },
@@ -85,7 +117,7 @@ fn main() {
                     .node(ArkivNode)
                     // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
                     .extend_rpc_modules(|ctx| {
-                        let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone())?;
+                        let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone(), arkiv_authenticated_store::Store::open(ctx.config().datadir().data_dir().join("arkiv-state"))?)?;
                         ctx.modules.merge_configured(module)?;
                         info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                         Ok(())
@@ -95,9 +127,5 @@ fn main() {
                 handle.wait_for_node_exit().await
             },
         ),
-    };
-    if let Err(err) = result {
-        eprintln!("Error: {err:?}");
-        std::process::exit(1);
     }
 }

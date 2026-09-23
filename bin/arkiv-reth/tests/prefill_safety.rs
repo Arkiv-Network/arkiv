@@ -42,9 +42,16 @@ impl Fixture {
         let genesis = dir.path().join("genesis.json");
         fs::write(
             &genesis,
-            export::genesis_with_state_hash(export::dev_genesis(DEV_CHAIN_ID), manifest.state_root)
-                .unwrap()
-                .to_string(),
+            export::genesis_with_state_hash(
+                export::with_snapshot(
+                    export::dev_genesis(DEV_CHAIN_ID),
+                    &manifest.authenticated_state,
+                )
+                .unwrap(),
+                manifest.state_root,
+            )
+            .unwrap()
+            .to_string(),
         )
         .unwrap();
         Self {
