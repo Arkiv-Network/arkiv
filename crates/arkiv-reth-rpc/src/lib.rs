@@ -343,6 +343,8 @@ where
             .next_cursor
             .map(|offset| cursor::encode(offset, binding)),
         nodes_read: counter.reads(),
+        index_entries_scanned: matches.stats.index_entries_scanned,
+        merge_steps: matches.stats.merge_steps,
     })
 }
 

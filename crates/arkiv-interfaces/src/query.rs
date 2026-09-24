@@ -121,12 +121,19 @@ pub struct QueryResult {
 /// What a query cost to run — for pricing, and for insight into a query's work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QueryStats {
-    /// Entities the query looked at.
+    /// Entities in the full match set, before paging.
     pub entities_scanned: u64,
     /// Entities it returned.
     pub entities_returned: u64,
-    /// Index lookups it made.
+    /// Index lookups it made: one per predicate evaluated.
     pub index_lookups: u64,
+    /// Index entries visited across every predicate's walk. A predicate costs
+    /// the number of entities that satisfy it, whatever the rest of the
+    /// query keeps.
+    pub index_entries_scanned: u64,
+    /// Elements consumed by the `AND`, `OR` and `NOT` merges: the sum of both
+    /// inputs' lengths per operation.
+    pub merge_steps: u64,
     /// Gas charged — a placeholder until [`CostModel`](crate::gas::CostModel) is
     /// filled in.
     pub gas_used: Gas,

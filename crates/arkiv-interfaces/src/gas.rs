@@ -176,6 +176,8 @@ mod tests {
             entities_scanned: 4,
             entities_returned: 2,
             index_lookups: 1,
+            index_entries_scanned: 4,
+            merge_steps: 0,
             gas_used: 0,
             partial: false,
         };

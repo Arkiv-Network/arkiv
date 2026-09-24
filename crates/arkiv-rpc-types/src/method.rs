@@ -75,6 +75,13 @@ pub struct QueryResponse {
     /// reading the page's entities. A measure of the work, not a price.
     #[serde(default)]
     pub nodes_read: u64,
+    /// Index entries visited by the predicate walks: each predicate costs the
+    /// number of entities that satisfy it.
+    #[serde(default)]
+    pub index_entries_scanned: u64,
+    /// Elements consumed by the `AND`, `OR` and `NOT` merges.
+    #[serde(default)]
+    pub merge_steps: u64,
 }
 
 /// The `arkiv_getBlockTiming` response.
@@ -124,10 +131,14 @@ mod tests {
             block_number: 0x8e1ff,
             cursor: Some("b64:abc".to_string()),
             nodes_read: 17,
+            index_entries_scanned: 40,
+            merge_steps: 45,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["blockNumber"], "0x8e1ff", "quantities go over as hex");
         assert_eq!(json["nodesRead"], 17);
+        assert_eq!(json["indexEntriesScanned"], 40);
+        assert_eq!(json["mergeSteps"], 45);
         let back: QueryResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back.block_number, 0x8e1ff);
         assert_eq!(back.cursor.as_deref(), Some("b64:abc"));
@@ -142,6 +153,8 @@ mod tests {
             block_number: 1,
             cursor: None,
             nodes_read: 0,
+            index_entries_scanned: 0,
+            merge_steps: 0,
         })
         .unwrap();
         assert!(json.get("cursor").is_none());
