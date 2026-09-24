@@ -61,8 +61,8 @@ pub struct CountRequest {
 }
 
 /// The `arkiv_query` response: one page of matched entities, the block the
-/// query evaluated against (hex), and an opaque continuation cursor (absent on
-/// the last page).
+/// query evaluated against (hex), an opaque continuation cursor (absent on
+/// the last page), and how many key-value pairs the node read to answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryResponse {
@@ -71,6 +71,10 @@ pub struct QueryResponse {
     pub block_number: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Trie nodes looked up in the node store while evaluating the query and
+    /// reading the page's entities. A measure of the work, not a price.
+    #[serde(default)]
+    pub nodes_read: u64,
 }
 
 /// The `arkiv_getBlockTiming` response.
@@ -119,12 +123,15 @@ mod tests {
             data: vec![],
             block_number: 0x8e1ff,
             cursor: Some("b64:abc".to_string()),
+            nodes_read: 17,
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["blockNumber"], "0x8e1ff", "quantities go over as hex");
+        assert_eq!(json["nodesRead"], 17);
         let back: QueryResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back.block_number, 0x8e1ff);
         assert_eq!(back.cursor.as_deref(), Some("b64:abc"));
+        assert_eq!(back.nodes_read, 17);
     }
 
     /// The last page omits `cursor` entirely rather than sending null.
@@ -134,11 +141,17 @@ mod tests {
             data: vec![],
             block_number: 1,
             cursor: None,
+            nodes_read: 0,
         })
         .unwrap();
         assert!(json.get("cursor").is_none());
         let back: QueryResponse = serde_json::from_value(json).unwrap();
         assert!(back.cursor.is_none());
+        // Older responses without the field still parse.
+        let old: QueryResponse =
+            serde_json::from_value(serde_json::json!({ "data": [], "blockNumber": "0x1" }))
+                .unwrap();
+        assert_eq!(old.nodes_read, 0);
     }
 
     #[test]

@@ -145,6 +145,37 @@ impl NodeStore for SharedMemNodeStore {
     }
 }
 
+/// A reader that counts every node lookup it forwards, cache hits included.
+/// What a query cost in key-value reads is this number.
+#[derive(Debug)]
+pub struct CountingReader<S> {
+    inner: S,
+    reads: core::cell::Cell<u64>,
+}
+
+impl<S> CountingReader<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            reads: core::cell::Cell::new(0),
+        }
+    }
+
+    /// Node lookups so far.
+    pub fn reads(&self) -> u64 {
+        self.reads.get()
+    }
+}
+
+impl<S: NodeReader> NodeReader for CountingReader<S> {
+    type Error = S::Error;
+
+    fn node(&self, hash: &B256) -> Result<Option<Vec<u8>>, S::Error> {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.node(hash)
+    }
+}
+
 /// A reader that consults `overlay` first, then `base`. This is how a batch of
 /// nodes written during a block is visible to the same block's later reads
 /// before the batch reaches the durable store.

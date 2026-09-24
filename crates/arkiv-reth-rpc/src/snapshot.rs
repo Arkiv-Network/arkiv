@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use arkiv_store::{ARKIV_ROOT_ACCOUNT, ARKIV_ROOT_SLOT, ArkivDb, B256, DbRoots, DbView};
+use arkiv_store::{
+    ARKIV_ROOT_ACCOUNT, ARKIV_ROOT_SLOT, ArkivDb, B256, CountingReader, DbRoots, DbView,
+};
 use reth_storage_api::StateProviderBox;
 
 /// The Arkiv database as of one reth state snapshot.
@@ -41,5 +43,15 @@ impl SnapshotView {
 
     pub fn view(&self) -> DbView<'_, Arc<ArkivDb>> {
         DbView::at(&self.db, self.roots)
+    }
+
+    /// A reader that counts every node lookup made through it. Open a
+    /// [`DbView`] over it with [`DbView::at`] and the snapshot's roots.
+    pub fn counting(&self) -> CountingReader<&Arc<ArkivDb>> {
+        CountingReader::new(&self.db)
+    }
+
+    pub const fn roots(&self) -> &DbRoots {
+        &self.roots
     }
 }

@@ -26,7 +26,7 @@ use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, PageParams, Query};
 use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
 use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
-use arkiv_store::{ArkivDb, evaluate_page};
+use arkiv_store::{ArkivDb, DbView, evaluate_page};
 use jsonrpsee::RpcModule;
 use jsonrpsee::types::ErrorObjectOwned;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
@@ -307,7 +307,9 @@ where
     };
 
     let snapshot = open_snapshot(&state, db)?;
-    let view = snapshot.view();
+    // Count every node lookup: the index walks and the page's entity reads.
+    let counter = snapshot.counting();
+    let view = DbView::at(&counter, *snapshot.roots());
     let matches = evaluate_page(
         &view,
         &live_at(query, block_number),
@@ -340,6 +342,7 @@ where
         cursor: matches
             .next_cursor
             .map(|offset| cursor::encode(offset, binding)),
+        nodes_read: counter.reads(),
     })
 }
 

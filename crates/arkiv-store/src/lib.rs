@@ -29,7 +29,9 @@ pub mod view;
 
 pub use alloy_primitives::{Address, B256, U256};
 pub use annotations::{AttrEntry, EntityDelta, annotation_delta, entity_annotations};
-pub use arkiv_trie::{MemNodeStore, NodeReader, NodeSink, NodeStore, SharedMemNodeStore, Staging};
+pub use arkiv_trie::{
+    CountingReader, MemNodeStore, NodeReader, NodeSink, NodeStore, SharedMemNodeStore, Staging,
+};
 pub use query::{evaluate, evaluate_page};
 pub use record::{RecordError, decode, encode};
 pub use roots::{DbRoots, EMPTY_DB_ROOT};

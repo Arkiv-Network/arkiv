@@ -475,6 +475,9 @@ async fn query_operator_classes_over_a_live_node() {
         let page = client.query("*", 2, cursor.as_deref()).await;
         let keys = result_keys(&page);
         assert!(keys.len() <= 2, "page larger than resultsPerPage");
+        // The node reports how many trie nodes it read to build the page.
+        let nodes_read = page["nodesRead"].as_u64().expect("nodesRead is a number");
+        assert!(nodes_read > 0, "a non-empty page reads at least one node");
         seen.extend(keys);
         pages += 1;
         assert!(pages <= 5, "pagination did not terminate");

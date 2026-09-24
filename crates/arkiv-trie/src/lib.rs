@@ -20,7 +20,7 @@ mod trie;
 pub use alloy_trie::EMPTY_ROOT_HASH;
 pub use node::{Child, DecodeError, Node, Path};
 pub use store::{
-    Layered, LayeredError, MemNodeStore, Never, NodeReader, NodeSink, NodeStore,
+    CountingReader, Layered, LayeredError, MemNodeStore, Never, NodeReader, NodeSink, NodeStore,
     SharedMemNodeStore, Staging,
 };
 pub use trie::{Changes, Item, Trie, TrieError, TrieIter};
