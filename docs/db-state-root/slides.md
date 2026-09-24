@@ -15,7 +15,7 @@ style: |
 
 # Arkiv under its own state root
 
-Experiment 2: one database root instead of state interleaved in accounts
+One database root instead of state interleaved in accounts
 
 Arkiv-Network/arkiv PR #122, issue #120
 
