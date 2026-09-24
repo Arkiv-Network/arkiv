@@ -199,16 +199,13 @@ def before_range_index() -> None:
 def before_insert() -> None:
     write("before-insert", f"""
   op [label="create entity k with\\nteam = red, rank = 42", fillcolor="{KV}"];
-  id [label="allocate dense id\\nread + bump entity_count slot\\nwrite key2id and id2key slots", fillcolor="{SLOT}"];
-  rec_ [label="write entity account\\ncode = record", fillcolor="{CODE}"];
-  p1 [label="pair(team, red): read bitmap,\\nset bit id, write code", fillcolor="{CODE}"];
-  p2 [label="pair(rank, 42): read bitmap,\\nset bit id, write code", fillcolor="{CODE}"];
-  p3 [label="$all, $owner, $creator, $key,\\n$expiration, $createdAtBlock, $contentType:\\nsame again, one account each", fillcolor="{CODE}"];
-  bt [label="rank B+ tree: descend from header,\\ninsert value 42 into a leaf, maybe split\\n(several slots per touched node)", fillcolor="{SLOT}"];
-  cs [label="team cascade: level-0 slot for \\"red\\",\\nenumeration list append", fillcolor="{SLOT}"];
-  root [label="reth rehashes every touched account\\n(≈ 12 accounts, dozens of slots)\\ninto the state root", fillcolor="{ROOT}"];
-  op -> id -> rec_ -> p1 -> p2 -> p3 -> bt -> cs -> root;
-""")
+  id [label="allocate a dense id:\\nbump the counter slot,\\nwrite the key2id and id2key slots", fillcolor="{SLOT}"];
+  rec_ [label="write the entity account:\\ncode = record", fillcolor="{CODE}"];
+  pairs [label="for each of the 9 (attribute, value) pairs\\n(team, rank, $all, $owner, $creator, $key,\\n$expiration, $createdAtBlock, $contentType):\\nread the pair account's bitmap, set the bit, rewrite the code", fillcolor="{CODE}"];
+  ordered [label="rank B+ tree: descend from the header,\\ninsert 42 into a leaf, maybe split (several slots)\\nteam cascade: level-0 slot + enumeration list", fillcolor="{SLOT}"];
+  root [label="reth rehashes every touched account,\\n≈ 12 accounts and dozens of slots,\\ninto the state root", fillcolor="{ROOT}"];
+  op -> id -> rec_ -> pairs -> ordered -> root;
+""", extra=' label="before this PR"; labelloc=t; fontsize=16;')
 
 
 def before_query() -> None:
@@ -343,20 +340,14 @@ def after_insert() -> None:
 
 def after_commit() -> None:
     write("after-commit", f"""
-  tx [label="transaction: create k5\\n(team = red, rank = 42)", fillcolor="{KV}"];
-  read [label="read parent root from the anchor slot\\nthrough the revm Database"];
-  ent [label="entities trie: insert k5 → record\\n(path copy)", fillcolor="{NEW}"];
-  i1 [label="team index: insert enc(red) ‖ k5", fillcolor="{NEW}"];
-  i2 [label="rank index: insert enc(42) ‖ k5", fillcolor="{NEW}"];
-  i3 [label="$owner, $creator, $key, $expiration,\\n$createdAtBlock, $contentType indexes: same", fillcolor="{NEW}"];
-  ioi [label="index-of-indexes: update the changed roots", fillcolor="{NEW}"];
-  non [label="nonces trie: owner → nonce + 1", fillcolor="{NEW}"];
-  top [label="top node → new database root", fillcolor="{ROOT}"];
-  flush [label="flush the new nodes to the node store\\n(durable, before the block can be committed)"];
-  diff [label="Ethereum diff: sender balance and nonce,\\nanchor slot 0 = new database root", fillcolor="{SLOT}"];
-  tx -> read -> ent -> i1 -> i2 -> i3 -> ioi -> non -> top -> flush -> diff;
-  note [shape=plaintext, label="reth rehashes 2 accounts and 1 slot, whatever the entity looks like"];
-""")
+  tx [label="create entity k5 with\\nteam = red, rank = 42", fillcolor="{KV}"];
+  read [label="read the parent database root\\nfrom the anchor slot", fillcolor="{SLOT}"];
+  ent [label="entities trie: insert k5 → record\\n(path copy, ≈ log n new nodes)", fillcolor="{NEW}"];
+  idx [label="for each of the 8 (attribute, value) pairs:\\ninsert enc(value) ‖ k5 into that index trie\\nthen update the index-of-indexes", fillcolor="{NEW}"];
+  top [label="nonces trie: owner → nonce + 1\\ntop node → new database root\\nflush the new nodes to the node store", fillcolor="{ROOT}"];
+  diff [label="Ethereum diff: the sender (balance, nonce),\\nthe anchor account (slot 0 = new database root),\\nthe fee recipient if there is a tip\\nreth rehashes those accounts and that one slot", fillcolor="{SLOT}"];
+  tx -> read -> ent -> idx -> top -> diff;
+""", extra=' label="after this PR"; labelloc=t; fontsize=16;')
 
 
 def after_query() -> None:

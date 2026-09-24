@@ -151,7 +151,7 @@ bitmaps, and a bitmap needs small integers.
 
 ## Inserting one entity
 
-![w:420](diagrams/before-insert.svg)
+![h:500](diagrams/before-insert.svg)
 
 ---
 
@@ -227,9 +227,13 @@ The Ethereum state root still covers everything, through that slot.
 
 ---
 
-## Inside one transaction
+<!-- _class: two -->
 
-![w:380](diagrams/after-commit.svg)
+## Inside one transaction: before and after
+
+![h:470](diagrams/before-insert.svg)
+
+![h:470](diagrams/after-commit.svg)
 
 ---
 
