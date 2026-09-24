@@ -28,6 +28,9 @@ Arkiv-Network/arkiv PR #122, issue #120
 3. After: three tries under one root in an anchor slot
 4. What changed, what is deferred
 
+Colours in the diagrams: blue is what reth does, red is database data crammed
+into accounts, yellow is Arkiv's own structures.
+
 ---
 
 ## A persistent tree
