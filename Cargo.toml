@@ -110,6 +110,7 @@ tempfile = "3"
 
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
+arkiv-valkey = { path = "crates/arkiv-valkey" }
 arkiv-rpc-types = { path = "crates/arkiv-rpc-types" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }

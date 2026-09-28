@@ -115,3 +115,13 @@ jobs:
       # package arguments, capped at 4 MiB).
       seed_count: "1000"
       seed_payload_size: "512"
+
+  # The cheap devnet check: one --dev node and a Valkey, no consensus layer and
+  # no enclave. Covers docker/compose.yml and `check.py --no-enclave`, which the
+  # Kurtosis lane does not touch. Runs at debug so the logs are readable.
+  docker-stack:
+    needs: build
+    uses: ./.github/workflows/docker-stack.yml
+    with:
+      artifact: arkiv-binaries-${{ inputs.profile || 'dev-fast' }}-${{ github.sha }}
+      log_filter: "debug"
