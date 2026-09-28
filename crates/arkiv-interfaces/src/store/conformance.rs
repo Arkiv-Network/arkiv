@@ -76,6 +76,9 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     query_reports_total_matched_beyond_the_page(store_generator);
     query_sorts_ascending_and_descending(store_generator);
     query_sort_puts_records_without_the_cell_last(store_generator);
+    failed_commit_changes_nothing(store_generator);
+    failed_commit_leaves_the_branch_usable(store_generator);
+    commit_applies_every_record_or_none(store_generator);
 }
 
 /// Run every [`StoreExt`] assertion against stores built by `new_store`.
@@ -84,6 +87,8 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
 /// `golem-db-api.md`, not part of it — an implementation may legitimately
 /// conform to the spec and not yet implement these.
 pub fn run_all_ext<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    changes_account_for_the_whole_difference(store_generator);
+    failed_commit_writes_no_changeset(store_generator);
     commits_are_resolvable_by_their_committag(store_generator);
     digest_same_on_branch_committal(store_generator);
     changeset_report_all_crud_ops(store_generator);
@@ -154,6 +159,18 @@ fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
         value,
         negated: false,
     }])])
+}
+
+/// The digest of committed state, using only [`Store`].
+///
+/// A fresh branch over head has staged nothing, so its digest *is* the
+/// committed one — which is how the atomicity assertions observe the digest
+/// without needing [`StoreExt::commit_hash`].
+fn committed_digest<S: Store>(store: &mut S) -> [u8; 32] {
+    let probe = store.begin(None).expect("open a probe branch");
+    let digest = store.branch_digest(probe).expect("read its digest");
+    store.discard(probe).expect("and drop it again");
+    digest
 }
 
 /// The single-cell change list most patch assertions use.
@@ -1283,6 +1300,204 @@ fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn
         matched_keys(&store, at, &query),
         vec![record_key(1), record_key(2), record_key(3)],
         "tie broken by key, and the record without the cell last"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// commit atomicity
+// ---------------------------------------------------------------------------
+//
+// These cover **logical** atomicity: a commit that fails applies nothing, and a
+// commit that succeeds leaves state, digest and changeset agreeing with each
+// other. They cannot cover **crash** atomicity — a process killed midway
+// through `commit` — because the trait gives a caller no way to inject that
+// fault. An implementation that writes its records, its digest and its head
+// non-transactionally will pass everything here and still tear on a crash; that
+// has to be established by reading its implementation, not by running this.
+
+/// A commit that is refused changes nothing observable: head stays put, the
+/// branch's records do not appear, and the digest does not move.
+///
+/// The error alone is not enough to assert. A store that advanced head and
+/// *then* noticed the conflict would return the same error and have already
+/// corrupted the chain.
+fn failed_commit_changes_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+
+    let first = store.begin(None).unwrap();
+    create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
+    let stale = store.begin(None).unwrap();
+    let committed = store.commit(first).unwrap();
+
+    let digest_before = committed_digest(&mut store);
+
+    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
+    assert_eq!(store.commit(stale).unwrap_err(), StoreError::Conflict);
+
+    assert_eq!(store.head(), committed, "head did not move");
+    assert!(
+        read_record(&store, ReadTarget::Commit(committed), record_key(2)).is_none(),
+        "the refused branch's records did not land"
+    );
+    assert_eq!(
+        committed_digest(&mut store),
+        digest_before,
+        "and the committed digest is unchanged"
+    );
+}
+
+/// A refused commit does **not** consume the branch.
+///
+/// `commit` consumes on success, so a caller that cannot distinguish the two
+/// has no way to clean up after a conflict — the branch would be unreachable
+/// and its staged writes stranded. Discarding it must still work.
+fn failed_commit_leaves_the_branch_usable<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+
+    let first = store.begin(None).unwrap();
+    let stale = store.begin(None).unwrap();
+    store.commit(first).unwrap();
+
+    assert_eq!(store.commit(stale).unwrap_err(), StoreError::Conflict);
+    assert!(
+        store.branch_info(stale).is_ok(),
+        "a refused commit leaves the handle valid"
+    );
+    store
+        .discard(stale)
+        .expect("so the caller can still clean it up");
+}
+
+/// Every record of a committed branch lands, and the commit's digest is exactly
+/// the one the branch reported before committing.
+///
+/// A commit that applied some records and not others would satisfy neither: the
+/// missing records would be absent, and the digest would not match.
+fn commit_applies_every_record_or_none<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+
+    let ordinals = 1u8..=5;
+    for ordinal in ordinals.clone() {
+        create_record(
+            &mut store,
+            branch,
+            record_key(ordinal),
+            &[("n", u64_attribute(u64::from(ordinal)))],
+        );
+    }
+    let expected_digest = store.branch_digest(branch).unwrap();
+    let committed = store.commit(branch).unwrap();
+
+    for ordinal in ordinals {
+        let found = read_record(&store, ReadTarget::Commit(committed), record_key(ordinal))
+            .unwrap_or_else(|| panic!("record {ordinal} landed"));
+        assert_eq!(found.cell("n"), Some(&u64_attribute(u64::from(ordinal))));
+    }
+    assert_eq!(
+        committed_digest(&mut store),
+        expected_digest,
+        "the commit's digest is the one its branch reported"
+    );
+}
+
+/// A commit's changeset accounts for the **whole** difference between it and
+/// its parent: every entry's `before` matches the parent state and its `after`
+/// matches the new state, and nothing changed that the changeset omits.
+///
+/// This is the strongest atomicity check available through the trait. A commit
+/// that applied records without logging them, or logged records it did not
+/// apply, fails here — and those are exactly the shapes a torn commit takes.
+fn changes_account_for_the_whole_difference<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+
+    // Parent commit: two records, one of which the next commit will touch.
+    let parent_branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        parent_branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
+    create_record(
+        &mut store,
+        parent_branch,
+        record_key(2),
+        &[("n", u64_attribute(2))],
+    );
+    let parent = store.commit(parent_branch).unwrap();
+
+    // A commit that creates one record, mutates one, deletes one, and leaves
+    // one alone — all four shapes in a single changeset.
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(3),
+        &[("n", u64_attribute(3))],
+    );
+    store
+        .patch(
+            branch,
+            record_key(1),
+            None,
+            set_cell("n", u64_attribute(99)),
+            None,
+        )
+        .unwrap();
+    store.delete(branch, record_key(2), None, None).unwrap();
+    let committed = store.commit(branch).unwrap();
+
+    let changes = store.changes(committed).unwrap();
+
+    // Each entry's before/after must match what the two commits actually hold.
+    for change in &changes {
+        assert_eq!(
+            change.before,
+            read_record(&store, ReadTarget::Commit(parent), change.key),
+            "changeset `before` disagrees with the parent commit for {:?}",
+            change.key
+        );
+        assert_eq!(
+            change.after,
+            read_record(&store, ReadTarget::Commit(committed), change.key),
+            "changeset `after` disagrees with the new commit for {:?}",
+            change.key
+        );
+    }
+
+    // And nothing moved that the changeset failed to mention. Record 4 is
+    // absent from both, record 1..=3 cover the three shapes above.
+    for ordinal in 1u8..=4 {
+        let key = record_key(ordinal);
+        let before = read_record(&store, ReadTarget::Commit(parent), key);
+        let after = read_record(&store, ReadTarget::Commit(committed), key);
+        let logged = changes.iter().any(|change| change.key == key);
+        assert_eq!(
+            before != after,
+            logged,
+            "record {ordinal} changed without being logged, or was logged without changing"
+        );
+    }
+}
+
+/// A refused commit writes no changeset, so the commit id it would have taken
+/// stays unused rather than holding an orphaned log.
+fn failed_commit_writes_no_changeset<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+
+    let first = store.begin(None).unwrap();
+    create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
+    let stale = store.begin(None).unwrap();
+    let committed = store.commit(first).unwrap();
+
+    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
+    assert_eq!(store.commit(stale).unwrap_err(), StoreError::Conflict);
+
+    // The id the refused commit would have claimed must not resolve at all.
+    assert!(
+        store.changes(CommitId(committed.0 + 1)).is_err(),
+        "a refused commit leaves no changeset behind"
     );
 }
 
