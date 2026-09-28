@@ -124,7 +124,7 @@ pub(crate) fn decode_change(
 ///
 /// **Not a commitment.** FNV-1a over the key and the canonical cell bytes,
 /// four seeds wide. The record's version is excluded, as
-/// [`branch_hash`](arkiv_interfaces::store::Store::branch_hash) requires: a
+/// [`branch_digest`](arkiv_interfaces::store::Store::branch_digest) requires: a
 /// write that leaves content unchanged must not move the digest.
 pub(crate) fn record_digest(key: RecordKey, record: &Stored) -> [u8; 32] {
     let mut encoded = Vec::from(key.0);

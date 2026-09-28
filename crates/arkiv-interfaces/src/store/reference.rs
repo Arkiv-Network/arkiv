@@ -17,7 +17,7 @@
 //! - **`fork` copies the parent's state** instead of layering a diff over it.
 //!   A real store makes `fork` O(1); here O(n) buys a trivially correct read
 //!   path with no stack walking. Observable behaviour is identical.
-//! - **[`MemStore::branch_hash`] is a deterministic digest, not a
+//! - **[`MemStore::branch_digest`] is a deterministic digest, not a
 //!   commitment.** FNV-1a over the canonical encoding — enough to detect
 //!   divergence between two implementations, which is all the suite asks. It
 //!   is *not* collision-resistant and proves nothing.
@@ -271,7 +271,7 @@ impl Store for MemStore {
             return Err(StoreError::HandleInvalid);
         };
         // The no-fork guarantee: a branch whose origin has been overtaken
-        // cannot seal. A host should treat this as fatal, not retry it.
+        // cannot commit. A host should treat this as fatal, not retry it.
         if origin != self.head() {
             return Err(StoreError::Conflict);
         }
@@ -446,7 +446,7 @@ impl Store for MemStore {
         ))
     }
 
-    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         Ok(content_digest(&self.branch_state(branch)?.state))
     }
 }
@@ -646,7 +646,7 @@ fn record_changes_between(
 /// which is what the conformance suite needs, and nothing more: no collision
 /// resistance, no proofs, no incremental maintenance. See the crate docs.
 ///
-/// Excludes `#version`, as [`Store::branch_hash`] requires — the input is
+/// Excludes `#version`, as [`Store::branch_digest`] requires — the input is
 /// built from cells alone, so a write leaving content unchanged leaves the
 /// digest unchanged. Lengths are framed so that neighbouring names and values
 /// cannot be confused for one another.

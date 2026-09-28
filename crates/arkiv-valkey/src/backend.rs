@@ -581,7 +581,7 @@ impl Backend {
         };
         let head = self.head().await?;
         // The no-fork guarantee: a branch whose origin has been overtaken
-        // cannot seal.
+        // cannot commit.
         if origin.0 != head {
             return Err(StoreError::Conflict);
         }
@@ -736,7 +736,7 @@ impl Backend {
 
     /// A branch's digest: the state it is grounded on, with its staged writes
     /// folded in. Linear in the size of the diff, not of the state.
-    pub(crate) async fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+    pub(crate) async fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         let origin = self.grounding_commit(branch).await?;
         let mut digest = if origin.0 == self.head().await? {
             self.digest().await?

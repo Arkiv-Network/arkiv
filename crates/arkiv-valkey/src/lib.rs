@@ -8,7 +8,7 @@
 //!
 //! # What this does not give you
 //!
-//! **The digest is not a commitment.** `branch_hash` is an XOR fold of
+//! **The digest is not a commitment.** `branch_digest` is an XOR fold of
 //! per-record FNV-1a digests. That is genuinely incremental — folding a record
 //! out and back in is how an update is applied, so the cost is proportional to
 //! what changed rather than to the state — and it is order-independent, so two
@@ -324,8 +324,8 @@ impl Store for ValkeyStore {
         .map(with_free_receipt)
     }
 
-    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
-        self.call(move |backend| async move { backend.branch_hash(branch).await })
+    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        self.call(move |backend| async move { backend.branch_digest(branch).await })
     }
 }
 

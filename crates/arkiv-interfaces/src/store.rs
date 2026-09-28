@@ -19,12 +19,12 @@
 //!     fork()   ── grandchild frame (an atomic op batch)
 //!     merge()  ── or discard(), on failure
 //!   merge()
-//! commit()     ── seal: assigns head+1, durable
+//! commit()     ── promote to a commit: head+1, durable
 //! ```
 //!
 //! # Deviations from `golem-db-api.md`
 //!
-//! Everything marked **[ext]** is an addition this seam requires and the spec
+//! Everything marked **\[ext\]** is an addition this seam requires and the spec
 //! does not yet provide; see `golem-db-api-reth-requirements.md` in
 //! `arkiv-architecture-review` for why each one is needed. They are grouped in
 //! [`StoreExt`] rather than [`Store`] so the gap between "what the spec says"
@@ -95,7 +95,7 @@ pub struct BranchVersion(pub u64);
 /// changes. Versions start at 1; `0` is therefore a guard that can never match.
 ///
 /// Coordination metadata, not content: stored and replicated, but **excluded
-/// from [`Store::branch_hash`]**, so a write that leaves a record logically
+/// from [`Store::branch_digest`]**, so a write that leaves a record logically
 /// unchanged never moves the digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RecordVersion(pub u64);
@@ -680,16 +680,16 @@ pub trait Store {
     ///
     /// A pure function of logical record content: `#`-prefixed meta entries,
     /// [`RecordVersion`] included, are **excluded**.
-    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError>;
+    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError>;
 }
 
 /// Host-facing additions this seam needs and `golem-db-api.md` does not yet
-/// provide. Each is **[ext]**; see `golem-db-api-reth-requirements.md`.
+/// provide. Each is **\[ext\]**; see `golem-db-api-reth-requirements.md`.
 ///
 /// Kept separate from [`Store`] so the gap between the spec and what a reth
 /// host requires stays legible — and shrinks visibly as the spec catches up.
 pub trait StoreExt: Store {
-    /// **[ext R1]** Seal a root branch, tagging the commit with an opaque
+    /// **\[ext R1\]** Commit a root branch, tagging the commit with an opaque
     /// 32-byte host identifier — for Arkiv, the block hash.
     ///
     /// reth addresses state by block hash everywhere (`state_by_block_hash`,
@@ -699,10 +699,10 @@ pub trait StoreExt: Store {
     /// store-side rather than in a host map that could disagree after a crash.
     fn commit_tagged(&mut self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError>;
 
-    /// **[ext R1]** Resolve a tag back to its commit, if still retained.
+    /// **\[ext R1\]** Resolve a tag back to its commit, if still retained.
     fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError>;
 
-    /// **[ext R2]** What one commit changed, as `(key, before, after)`.
+    /// **\[ext R2\]** What one commit changed, as `(key, before, after)`.
     ///
     /// Three consumers: reth's `ChangeSetReader` / `StorageChangeSetReader`,
     /// which any provider the engine tree accepts must implement; txpool
@@ -711,7 +711,7 @@ pub trait StoreExt: Store {
     /// a rewind did what it claimed.
     fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError>;
 
-    /// **[ext R3]** Apply many writes under one call and one receipt.
+    /// **\[ext R3\]** Apply many writes under one call and one receipt.
     ///
     /// A block is hundreds of individual calls and a genesis seed is
     /// thousands. Tolerable in-process; fatal across a process boundary, which
@@ -723,21 +723,21 @@ pub trait StoreExt: Store {
         budget: Option<Budget>,
     ) -> Result<Metered<Vec<WriteOutcome>>, StoreError>;
 
-    /// **[ext R4]** A committed digest, after the branch handle is gone.
+    /// **\[ext R4\]** A committed digest, after the branch handle is gone.
     ///
-    /// [`Store::branch_hash`] takes a branch, and `commit` consumes it — so
+    /// [`Store::branch_digest`] takes a branch, and `commit` consumes it — so
     /// there is otherwise no way to ask what commit `c` hashed to. Needed to
     /// validate a peer's block and to re-derive a historical root.
     fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError>;
 
-    /// **[ext]** The retention window, oldest first.
+    /// **\[ext\]** The retention window, oldest first.
     ///
     /// A host must choose between a latest-state and a historical-state
     /// provider per request; without this it discovers unavailability by
     /// failing a read.
     fn retention(&self) -> (CommitId, CommitId);
 
-    /// **[ext]** Batched point read. reth's prewarm and parallel-execution
+    /// **\[ext\]** Batched point read. reth's prewarm and parallel-execution
     /// paths issue many point reads per block; this is the cheapest
     /// throughput win available on the seam.
     fn get_many(
