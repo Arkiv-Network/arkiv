@@ -25,7 +25,7 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 serde_json.workspace = true
 # Cursors are base64 of an id plus a binding hash — the spec's `b64:` form.
-base64 = "0.22"
+base64 = "0.23"
 # Store reads hit MDBX, so they run on `spawn_blocking`.
 tokio.workspace = true
 eyre.workspace = true

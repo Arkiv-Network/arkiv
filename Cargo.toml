@@ -3,7 +3,7 @@ members = ["bin/*", "crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.97"
 license = "GPL-3.0-or-later"
@@ -16,35 +16,49 @@ license = "GPL-3.0-or-later"
 # the slim Docker builder has. We only use `reth::cli::Cli`, so nothing else in
 # that default set is required — except "asm-keccak" (assembly keccak256 on the
 # state-root/tx-hash hot path) and "jemalloc".
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", default-features = false, features = [
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", default-features = false, features = [
     "asm-keccak",
     "jemalloc",
 ] }
-reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 # The `ChainSpecParser` trait behind `--chain`; arkiv-reth-chainspec implements it.
-reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 # `NodeRecord`, the bootnode type in the `EthChainSpec` trait the Arkiv chain spec implements.
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 # The jemalloc allocator itself. `reth`'s "jemalloc" feature only wires up the
 # jemalloc *stats* reporting in node-core/metrics/provider; the allocator has to
 # be declared as `#[global_allocator]` by the binary, which is what reth's own
 # main.rs does. `reth` doesn't re-export it, so we depend on it directly.
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0", features = [
+reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", features = [
     "jemalloc",
 ] }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 # Umbrella crate used by the executor seam (matches the custom-evm example's deps).
 # Keep default features (std); the executor crate adds "evm" + "node".
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
-reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
-reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
-reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.0" }
+reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# `init-state`'s argument struct and datadir setup, and the state-dump importer
+# behind it: arkiv-reth re-routes that one subcommand to make it work at genesis.
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# The parts of that importer arkiv-reth's streaming variant is assembled from:
+# the ETL collector, the tables and their codecs, the trie walk, the stage ids.
+reth-etl = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# `Layers`, to hang `init-state`'s progress layer onto reth's tracing setup.
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 
 # JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
-# reth v2.5.0 uses so the RpcModule we register merges into reth's rpc modules.
+# reth v2.7.0 uses so the RpcModule we register merges into reth's rpc modules.
 jsonrpsee = { version = "0.26", features = ["server"] }
 
 # Common
@@ -56,8 +70,11 @@ turso = { version = "=0.7.2", default-features = false }
 # alloy primitives used by the Arkiv protocol crates.
 alloy-rlp = "0.3"
 alloy-primitives = { version = "1.6", features = ["rlp"] }
-alloy-consensus = "2.3"
-alloy-evm = "0.38"
+alloy-consensus = "2.5"
+alloy-evm = "0.39"
+# The keccak-MPT state-root helpers arkiv-seed derives a genesis `stateHash`
+# with. Same line reth v2.7.0 pins, so the root matches the chain spec's.
+alloy-trie = "0.9"
 
 # Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
 # pair account's bitmap bytes are consensus state (its codeHash =
@@ -67,18 +84,18 @@ alloy-evm = "0.38"
 roaring = "=0.11.4"
 
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
-# arkiv-genesis (mnemonic-derived dev signers). Kept on the same 2.3 line reth
-# v2.5.0 pins so cargo unifies these with reth's copies.
-alloy-genesis = "2.3"
-alloy-eips = "2.3"
+# arkiv-genesis (mnemonic-derived dev signers). Kept on the same 2.5 line reth
+# v2.7.0 pins so cargo unifies these with reth's copies.
+alloy-genesis = "2.5"
+alloy-eips = "2.5"
 alloy-sol-types = "1.6.1"
-alloy-provider = "2.3"
-alloy-signer-local = { version = "2.3", features = ["mnemonic"] }
-alloy-rpc-types-engine = "2.3"
+alloy-provider = "2.5"
+alloy-signer-local = { version = "2.5", features = ["mnemonic"] }
+alloy-rpc-types-engine = "2.5"
 futures-util = "0.3"
-alloy-network = "2.3"
-alloy-contract = "2.3"
-alloy-rpc-types = "2.3"
+alloy-network = "2.5"
+alloy-contract = "2.5"
+alloy-rpc-types = "2.5"
 
 # Solidity bindings for the Arkiv EntityRegistry ABI, vendored from
 # arkiv-contracts rev d6ebe18 (see crates/arkiv-bindings for the sync story).
@@ -93,9 +110,11 @@ tempfile = "3"
 
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
+arkiv-valkey = { path = "crates/arkiv-valkey" }
 arkiv-rpc-types = { path = "crates/arkiv-rpc-types" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
+arkiv-seed = { path = "crates/arkiv-seed" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }

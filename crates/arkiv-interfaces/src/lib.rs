@@ -13,6 +13,7 @@ pub mod primitives;
 pub mod query;
 pub mod rpc;
 pub mod statemanager;
+pub mod store;
 
 pub use constants::*;
 pub use entity::*;
@@ -22,3 +23,7 @@ pub use primitives::*;
 pub use query::*;
 pub use rpc::*;
 pub use statemanager::*;
+
+// `store` is deliberately NOT glob re-exported: it names `Query`/`QueryResult`
+// of its own, which are the store's wire shapes and not the Arkiv query AST in
+// `query`. Reach them as `arkiv_interfaces::store::*`.

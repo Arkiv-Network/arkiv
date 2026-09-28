@@ -23,9 +23,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
-        with:
-          components: rustfmt
       - run: cargo fmt --all --check
 
   build:
@@ -38,7 +35,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -56,7 +52,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -65,6 +60,33 @@ jobs:
       # nextest is the test runner; installed from a prebuilt binary.
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
+
+  # The arkiv-valkey conformance suite needs a real server, so it is #[ignore]
+  # by default and runs here against a service container. A fake backend would
+  # only prove our model of Valkey is self-consistent, which MemStore already
+  # does without a network.
+  valkey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      VALKEY_URL: redis://127.0.0.1:6379
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # Only this crate and its dependencies, so the job does not pay for the
+      # reth build the other jobs already cover.
+      - run: cargo test -p arkiv-valkey --locked -- --ignored
 
   udeps:
     runs-on: ubuntu-latest

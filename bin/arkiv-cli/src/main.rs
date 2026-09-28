@@ -1,3 +1,4 @@
+mod seed;
 mod simulate;
 
 use alloy_network::EthereumWallet;
@@ -11,7 +12,7 @@ use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_rpc_types::method::BlockTimingView;
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -224,6 +225,11 @@ enum Command {
     /// Continuously generate a weighted mix of entity operations against
     /// a running node, simulating live system traffic.
     Simulate(simulate::SimulateArgs),
+
+    /// Build a pre-populated block-0 state: a genesis JSON (or an
+    /// ethereum-package preload object, or a `reth init-state` dump) holding
+    /// thousands to millions of entities, indexed and queryable from block 0.
+    SeedGenesis(seed::SeedGenesisArgs),
 }
 
 /// The `$contentType` triple — a `str` attribute, since content type is a
@@ -880,6 +886,10 @@ async fn main() -> Result<()> {
     if let Command::InjectPredeploy { file, out } = &cli.command {
         return inject_predeploy(file, out.as_deref());
     }
+    // `seed-genesis` is offline too: it builds state, never talks to a node.
+    if let Command::SeedGenesis(args) = cli.command {
+        return seed::run(args);
+    }
 
     // `simulate` builds its own multi-signer provider; bypass the
     // single-signer setup below.
@@ -1037,6 +1047,7 @@ async fn main() -> Result<()> {
 
         Command::InjectPredeploy { .. } => unreachable!("handled at top of main"),
         Command::Simulate(_) => unreachable!("handled at top of main"),
+        Command::SeedGenesis(_) => unreachable!("handled at top of main"),
 
         Command::Batch { file } => {
             let json = std::fs::read_to_string(&file)

@@ -1,39 +1,20 @@
 //! The Arkiv chain specification.
 //!
-//! [`ArkivChainSpec`] is reth's stock [`ChainSpec`] with one protocol rule on top:
-//! **the base fee never drops below the genesis block's base fee.**
-//!
-//! ## Why a wrapper type
-//!
-//! Every consumer of the base fee in reth — the payload builder (`next_evm_env`),
-//! consensus (`validate_against_parent_eip1559_base_fee`), the transaction pool
-//! (its pending base fee on every new tip) and the `eth_*` RPC (`eth_gasPrice`,
-//! `eth_feeHistory`) — derives it through one trait method,
-//! [`EthChainSpec::next_block_base_fee`]. reth's concrete `ChainSpec` uses the
-//! trait's default body and offers no hook, and there is no genesis JSON field or
-//! CLI flag for a floor. So the rule lives in a newtype that overrides that one
-//! method and delegates everything else, the way reth's `custom-hardforks`
-//! example does it. Because all consumers share the method, they agree by
-//! construction; there is no second place to keep in sync.
-//!
-//! ## The rule
+//! [`ArkivChainSpec`] is reth's stock [`ChainSpec`] with one protocol rule on
+//! top: the base fee never drops below the genesis block's base fee.
 //!
 //! ```text
 //! next_base_fee = max(eip1559(parent), genesis.baseFeePerGas)
 //! ```
 //!
-//! The floor is whatever the genesis header carries: `baseFeePerGas` from the
-//! genesis JSON, or reth's default of 1 gwei when the field is absent (this is
-//! also what `--dev` gets). A genesis with `"baseFeePerGas": "0xa"` therefore
-//! floors the chain at 10 wei. Without the rule an idle chain decays by 12.5 %
-//! per block to the protocol minimum of 7 wei. Above the floor the fee behaves
-//! exactly as EIP-1559 prescribes, so congestion still prices it up and it decays
-//! back down to the floor, not below it.
+//! Every base-fee consumer in reth (payload builder, consensus, transaction pool
+//! and the `eth_*` RPC) derives it through [`EthChainSpec::next_block_base_fee`],
+//! so overriding that one method is enough; everything else delegates to the
+//! wrapped spec. The floor is read from the genesis header and is 0 when that
+//! header carries no base fee, which makes the rule inert.
 //!
-//! This is a consensus rule: a node without it rejects every block this rule
-//! produces (`BaseFeeDiff`), so every producer and watcher of a chain must run it.
-//! If London is not active at genesis the genesis header has no base fee and the
-//! rule is inert (floor 0).
+//! This is a consensus rule: a node without it rejects every block produced
+//! under it, so every node on the chain must run it.
 
 mod parser;
 
@@ -57,7 +38,7 @@ use reth_network_peers::NodeRecord;
 pub struct ArkivChainSpec {
     inner: ChainSpec,
     /// The genesis header's base fee, cached: the floor every later block's base
-    /// fee is clamped to. Zero when London is not active at genesis.
+    /// fee is clamped to. Zero when the genesis header carries no base fee.
     min_base_fee: u64,
 }
 
@@ -195,7 +176,8 @@ mod tests {
     use alloy_eips::eip1559::{INITIAL_BASE_FEE, MIN_PROTOCOL_BASE_FEE};
     use reth_ethereum::chainspec::DEV;
 
-    /// A London-at-genesis chain, with or without an explicit genesis base fee.
+    /// A genesis with EIP-1559 active from block 0, with or without an explicit
+    /// base fee.
     fn genesis(base_fee: Option<u128>) -> Genesis {
         let mut genesis: Genesis = serde_json::from_value(serde_json::json!({
             "config": {
@@ -307,7 +289,8 @@ mod tests {
     }
 
     #[test]
-    fn no_london_at_genesis_means_no_floor() {
+    fn no_genesis_base_fee_means_no_floor() {
+        // EIP-1559 not active at block 0: the genesis header has no base fee.
         let mut genesis = genesis(None);
         genesis.config.london_block = Some(100);
         let spec = ArkivChainSpec::from_genesis(genesis);
