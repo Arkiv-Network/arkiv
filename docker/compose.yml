@@ -47,8 +47,16 @@ services:
       - --http
       - --http.addr
       - 0.0.0.0
+      # Deliberately not listing `arkiv`: reth validates --http.api against its
+      # own namespace enum and rejects unknown names. The arkiv_* methods arrive
+      # via `merge_configured` in main.rs, which bypasses this allowlist — which
+      # is also why the Kurtosis args file never sets --http.api either.
       - --http.api
-      - eth,net,web3,arkiv
+      - eth,net,web3
+      # CI sets ARKIV_LOG_FILTER=debug so a failure shows what the node was
+      # doing; locally `info` keeps the console readable.
+      - --log.stdout.filter
+      - ${ARKIV_LOG_FILTER:-info}
     volumes:
       - node-data:/data
     healthcheck:

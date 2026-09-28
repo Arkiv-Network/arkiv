@@ -32,40 +32,40 @@ use super::*;
 /// Run every [`Store`] assertion against stores built by `new_store`.
 ///
 /// Panics on the first violation, naming the rule that broke.
-pub fn run_all<S: Store>(new_store: &dyn Fn() -> S) {
-    genesis_head_is_zero(new_store);
-    create_then_read_on_branch(new_store);
-    read_your_own_writes(new_store);
-    absent_record_reads_none(new_store);
-    create_collision_is_already_exists(new_store);
-    commit_advances_head(new_store);
-    committed_state_is_readable_at_commit(new_store);
-    uncommitted_writes_invisible_to_origin_commit(new_store);
-    fork_isolates_child_writes(new_store);
-    discard_drops_child_writes(new_store);
-    merge_folds_child_into_parent(new_store);
-    merge_guard_fires_when_parent_advanced(new_store);
-    commit_guard_fires_when_origin_not_head(new_store);
-    consumed_handle_is_invalid(new_store);
-    child_branch_cannot_commit(new_store);
-    concurrent_root_branches_are_independent(new_store);
-    patch_bumps_record_version(new_store);
-    patch_version_guard_rejects_stale_reader(new_store);
-    zero_version_guard_never_matches(new_store);
-    patch_may_not_remove_last_cell(new_store);
-    delete_removes_record(new_store);
-    reserved_cell_name_rejected(new_store);
-    field_only_type_cannot_be_attribute(new_store);
-    invalid_type_id_rejected(new_store);
-    branch_hash_ignores_record_version(new_store);
-    branch_hash_tracks_content(new_store);
-    query_sees_committed_state(new_store);
-    query_dnf_unions_and_dedups(new_store);
-    query_defaults_to_key_order(new_store);
-    query_range_on_eq_only_type_is_invalid(new_store);
-    genesis_lands_as_the_first_commit(new_store);
-    genesis_refuses_to_apply_twice(new_store);
-    genesis_is_readable_at_its_commit(new_store);
+pub fn run_all<S: Store>(store: &dyn Fn() -> S) {
+    fresh_backing_store_at_commit_zero(store);
+    create_then_read_on_branch(store);
+    read_your_own_writes(store);
+    absent_record_reads_none(store);
+    create_collision_is_already_exists(store);
+    commit_advances_head(store);
+    committed_state_is_readable_at_commit(store);
+    uncommitted_writes_invisible_to_origin_commit(store);
+    fork_isolates_child_writes(store);
+    discard_drops_child_writes(store);
+    merge_folds_child_into_parent(store);
+    merge_guard_fires_when_parent_advanced(store);
+    commit_guard_fires_when_origin_not_head(store);
+    consumed_handle_is_invalid(store);
+    child_branch_cannot_commit(store);
+    concurrent_root_branches_are_independent(store);
+    patch_bumps_record_version(store);
+    patch_version_guard_rejects_stale_reader(store);
+    zero_version_guard_never_matches(store);
+    patch_may_not_remove_last_cell(store);
+    delete_removes_record(store);
+    reserved_cell_name_rejected(store);
+    field_only_type_cannot_be_attribute(store);
+    invalid_type_id_rejected(store);
+    branch_hash_ignores_record_version(store);
+    branch_hash_tracks_content(store);
+    query_sees_committed_state(store);
+    query_dnf_unions_and_dedups(store);
+    query_defaults_to_key_order(store);
+    query_range_on_eq_only_type_is_invalid(store);
+    genesis_lands_as_the_first_commit(store);
+    genesis_refuses_to_apply_twice(store);
+    genesis_is_readable_at_its_commit(store);
 }
 
 /// Run every [`StoreExt`] assertion against stores built by `new_store`.
@@ -156,7 +156,7 @@ fn set_cell(name: &str, cell: Cell) -> Vec<(CellName, CellChange)> {
 // ---------------------------------------------------------------------------
 
 /// A fresh store is at genesis: commit 0, empty state.
-fn genesis_head_is_zero<S: Store>(new_store: &dyn Fn() -> S) {
+fn fresh_backing_store_at_commit_zero<S: Store>(new_store: &dyn Fn() -> S) {
     assert_eq!(new_store().head(), CommitId::GENESIS);
 }
 

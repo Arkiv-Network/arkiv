@@ -1,0 +1,171 @@
+# Single-node docker stack smoke test.
+#
+# The cheap counterpart to `kurtosis`: no consensus layer, no second node, no
+# enclave — one auto-sealing `--dev` node plus the Valkey that arkiv-valkey's
+# conformance suite needs. It proves `docker/compose.yml` and
+# `check.py --no-enclave` actually work, which the Kurtosis lane does not cover.
+#
+# Called by `pr-artifact` once the binaries exist, so it packages that
+# `arkiv-reth` rather than recompiling the reth tree inside BuildKit. Dispatched
+# on its own it builds from source, which is slow but self-contained.
+#
+# Everything runs verbose on purpose: `set -x` on each step, the node at debug,
+# and container logs dumped whether or not the run passed. A smoke test you
+# cannot read is a smoke test you will not trust.
+name: docker-stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      log_filter:
+        description: "Node stdout log filter"
+        required: false
+        default: "debug"
+        type: string
+  workflow_call:
+    inputs:
+      artifact:
+        description: "Artifact holding a prebuilt arkiv-reth; empty builds from source"
+        required: false
+        default: ""
+        type: string
+      log_filter:
+        description: "Node stdout log filter"
+        required: false
+        default: "debug"
+        type: string
+
+jobs:
+  single-node-smoke:
+    name: single node + valkey
+    runs-on: ubuntu-latest
+    # Packaging a prebuilt binary is a couple of minutes; a from-source dispatch
+    # compiles reth, so the timeout has to cover the slow path.
+    timeout-minutes: 120
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+      ARTIFACT: ${{ inputs.artifact }}
+      ARKIV_LOG_FILTER: ${{ inputs.log_filter || 'debug' }}
+      COMPOSE: docker/compose.yml
+      VALKEY_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch the prebuilt arkiv-reth
+        if: inputs.artifact != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: prebuilt
+
+      # Only the from-source path compiles anything on the runner.
+      - name: Install native build dependencies
+        if: inputs.artifact == ''
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        if: inputs.artifact == ''
+
+      - name: Verify CI runtime
+        run: |
+          set -euxo pipefail
+          docker --version
+          docker compose version
+          python3 --version
+
+      # Same two paths as scripts/kurtosis/up.py, and the same image tag the
+      # compose file expects.
+      - name: Build the arkiv-reth:dev image
+        run: |
+          set -euxo pipefail
+          if [ -n "$ARTIFACT" ]; then
+            chmod +x prebuilt/arkiv-reth
+            docker build -t arkiv-reth:dev \
+              -f docker/arkiv-reth-prebuilt.Dockerfile \
+              prebuilt
+          else
+            docker buildx build -t arkiv-reth:dev \
+              -f docker/arkiv-reth.Dockerfile \
+              --build-arg CARGO_BUILD_JOBS=2 \
+              --load .
+          fi
+          docker image inspect arkiv-reth:dev --format '{{.Id}} {{.Size}} bytes'
+
+      - name: Bring up the stack
+        run: |
+          set -euxo pipefail
+          # --wait blocks on both healthchecks, so a failure here means a
+          # container never became healthy rather than a race in a later step.
+          docker compose -f "$COMPOSE" up -d --wait
+          docker compose -f "$COMPOSE" ps
+
+      # The node's own startup logs, before anything else touches it: this is
+      # where a bad genesis or a refused flag shows up.
+      - name: Node startup logs
+        run: docker compose -f "$COMPOSE" logs --no-color arkiv-reth
+
+      - name: Check the node is producing blocks
+        run: |
+          set -euxo pipefail
+          # No --follower-rpc: one node, so the cross-node agreement checks are
+          # skipped and this verifies RPC reachability and block production.
+          python3 scripts/kurtosis/check.py \
+            --no-enclave \
+            --sequencer-rpc http://127.0.0.1:8545 \
+            --wait 60 \
+            --samples 3 \
+            --no-color
+
+      - name: Show a block and the arkiv_* namespace
+        run: |
+          set -euxo pipefail
+          rpc() {
+            curl -sS -X POST http://127.0.0.1:8545 \
+              -H 'content-type: application/json' \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}"
+          }
+          rpc eth_blockNumber '[]'
+          rpc eth_getBlockByNumber '["latest",false]'
+          # Proves the arkiv_* namespace is actually served, not just enabled:
+          # a count is the cheapest call that touches the index.
+          rpc arkiv_getEntityCount '[{}]'
+
+      # arkiv-valkey pulls in neither reth nor the Solidity bindings, so this
+      # compiles a handful of crates rather than the workspace.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-stack
+
+      - name: Run the arkiv-valkey conformance suite against the stack
+        run: |
+          set -euxo pipefail
+          # Same suite rust.yml runs against a service container; here it runs
+          # against the compose Valkey, which also proves the compose service is
+          # reachable from the runner.
+          cargo test -p arkiv-valkey --locked -- --ignored --nocapture
+
+      # Unconditional, and after the tests: the point is to see what happened,
+      # not only to debug failures.
+      - name: Container logs
+        if: always()
+        run: |
+          set +e
+          echo '--- compose ps ---'
+          docker compose -f "$COMPOSE" ps -a
+          echo '--- arkiv-reth ---'
+          docker compose -f "$COMPOSE" logs --no-color --tail 400 arkiv-reth
+          echo '--- valkey ---'
+          docker compose -f "$COMPOSE" logs --no-color --tail 100 valkey
+          echo '--- valkey keyspace (should be empty: ephemeral stores erase on drop) ---'
+          docker compose -f "$COMPOSE" exec -T valkey valkey-cli --scan --pattern 'arkiv-test:*' | head -50
+          docker compose -f "$COMPOSE" exec -T valkey valkey-cli dbsize
+
+      - name: Tear down
+        if: always()
+        run: |
+          set +e
+          docker compose -f "$COMPOSE" down -v
