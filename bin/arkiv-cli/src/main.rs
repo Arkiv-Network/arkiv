@@ -12,7 +12,7 @@ use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 use arkiv_rpc_types::method::BlockTimingView;
 use clap::{Parser, Subcommand};
 use eyre::{Result, bail};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::PathBuf;
