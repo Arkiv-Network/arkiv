@@ -65,7 +65,17 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
     genesis_is_readable_at_its_commit(store_generator);
-    // We should have a test where CommitID(1) should be either empty or contain the genesis record, but not both.
+    genesis_is_all_or_nothing(store_generator);
+    block_lifecycle_at_depth_three(store_generator);
+    discard_drops_descendants(store_generator);
+    branch_reads_its_origin_not_the_head(store_generator);
+    projection_limits_returned_cells(store_generator);
+    query_and_group_intersects_predicates(store_generator);
+    query_negated_predicate_excludes_matches(store_generator);
+    query_pages_with_offset_and_limit(store_generator);
+    query_reports_total_matched_beyond_the_page(store_generator);
+    query_sorts_ascending_and_descending(store_generator);
+    query_sort_puts_records_without_the_cell_last(store_generator);
 }
 
 /// Run every [`StoreExt`] assertion against stores built by `new_store`.
@@ -892,6 +902,387 @@ fn genesis_is_readable_at_its_commit<S: Store>(store_generator: &dyn Fn() -> S) 
     assert!(
         read_record(&store, ReadTarget::Commit(CommitId::GENESIS), record_key(1)).is_none(),
         "commit 0 is the empty state"
+    );
+}
+
+/// A genesis that fails part-way leaves **nothing** behind: head stays at the
+/// empty commit, and no record from the accepted prefix is readable.
+///
+/// Without this, a rejected allocation could leave a half-populated commit 1
+/// that is neither empty nor genesis — and since `apply_genesis` refuses once
+/// `head != 0`, the chain could never be repaired.
+fn genesis_is_all_or_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let outcome = super::apply_genesis(
+        &mut store,
+        vec![
+            (record_key(1), cell_map(&[("balance", u64_attribute(100))])),
+            // `#` is reserved, so this entry is refused — after the first was
+            // already staged.
+            (record_key(2), cell_map(&[("#version", u64_attribute(1))])),
+        ],
+    );
+
+    assert_eq!(outcome.unwrap_err(), StoreError::InvalidArgument);
+    assert_eq!(
+        store.head(),
+        CommitId::GENESIS,
+        "a failed genesis commits nothing"
+    );
+    assert!(
+        read_record(&store, ReadTarget::Commit(CommitId::GENESIS), record_key(1)).is_none(),
+        "not even the entries that were accepted before the failure"
+    );
+}
+
+/// The block lifecycle the blockchain profile specifies, end to end: a block
+/// branch, a transaction frame per transaction, and an op-batch frame inside
+/// each one.
+///
+/// This is the assertion that matters most, because it is the only sequence
+/// Arkiv actually runs. The load-bearing rule is the **two rollback scopes**: a
+/// reverted transaction loses its entity ops but keeps its fee accounting, so
+/// the op frame is discarded while the transaction frame is merged either way.
+fn block_lifecycle_at_depth_three<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let block = store.begin(None).unwrap();
+
+    // Transaction one succeeds: fee frame and op frame both land.
+    let succeeding = store.fork(block).unwrap();
+    create_record(
+        &mut store,
+        succeeding,
+        record_key(1),
+        &[("fee", u64_attribute(21))],
+    );
+    let ops = store.fork(succeeding).unwrap();
+    create_record(
+        &mut store,
+        ops,
+        record_key(10),
+        &[("entity", u64_attribute(1))],
+    );
+    store.merge(ops).unwrap();
+    store.merge(succeeding).unwrap();
+
+    // Transaction two reverts: the op frame is discarded, the fee frame is
+    // merged regardless.
+    let reverting = store.fork(block).unwrap();
+    create_record(
+        &mut store,
+        reverting,
+        record_key(2),
+        &[("fee", u64_attribute(21))],
+    );
+    let doomed = store.fork(reverting).unwrap();
+    create_record(
+        &mut store,
+        doomed,
+        record_key(20),
+        &[("entity", u64_attribute(2))],
+    );
+    store.discard(doomed).unwrap();
+    store.merge(reverting).unwrap();
+
+    let committed = store.commit(block).unwrap();
+    let present = |key| read_record(&store, ReadTarget::Commit(committed), key).is_some();
+
+    assert!(present(record_key(1)), "the successful tx's fee");
+    assert!(present(record_key(10)), "and its entity writes");
+    assert!(
+        present(record_key(2)),
+        "the reverted tx still paid: fee accounting survives failure"
+    );
+    assert!(
+        !present(record_key(20)),
+        "but its entity writes were discarded"
+    );
+}
+
+/// Discarding a branch takes its open descendants with it: they are grounded on
+/// a handle that no longer exists, so continuing to use them would read from a
+/// parent that is gone.
+fn discard_drops_descendants<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let block = store.begin(None).unwrap();
+    let transaction = store.fork(block).unwrap();
+    let ops = store.fork(transaction).unwrap();
+
+    store.discard(transaction).unwrap();
+
+    assert_eq!(
+        store.branch_info(ops).unwrap_err(),
+        StoreError::HandleInvalid,
+        "the grandchild went with its parent"
+    );
+    assert!(
+        store.branch_info(block).is_ok(),
+        "but the grandparent is untouched"
+    );
+}
+
+/// A branch reads the commit it was opened on, not whatever head has since
+/// become — which is what makes a branch a stable base for simulation while
+/// the chain advances underneath it.
+fn branch_reads_its_origin_not_the_head<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+
+    let first = store.begin(None).unwrap();
+    create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
+    let origin = store.commit(first).unwrap();
+
+    // Opened on `origin`, and held open while the chain moves on.
+    let held = store.begin(None).unwrap();
+
+    let second = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        second,
+        record_key(2),
+        &[("n", u64_attribute(2))],
+    );
+    let newer = store.commit(second).unwrap();
+    assert_ne!(newer, origin, "head advanced past the held branch's origin");
+
+    assert!(
+        read_record(&store, ReadTarget::Branch(held), record_key(1)).is_some(),
+        "the held branch still sees its origin's state"
+    );
+    assert!(
+        read_record(&store, ReadTarget::Branch(held), record_key(2)).is_none(),
+        "and does not see a commit made after it was opened"
+    );
+}
+
+/// A projection returns only the named cells. The record's key and version are
+/// always present — they identify it, they are not content.
+fn projection_limits_returned_cells<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("wanted", u64_attribute(1)), ("unwanted", u64_attribute(2))],
+    );
+
+    let projected = store
+        .get(
+            ReadTarget::Branch(branch),
+            record_key(1),
+            Some(&["wanted".to_string()]),
+            None,
+        )
+        .unwrap()
+        .into_value()
+        .expect("the record is present");
+
+    assert_eq!(projected.key, record_key(1));
+    assert_eq!(projected.cell("wanted"), Some(&u64_attribute(1)));
+    assert_eq!(projected.cell("unwanted"), None, "projected away");
+}
+
+// ---------------------------------------------------------------------------
+// query: grouping, paging, ordering
+// ---------------------------------------------------------------------------
+
+/// Build a committed three-record fixture: keys 1..=3, `kind` and `n` cells.
+fn committed_fixture<S: Store>(store: &mut S) -> CommitId {
+    let branch = store.begin(None).unwrap();
+    for (ordinal, kind) in [(1u8, "a"), (2, "a"), (3, "b")] {
+        create_record(
+            store,
+            branch,
+            record_key(ordinal),
+            &[
+                ("kind", str_attribute(kind)),
+                ("n", u64_attribute(u64::from(ordinal))),
+            ],
+        );
+    }
+    store.commit(branch).unwrap()
+}
+
+fn paged_query(filter: Filter, offset: u64, limit: u64) -> Query {
+    Query {
+        filter,
+        page: Page { offset, limit },
+        ..Query::default()
+    }
+}
+
+fn matched_keys<S: Store>(store: &S, at: CommitId, query: &Query) -> Vec<RecordKey> {
+    store
+        .query(Some(at), query, None)
+        .unwrap()
+        .into_value()
+        .records
+        .iter()
+        .map(|record| record.key)
+        .collect()
+}
+
+/// Predicates inside one AND-group intersect: a record must satisfy all of
+/// them, not merely one.
+fn query_and_group_intersects_predicates<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+
+    let both = Filter(vec![AndGroup(vec![
+        Predicate {
+            cell: "kind".to_string(),
+            op: CompareOp::Eq,
+            type_id: TypeId::STR,
+            value: b"a".to_vec(),
+            negated: false,
+        },
+        Predicate {
+            cell: "n".to_string(),
+            op: CompareOp::Eq,
+            type_id: TypeId::U64,
+            value: 2u64.to_be_bytes().to_vec(),
+            negated: false,
+        },
+    ])]);
+
+    assert_eq!(
+        matched_keys(&store, at, &paged_query(both, 0, 10)),
+        vec![record_key(2)],
+        "only the record satisfying both predicates"
+    );
+}
+
+/// A negated predicate matches the records the predicate does not.
+fn query_negated_predicate_excludes_matches<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+
+    let not_a = Filter(vec![AndGroup(vec![Predicate {
+        cell: "kind".to_string(),
+        op: CompareOp::Eq,
+        type_id: TypeId::STR,
+        value: b"a".to_vec(),
+        negated: true,
+    }])]);
+
+    assert_eq!(
+        matched_keys(&store, at, &paged_query(not_a, 0, 10)),
+        vec![record_key(3)],
+        "the one record whose kind is not `a`"
+    );
+}
+
+/// `offset` skips and `limit` truncates, over the result order.
+fn query_pages_with_offset_and_limit<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+    let all = || Filter::default();
+
+    assert_eq!(
+        matched_keys(&store, at, &paged_query(all(), 0, 2)),
+        vec![record_key(1), record_key(2)],
+        "limit truncates"
+    );
+    assert_eq!(
+        matched_keys(&store, at, &paged_query(all(), 1, 1)),
+        vec![record_key(2)],
+        "offset skips"
+    );
+    assert!(
+        matched_keys(&store, at, &paged_query(all(), 99, 10)).is_empty(),
+        "an offset past the end is an empty page, not an error"
+    );
+}
+
+/// `total_matched` counts the whole match, not the page — so a caller can page
+/// without losing the size of what it is paging through.
+fn query_reports_total_matched_beyond_the_page<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+
+    let counted = Query {
+        total_matched: true,
+        ..paged_query(Filter::default(), 0, 1)
+    };
+    let result = store.query(Some(at), &counted, None).unwrap().into_value();
+
+    assert_eq!(result.records.len(), 1, "one record on the page");
+    assert_eq!(result.total_matched, Some(3), "three in the match");
+
+    let uncounted = paged_query(Filter::default(), 0, 1);
+    assert_eq!(
+        store
+            .query(Some(at), &uncounted, None)
+            .unwrap()
+            .into_value()
+            .total_matched,
+        None,
+        "and it is absent unless asked for"
+    );
+}
+
+/// Sorting orders by a cell in either direction.
+fn query_sorts_ascending_and_descending<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+
+    let sorted = |direction| Query {
+        sort: Some(Sort {
+            cell: "n".to_string(),
+            direction,
+        }),
+        ..paged_query(Filter::default(), 0, 10)
+    };
+
+    assert_eq!(
+        matched_keys(&store, at, &sorted(SortDirection::Ascending)),
+        vec![record_key(1), record_key(2), record_key(3)]
+    );
+    assert_eq!(
+        matched_keys(&store, at, &sorted(SortDirection::Descending)),
+        vec![record_key(3), record_key(2), record_key(1)]
+    );
+}
+
+/// A record lacking the sort cell sorts last, and ties break on key order — so
+/// the ordering is total and two implementations agreeing on the match set also
+/// agree on the page.
+fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    // Two records share a sort value, and one has no sort cell at all.
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
+    create_record(
+        &mut store,
+        branch,
+        record_key(2),
+        &[("n", u64_attribute(1))],
+    );
+    create_record(
+        &mut store,
+        branch,
+        record_key(3),
+        &[("other", u64_attribute(9))],
+    );
+    let at = store.commit(branch).unwrap();
+
+    let query = Query {
+        sort: Some(Sort {
+            cell: "n".to_string(),
+            direction: SortDirection::Ascending,
+        }),
+        ..paged_query(Filter::default(), 0, 10)
+    };
+
+    assert_eq!(
+        matched_keys(&store, at, &query),
+        vec![record_key(1), record_key(2), record_key(3)],
+        "tie broken by key, and the record without the cell last"
     );
 }
 
