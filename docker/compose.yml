@@ -1,0 +1,64 @@
+# A single-node dev stack: one auto-sealing arkiv-reth, plus the Valkey that
+# arkiv-valkey's conformance suite needs.
+#
+#   docker buildx build -t arkiv-reth:dev -f docker/arkiv-reth.Dockerfile .
+#   docker compose -f docker/compose.yml up -d --wait
+#   scripts/kurtosis/check.py --no-enclave --sequencer-rpc http://127.0.0.1:8545
+#   VALKEY_URL=redis://127.0.0.1:6379 cargo test -p arkiv-valkey -- --ignored
+#   docker compose -f docker/compose.yml down -v
+#
+# The node does NOT talk to Valkey. Nothing wires arkiv-valkey into arkiv-reth
+# yet — that is the arkiv-statemanager work. These two share a compose file
+# because they share one `up`, not because they are connected.
+#
+# For a real two-node network with a consensus layer, use Kurtosis
+# (scripts/kurtosis/up.py). This is for a node you can poke at and a Valkey you
+# can test against, without the enclave.
+
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    # No persistence: every run starts from an empty keyspace. The conformance
+    # suite namespaces itself and erases its namespace on drop, so this is only
+    # belt-and-braces against a crashed run.
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  arkiv-reth:
+    # Built by scripts/kurtosis/up.py, or by hand with the buildx line above.
+    image: arkiv-reth:dev
+    ports:
+      - "8545:8545"
+    command:
+      - node
+      - --dev
+      # Without a block time, --dev seals only when a transaction arrives, and
+      # a health check that waits for block production would hang forever.
+      - --dev.block-time
+      - 2s
+      - --datadir
+      - /data
+      - --http
+      - --http.addr
+      - 0.0.0.0
+      - --http.api
+      - eth,net,web3,arkiv
+    volumes:
+      - node-data:/data
+    healthcheck:
+      # The image is debian-slim with no curl, so this opens the RPC port over
+      # bash's /dev/tcp rather than speaking HTTP. Port open is enough to gate
+      # `up --wait`; scripts/node-check.py does the real verification.
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/8545'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  node-data:

@@ -62,6 +62,9 @@ use crate::keys::Namespace;
 pub struct ValkeyStore {
     bridge: Bridge,
     backend: Backend,
+    /// Whether dropping this store should erase its namespace — true only for
+    /// [`ephemeral`](Self::ephemeral). See the [`Drop`] impl.
+    owns_namespace: bool,
 }
 
 impl ValkeyStore {
@@ -85,16 +88,18 @@ impl ValkeyStore {
         let store = Self {
             bridge,
             backend: Backend::new(client, namespace),
+            owns_namespace: false,
         };
         store.clear_branches()?;
         Ok(store)
     }
 
-    /// Connect to a namespace nothing else is using.
+    /// Connect to a namespace nothing else is using, and **erase it on drop**.
     ///
     /// For tests: each call gets a fresh, empty state on a shared server, so
-    /// conformance assertions cannot see one another's writes. Pair it with
-    /// [`drop_namespace`](Self::drop_namespace) to leave the server clean.
+    /// assertions cannot see one another's writes, and none of them leave
+    /// anything behind. The conformance suite builds a store per assertion, so
+    /// without the drop a single run would leave dozens of dead namespaces.
     pub fn ephemeral(url: &str) -> Result<Self, StoreError> {
         // Wall-clock nanos plus the process id: unique enough for tests on one
         // machine, and it needs no dependency.
@@ -102,7 +107,9 @@ impl ValkeyStore {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| StoreError::Internal)?
             .as_nanos();
-        Self::connect(url, &format!("arkiv-test:{}:{nanos}", std::process::id()))
+        let mut store = Self::connect(url, &format!("arkiv-test:{}:{nanos}", std::process::id()))?;
+        store.owns_namespace = true;
+        Ok(store)
     }
 
     /// Delete every key in this store's namespace.
@@ -140,6 +147,20 @@ impl ValkeyStore {
         T: Send + 'static,
     {
         self.bridge.run(operation(self.backend.clone()))
+    }
+}
+
+impl Drop for ValkeyStore {
+    /// Erase the namespace, but only for [`ephemeral`](ValkeyStore::ephemeral).
+    ///
+    /// A [`connect`](ValkeyStore::connect) namespace holds the caller's data —
+    /// a node's committed state — and wiping that on shutdown would be a
+    /// catastrophe, not a cleanup. Errors are swallowed: a drop cannot report,
+    /// and a failed teardown leaves junk rather than corruption.
+    fn drop(&mut self) {
+        if self.owns_namespace {
+            let _ = self.drop_namespace();
+        }
     }
 }
 

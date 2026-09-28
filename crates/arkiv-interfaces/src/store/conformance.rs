@@ -63,6 +63,9 @@ pub fn run_all<S: Store>(new_store: &dyn Fn() -> S) {
     query_dnf_unions_and_dedups(new_store);
     query_defaults_to_key_order(new_store);
     query_range_on_eq_only_type_is_invalid(new_store);
+    genesis_lands_as_the_first_commit(new_store);
+    genesis_refuses_to_apply_twice(new_store);
+    genesis_is_readable_at_its_commit(new_store);
 }
 
 /// Run every [`StoreExt`] assertion against stores built by `new_store`.
@@ -849,6 +852,63 @@ fn query_range_on_eq_only_type_is_invalid<S: Store>(new_store: &dyn Fn() -> S) {
         store.count(Some(committed), &filter, None).unwrap_err(),
         StoreError::InvalidQuery,
         "bytes32 indexes equality only"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// genesis
+// ---------------------------------------------------------------------------
+
+/// The allocation lands as commit 1, leaving commit 0 the empty state — so
+/// `head() >= 1` is the "genesis applied" marker, and block `n` is commit
+/// `n + 1`.
+fn genesis_lands_as_the_first_commit<S: Store>(new_store: &dyn Fn() -> S) {
+    let mut store = new_store();
+    let committed = super::apply_genesis(
+        &mut store,
+        vec![(record_key(1), cell_map(&[("balance", u64_attribute(100))]))],
+    )
+    .expect("genesis applies to an empty store");
+
+    assert_eq!(committed, CommitId::CHAIN_GENESIS);
+    assert_eq!(store.head(), CommitId::CHAIN_GENESIS);
+}
+
+/// Applying genesis over live state is refused, so a restart cannot overwrite
+/// the chain it is restarting.
+fn genesis_refuses_to_apply_twice<S: Store>(new_store: &dyn Fn() -> S) {
+    let mut store = new_store();
+    let allocation = || vec![(record_key(1), cell_map(&[("balance", u64_attribute(100))]))];
+
+    super::apply_genesis(&mut store, allocation()).expect("the first apply succeeds");
+    assert_eq!(
+        super::apply_genesis(&mut store, allocation()).unwrap_err(),
+        StoreError::AlreadyExists,
+        "genesis is applied once or not at all"
+    );
+    assert_eq!(store.head(), CommitId::CHAIN_GENESIS, "and nothing moved");
+}
+
+/// Genesis records are ordinary committed state: readable at commit 1, absent
+/// from the empty commit 0.
+fn genesis_is_readable_at_its_commit<S: Store>(new_store: &dyn Fn() -> S) {
+    let mut store = new_store();
+    super::apply_genesis(
+        &mut store,
+        vec![(record_key(1), cell_map(&[("balance", u64_attribute(100))]))],
+    )
+    .expect("genesis applies");
+
+    let found = read_record(
+        &store,
+        ReadTarget::Commit(CommitId::CHAIN_GENESIS),
+        record_key(1),
+    )
+    .expect("the genesis record is present at commit 1");
+    assert_eq!(found.cell("balance"), Some(&u64_attribute(100)));
+    assert!(
+        read_record(&store, ReadTarget::Commit(CommitId::GENESIS), record_key(1)).is_none(),
+        "commit 0 is the empty state"
     );
 }
 

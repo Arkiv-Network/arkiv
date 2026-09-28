@@ -58,8 +58,22 @@ use core::fmt::Debug;
 pub struct CommitId(pub u64);
 
 impl CommitId {
-    /// The empty state, before any commit.
+    /// The **empty** state, before any commit. Note that this is not the chain's
+    /// genesis *block*: see [`CHAIN_GENESIS`](Self::CHAIN_GENESIS).
     pub const GENESIS: Self = Self(0);
+
+    /// The commit holding the chain's genesis allocation — prefunded accounts,
+    /// and any seeded entities.
+    ///
+    /// Arkiv's genesis block is not empty, but commit 0 is, so the allocation
+    /// lands as the first ordinary commit and `head() >= 1` *is* the
+    /// "genesis applied" marker. No separate flag exists, and none is needed.
+    ///
+    /// The consequence to keep in mind: **commit ids run one ahead of block
+    /// heights**, so block `n` is commit `n + 1`. That is the price of leaving
+    /// commit 0 empty, and it is paid deliberately — see
+    /// [`apply_genesis`].
+    pub const CHAIN_GENESIS: Self = Self(1);
 }
 
 /// A handle to one open branch. Store-assigned, monotonic per instance run,
@@ -769,6 +783,42 @@ pub enum WriteOutcome {
     Created,
     Patched(RecordVersion),
     Deleted,
+}
+
+// ---------------------------------------------------------------------------
+// Genesis
+// ---------------------------------------------------------------------------
+
+/// Write the chain's genesis allocation as [`CommitId::CHAIN_GENESIS`].
+///
+/// Genesis is not special to the store — it is the first ordinary commit — so
+/// this is `begin` / `create` / `commit` and nothing more. It lives here rather
+/// than on [`Store`] so every backend gets it for free and none can implement
+/// it differently.
+///
+/// Refuses with [`StoreError::AlreadyExists`] unless the store is empty, which
+/// is what makes it safe to call on every start-up: a node cannot half-apply
+/// genesis, and cannot apply it twice over live state. `head() >= 1` afterwards
+/// is the only "genesis applied" marker there is.
+pub fn apply_genesis<S: Store>(
+    store: &mut S,
+    records: Vec<(RecordKey, Vec<(CellName, Cell)>)>,
+) -> Result<CommitId, StoreError> {
+    if store.head() != CommitId::GENESIS {
+        return Err(StoreError::AlreadyExists);
+    }
+
+    let branch = store.begin(None)?;
+    for (key, cells) in records {
+        // Unbudgeted: genesis is not a metered transaction, it is the state
+        // every metered transaction starts from.
+        if let Err(error) = store.create(branch, key, cells, None) {
+            // Leave nothing half-written for the next start-up to puzzle over.
+            let _ = store.discard(branch);
+            return Err(error);
+        }
+    }
+    store.commit(branch)
 }
 
 // ---------------------------------------------------------------------------
