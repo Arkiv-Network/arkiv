@@ -77,6 +77,19 @@ CI runs three workflows:
 
 Enable the local pre-commit hook with `pip install pre-commit && pre-commit install` — black then runs on staged Python before each commit.
 
+### Dev container (optional)
+
+`.devcontainer/` holds a light container with the pinned Rust toolchain and the
+system packages the workspace build needs. Open the repo in VS Code and choose
+**Reopen in Container**; native setups are unaffected. Build output and the
+cargo caches live on named Docker volumes, so rebuilding the container keeps
+them. The container has no Docker access, so Kurtosis runs stay on the host.
+
+```sh
+# The store conformance suite against the in-memory reference store
+cargo test -p arkiv-interfaces --features conformance conformance
+```
+
 ## Releasing
 
 Every merged commit on `main` is pushed to GHCR automatically as
