@@ -29,7 +29,7 @@
     "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=lld"
   },
   // New volumes are created root-owned; hand them to the container user.
-  "postCreateCommand": "sudo chown -R vscode:vscode target /usr/local/cargo/registry /usr/local/cargo/git /home/vscode/.claude && cargo --version",
+  "postCreateCommand": "for dir in target /usr/local/cargo/registry /usr/local/cargo/git /home/vscode/.claude; do if [ \"$(stat -c %U \"$dir\")\" != vscode ]; then sudo chown -R vscode:vscode \"$dir\" || exit 1; fi; done && cargo --version",
 
   "customizations": {
     "vscode": {
