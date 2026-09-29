@@ -86,8 +86,8 @@ cargo caches live on named Docker volumes, so rebuilding the container keeps
 them. The container has no Docker access, so Kurtosis runs stay on the host.
 
 ```sh
-# The store conformance suite against the in-memory reference store
-cargo test -p arkiv-interfaces --features conformance conformance
+# Run the arkiv-interfaces unit tests
+cargo test -p arkiv-interfaces
 ```
 
 ## Releasing
