@@ -10,6 +10,7 @@ pub mod entity;
 pub mod entity_records;
 pub mod execution;
 pub mod gas;
+pub mod keys;
 pub mod primitives;
 pub mod query;
 pub mod rpc;
