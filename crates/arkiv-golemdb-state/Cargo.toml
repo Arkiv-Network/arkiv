@@ -11,8 +11,6 @@ license.workspace = true
 
 [dependencies]
 arkiv-interfaces.workspace = true
-# keccak only. `default-features = false` keeps this crate `no_std`.
-alloy-primitives = { version = "1.6", default-features = false }
 
 [dev-dependencies]
 arkiv-interfaces = { workspace = true, features = ["conformance"] }

@@ -1491,7 +1491,6 @@ dependencies = [
 name = "arkiv-golemdb-state"
 version = "0.5.1"
 dependencies = [
- "alloy-primitives",
  "arkiv-interfaces",
 ]
 
