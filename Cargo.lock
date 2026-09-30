@@ -1492,6 +1492,7 @@ name = "arkiv-golemdb-state"
 version = "0.5.1"
 dependencies = [
  "arkiv-interfaces",
+ "arkiv-reth-uncommitted-store",
 ]
 
 [[package]]

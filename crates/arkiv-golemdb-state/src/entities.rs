@@ -9,20 +9,19 @@
 //!
 //! # The commitment
 //!
-//! [`StoreEntities::commit`] is `Store::branch_digest`, unchanged. That value becomes
+//! [`GolemStateView::digest`] is `Store::branch_digest`, unchanged. That value becomes
 //! the block's state root, which is the whole reason entities are laid out by
 //! [`entity_records`] — a spec-level mapping — rather than by this crate.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::entity_records::{self, RecordError};
 use arkiv_interfaces::primitives::EntityAddress;
-use arkiv_interfaces::statemanager::{Commitment, EntityUpdates, ReadMode};
-use arkiv_interfaces::store::{
-    BranchId, CellChange, CellName, CommitId, ReadTarget, Store, StoreError,
-};
+use arkiv_interfaces::statemanager::{Commitment, EntityStore, EntityUpdates, ReadMode};
+use arkiv_interfaces::store::{CellChange, CellName, Store, StoreError};
+
+use crate::view::{GolemStateView, ViewError};
 
 /// Why an entity operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,45 +84,9 @@ fn merge(base: &mut EntityUpdates, next: EntityUpdates) {
     }
 }
 
-/// Arkiv's entity store over a GolemDB [`Store`].
-#[derive(Debug)]
-pub struct StoreEntities<S: Store> {
-    store: S,
-    branch: BranchId,
-    origin: CommitId,
-    /// Net-against-base changes, ordered by entity — the order the trait promises.
-    staged: BTreeMap<EntityAddress, EntityUpdates>,
-}
-
-impl<S: Store> StoreEntities<S> {
-    /// Stage writes on `branch`, whose base state is the commit `origin`.
-    pub const fn new(store: S, branch: BranchId, origin: CommitId) -> Self {
-        Self {
-            store,
-            branch,
-            origin,
-            staged: BTreeMap::new(),
-        }
-    }
-
-    /// Give the store back.
-    pub fn into_store(self) -> S {
-        self.store
-    }
-
-    const fn target(&self, read: ReadMode) -> ReadTarget {
-        match read {
-            ReadMode::ViewOnBase => ReadTarget::Commit(self.origin),
-            ReadMode::ViewWithOverlay => ReadTarget::Branch(self.branch),
-        }
-    }
-
+impl<S: Store> GolemStateView<S> {
     /// Read an entity, or `None` if it does not exist at that read mode.
-    pub fn get(
-        &self,
-        address: EntityAddress,
-        read: ReadMode,
-    ) -> Result<Option<Entity>, EntityError> {
+    fn get(&self, address: EntityAddress, read: ReadMode) -> Result<Option<Entity>, EntityError> {
         let record = self
             .store
             .get(
@@ -141,7 +104,7 @@ impl<S: Store> StoreEntities<S> {
     }
 
     /// Apply `updates` to an entity, creating it if it does not exist.
-    pub fn update(&mut self, updates: EntityUpdates) -> Result<(), EntityError> {
+    fn update(&mut self, updates: EntityUpdates) -> Result<(), EntityError> {
         let address = updates.entity;
         let key = entity_records::record_key(address);
 
@@ -196,13 +159,35 @@ impl<S: Store> StoreEntities<S> {
     }
 
     /// The net-against-base change per touched entity, ascending.
-    pub fn uncommitted_deltas(&self) -> Vec<EntityUpdates> {
+    fn uncommitted_deltas(&self) -> Vec<EntityUpdates> {
         self.staged.values().cloned().collect()
     }
+}
 
-    /// The branch's content digest — the value that becomes the state root.
-    pub fn commit(&self) -> Result<Commitment, EntityError> {
-        Ok(self.store.branch_digest(self.branch)?)
+impl<S: Store> EntityStore for GolemStateView<S> {
+    type Error = ViewError;
+
+    fn get_entity(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Option<Entity>, Self::Error> {
+        self.get(address, read).map_err(Into::into)
+    }
+
+    fn update_entity(&mut self, updates: EntityUpdates) -> Result<(), Self::Error> {
+        self.update(updates).map_err(Into::into)
+    }
+
+    fn get_uncommitted_deltas(&self) -> Result<Vec<EntityUpdates>, Self::Error> {
+        Ok(self.uncommitted_deltas())
+    }
+
+    /// The writes are already on the branch; what clears is the delta log the
+    /// index stores fold in, which only this view keeps.
+    fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
+        self.staged.clear();
+        self.shared_commitment()
     }
 }
 
@@ -212,7 +197,6 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
     use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags};
-    use arkiv_interfaces::store::reference::MemStore;
 
     fn entity(key: u8) -> Entity {
         Entity {
@@ -229,12 +213,9 @@ mod tests {
         }
     }
 
-    fn view() -> StoreEntities<MemStore> {
-        let mut store = MemStore::default();
-        let branch = store.begin(None).expect("begin");
-        let origin = store.head();
-        StoreEntities::new(store, branch, origin)
-    }
+    use arkiv_interfaces::store::ReadTarget;
+
+    use crate::view::tests::view;
 
     #[test]
     fn a_created_entity_reads_back_through_the_overlay() {
@@ -391,16 +372,16 @@ mod tests {
     #[test]
     fn the_commitment_moves_only_when_content_does() {
         let mut view = view();
-        let empty = view.commit().expect("digest");
+        let empty = view.digest().expect("digest");
         view.update(EntityUpdates::create(entity(1)))
             .expect("create");
-        let one = view.commit().expect("digest");
+        let one = view.digest().expect("digest");
         assert_ne!(empty, one, "a write must move the digest");
 
         // Writing the same content again is not a change.
         view.update(EntityUpdates::create(entity(1)))
             .expect("rewrite");
-        assert_eq!(view.commit().expect("digest"), one);
+        assert_eq!(view.digest().expect("digest"), one);
     }
 
     #[test]
