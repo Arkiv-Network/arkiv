@@ -97,10 +97,7 @@ pub fn cells(
             CELL_ORDER.to_owned(),
             Cell::attribute(TypeId::U256, encode_ordering(key)?.to_vec()),
         ),
-        (
-            CELL_VALUE.to_owned(),
-            Cell::field(TypeId::BYTES, value),
-        ),
+        (CELL_VALUE.to_owned(), Cell::field(TypeId::BYTES, value)),
     ];
     if let Some(subkey) = subkey {
         cells.push((
@@ -128,15 +125,15 @@ mod tests {
             vec![0xff],
             vec![0xff, 0xff],
         ];
-        let mut padded: Vec<[u8; 32]> =
-            raw.iter().map(|k| encode_ordering(k).unwrap()).collect();
+        let mut padded: Vec<[u8; 32]> = raw.iter().map(|k| encode_ordering(k).unwrap()).collect();
         padded.sort_unstable();
         raw.sort_by(|a, b| {
             // Byte-string order on equal-width-padded values is numeric order.
-            encode_ordering(a).unwrap().cmp(&encode_ordering(b).unwrap())
+            encode_ordering(a)
+                .unwrap()
+                .cmp(&encode_ordering(b).unwrap())
         });
-        let expected: Vec<[u8; 32]> =
-            raw.iter().map(|k| encode_ordering(k).unwrap()).collect();
+        let expected: Vec<[u8; 32]> = raw.iter().map(|k| encode_ordering(k).unwrap()).collect();
         assert_eq!(padded, expected);
     }
 
@@ -164,9 +161,21 @@ mod tests {
         let k = |t, key: &[u8], sub: Option<&[u8]>| record_key(t, key, sub).unwrap();
         assert_ne!(k(1, b"a", None), k(2, b"a", None), "different table");
         assert_ne!(k(1, b"a", None), k(1, b"b", None), "different key");
-        assert_ne!(k(1, b"a", Some(b"x")), k(1, b"a", Some(b"y")), "different subkey");
-        assert_ne!(k(1, b"a", None), k(1, b"a", Some(b"")), "subkey absent vs empty");
-        assert_eq!(k(1, b"a", Some(b"x")), k(1, b"a", Some(b"x")), "deterministic");
+        assert_ne!(
+            k(1, b"a", Some(b"x")),
+            k(1, b"a", Some(b"y")),
+            "different subkey"
+        );
+        assert_ne!(
+            k(1, b"a", None),
+            k(1, b"a", Some(b"")),
+            "subkey absent vs empty"
+        );
+        assert_eq!(
+            k(1, b"a", Some(b"x")),
+            k(1, b"a", Some(b"x")),
+            "deterministic"
+        );
     }
 
     #[test]
