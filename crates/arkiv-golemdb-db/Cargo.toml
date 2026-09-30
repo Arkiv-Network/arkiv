@@ -1,0 +1,18 @@
+[package]
+name = "arkiv-golemdb-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# reth's `Database` (its key/value seam) implemented over a GolemDB `Store`, so
+# every reth table lands in GolemDB instead of MDBX and everything above the
+# seam -- providers, persistence, sync, pruning -- is reth's, unmodified.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+reth-db-api.workspace = true
+alloy-primitives.workspace = true
+
+[dev-dependencies]
+arkiv-valkey.workspace = true
