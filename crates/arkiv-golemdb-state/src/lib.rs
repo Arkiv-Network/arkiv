@@ -7,5 +7,6 @@
 
 extern crate alloc;
 
+pub mod accounts;
 pub mod entities;
 pub mod indices;
