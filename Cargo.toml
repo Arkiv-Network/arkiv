@@ -129,6 +129,7 @@ arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
+arkiv-golemdb-state = { path = "crates/arkiv-golemdb-state" }
 arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
 
 # Copied from yagna (.cargo/config). A dev build without debug info or
