@@ -111,6 +111,11 @@ impl<S: Store> GolemStateView<S> {
         &self.store
     }
 
+    /// The branch this view stages on — what a host commits to promote it.
+    pub const fn branch(&self) -> BranchId {
+        self.branch
+    }
+
     pub(crate) const fn target(&self, read: ReadMode) -> ReadTarget {
         match read {
             ReadMode::ViewOnBase => ReadTarget::Commit(self.origin),

@@ -1493,6 +1493,7 @@ version = "0.5.1"
 dependencies = [
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
+ "arkiv-valkey",
 ]
 
 [[package]]

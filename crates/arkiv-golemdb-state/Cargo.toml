@@ -15,3 +15,4 @@ arkiv-reth-uncommitted-store.workspace = true
 
 [dev-dependencies]
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
+arkiv-valkey.workspace = true
