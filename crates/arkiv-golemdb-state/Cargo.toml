@@ -1,0 +1,16 @@
+[package]
+name = "arkiv-golemdb-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Arkiv's committed stores over a GolemDB `Store`, with entities as native
+# records. Replaces arkiv-reth-mpt-committed-store, whose bulk is the index
+# machinery GolemDB provides directly.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+
+[dev-dependencies]
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
