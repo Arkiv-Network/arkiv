@@ -2,25 +2,26 @@
 //!
 //! # The reserved key namespace
 //!
-//! Account state needs a key space that can never collide with an entity's. The
-//! seam already has one: [`RecordKey::from_address`] left-pads a 20-byte address
-//! with **twelve zero bytes**, and [`RecordKey::as_address`] reverses it. Those
-//! twelve zeros are the reservation — an [`EntityAddress`] is a derived 32-byte
-//! value, so one landing in that range is a hash collision rather than a layout
-//! mistake, and [`tests::an_account_key_cannot_be_an_entity_key`] pins the property.
+//! Addresses are 32 bytes and so are record keys, so account keys and entity keys
+//! occupy the same space with nothing structural between them. Account keys are
+//! therefore `keccak(DOMAIN_ACCOUNT ‖ address)` — see
+//! [`arkiv_interfaces::keys`], which owns the preimage because these bytes reach the
+//! state root. [`tests::an_account_key_cannot_be_an_entity_key`] pins the property.
 //!
-//! [`EntityAddress`]: arkiv_interfaces::primitives::EntityAddress
+//! The cost of hashing is that a key no longer reveals its address, so the record
+//! carries an [`CELL_ADDRESS`] cell and stays self-describing for a state dump.
 //!
 //! # One record, three cells
 //!
 //! The three traits are separate, but their storage need not mirror them. All three
 //! values hang off the same address, so they live in one record:
 //!
-//! | cell            | type   | holds                               |
-//! |-----------------|--------|-------------------------------------|
-//! | [`CELL_BALANCE`]| `U256` | the balance                         |
-//! | [`CELL_NONCE`]  | `U64`  | the transaction nonce               |
-//! | [`CELL_MINTED`] | `U64`  | the entity-creation nonce           |
+//! | cell             | type    | holds                              |
+//! |------------------|---------|------------------------------------|
+//! | [`CELL_ADDRESS`] | `BYTES` | the account's own address          |
+//! | [`CELL_BALANCE`] | `U256`  | the balance                        |
+//! | [`CELL_NONCE`]   | `U64`   | the transaction nonce              |
+//! | [`CELL_MINTED`]  | `U64`   | the entity-creation nonce          |
 //!
 //! Reading balance and nonce together — which every transaction does, to check the
 //! sender can pay — is then one `get` rather than two. `patch` updates a single cell,
@@ -36,6 +37,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use alloy_primitives::keccak256;
+use arkiv_interfaces::keys::account_key_preimage;
 use arkiv_interfaces::primitives::{EntityCreationNonce, UserAddress, UserBalance, UserNonce};
 use arkiv_interfaces::statemanager::{Commitment, ReadMode};
 use arkiv_interfaces::store::{
@@ -43,6 +46,8 @@ use arkiv_interfaces::store::{
     StoreError, TypeId,
 };
 
+/// The account's own address, so a hashed key stays reversible.
+pub const CELL_ADDRESS: &str = "adr";
 /// The account's balance.
 pub const CELL_BALANCE: &str = "bal";
 /// The account's transaction nonce.
@@ -69,18 +74,35 @@ impl From<StoreError> for AccountError {
     }
 }
 
-/// The record key for an account. See the module docs on the reserved namespace.
-pub const fn record_key(account: UserAddress) -> RecordKey {
-    RecordKey::from_address(account)
+/// Widen a host address into the 32-byte form the store keys on.
+///
+/// `UserAddress` is still 20 bytes in `arkiv-interfaces`; the store keys on 32.
+/// One place does the widening so that when the primitive widens, only this
+/// function changes — and it is left-padding, matching ABI convention, so the two
+/// forms name the same account.
+pub fn wide(account: UserAddress) -> [u8; 32] {
+    let mut wide = [0u8; 32];
+    wide[12..].copy_from_slice(&account);
+    wide
+}
+
+/// The record key for an account: `keccak(DOMAIN_ACCOUNT ‖ address)`.
+pub fn record_key(account: UserAddress) -> RecordKey {
+    RecordKey::from_entity(keccak256(account_key_preimage(&wide(account))).into())
 }
 
 /// The cells of a fresh account record, all three written explicitly.
 fn fresh_cells(
+    account: UserAddress,
     balance: UserBalance,
     nonce: UserNonce,
     minted: EntityCreationNonce,
 ) -> Vec<(CellName, Cell)> {
     vec![
+        (
+            CellName::from(CELL_ADDRESS),
+            Cell::field(TypeId::BYTES, wide(account).to_vec()),
+        ),
         (
             CellName::from(CELL_BALANCE),
             Cell::field(TypeId::U256, balance.to_be_bytes().to_vec()),
@@ -193,6 +215,7 @@ impl<S: Store> StoreAccounts<S> {
             // New account: write all three cells so the read path never has to tell
             // an absent cell from a zero one.
             let mut cells = fresh_cells(
+                account,
                 UserBalance::from_u64(0),
                 UserNonce::new(0),
                 EntityCreationNonce::new(0),
@@ -335,18 +358,28 @@ mod tests {
 
     #[test]
     fn an_account_key_cannot_be_an_entity_key() {
-        // The reservation the whole layout rests on: account keys have twelve
-        // leading zeros and are reversible; an entity key is a derived 32 bytes.
-        let account = record_key(ALICE);
-        assert_eq!(&account.0[..12], &[0u8; 12]);
-        assert_eq!(account.as_address(), Some(ALICE));
+        // Addresses and record keys are both 32 bytes, so nothing structural keeps
+        // the two spaces apart -- only the domain tag does. The sharpest case is an
+        // entity whose address *is* an account's: the keys must still differ.
+        let shared = wide(ALICE);
+        assert_ne!(record_key(ALICE), entity_records::record_key(shared));
 
-        let entity = entity_records::record_key([0x37; 32]);
-        assert_ne!(account, entity);
+        // And a bare address is never an account key, which is what a caller
+        // reaching for the old padding convention would produce.
+        assert_ne!(record_key(ALICE), RecordKey::from_entity(shared));
+    }
+
+    #[test]
+    fn a_hashed_key_stays_reversible_through_the_record() {
+        let mut view = view();
+        view.set_balance(ALICE, UserBalance::from_u64(1)).unwrap();
+        let record = view
+            .read(ALICE, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .expect("the account exists");
         assert_eq!(
-            entity.as_address(),
-            None,
-            "an entity key is not in the reserved range"
+            record.cell(CELL_ADDRESS).unwrap().value,
+            wide(ALICE).to_vec()
         );
     }
 
