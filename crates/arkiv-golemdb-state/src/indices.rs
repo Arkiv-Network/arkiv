@@ -23,11 +23,15 @@ use core::ops::Bound;
 use arkiv_interfaces::entity::AttributeValue;
 use arkiv_interfaces::entity_records::type_id_of;
 use arkiv_interfaces::primitives::EntityAddress;
-use arkiv_interfaces::statemanager::{EntityUpdates, ReadMode};
+use arkiv_interfaces::statemanager::{
+    EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode,
+};
 use arkiv_interfaces::store::{
     AndGroup, CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store,
     StoreError, TypeId,
 };
+
+use crate::view::{GolemStateView, ViewError};
 
 /// How many records one index lookup will pull back.
 ///
@@ -124,14 +128,14 @@ const KEY_CELL: &str = "$key";
 /// never sees a branch's uncommitted writes, and it matches Arkiv, where
 /// `arkiv_query` runs against a committed snapshot.
 #[derive(Debug)]
-pub struct StoreIndices<S: Store> {
-    store: S,
+pub struct StoreIndices<'s, S: Store> {
+    store: &'s S,
     at: CommitId,
 }
 
-impl<S: Store> StoreIndices<S> {
+impl<'s, S: Store> StoreIndices<'s, S> {
     /// Index lookups as of `at`.
-    pub const fn new(store: S, at: CommitId) -> Self {
+    pub const fn new(store: &'s S, at: CommitId) -> Self {
         Self { store, at }
     }
 
@@ -142,7 +146,7 @@ impl<S: Store> StoreIndices<S> {
         value: &AttributeValue,
     ) -> Result<Vec<EntityAddress>, IndexError> {
         let group = AndGroup(vec![predicate(attribute, value, CompareOp::Eq)?]);
-        matching(&self.store, self.at, group)
+        matching(self.store, self.at, group)
     }
 
     /// Entities whose string `attribute` starts with `prefix`.
@@ -157,7 +161,7 @@ impl<S: Store> StoreIndices<S> {
             CompareOp::Prefix,
         )?;
         term.type_id = TypeId::STR;
-        matching(&self.store, self.at, AndGroup(vec![term]))
+        matching(self.store, self.at, AndGroup(vec![term]))
     }
 
     /// Entities whose `attribute` falls within the bounds.
@@ -181,23 +185,85 @@ impl<S: Store> StoreIndices<S> {
             Bound::Excluded(value) => terms.push(predicate(attribute, value, CompareOp::Lt)?),
             Bound::Unbounded => {}
         }
-        matching(&self.store, self.at, AndGroup(terms))
+        matching(self.store, self.at, AndGroup(terms))
+    }
+}
+
+/// Fold staged entity changes into the index.
+///
+/// Deliberately nothing. The store indexes attribute cells as they are written,
+/// so by the time an entity record is staged its index entries have already
+/// moved. The parameter is kept so the shape still matches the trait it serves.
+pub const fn apply_deltas(_updates: &[EntityUpdates]) {}
+
+/// Read mode is not a distinction this index can make.
+///
+/// `Store::query` answers from a commit and never from a branch, so there is no
+/// "with overlay" to offer. Callers that need staged entities read them by key
+/// through `Store::get`, which does see the branch.
+pub const fn supports(read: ReadMode) -> bool {
+    matches!(read, ReadMode::ViewOnBase)
+}
+
+// ── The index traits ────────────────────────────────────────────────────────
+
+/// Both index traits answer from the view's origin commit.
+///
+/// `ViewWithOverlay` is refused rather than silently answered from the base:
+/// `Store::query` cannot see a branch, and a stale index answer is a wrong query
+/// result, not a slow one. Nothing in the executor reads the indexes — it only
+/// folds deltas in — so this refusal is unreachable today and loud if that changes.
+impl<S: Store> EqualityIndexStore for GolemStateView<S> {
+    type Error = ViewError;
+
+    fn get_equal_entities(
+        &self,
+        attribute: &[u8],
+        value: &AttributeValue,
+        read: ReadMode,
+    ) -> Result<Vec<EntityAddress>, ViewError> {
+        Ok(self.indices(read)?.equal(attribute, value)?)
     }
 
-    /// Fold staged entity changes into the index.
-    ///
-    /// Deliberately nothing. The store indexes attribute cells as they are written,
-    /// so by the time an entity record is staged its index entries have already
-    /// moved. The parameter is kept so the shape still matches the trait it serves.
-    pub const fn apply_deltas(_updates: &[EntityUpdates]) {}
+    fn get_prefixed_entities(
+        &self,
+        attribute: &[u8],
+        prefix: &str,
+        read: ReadMode,
+    ) -> Result<Vec<EntityAddress>, ViewError> {
+        Ok(self.indices(read)?.prefixed(attribute, prefix)?)
+    }
 
-    /// Read mode is not a distinction this index can make.
-    ///
-    /// `Store::query` answers from a commit and never from a branch, so there is no
-    /// "with overlay" to offer. Callers that need staged entities read them by key
-    /// through `Store::get`, which does see the branch.
-    pub const fn supports(read: ReadMode) -> bool {
-        matches!(read, ReadMode::ViewOnBase)
+    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), ViewError> {
+        apply_deltas(entity_updates);
+        Ok(())
+    }
+
+    fn commit_store(&mut self) -> Result<(), ViewError> {
+        Ok(())
+    }
+}
+
+impl<S: Store> RangeIndexStore for GolemStateView<S> {
+    type Error = ViewError;
+
+    fn get_within_range(
+        &self,
+        attribute: &[u8],
+        low: Bound<&AttributeValue>,
+        high: Bound<&AttributeValue>,
+        read: ReadMode,
+    ) -> Result<Vec<EntityAddress>, ViewError> {
+        Ok(self.indices(read)?.within(attribute, low, high)?)
+    }
+
+    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), ViewError> {
+        apply_deltas(entity_updates);
+        Ok(())
+    }
+
+    fn commit_store(&mut self) -> Result<(), ViewError> {
+        Ok(())
     }
 }
 
@@ -249,7 +315,7 @@ mod tests {
     #[test]
     fn equality_finds_exactly_the_matching_entities() {
         let (store, at) = stored(&[entity(1, 10, "a"), entity(2, 20, "b"), entity(3, 10, "c")]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         let mut hits = indices
             .equal(b"level", &AttributeValue::Int(10))
             .expect("query");
@@ -260,7 +326,7 @@ mod tests {
     #[test]
     fn a_range_is_inclusive_and_exclusive_as_asked() {
         let (store, at) = stored(&[entity(1, 10, "a"), entity(2, 20, "b"), entity(3, 30, "c")]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         let ten = AttributeValue::Int(10);
         let thirty = AttributeValue::Int(30);
 
@@ -281,7 +347,7 @@ mod tests {
     fn negative_values_order_correctly_through_the_index() {
         // The sign-bias trap again, this time end to end through a real store.
         let (store, at) = stored(&[entity(1, -10, "a"), entity(2, 0, "b"), entity(3, 10, "c")]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         let zero = AttributeValue::Int(0);
         let hits = indices
             .within(b"level", Bound::Unbounded, Bound::Excluded(&zero))
@@ -296,7 +362,7 @@ mod tests {
             entity(2, 1, "abd"),
             entity(3, 1, "xyz"),
         ]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         let mut hits = indices.prefixed(b"name", "ab").expect("query");
         hits.sort_unstable();
         assert_eq!(hits, vec![[1u8; 32], [2u8; 32]]);
@@ -307,7 +373,7 @@ mod tests {
         // `level` is an i32. A u64 of the same numeric value must not match, or the
         // language's "the tag is part of what the predicate asserts" rule is broken.
         let (store, at) = stored(&[entity(1, 10, "a")]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         assert!(
             indices
                 .equal(b"level", &AttributeValue::U64(10))
@@ -329,7 +395,7 @@ mod tests {
         // store's tie-break being ascending record key plus an entity's record key
         // being its address. Assert it rather than assume the chain holds.
         let (store, at) = stored(&[entity(3, 1, "c"), entity(1, 1, "a"), entity(2, 1, "b")]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         let hits = indices
             .equal(b"level", &AttributeValue::Int(1))
             .expect("query");
@@ -342,11 +408,11 @@ mod tests {
         // record is what moves its index entries, so there is no separate index to
         // keep in step. Query results must be identical before and after.
         let (store, at) = stored(&[entity(1, 10, "a")]);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         let before = indices
             .equal(b"level", &AttributeValue::Int(10))
             .expect("query");
-        StoreIndices::<MemStore>::apply_deltas(&[EntityUpdates {
+        apply_deltas(&[EntityUpdates {
             entity: [1; 32],
             delete: false,
             ..EntityUpdates::default()
@@ -361,7 +427,7 @@ mod tests {
     fn an_overlarge_result_is_refused_rather_than_truncated() {
         let entities: Vec<Entity> = (0..8).map(|i| entity(i, 1, "x")).collect();
         let (store, at) = stored(&entities);
-        let indices = StoreIndices::new(store, at);
+        let indices = StoreIndices::new(&store, at);
         // Sanity: within the real cap everything comes back.
         assert_eq!(
             indices

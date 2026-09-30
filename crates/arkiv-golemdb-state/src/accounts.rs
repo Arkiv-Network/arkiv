@@ -37,11 +37,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use arkiv_interfaces::primitives::{EntityCreationNonce, UserAddress, UserBalance, UserNonce};
-use arkiv_interfaces::statemanager::{Commitment, ReadMode};
-use arkiv_interfaces::store::{
-    BranchId, Cell, CellChange, CellName, CommitId, ReadTarget, Record, RecordKey, Store,
-    StoreError, TypeId,
+use arkiv_interfaces::statemanager::{
+    AccountBalancesStore, AccountNoncesStore, Commitment, EntityCreationNoncesStore, ReadMode,
 };
+use arkiv_interfaces::store::{
+    Cell, CellChange, CellName, Record, RecordKey, Store, StoreError, TypeId,
+};
+
+use crate::view::{GolemStateView, ViewError};
 
 /// The account's balance.
 pub const CELL_BALANCE: &str = "bal";
@@ -107,36 +110,7 @@ fn u64_cell(record: Option<&Record>, name: &'static str) -> Result<u64, AccountE
         .map_err(|_| AccountError::Malformed(name))
 }
 
-/// Balances and nonces over a GolemDB [`Store`].
-#[derive(Debug)]
-pub struct StoreAccounts<S: Store> {
-    store: S,
-    branch: BranchId,
-    origin: CommitId,
-}
-
-impl<S: Store> StoreAccounts<S> {
-    /// Stage writes on `branch`, whose base state is the commit `origin`.
-    pub const fn new(store: S, branch: BranchId, origin: CommitId) -> Self {
-        Self {
-            store,
-            branch,
-            origin,
-        }
-    }
-
-    /// Give the store back.
-    pub fn into_store(self) -> S {
-        self.store
-    }
-
-    const fn target(&self, read: ReadMode) -> ReadTarget {
-        match read {
-            ReadMode::ViewOnBase => ReadTarget::Commit(self.origin),
-            ReadMode::ViewWithOverlay => ReadTarget::Branch(self.branch),
-        }
-    }
-
+impl<S: Store> GolemStateView<S> {
     fn read(&self, account: UserAddress, read: ReadMode) -> Result<Option<Record>, AccountError> {
         Ok(self
             .store
@@ -145,11 +119,7 @@ impl<S: Store> StoreAccounts<S> {
     }
 
     /// The account's balance. Absent is zero.
-    pub fn balance(
-        &self,
-        account: UserAddress,
-        read: ReadMode,
-    ) -> Result<UserBalance, AccountError> {
+    fn balance(&self, account: UserAddress, read: ReadMode) -> Result<UserBalance, AccountError> {
         let record = self.read(account, read)?;
         let Some(cell) = record.as_ref().and_then(|record| record.cell(CELL_BALANCE)) else {
             return Ok(UserBalance::from_u64(0));
@@ -162,7 +132,7 @@ impl<S: Store> StoreAccounts<S> {
     }
 
     /// The account's transaction nonce. Absent is zero.
-    pub fn nonce(&self, account: UserAddress, read: ReadMode) -> Result<UserNonce, AccountError> {
+    fn nonce(&self, account: UserAddress, read: ReadMode) -> Result<UserNonce, AccountError> {
         Ok(UserNonce::new(u64_cell(
             self.read(account, read)?.as_ref(),
             CELL_NONCE,
@@ -170,7 +140,7 @@ impl<S: Store> StoreAccounts<S> {
     }
 
     /// The account's entity-creation nonce. Absent is zero.
-    pub fn minted(
+    fn minted(
         &self,
         account: UserAddress,
         read: ReadMode,
@@ -216,7 +186,7 @@ impl<S: Store> StoreAccounts<S> {
     }
 
     /// Set the balance outright.
-    pub fn set_balance(
+    fn write_balance(
         &mut self,
         account: UserAddress,
         balance: UserBalance,
@@ -226,7 +196,7 @@ impl<S: Store> StoreAccounts<S> {
     }
 
     /// Add to the balance, returning the value **before** the addition.
-    pub fn fetch_add_balance(
+    fn add_balance(
         &mut self,
         account: UserAddress,
         amount: UserBalance,
@@ -237,12 +207,12 @@ impl<S: Store> StoreAccounts<S> {
         let after = before
             .checked_add(amount)
             .ok_or(AccountError::BalanceOutOfRange)?;
-        self.set_balance(account, after)?;
+        self.write_balance(account, after)?;
         Ok(before)
     }
 
     /// Subtract from the balance, returning the value **before** the subtraction.
-    pub fn fetch_sub_balance(
+    fn sub_balance(
         &mut self,
         account: UserAddress,
         amount: UserBalance,
@@ -251,12 +221,12 @@ impl<S: Store> StoreAccounts<S> {
         let after = before
             .checked_sub(amount)
             .ok_or(AccountError::BalanceOutOfRange)?;
-        self.set_balance(account, after)?;
+        self.write_balance(account, after)?;
         Ok(before)
     }
 
     /// Set the balance to `new` only if it is currently `current`.
-    pub fn compare_set_balance(
+    fn cas_balance(
         &mut self,
         account: UserAddress,
         current: UserBalance,
@@ -265,15 +235,12 @@ impl<S: Store> StoreAccounts<S> {
         if self.balance(account, ReadMode::ViewWithOverlay)? != current {
             return Ok(false);
         }
-        self.set_balance(account, new)?;
+        self.write_balance(account, new)?;
         Ok(true)
     }
 
     /// Advance the transaction nonce, returning the value **before**.
-    pub fn fetch_increment_nonce(
-        &mut self,
-        account: UserAddress,
-    ) -> Result<UserNonce, AccountError> {
+    fn fetch_increment_nonce(&mut self, account: UserAddress) -> Result<UserNonce, AccountError> {
         let before = self.nonce(account, ReadMode::ViewWithOverlay)?;
         let cell = Cell::field(TypeId::U64, before.next().get().to_be_bytes().to_vec());
         self.write_cell(account, CELL_NONCE, cell)?;
@@ -281,7 +248,7 @@ impl<S: Store> StoreAccounts<S> {
     }
 
     /// Advance the entity-creation nonce, returning the value **before**.
-    pub fn fetch_increment_minted(
+    fn fetch_increment_minted(
         &mut self,
         account: UserAddress,
     ) -> Result<EntityCreationNonce, AccountError> {
@@ -293,10 +260,85 @@ impl<S: Store> StoreAccounts<S> {
         self.write_cell(account, CELL_MINTED, cell)?;
         Ok(before)
     }
+}
 
-    /// The branch's content digest.
-    pub fn commit(&self) -> Result<Commitment, AccountError> {
-        Ok(self.store.branch_digest(self.branch)?)
+impl<S: Store> AccountBalancesStore for GolemStateView<S> {
+    type Error = ViewError;
+
+    fn get_balance(&self, account: UserAddress, read: ReadMode) -> Result<UserBalance, ViewError> {
+        self.balance(account, read).map_err(Into::into)
+    }
+
+    fn fetch_add_balance(
+        &mut self,
+        account: UserAddress,
+        amount: UserBalance,
+    ) -> Result<UserBalance, ViewError> {
+        self.add_balance(account, amount).map_err(Into::into)
+    }
+
+    fn fetch_sub_balance(
+        &mut self,
+        account: UserAddress,
+        amount: UserBalance,
+    ) -> Result<UserBalance, ViewError> {
+        self.sub_balance(account, amount).map_err(Into::into)
+    }
+
+    fn compare_set_balance(
+        &mut self,
+        account: UserAddress,
+        current: UserBalance,
+        new: UserBalance,
+    ) -> Result<bool, ViewError> {
+        self.cas_balance(account, current, new).map_err(Into::into)
+    }
+
+    fn set_balance(&mut self, account: UserAddress, balance: UserBalance) -> Result<(), ViewError> {
+        self.write_balance(account, balance).map_err(Into::into)
+    }
+
+    fn commit_store(&mut self) -> Result<Commitment, ViewError> {
+        self.shared_commitment()
+    }
+}
+
+impl<S: Store> AccountNoncesStore for GolemStateView<S> {
+    type Error = ViewError;
+
+    fn get_acc_nonce(&self, account: UserAddress, read: ReadMode) -> Result<UserNonce, ViewError> {
+        self.nonce(account, read).map_err(Into::into)
+    }
+
+    fn fetch_increment_acc_nonce(&mut self, account: UserAddress) -> Result<UserNonce, ViewError> {
+        self.fetch_increment_nonce(account).map_err(Into::into)
+    }
+
+    fn commit_store(&mut self) -> Result<Commitment, ViewError> {
+        self.shared_commitment()
+    }
+}
+
+impl<S: Store> EntityCreationNoncesStore for GolemStateView<S> {
+    type Error = ViewError;
+
+    fn get_entity_creation_nonce(
+        &self,
+        owner: UserAddress,
+        read: ReadMode,
+    ) -> Result<EntityCreationNonce, ViewError> {
+        self.minted(owner, read).map_err(Into::into)
+    }
+
+    fn fetch_increment_entity_creation_nonce(
+        &mut self,
+        owner: UserAddress,
+    ) -> Result<EntityCreationNonce, ViewError> {
+        self.fetch_increment_minted(owner).map_err(Into::into)
+    }
+
+    fn commit_store(&mut self) -> Result<Commitment, ViewError> {
+        self.shared_commitment()
     }
 }
 
@@ -304,17 +346,11 @@ impl<S: Store> StoreAccounts<S> {
 mod tests {
     use super::*;
     use arkiv_interfaces::entity_records;
-    use arkiv_interfaces::store::reference::MemStore;
 
     const ALICE: UserAddress = [0xaa; 20];
     const BOB: UserAddress = [0xbb; 20];
 
-    fn view() -> StoreAccounts<MemStore> {
-        let mut store = MemStore::default();
-        let branch = store.begin(None).expect("begin");
-        let origin = store.head();
-        StoreAccounts::new(store, branch, origin)
-    }
+    use crate::view::tests::view;
 
     #[test]
     fn an_unseen_account_reads_as_zero() {
@@ -354,7 +390,8 @@ mod tests {
     fn the_three_values_are_independent() {
         // They share a record, so writing one must not disturb the others.
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_u64(500)).unwrap();
+        view.write_balance(ALICE, UserBalance::from_u64(500))
+            .unwrap();
         view.fetch_increment_nonce(ALICE).unwrap();
         view.fetch_increment_minted(ALICE).unwrap();
         view.fetch_increment_minted(ALICE).unwrap();
@@ -376,7 +413,8 @@ mod tests {
     #[test]
     fn accounts_do_not_leak_into_each_other() {
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_u64(10)).unwrap();
+        view.write_balance(ALICE, UserBalance::from_u64(10))
+            .unwrap();
         assert_eq!(
             view.balance(BOB, ReadMode::ViewWithOverlay).unwrap(),
             UserBalance::from_u64(0)
@@ -386,11 +424,10 @@ mod tests {
     #[test]
     fn fetch_ops_return_the_value_before_the_change() {
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_u64(100)).unwrap();
-
-        let before = view
-            .fetch_add_balance(ALICE, UserBalance::from_u64(5))
+        view.write_balance(ALICE, UserBalance::from_u64(100))
             .unwrap();
+
+        let before = view.add_balance(ALICE, UserBalance::from_u64(5)).unwrap();
         assert_eq!(
             before,
             UserBalance::from_u64(100),
@@ -401,9 +438,7 @@ mod tests {
             UserBalance::from_u64(105)
         );
 
-        let before = view
-            .fetch_sub_balance(ALICE, UserBalance::from_u64(5))
-            .unwrap();
+        let before = view.sub_balance(ALICE, UserBalance::from_u64(5)).unwrap();
         assert_eq!(before, UserBalance::from_u64(105));
         assert_eq!(
             view.balance(ALICE, ReadMode::ViewWithOverlay).unwrap(),
@@ -422,9 +457,10 @@ mod tests {
     fn an_overdraft_is_refused_not_clamped() {
         // Saturating here would destroy money and leave no trace.
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_u64(10)).unwrap();
+        view.write_balance(ALICE, UserBalance::from_u64(10))
+            .unwrap();
         assert_eq!(
-            view.fetch_sub_balance(ALICE, UserBalance::from_u64(11)),
+            view.sub_balance(ALICE, UserBalance::from_u64(11)),
             Err(AccountError::BalanceOutOfRange)
         );
         assert_eq!(
@@ -437,10 +473,10 @@ mod tests {
     #[test]
     fn an_overflow_is_refused_not_clamped() {
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_be_bytes([0xff; 32]))
+        view.write_balance(ALICE, UserBalance::from_be_bytes([0xff; 32]))
             .unwrap();
         assert_eq!(
-            view.fetch_add_balance(ALICE, UserBalance::from_u64(1)),
+            view.add_balance(ALICE, UserBalance::from_u64(1)),
             Err(AccountError::BalanceOutOfRange)
         );
     }
@@ -448,10 +484,11 @@ mod tests {
     #[test]
     fn compare_set_only_fires_on_a_match() {
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_u64(10)).unwrap();
+        view.write_balance(ALICE, UserBalance::from_u64(10))
+            .unwrap();
         assert!(
             !view
-                .compare_set_balance(ALICE, UserBalance::from_u64(99), UserBalance::from_u64(1))
+                .cas_balance(ALICE, UserBalance::from_u64(99), UserBalance::from_u64(1))
                 .unwrap()
         );
         assert_eq!(
@@ -459,7 +496,7 @@ mod tests {
             UserBalance::from_u64(10)
         );
         assert!(
-            view.compare_set_balance(ALICE, UserBalance::from_u64(10), UserBalance::from_u64(1))
+            view.cas_balance(ALICE, UserBalance::from_u64(10), UserBalance::from_u64(1))
                 .unwrap()
         );
         assert_eq!(
@@ -471,7 +508,8 @@ mod tests {
     #[test]
     fn base_reads_do_not_see_staged_writes() {
         let mut view = view();
-        view.set_balance(ALICE, UserBalance::from_u64(10)).unwrap();
+        view.write_balance(ALICE, UserBalance::from_u64(10))
+            .unwrap();
         assert_eq!(
             view.balance(ALICE, ReadMode::ViewOnBase).unwrap(),
             UserBalance::from_u64(0)
@@ -483,7 +521,7 @@ mod tests {
         // 32 bytes, not a u64: truncating here would silently cap every balance.
         let mut view = view();
         let big = UserBalance::from_be_bytes([0xab; 32]);
-        view.set_balance(ALICE, big).unwrap();
+        view.write_balance(ALICE, big).unwrap();
         assert_eq!(view.balance(ALICE, ReadMode::ViewWithOverlay).unwrap(), big);
     }
 }

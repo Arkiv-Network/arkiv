@@ -11,6 +11,7 @@ license.workspace = true
 
 [dependencies]
 arkiv-interfaces.workspace = true
+arkiv-reth-uncommitted-store.workspace = true
 
 [dev-dependencies]
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
