@@ -63,9 +63,6 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
-        with:
-          components: ${{ matrix.lane == 'clippy' && 'clippy' || '' }}
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile
       # installs. The clippy lane needs them too: check mode still compiles and
       # runs every build script, C and all.

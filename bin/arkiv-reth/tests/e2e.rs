@@ -315,10 +315,9 @@ async fn typed_revert_errors_over_a_live_node() {
         "expected EmptyBatch revert data, got: {err}"
     );
 
-    // An invalid attribute name (uppercase bytes, as an SDK sends for
-    // "testInvalidKey") → Ident32InvalidByte(position, value).
+    // A slash in an attribute name causes Ident32InvalidByte.
     let mut name = [0u8; 32];
-    name[..14].copy_from_slice(b"testInvalidKey");
+    name[..14].copy_from_slice(b"test/attribute");
     let bad_attr = Attribute {
         name: alloy_primitives::FixedBytes::from(name),
         typeId: AttributeType::Str.id(),

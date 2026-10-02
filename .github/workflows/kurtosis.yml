@@ -79,6 +79,20 @@ jobs:
           fi
           python3 scripts/kurtosis/up.py arkiv-harness
 
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Drives the running enclave through the Arkiv SDK; see
+      # kurtosis/integration/README.md for what is covered.
+      - name: Run SDK integration tests
+        working-directory: kurtosis/integration
+        run: |
+          set -euxo pipefail
+          bun install --frozen-lockfile
+          bun test
+
       - name: Collect Kurtosis diagnostics
         if: always()
         run: |
