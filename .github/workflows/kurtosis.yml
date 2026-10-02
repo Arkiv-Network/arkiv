@@ -8,12 +8,33 @@ name: kurtosis
 
 on:
   workflow_dispatch:
+    inputs:
+      seed_count:
+        description: "Entities to seed into the genesis state (0 for none)"
+        required: false
+        default: "1000"
+        type: string
+      seed_payload_size:
+        description: "Payload bytes per seeded entity"
+        required: false
+        default: "512"
+        type: string
   workflow_call:
     inputs:
       artifact:
         description: "Artifact holding a prebuilt arkiv-reth; empty builds from source"
         required: false
         default: ""
+        type: string
+      seed_count:
+        description: "Entities to seed into the genesis state (0 for none)"
+        required: false
+        default: "1000"
+        type: string
+      seed_payload_size:
+        description: "Payload bytes per seeded entity"
+        required: false
+        default: "512"
         type: string
 
 jobs:
@@ -33,6 +54,12 @@ jobs:
       CI: "true"
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
+      # up.py seeds the genesis state with this many entities before the
+      # enclave starts; the integration tests then check both nodes serve them.
+      # The seed rides in the Kurtosis package arguments (4 MiB cap): 1000 x
+      # 512 B is about 2.5 MiB of alloc.
+      ARKIV_SEED_COUNT: ${{ inputs.seed_count || '1000' }}
+      ARKIV_SEED_PAYLOAD_SIZE: ${{ inputs.seed_payload_size || '512' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -45,12 +72,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
 
-      - name: Fetch the prebuilt arkiv-reth
+      - name: Fetch the prebuilt arkiv-reth and arkiv-cli
         if: inputs.artifact != ''
         uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.artifact }}
           path: prebuilt
+
+      # Seeding runs arkiv-cli on the runner; the from-source path builds it
+      # with cargo, which needs the same native deps as the node.
+      - uses: foundry-rs/foundry-toolchain@v1
+        if: inputs.artifact == ''
 
       - name: Install Kurtosis CLI
         run: |
@@ -74,10 +106,26 @@ jobs:
           # up.py packages this binary when the variable is set, and builds the
           # image from source when it is empty.
           if [ -n "$ARTIFACT" ]; then
-            chmod +x prebuilt/arkiv-reth
+            chmod +x prebuilt/arkiv-reth prebuilt/arkiv-cli
             export ARKIV_RETH_BINARY="$PWD/prebuilt/arkiv-reth"
+            export ARKIV_CLI_BINARY="$PWD/prebuilt/arkiv-cli"
           fi
           python3 scripts/kurtosis/up.py arkiv-harness
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Drives the running enclave through the Arkiv SDK; see
+      # kurtosis/integration/README.md for what is covered. The seeded-genesis
+      # tests find the seed's manifest where up.py left it.
+      - name: Run SDK integration tests
+        working-directory: kurtosis/integration
+        run: |
+          set -euxo pipefail
+          bun install --frozen-lockfile
+          bun test
 
       - name: Collect Kurtosis diagnostics
         if: always()
@@ -89,6 +137,8 @@ jobs:
           kurtosis enclave inspect arkiv-harness
           echo '--- Arkiv service logs ---'
           kurtosis service logs --all-services --num 200 arkiv-harness
+          echo '--- seed manifest ---'
+          cat kurtosis/.seed/manifest.json 2>/dev/null || echo '(no seed)'
 
       - name: Tear down Kurtosis enclave
         if: always()

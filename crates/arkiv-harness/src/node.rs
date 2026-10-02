@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,8 @@ pub struct NodeBuilder {
     dev: bool,
     block_time: String,
     http_api: String,
+    chain: Option<PathBuf>,
+    init_state: Option<PathBuf>,
     extra_args: Vec<String>,
 }
 
@@ -47,8 +49,25 @@ impl NodeBuilder {
             dev: true,
             block_time: "250ms".to_string(),
             http_api: "eth,net,web3,txpool".to_string(),
+            chain: None,
+            init_state: None,
             extra_args: Vec::new(),
         }
+    }
+
+    /// Run on the genesis file at `path` (`--chain`) instead of the built-in
+    /// dev chain. Dev mode still auto-seals on it.
+    pub fn chain(mut self, path: impl Into<PathBuf>) -> Self {
+        self.chain = Some(path.into());
+        self
+    }
+
+    /// Import the `reth init-state` dump at `path` into the datadir before the
+    /// node starts — the route for a genesis carrying `stateHash`. Needs
+    /// [`chain`](Self::chain).
+    pub fn init_state(mut self, path: impl Into<PathBuf>) -> Self {
+        self.init_state = Some(path.into());
+        self
     }
 
     /// Toggle `--dev` (auto-sealing sequencer). Off = a follower that only
@@ -120,8 +139,36 @@ impl Node {
             child: None,
         };
         drop((http, authrpc, p2p));
+        if let Some(dump) = node.config.init_state.clone() {
+            node.import_state(&dump);
+        }
         node.child = Some(node.spawn_process());
         node
+    }
+
+    /// `arkiv-reth init-state`: write the genesis block from `--chain`, then
+    /// stream the dump into the datadir and check its state root against the
+    /// header. Synchronous, and a failure is the test's failure.
+    fn import_state(&self, dump: &Path) {
+        let chain = self
+            .config
+            .chain
+            .as_ref()
+            .expect("init_state needs a --chain genesis carrying the dump's stateHash");
+        let output: Output = Command::new(&self.config.binary)
+            .args(["init-state", "--chain"])
+            .arg(chain)
+            .arg("--datadir")
+            .arg(&self.datadir)
+            .arg(dump)
+            .output()
+            .expect("spawn arkiv-reth init-state");
+        assert!(
+            output.status.success(),
+            "arkiv-reth init-state failed ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     fn spawn_process(&self) -> Child {
@@ -132,6 +179,9 @@ impl Node {
         if self.config.dev {
             cmd.arg("--dev")
                 .args(["--dev.block-time", &self.config.block_time]);
+        }
+        if let Some(chain) = &self.config.chain {
+            cmd.arg("--chain").arg(chain);
         }
         cmd.args([
             "--http",

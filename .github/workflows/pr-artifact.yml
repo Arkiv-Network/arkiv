@@ -44,7 +44,6 @@ jobs:
       PACKAGE: ghcr.io/arkiv-network/arkiv-build-cache:${{ inputs.profile || 'dev-fast' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
       - uses: foundry-rs/foundry-toolchain@v1
       - uses: oras-project/setup-oras@v2
@@ -111,3 +110,8 @@ jobs:
     uses: ./.github/workflows/kurtosis.yml
     with:
       artifact: arkiv-binaries-${{ inputs.profile || 'dev-fast' }}-${{ github.sha }}
+      # The smoke test runs on a seeded genesis: a thousand 512 B entities
+      # both nodes must serve from block 0 (the seed rides in the Kurtosis
+      # package arguments, capped at 4 MiB).
+      seed_count: "1000"
+      seed_payload_size: "512"

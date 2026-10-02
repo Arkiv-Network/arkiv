@@ -10,7 +10,10 @@ use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder, PayloadTypes},
-    builder::{DebugNode, Node, NodeAdapter, components::ComponentsBuilder},
+    builder::{
+        BuilderContext, DebugNode, Node, NodeAdapter,
+        components::{ComponentsBuilder, NodeComponentsBuilder},
+    },
 };
 use reth_ethereum::{Block, EthPrimitives, engine::local::LocalPayloadAttributesBuilder};
 use reth_node_ethereum::{
@@ -34,7 +37,7 @@ impl NodeTypes for ArkivNode {
 }
 
 /// reth's Ethereum component set with the executor swapped for Arkiv's.
-pub type ArkivComponentsBuilder<N> = ComponentsBuilder<
+type InnerComponentsBuilder<N> = ComponentsBuilder<
     N,
     EthereumPoolBuilder,
     ArkivPayloadServiceBuilder,
@@ -42,6 +45,19 @@ pub type ArkivComponentsBuilder<N> = ComponentsBuilder<
     ArkivExecutorBuilder,
     EthereumConsensusBuilder,
 >;
+
+/// Check imported genesis state before starting the network, payload service or
+/// pruning bootstrap. An initialized genesis header alone is not proof of state.
+pub struct ArkivComponentsBuilder<N>(InnerComponentsBuilder<N>);
+
+impl<N: FullNodeTypes<Types = ArkivNode>> NodeComponentsBuilder<N> for ArkivComponentsBuilder<N> {
+    type Components = <InnerComponentsBuilder<N> as NodeComponentsBuilder<N>>::Components;
+
+    async fn build_components(self, ctx: &BuilderContext<N>) -> eyre::Result<Self::Components> {
+        crate::init_state::status::ensure_complete(ctx.provider(), &ctx.chain_spec())?;
+        self.0.build_components(ctx).await
+    }
+}
 
 impl<N> Node<N> for ArkivNode
 where
@@ -52,9 +68,11 @@ where
         EthereumAddOns<NodeAdapter<N>, EthereumEthApiBuilder, EthereumEngineValidatorBuilder>;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
-        EthereumNode::components()
-            .executor(ArkivExecutorBuilder::default())
-            .payload(ArkivPayloadServiceBuilder)
+        ArkivComponentsBuilder(
+            EthereumNode::components()
+                .executor(ArkivExecutorBuilder::default())
+                .payload(ArkivPayloadServiceBuilder),
+        )
     }
 
     fn add_ons(&self) -> Self::AddOns {

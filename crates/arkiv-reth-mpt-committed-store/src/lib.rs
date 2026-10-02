@@ -49,6 +49,7 @@ pub use entities::{
 };
 pub use entity_creation_nonces::RethEntityCreationNoncesStore;
 pub use indices::annotation::{annotation_delta, entity_annotations};
+pub use indices::store::{entity_count_slot, id_to_key_slot, key_to_id_slot};
 pub use indices::{
     AttrEntry, AuxError, AuxiliaryEntityDelta, Bitmap, BitmapError, Bound, IndexStorage,
     QueryCapabilities, RethAuxStore, all_entities_bucket, pair_address,
