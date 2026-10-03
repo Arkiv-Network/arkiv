@@ -18,9 +18,6 @@ pub enum AuxError<E> {
     /// A range lookup with no typed bound on either side — nothing names the
     /// `(attribute, type)` buckets to scan, so the request is unanswerable.
     UnboundedRange,
-    /// A bulk insert-only fold was handed a delta that removes annotations —
-    /// see [`RethAuxStore::apply_inserts_bulk`](crate::RethAuxStore::apply_inserts_bulk).
-    BulkRemovesUnsupported,
 }
 
 impl<E> From<BitmapError> for AuxError<E> {
