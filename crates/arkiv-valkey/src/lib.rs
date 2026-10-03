@@ -178,6 +178,15 @@ fn with_free_receipt<T>(value: T) -> Metered<T> {
     Metered::new(value, free_receipt())
 }
 
+/// A store handle is shared across threads, which is what the `&self` [`Store`]
+/// seam is for: a host wraps this in an `Arc` and hands it to every open view.
+/// `MemStore` cannot do this — it is a `RefCell` — so the property is pinned
+/// here, where the real store is.
+const _: () = {
+    const fn shareable<T: Send + Sync>() {}
+    shareable::<ValkeyStore>();
+};
+
 impl Store for ValkeyStore {
     fn head(&self) -> CommitId {
         // The trait's one infallible method. A server that cannot answer is
@@ -187,23 +196,23 @@ impl Store for ValkeyStore {
             .map_or(CommitId::GENESIS, CommitId)
     }
 
-    fn begin(&mut self, at: Option<CommitId>) -> Result<BranchId, StoreError> {
+    fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError> {
         self.call(move |backend| async move { backend.begin(at).await })
     }
 
-    fn fork(&mut self, parent: BranchId) -> Result<BranchId, StoreError> {
+    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
         self.call(move |backend| async move { backend.fork(parent).await })
     }
 
-    fn merge(&mut self, child: BranchId) -> Result<BranchVersion, StoreError> {
+    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
         self.call(move |backend| async move { backend.merge(child).await })
     }
 
-    fn discard(&mut self, branch: BranchId) -> Result<(), StoreError> {
+    fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
         self.call(move |backend| async move { backend.discard(branch).await })
     }
 
-    fn commit(&mut self, root: BranchId) -> Result<CommitId, StoreError> {
+    fn commit(&self, root: BranchId) -> Result<CommitId, StoreError> {
         self.call(move |backend| async move { backend.commit(root, None).await })
     }
 
@@ -212,7 +221,7 @@ impl Store for ValkeyStore {
     }
 
     fn create(
-        &mut self,
+        &self,
         branch: BranchId,
         key: RecordKey,
         cells: Vec<(CellName, Cell)>,
@@ -238,7 +247,7 @@ impl Store for ValkeyStore {
     }
 
     fn patch(
-        &mut self,
+        &self,
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
@@ -252,7 +261,7 @@ impl Store for ValkeyStore {
     }
 
     fn delete(
-        &mut self,
+        &self,
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
@@ -330,7 +339,7 @@ impl Store for ValkeyStore {
 }
 
 impl StoreExt for ValkeyStore {
-    fn commit_tagged(&mut self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
+    fn commit_tagged(&self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
         self.call(move |backend| async move { backend.commit(root, Some(tag)).await })
     }
 
@@ -343,7 +352,7 @@ impl StoreExt for ValkeyStore {
     }
 
     fn apply(
-        &mut self,
+        &self,
         branch: BranchId,
         ops: Vec<WriteOp>,
         budget: Option<Budget>,

@@ -231,7 +231,7 @@ fn read_patch_write_on_branch_without_commit_works<S: Store>(store_generator: &d
 
 /// Reading a key that was never written is `None`, not an error.
 fn absent_record_read_returns_none<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let branch = store.begin(None).unwrap();
     assert!(read_record(&store, ReadTarget::Branch(branch), record_key(99)).is_none());
 }
@@ -387,7 +387,7 @@ fn commit_guard_rejects_second_branch_committal<S: Store>(store_generator: &dyn 
 
 /// Handles are never reused: anything touching a consumed branch is refused.
 fn committed_branchid_becomes_invalid<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let branch = store.begin(None).unwrap();
     store.commit(branch).unwrap();
 
@@ -411,7 +411,7 @@ fn committed_branchid_becomes_invalid<S: Store>(store_generator: &dyn Fn() -> S)
 /// Capability follows the constructor: only root branches commit, and a child
 /// may merge or discard but never promote.
 fn nested_branch_cannot_commit_to_grandparent<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let parent = store.begin(None).unwrap();
     let child = store.fork(parent).unwrap();
 
@@ -580,7 +580,7 @@ fn delete_removes_record<S: Store>(store_generator: &dyn Fn() -> S) {
 /// `#` is reserved for store-internal meta entries and is refused in any
 /// caller-supplied cell map.
 fn reserved_cell_name_rejected<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let branch = store.begin(None).unwrap();
 
     assert_eq!(
@@ -600,7 +600,7 @@ fn reserved_cell_name_rejected<S: Store>(store_generator: &dyn Fn() -> S) {
 /// `bytes` has no index, so it may only be a field. The same value as a field
 /// is accepted, which is what makes this a kind rule and not a type ban.
 fn field_only_type_cannot_be_attribute<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let branch = store.begin(None).unwrap();
 
     let indexed = Cell::attribute(TypeId::BYTES, vec![1, 2, 3]);
@@ -621,7 +621,7 @@ fn field_only_type_cannot_be_attribute<S: Store>(store_generator: &dyn Fn() -> S
 
 /// Type id `0` is reserved and never storable, in either kind.
 fn invalid_type_id_rejected<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let branch = store.begin(None).unwrap();
     let reserved = Cell::field(TypeId(0), vec![1]);
 
@@ -1020,7 +1020,7 @@ fn block_lifecycle_at_depth_three<S: Store>(store_generator: &dyn Fn() -> S) {
 /// a handle that no longer exists, so continuing to use them would read from a
 /// parent that is gone.
 fn discard_drops_descendants<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let block = store.begin(None).unwrap();
     let transaction = store.fork(block).unwrap();
     let ops = store.fork(transaction).unwrap();
@@ -1352,7 +1352,7 @@ fn failed_commit_changes_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
 /// has no way to clean up after a conflict — the branch would be unreachable
 /// and its staged writes stranded. Discarding it must still work.
 fn failed_commit_leaves_the_branch_usable<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
 
     let first = store.begin(None).unwrap();
     let stale = store.begin(None).unwrap();
@@ -1593,7 +1593,7 @@ fn changeset_report_all_crud_ops<S: StoreExt>(store_generator: &dyn Fn() -> S) {
 /// This is what keeps batching a transport optimization and never a semantic
 /// one — without it, the RPC binding could change consensus.
 fn apply_batch_matches_individual_writes<S: StoreExt>(store_generator: &dyn Fn() -> S) {
-    let mut batched = store_generator();
+    let batched = store_generator();
     let batched_branch = batched.begin(None).unwrap();
     batched
         .apply(

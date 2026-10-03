@@ -24,6 +24,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use super::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
@@ -85,8 +86,20 @@ struct BranchState {
 }
 
 /// An in-memory [`Store`]. See the crate docs for what it is and is not.
+///
+/// [`Store`] takes `&self` throughout, so the state sits behind a [`RefCell`].
+/// That makes this store `!Sync` — fine for the reference implementation,
+/// which is single-threaded test scaffolding; a real store uses a lock or a
+/// connection pool instead.
+///
+/// ponytail: `RefCell`, not a lock — swap if the suite ever goes concurrent.
 #[derive(Debug)]
-pub struct MemStore {
+pub struct MemStore(RefCell<Inner>);
+
+/// The state itself. Every method here is the plain `&mut self` logic; the
+/// trait impls below are the borrow.
+#[derive(Debug)]
+struct Inner {
     /// Indexed by [`CommitId`], so `commits[0]` is always genesis.
     commits: Vec<Snapshot>,
     branches: BTreeMap<u64, BranchState>,
@@ -103,6 +116,12 @@ impl Default for MemStore {
 impl MemStore {
     /// A store at genesis: commit 0, empty state, no open branches.
     pub fn new() -> Self {
+        Self(RefCell::new(Inner::new()))
+    }
+}
+
+impl Inner {
+    fn new() -> Self {
         let genesis = BTreeMap::new();
         Self {
             commits: alloc::vec![Snapshot {
@@ -182,7 +201,7 @@ fn with_free_receipt<T>(value: T) -> Metered<T> {
     Metered::new(value, free_receipt())
 }
 
-impl Store for MemStore {
+impl Inner {
     fn head(&self) -> CommitId {
         CommitId(self.commits.len() as u64 - 1)
     }
@@ -451,7 +470,7 @@ impl Store for MemStore {
     }
 }
 
-impl StoreExt for MemStore {
+impl Inner {
     fn commit_tagged(&mut self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
         let committed = self.commit(root)?;
         self.commits[committed.0 as usize].tag = Some(tag);
@@ -543,6 +562,152 @@ impl StoreExt for MemStore {
             })
             .collect();
         Ok(with_free_receipt(found))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the borrow
+// ---------------------------------------------------------------------------
+//
+// One borrow per call, taken at the top and released at the bottom. Nothing in
+// `Inner` calls back out through the trait, so the `RefCell` can never be
+// re-entered.
+
+impl Store for MemStore {
+    fn head(&self) -> CommitId {
+        self.0.borrow().head()
+    }
+
+    fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError> {
+        self.0.borrow_mut().begin(at)
+    }
+
+    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
+        self.0.borrow_mut().fork(parent)
+    }
+
+    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
+        self.0.borrow_mut().merge(child)
+    }
+
+    fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
+        self.0.borrow_mut().discard(branch)
+    }
+
+    fn commit(&self, root: BranchId) -> Result<CommitId, StoreError> {
+        self.0.borrow_mut().commit(root)
+    }
+
+    fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError> {
+        self.0.borrow().branch_info(branch)
+    }
+
+    fn create(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        cells: Vec<(CellName, Cell)>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<RecordKey>, StoreError> {
+        self.0.borrow_mut().create(branch, key, cells, budget)
+    }
+
+    fn get(
+        &self,
+        target: ReadTarget,
+        key: RecordKey,
+        projection: Option<&[CellName]>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Option<Record>>, StoreError> {
+        self.0.borrow().get(target, key, projection, budget)
+    }
+
+    fn patch(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        expected_version: Option<RecordVersion>,
+        changes: Vec<(CellName, CellChange)>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<RecordVersion>, StoreError> {
+        self.0
+            .borrow_mut()
+            .patch(branch, key, expected_version, changes, budget)
+    }
+
+    fn delete(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        expected_version: Option<RecordVersion>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<()>, StoreError> {
+        self.0
+            .borrow_mut()
+            .delete(branch, key, expected_version, budget)
+    }
+
+    fn query(
+        &self,
+        at: Option<CommitId>,
+        query: &Query,
+        budget: Option<Budget>,
+    ) -> Result<Metered<QueryResult>, StoreError> {
+        self.0.borrow().query(at, query, budget)
+    }
+
+    fn count(
+        &self,
+        at: Option<CommitId>,
+        filter: &Filter,
+        budget: Option<Budget>,
+    ) -> Result<Metered<u64>, StoreError> {
+        self.0.borrow().count(at, filter, budget)
+    }
+
+    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        self.0.borrow().branch_digest(branch)
+    }
+}
+
+impl StoreExt for MemStore {
+    fn commit_tagged(&self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
+        self.0.borrow_mut().commit_tagged(root, tag)
+    }
+
+    fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError> {
+        self.0.borrow().commit_by_tag(tag)
+    }
+
+    fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {
+        self.0.borrow().changes(commit)
+    }
+
+    fn apply(
+        &self,
+        branch: BranchId,
+        ops: Vec<WriteOp>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Vec<WriteOutcome>>, StoreError> {
+        self.0.borrow_mut().apply(branch, ops, budget)
+    }
+
+    fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError> {
+        self.0.borrow().commit_hash(commit)
+    }
+
+    fn retention(&self) -> (CommitId, CommitId) {
+        self.0.borrow().retention()
+    }
+
+    fn get_many(
+        &self,
+        target: ReadTarget,
+        keys: &[RecordKey],
+        projection: Option<&[CellName]>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Vec<Option<Record>>>, StoreError> {
+        self.0.borrow().get_many(target, keys, projection, budget)
     }
 }
 
