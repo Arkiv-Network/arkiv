@@ -259,6 +259,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// The shared `StateView` contract, the same suite the MPT host runs.
+    #[test]
+    fn conformance() {
+        arkiv_interfaces::statemanager::conformance::run_all(&view);
+    }
+
     #[test]
     fn every_store_commits_to_the_same_digest() {
         let mut view = view();
