@@ -87,10 +87,13 @@ struct BranchState {
 
 /// An in-memory [`Store`]. See the crate docs for what it is and is not.
 ///
-/// [`Store`] takes `&self` throughout, so the state sits behind a [`RefCell`].
-/// That makes this store `!Sync` — fine for the reference implementation,
-/// which is single-threaded test scaffolding; a real store uses a lock or a
-/// connection pool instead.
+/// Alone among the implementations, this one *is* the data rather than a
+/// handle to it, so it is the only one that needs interior mutability for
+/// [`Store`]'s `&self` writes: the state sits behind a [`RefCell`]. A real
+/// store writes to a server and needs none.
+///
+/// The cost is that this store is `!Sync`, which is fine for single-threaded
+/// test scaffolding and is why `arkiv-valkey` pins shareability instead.
 ///
 /// ponytail: `RefCell`, not a lock — swap if the suite ever goes concurrent.
 #[derive(Debug)]
