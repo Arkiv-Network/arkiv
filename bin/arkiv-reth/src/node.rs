@@ -10,10 +10,7 @@ use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder, PayloadTypes},
-    builder::{
-        BuilderContext, DebugNode, Node, NodeAdapter,
-        components::{ComponentsBuilder, NodeComponentsBuilder},
-    },
+    builder::{DebugNode, Node, NodeAdapter, components::ComponentsBuilder},
 };
 use reth_ethereum::{Block, EthPrimitives, engine::local::LocalPayloadAttributesBuilder};
 use reth_node_ethereum::{
@@ -46,33 +43,18 @@ type InnerComponentsBuilder<N> = ComponentsBuilder<
     EthereumConsensusBuilder,
 >;
 
-/// Check imported genesis state before starting the network, payload service or
-/// pruning bootstrap. An initialized genesis header alone is not proof of state.
-pub struct ArkivComponentsBuilder<N>(InnerComponentsBuilder<N>);
-
-impl<N: FullNodeTypes<Types = ArkivNode>> NodeComponentsBuilder<N> for ArkivComponentsBuilder<N> {
-    type Components = <InnerComponentsBuilder<N> as NodeComponentsBuilder<N>>::Components;
-
-    async fn build_components(self, ctx: &BuilderContext<N>) -> eyre::Result<Self::Components> {
-        crate::init_state::status::ensure_complete(ctx.provider(), &ctx.chain_spec())?;
-        self.0.build_components(ctx).await
-    }
-}
-
 impl<N> Node<N> for ArkivNode
 where
     N: FullNodeTypes<Types = Self>,
 {
-    type ComponentsBuilder = ArkivComponentsBuilder<N>;
+    type ComponentsBuilder = InnerComponentsBuilder<N>;
     type AddOns =
         EthereumAddOns<NodeAdapter<N>, EthereumEthApiBuilder, EthereumEngineValidatorBuilder>;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
-        ArkivComponentsBuilder(
-            EthereumNode::components()
-                .executor(ArkivExecutorBuilder::default())
-                .payload(ArkivPayloadServiceBuilder),
-        )
+        EthereumNode::components()
+            .executor(ArkivExecutorBuilder::default())
+            .payload(ArkivPayloadServiceBuilder)
     }
 
     fn add_ons(&self) -> Self::AddOns {

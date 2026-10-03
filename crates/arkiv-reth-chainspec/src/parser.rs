@@ -2,12 +2,9 @@
 
 use crate::ArkivChainSpec;
 use alloy_genesis::Genesis;
-use alloy_primitives::B256;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_ethereum::chainspec::ChainSpec;
-use reth_ethereum::primitives::SealedHeader;
 use reth_ethereum_cli::chainspec::chain_value_parser;
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,15 +16,9 @@ use std::sync::Arc;
 /// rejects every block. `dev` is also the default when nothing is given.
 pub const SUPPORTED_CHAINS: &[&str] = &["dev"];
 
-/// The genesis field naming the block-0 state root outright, for a genesis
-/// whose state is imported with `init-state` rather than listed in `alloc`.
-/// geth's spelling, with geth's rule: it and a non-empty `alloc` are mutually
-/// exclusive, because the root is otherwise derived from the alloc.
-pub const STATE_HASH_FIELD: &str = "stateHash";
-
 /// Clap value parser for `--chain`: reth's own parser, wrapped in
 /// [`ArkivChainSpec`] so the minimum-base-fee rule applies to every chain the
-/// node can be pointed at — plus [`STATE_HASH_FIELD`] on a genesis file.
+/// node can be pointed at.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ArkivChainSpecParser;
@@ -48,15 +39,7 @@ impl ChainSpecParser for ArkivChainSpecParser {
     }
 }
 
-/// The one genesis field read past the `Genesis` type: [`STATE_HASH_FIELD`].
-#[derive(Deserialize)]
-struct StateHash {
-    #[serde(rename = "stateHash")]
-    state_hash: Option<B256>,
-}
-
-/// A genesis file path or inline genesis JSON, as reth reads it, honouring
-/// [`STATE_HASH_FIELD`].
+/// A genesis file path or inline genesis JSON, as reth reads it.
 fn parse_genesis_spec(s: &str) -> eyre::Result<ChainSpec> {
     // reth's rule: a readable path first, else the text itself if it looks
     // like JSON.
@@ -70,24 +53,8 @@ fn parse_genesis_spec(s: &str) -> eyre::Result<ChainSpec> {
             }
         }
     };
-    // Straight into `Genesis`, as reth does, then a second pass for the one
-    // field that type does not carry. The second pass allocates nothing per
-    // account; going through a `serde_json::Value` instead would cost several
-    // times the alloc's size in memory, on a file that can run to gigabytes.
     let genesis: Genesis = serde_json::from_str(&raw)?;
-    let StateHash { state_hash } = serde_json::from_str(&raw)?;
-    let mut spec = ChainSpec::from_genesis(genesis);
-    if let Some(root) = state_hash {
-        eyre::ensure!(
-            spec.genesis.alloc.is_empty(),
-            "genesis carries both {STATE_HASH_FIELD} and a non-empty alloc; the state root is \
-             derived from the alloc, so it can name one or the other"
-        );
-        let mut header = spec.genesis_header.clone_header();
-        header.state_root = root;
-        spec.genesis_header = SealedHeader::seal_slow(header);
-    }
-    Ok(spec)
+    Ok(ChainSpec::from_genesis(genesis))
 }
 
 #[cfg(test)]
@@ -132,41 +99,5 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let inline = ArkivChainSpecParser::parse(GENESIS).unwrap();
         assert_eq!(from_file.genesis_hash(), inline.genesis_hash());
-    }
-
-    /// `stateHash` replaces the alloc-derived root in the genesis header, and
-    /// with it the genesis hash — the header an `init-state` import is checked
-    /// against.
-    #[test]
-    fn state_hash_sets_the_genesis_state_root() {
-        let root = B256::repeat_byte(0x42);
-        let mut value: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
-        value[STATE_HASH_FIELD] = serde_json::to_value(root).unwrap();
-        let seeded = ArkivChainSpecParser::parse(&value.to_string()).expect("parses");
-        let plain = ArkivChainSpecParser::parse(GENESIS).unwrap();
-
-        assert_eq!(seeded.genesis_header().state_root, root);
-        assert_ne!(plain.genesis_header().state_root, root);
-        assert_ne!(seeded.genesis_hash(), plain.genesis_hash());
-        assert_eq!(
-            seeded.genesis_hash(),
-            alloy_primitives::keccak256(alloy_rlp::encode(seeded.genesis_header())),
-            "the sealed hash is the header's own hash",
-        );
-        assert!(seeded.genesis().alloc.is_empty());
-        // Everything else is untouched.
-        assert_eq!(seeded.min_base_fee(), 10);
-        assert_eq!(seeded.chain().id(), 7738577);
-    }
-
-    #[test]
-    fn state_hash_with_an_alloc_is_refused() {
-        let mut value: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
-        value[STATE_HASH_FIELD] = serde_json::to_value(B256::repeat_byte(1)).unwrap();
-        value["alloc"] = serde_json::json!({
-            "0x0000000000000000000000000000000000000001": {"balance": "0x1"}
-        });
-        let err = ArkivChainSpecParser::parse(&value.to_string()).unwrap_err();
-        assert!(err.to_string().contains(STATE_HASH_FIELD), "{err}");
     }
 }
