@@ -577,7 +577,36 @@ pub enum StoreError {
 ///
 /// Implementations: the in-memory reference (`arkiv-store-mem`), and the real
 /// store. Both are held to [`conformance`].
-pub trait Store {
+///
+/// # This is a handle, not the data
+///
+/// Every method takes `&self`, writes included. A `Store` value is a *handle
+/// to a database that lives elsewhere* — out of process, for the real one.
+/// Writing through it changes the database, not the handle: `ValkeyStore`
+/// holds no cell, lock or atomic, and a write leaves every one of its bytes
+/// untouched.
+///
+/// So `&mut self` on a write was never describing mutation of the receiver.
+/// It was claiming exclusive access to the database, which a handle does not
+/// have and cannot get — the real store is a server, and this process is one
+/// of its clients.
+///
+/// Concurrency control is therefore the store's own job, and it is already in
+/// this API: [`BranchVersion`] and [`StoreError::Conflict`]. `merge` fails if
+/// the parent moved; `commit` fails if head moved. A `&mut self` seam adds a
+/// compile-time exclusion on top of that, which is redundant where it holds
+/// and false where it matters — it cannot reach another process.
+///
+/// What it costs is the thing a host actually needs: [`Arc<T>`] is a `Store`,
+/// so one store can serve many concurrently open views.
+///
+/// Interior mutability is only needed by an implementation that *is* the
+/// data — the in-memory reference store, which holds it in-process and
+/// pays a `RefCell` for the pretence. That is a property of the reference
+/// implementation, not of this seam.
+///
+/// [`Arc<T>`]: alloc::sync::Arc
+pub trait Store: core::fmt::Debug {
     // -- commits and branches (unmetered) ----------------------------------
 
     /// The current canonical head.
@@ -588,27 +617,27 @@ pub trait Store {
     ///
     /// Any number may be open concurrently over the same origin — which is what
     /// lets a host validate competing payloads at one height.
-    fn begin(&mut self, at: Option<CommitId>) -> Result<BranchId, StoreError>;
+    fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError>;
 
     /// An O(1) child branch, snapshotting `parent` at its current version. The
     /// parent may advance afterwards without affecting the child. Child
     /// branches may only `merge` or `discard`.
-    fn fork(&mut self, parent: BranchId) -> Result<BranchId, StoreError>;
+    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError>;
 
     /// Fold `child`'s diff into its parent, consuming the handle. The parent's
     /// version must still equal the child's fork-time version, else
     /// [`StoreError::Conflict`]. Returns the parent's new version.
-    fn merge(&mut self, child: BranchId) -> Result<BranchVersion, StoreError>;
+    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError>;
 
     /// Drop a branch and its open descendants; the parent is untouched.
     /// Receipts already returned stay valid — cost is a return value, never
     /// state.
-    fn discard(&mut self, branch: BranchId) -> Result<(), StoreError>;
+    fn discard(&self, branch: BranchId) -> Result<(), StoreError>;
 
     /// Seal a root branch: assigns `head + 1`, writes history, persists
     /// durably, consumes the handle. The origin commit must still be head,
     /// else [`StoreError::Conflict`].
-    fn commit(&mut self, root: BranchId) -> Result<CommitId, StoreError>;
+    fn commit(&self, root: BranchId) -> Result<CommitId, StoreError>;
 
     fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError>;
 
@@ -619,7 +648,7 @@ pub trait Store {
     /// Besides `cells`, the store writes the record's `#version` meta entry at
     /// `1` — its presence *is* record existence.
     fn create(
-        &mut self,
+        &self,
         branch: BranchId,
         key: RecordKey,
         cells: Vec<(CellName, Cell)>,
@@ -638,7 +667,7 @@ pub trait Store {
     /// Partial mutation. Names absent from `changes` are untouched; the last
     /// cell of a record may not be removed. Returns the new record version.
     fn patch(
-        &mut self,
+        &self,
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
@@ -647,7 +676,7 @@ pub trait Store {
     ) -> Result<Metered<RecordVersion>, StoreError>;
 
     fn delete(
-        &mut self,
+        &self,
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
@@ -697,7 +726,7 @@ pub trait StoreExt: Store {
     /// cannot express. The store attaches no meaning to the tag; it only has
     /// to keep it consistent with retention trimming, which is why this lives
     /// store-side rather than in a host map that could disagree after a crash.
-    fn commit_tagged(&mut self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError>;
+    fn commit_tagged(&self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError>;
 
     /// **\[ext R1\]** Resolve a tag back to its commit, if still retained.
     fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError>;
@@ -717,7 +746,7 @@ pub trait StoreExt: Store {
     /// thousands. Tolerable in-process; fatal across a process boundary, which
     /// is exactly where the A/B equivalence harness lives.
     fn apply(
-        &mut self,
+        &self,
         branch: BranchId,
         ops: Vec<WriteOp>,
         budget: Option<Budget>,
@@ -747,6 +776,142 @@ pub trait StoreExt: Store {
         projection: Option<&[CellName]>,
         budget: Option<Budget>,
     ) -> Result<Metered<Vec<Option<Record>>>, StoreError>;
+}
+
+/// A shared handle is a store. This is the point of the `&self` seam: a host
+/// opens one store and gives every view an `Arc` of it.
+impl<T: Store + ?Sized> Store for alloc::sync::Arc<T> {
+    fn head(&self) -> CommitId {
+        (**self).head()
+    }
+
+    fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError> {
+        (**self).begin(at)
+    }
+
+    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
+        (**self).fork(parent)
+    }
+
+    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
+        (**self).merge(child)
+    }
+
+    fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
+        (**self).discard(branch)
+    }
+
+    fn commit(&self, root: BranchId) -> Result<CommitId, StoreError> {
+        (**self).commit(root)
+    }
+
+    fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError> {
+        (**self).branch_info(branch)
+    }
+
+    fn create(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        cells: Vec<(CellName, Cell)>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<RecordKey>, StoreError> {
+        (**self).create(branch, key, cells, budget)
+    }
+
+    fn get(
+        &self,
+        target: ReadTarget,
+        key: RecordKey,
+        projection: Option<&[CellName]>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Option<Record>>, StoreError> {
+        (**self).get(target, key, projection, budget)
+    }
+
+    fn patch(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        expected_version: Option<RecordVersion>,
+        changes: Vec<(CellName, CellChange)>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<RecordVersion>, StoreError> {
+        (**self).patch(branch, key, expected_version, changes, budget)
+    }
+
+    fn delete(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        expected_version: Option<RecordVersion>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<()>, StoreError> {
+        (**self).delete(branch, key, expected_version, budget)
+    }
+
+    fn query(
+        &self,
+        at: Option<CommitId>,
+        query: &Query,
+        budget: Option<Budget>,
+    ) -> Result<Metered<QueryResult>, StoreError> {
+        (**self).query(at, query, budget)
+    }
+
+    fn count(
+        &self,
+        at: Option<CommitId>,
+        filter: &Filter,
+        budget: Option<Budget>,
+    ) -> Result<Metered<u64>, StoreError> {
+        (**self).count(at, filter, budget)
+    }
+
+    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        (**self).branch_digest(branch)
+    }
+}
+
+impl<T: StoreExt + ?Sized> StoreExt for alloc::sync::Arc<T> {
+    fn commit_tagged(&self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
+        (**self).commit_tagged(root, tag)
+    }
+
+    fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError> {
+        (**self).commit_by_tag(tag)
+    }
+
+    fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {
+        (**self).changes(commit)
+    }
+
+    fn apply(
+        &self,
+        branch: BranchId,
+        ops: Vec<WriteOp>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Vec<WriteOutcome>>, StoreError> {
+        (**self).apply(branch, ops, budget)
+    }
+
+    fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError> {
+        (**self).commit_hash(commit)
+    }
+
+    fn retention(&self) -> (CommitId, CommitId) {
+        (**self).retention()
+    }
+
+    fn get_many(
+        &self,
+        target: ReadTarget,
+        keys: &[RecordKey],
+        projection: Option<&[CellName]>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Vec<Option<Record>>>, StoreError> {
+        (**self).get_many(target, keys, projection, budget)
+    }
 }
 
 /// One record's before/after across a commit, from [`StoreExt::changes`].

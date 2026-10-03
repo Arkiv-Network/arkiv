@@ -16,11 +16,7 @@
 //! reth's is hard-wired to reth's `ChainSpec`.
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
-//!
-//! One reth subcommand is re-routed: `init-state`, which reth v2.5.0 cannot
-//! run at genesis under its default storage layout. See [`init_state`].
 
-mod init_state;
 mod node;
 
 // jemalloc, as reth's own binary does it. reth fragments badly under the stock
@@ -36,15 +32,36 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
 use arkiv_reth_chainspec::ArkivChainSpecParser;
 use arkiv_reth_executor::ArkivEvmFactory;
+use arkiv_reth_statemanager::HostStore;
 use clap::Parser;
 use node::ArkivNode;
-use reth::{
-    beacon_consensus::EthBeaconConsensus,
-    cli::{Cli, Commands},
-};
+use reth::{beacon_consensus::EthBeaconConsensus, cli::Cli};
 use reth_node_ethereum::EthEvmConfig;
 use std::sync::Arc;
 use tracing::info;
+
+/// The store Arkiv's state lives in.
+///
+/// `ARKIV_STORE_URL` names a Valkey server; unset, the node runs the in-process
+/// reference store, which is what `--dev` wants and what the black-box tests
+/// spawn. Either way there is exactly one store, and it holds every entity,
+/// the query index and the minting nonces.
+fn open_store() -> eyre::Result<HostStore> {
+    match std::env::var("ARKIV_STORE_URL") {
+        Ok(url) => {
+            let namespace =
+                std::env::var("ARKIV_STORE_NAMESPACE").unwrap_or_else(|_| "arkiv".to_owned());
+            let store = arkiv_valkey::ValkeyStore::connect(&url, &namespace)
+                .map_err(|e| eyre::eyre!("connect to the Arkiv store at {url}: {e:?}"))?;
+            info!(target: "arkiv-reth", %url, %namespace, "Arkiv state on Valkey");
+            Ok(Arc::new(store))
+        }
+        Err(_) => {
+            info!(target: "arkiv-reth", "Arkiv state in-process (set ARKIV_STORE_URL for Valkey)");
+            Ok(Arc::new(arkiv_interfaces::store::reference::MemStore::new()))
+        }
+    }
+}
 
 fn main() {
     // Enable backtraces unless the caller already set a preference.
@@ -61,41 +78,46 @@ fn main() {
         .with_log_file_filter("debug,turso_core=info,turso=info".to_owned())
         .try_init();
 
-    let result = match Cli::<ArkivChainSpecParser>::parse() {
-        // The genesis-aware `init-state`; every other command is reth's.
-        Cli {
-            command: Commands::InitState(command),
-            logs,
-            ..
-        } => init_state::run(command, logs),
-        // `run_with_components` rather than `run`: the latter is bound to reth's
-        // `ChainSpec`. The components closure gives the non-`node` subcommands
-        // (`init`, `import`, `db`, ...) the same executor and consensus the node uses.
-        cli => cli.run_with_components::<ArkivNode>(
-            |spec| {
-                (
-                    EthEvmConfig::new_with_evm_factory(spec.clone(), ArkivEvmFactory::default()),
-                    Arc::new(EthBeaconConsensus::new(spec)),
-                )
-            },
-            async move |builder, _| {
-                info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
-                let handle = builder
-                    // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
-                    .node(ArkivNode)
-                    // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
-                    .extend_rpc_modules(|ctx| {
-                        let module = arkiv_reth_rpc::arkiv_module(ctx.provider().clone())?;
-                        ctx.modules.merge_configured(module)?;
-                        info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
-                        Ok(())
-                    })
-                    .launch_with_debug_capabilities()
-                    .await?;
-                handle.wait_for_node_exit().await
-            },
-        ),
+    // `run_with_components` rather than `run`: the latter is bound to reth's
+    // `ChainSpec`. The components closure gives the non-`node` subcommands
+    // (`init`, `import`, `db`, ...) the same executor and consensus the node uses.
+    let store = match open_store() {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            std::process::exit(1);
+        }
     };
+    let factory_store = store.clone();
+    let result = Cli::<ArkivChainSpecParser>::parse().run_with_components::<ArkivNode>(
+        move |spec| {
+            (
+                EthEvmConfig::new_with_evm_factory(
+                    spec.clone(),
+                    ArkivEvmFactory::new(factory_store.clone()),
+                ),
+                Arc::new(EthBeaconConsensus::new(spec)),
+            )
+        },
+        async move |builder, _| {
+            info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
+            let rpc_store = store.clone();
+            let handle = builder
+                // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
+                .node(ArkivNode::new(store.clone()))
+                // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
+                .extend_rpc_modules(move |ctx| {
+                    let module =
+                        arkiv_reth_rpc::arkiv_module(ctx.provider().clone(), rpc_store.clone())?;
+                    ctx.modules.merge_configured(module)?;
+                    info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
+                    Ok(())
+                })
+                .launch_with_debug_capabilities()
+                .await?;
+            handle.wait_for_node_exit().await
+        },
+    );
     if let Err(err) = result {
         eprintln!("Error: {err:?}");
         std::process::exit(1);

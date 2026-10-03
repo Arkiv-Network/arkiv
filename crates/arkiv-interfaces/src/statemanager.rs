@@ -489,6 +489,9 @@ pub trait StateView:
         Self: Sized;
 }
 
+#[cfg(feature = "conformance")]
+pub mod conformance;
+
 /// Mints [`StateView`]s, and prices work. Pricing is consensus: it decides
 /// out-of-gas, so two managers at the same state must answer identically.
 pub trait StateManager {

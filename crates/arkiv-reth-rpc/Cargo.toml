@@ -12,7 +12,6 @@ license.workspace = true
 # The wire contract this crate implements.
 arkiv-rpc-types.workspace = true
 # The committed stores a read goes through, plus the query-language parser.
-arkiv-reth-mpt-committed-store.workspace = true
 arkiv-query.workspace = true
 arkiv-interfaces.workspace = true
 # The `StateProvider` snapshot each call is served from.
@@ -29,3 +28,4 @@ base64 = "0.23"
 # Store reads hit MDBX, so they run on `spawn_blocking`.
 tokio.workspace = true
 eyre.workspace = true
+arkiv-reth-statemanager.workspace = true

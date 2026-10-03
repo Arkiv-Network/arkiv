@@ -14,8 +14,8 @@ license.workspace = true
 [dependencies]
 # The StateManager trait family this crate implements.
 arkiv-interfaces.workspace = true
+arkiv-golemdb-state.workspace = true
 # The committed lanes: entities, index, balances, nonces, minting nonces.
-arkiv-reth-mpt-committed-store.workspace = true
 # The uncommitted lane(s): the pruning map.
 arkiv-reth-uncommitted-store.workspace = true
 
@@ -23,3 +23,6 @@ alloy-primitives.workspace = true
 # WriteOverlay reads through revm's Database and stages an EvmState diff.
 reth-ethereum = { workspace = true, features = ["evm"] }
 eyre.workspace = true
+
+[dev-dependencies]
+arkiv-interfaces = { workspace = true, features = ["conformance"] }

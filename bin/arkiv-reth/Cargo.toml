@@ -10,9 +10,7 @@ name = "arkiv-reth"
 path = "src/main.rs"
 
 # The assembly point and nothing else: reth's host plus the two things Arkiv
-# replaces. Anything more than wiring belongs in one of the crates below. The
-# one exception is `init_state`, a re-routed reth subcommand that only makes
-# sense next to the CLI dispatch.
+# replaces. Anything more than wiring belongs in one of the crates below.
 
 [dependencies]
 reth.workspace = true
@@ -21,30 +19,17 @@ reth-cli-util.workspace = true
 reth-node-ethereum.workspace = true
 # `LocalPayloadAttributesBuilder` for the `--dev` miner, via the umbrella's `node` feature.
 reth-ethereum = { workspace = true, features = ["node"] }
-# `EthStorage`, the node's storage type; the provider traits `init_state` reads through.
+# `EthStorage`, the node's storage type.
 reth-storage-api.workspace = true
-# `init-state` re-routed: reth's argument struct and environment setup, and the importer itself.
-reth-cli-commands.workspace = true
-reth-db-common.workspace = true
-# The streaming importer behind it: reth's ETL collector, tables, trie walk.
-reth-etl.workspace = true
-reth-db-api.workspace = true
-reth-trie.workspace = true
-reth-trie-db.workspace = true
-reth-stages-types.workspace = true
-reth-config.workspace = true
-alloy-genesis.workspace = true
-# `BlockHeader::state_root`, read off the genesis header the dump must match.
-alloy-consensus.workspace = true
-serde.workspace = true
-# The progress file `init-state` keeps: a tracing layer on reth's log, JSON out.
-reth-tracing.workspace = true
-serde_json.workspace = true
-alloy-primitives.workspace = true
 # The chain spec with the minimum-base-fee rule, and its `--chain` parser.
 arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
+arkiv-reth-statemanager.workspace = true
+# The node's backing store: the reference one in-process by default, Valkey
+# when ARKIV_STORE_URL names a server.
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
+arkiv-valkey.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true
@@ -60,9 +45,6 @@ tracing.workspace = true
 # the tests build calldata with arkiv-bindings and decode EntityOperation logs.
 arkiv-harness.workspace = true
 arkiv-bindings.workspace = true
-# The seeded-genesis tests build their block-0 state in-process.
-arkiv-seed.workspace = true
-arkiv-genesis.workspace = true
 alloy-provider.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
@@ -71,4 +53,6 @@ alloy-sol-types.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 tokio.workspace = true
-tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+alloy-primitives.workspace = true

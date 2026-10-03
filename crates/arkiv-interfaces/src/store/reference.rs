@@ -24,6 +24,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use std::sync::Mutex;
 
 use super::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
@@ -85,8 +86,23 @@ struct BranchState {
 }
 
 /// An in-memory [`Store`]. See the crate docs for what it is and is not.
+///
+/// Alone among the implementations, this one *is* the data rather than a
+/// handle to it, so it is the only one that needs interior mutability for
+/// [`Store`]'s `&self` writes: the state sits behind a [`Mutex`]. A real store
+/// writes to a server and needs none.
+///
+/// A lock rather than a `RefCell` because this is also the node's default
+/// in-process backing store, and reth reaches it from several threads.
+///
+/// ponytail: one global lock. Shard it if a single node ever contends.
 #[derive(Debug)]
-pub struct MemStore {
+pub struct MemStore(Mutex<Inner>);
+
+/// The state itself. Every method here is the plain `&mut self` logic; the
+/// trait impls below are the borrow.
+#[derive(Debug)]
+struct Inner {
     /// Indexed by [`CommitId`], so `commits[0]` is always genesis.
     commits: Vec<Snapshot>,
     branches: BTreeMap<u64, BranchState>,
@@ -103,6 +119,12 @@ impl Default for MemStore {
 impl MemStore {
     /// A store at genesis: commit 0, empty state, no open branches.
     pub fn new() -> Self {
+        Self(Mutex::new(Inner::new()))
+    }
+}
+
+impl Inner {
+    fn new() -> Self {
         let genesis = BTreeMap::new();
         Self {
             commits: alloc::vec![Snapshot {
@@ -165,6 +187,12 @@ impl MemStore {
     }
 }
 
+/// The node holds one handle across reth's threads.
+const _: () = {
+    const fn shareable<T: Send + Sync>() {}
+    shareable::<MemStore>();
+};
+
 /// Nothing here meters, so every receipt is the same zero.
 ///
 /// Cost is the real store's concern, priced against a schedule this
@@ -182,7 +210,7 @@ fn with_free_receipt<T>(value: T) -> Metered<T> {
     Metered::new(value, free_receipt())
 }
 
-impl Store for MemStore {
+impl Inner {
     fn head(&self) -> CommitId {
         CommitId(self.commits.len() as u64 - 1)
     }
@@ -451,7 +479,7 @@ impl Store for MemStore {
     }
 }
 
-impl StoreExt for MemStore {
+impl Inner {
     fn commit_tagged(&mut self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
         let committed = self.commit(root)?;
         self.commits[committed.0 as usize].tag = Some(tag);
@@ -543,6 +571,211 @@ impl StoreExt for MemStore {
             })
             .collect();
         Ok(with_free_receipt(found))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the borrow
+// ---------------------------------------------------------------------------
+//
+// One lock per call, taken at the top and released at the bottom. Nothing in
+// `Inner` calls back out through the trait, so the lock can never be taken
+// re-entrantly and deadlock.
+
+impl Store for MemStore {
+    fn head(&self) -> CommitId {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .head()
+    }
+
+    fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .begin(at)
+    }
+
+    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .fork(parent)
+    }
+
+    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .merge(child)
+    }
+
+    fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .discard(branch)
+    }
+
+    fn commit(&self, root: BranchId) -> Result<CommitId, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .commit(root)
+    }
+
+    fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .branch_info(branch)
+    }
+
+    fn create(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        cells: Vec<(CellName, Cell)>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<RecordKey>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .create(branch, key, cells, budget)
+    }
+
+    fn get(
+        &self,
+        target: ReadTarget,
+        key: RecordKey,
+        projection: Option<&[CellName]>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Option<Record>>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .get(target, key, projection, budget)
+    }
+
+    fn patch(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        expected_version: Option<RecordVersion>,
+        changes: Vec<(CellName, CellChange)>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<RecordVersion>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .patch(branch, key, expected_version, changes, budget)
+    }
+
+    fn delete(
+        &self,
+        branch: BranchId,
+        key: RecordKey,
+        expected_version: Option<RecordVersion>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<()>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .delete(branch, key, expected_version, budget)
+    }
+
+    fn query(
+        &self,
+        at: Option<CommitId>,
+        query: &Query,
+        budget: Option<Budget>,
+    ) -> Result<Metered<QueryResult>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .query(at, query, budget)
+    }
+
+    fn count(
+        &self,
+        at: Option<CommitId>,
+        filter: &Filter,
+        budget: Option<Budget>,
+    ) -> Result<Metered<u64>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .count(at, filter, budget)
+    }
+
+    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .branch_digest(branch)
+    }
+}
+
+impl StoreExt for MemStore {
+    fn commit_tagged(&self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .commit_tagged(root, tag)
+    }
+
+    fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .commit_by_tag(tag)
+    }
+
+    fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .changes(commit)
+    }
+
+    fn apply(
+        &self,
+        branch: BranchId,
+        ops: Vec<WriteOp>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Vec<WriteOutcome>>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .apply(branch, ops, budget)
+    }
+
+    fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .commit_hash(commit)
+    }
+
+    fn retention(&self) -> (CommitId, CommitId) {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .retention()
+    }
+
+    fn get_many(
+        &self,
+        target: ReadTarget,
+        keys: &[RecordKey],
+        projection: Option<&[CellName]>,
+        budget: Option<Budget>,
+    ) -> Result<Metered<Vec<Option<Record>>>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .get_many(target, keys, projection, budget)
     }
 }
 

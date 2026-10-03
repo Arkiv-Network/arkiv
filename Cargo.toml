@@ -9,53 +9,46 @@ rust-version = "1.97"
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
-# reth, pinned to the tag the local checkout tracks (~/Projects/arkiv/reth).
+# reth, from our private fork at ~/Projects/arkiv/reth rather than upstream: this
+# branch carries the patch that lets the engine run on a provider of our own
+# (Arkiv-Network/reth#1). Flip `branch` to `arkiv/custom-golemdb` once that merges.
+#
+# The fork is PRIVATE, so cargo needs credentials to fetch it. Locally that is your
+# SSH key, via the `ssh://` URL plus `net.git-fetch-with-cli` in .cargo/config.toml.
+# CI has no credential yet -- see the branch's README notes.
+#
 # Docker builds the workspace in isolation, so reth must be a git dependency.
 # Default features are off: v2.5.0 added "jit" to reth's defaults, which pulls
 # revmc -> llvm-sys and needs a system LLVM 22 that neither the dev machines nor
 # the slim Docker builder has. We only use `reth::cli::Cli`, so nothing else in
 # that default set is required — except "asm-keccak" (assembly keccak256 on the
 # state-root/tx-hash hot path) and "jemalloc".
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", default-features = false, features = [
+reth = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider", default-features = false, features = [
     "asm-keccak",
     "jemalloc",
 ] }
-reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-cli = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # The `ChainSpecParser` trait behind `--chain`; arkiv-reth-chainspec implements it.
-reth-cli = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-cli = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # `NodeRecord`, the bootnode type in the `EthChainSpec` trait the Arkiv chain spec implements.
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-peers = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # The jemalloc allocator itself. `reth`'s "jemalloc" feature only wires up the
 # jemalloc *stats* reporting in node-core/metrics/provider; the allocator has to
 # be declared as `#[global_allocator]` by the binary, which is what reth's own
 # main.rs does. `reth` doesn't re-export it, so we depend on it directly.
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", features = [
+reth-cli-util = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider", features = [
     "jemalloc",
 ] }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-node-ethereum = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # Umbrella crate used by the executor seam (matches the custom-evm example's deps).
 # Keep default features (std); the executor crate adds "evm" + "node".
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-# `init-state`'s argument struct and datadir setup, and the state-dump importer
-# behind it: arkiv-reth re-routes that one subcommand to make it work at genesis.
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-# The parts of that importer arkiv-reth's streaming variant is assembled from:
-# the ETL collector, the tables and their codecs, the trie walk, the stage ids.
-reth-etl = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-# `Layers`, to hang `init-state`'s progress layer onto reth's tracing setup.
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-storage-api = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-basic-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-ethereum-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-payload-builder-primitives = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 
 # JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
 # reth v2.7.0 uses so the RpcModule we register merges into reth's rpc modules.
@@ -72,9 +65,6 @@ alloy-rlp = "0.3"
 alloy-primitives = { version = "1.6", features = ["rlp"] }
 alloy-consensus = "2.5"
 alloy-evm = "0.39"
-# The keccak-MPT state-root helpers arkiv-seed derives a genesis `stateHash`
-# with. Same line reth v2.7.0 pins, so the root matches the chain spec's.
-alloy-trie = "0.9"
 
 # Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
 # pair account's bitmap bytes are consensus state (its codeHash =
@@ -114,14 +104,13 @@ arkiv-valkey = { path = "crates/arkiv-valkey" }
 arkiv-rpc-types = { path = "crates/arkiv-rpc-types" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
-arkiv-seed = { path = "crates/arkiv-seed" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }
-arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store" }
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
+arkiv-golemdb-state = { path = "crates/arkiv-golemdb-state" }
 arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
 
 # Copied from yagna (.cargo/config). A dev build without debug info or
