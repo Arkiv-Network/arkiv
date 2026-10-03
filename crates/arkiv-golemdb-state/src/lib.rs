@@ -15,3 +15,11 @@ pub mod view;
 
 pub use manager::GolemStateManager;
 pub use view::{GolemStateView, ViewError};
+
+/// The node carries one erased store handle, so nothing downstream has to be
+/// generic over the store type: `StoreExt` is object-safe, a trait object
+/// implements its supertrait `Store`, and `Arc<T: Store>` is itself a `Store`.
+#[allow(dead_code)]
+fn _erased_handle_is_a_store(store: alloc::sync::Arc<dyn arkiv_interfaces::store::StoreExt>) {
+    let _: &dyn arkiv_interfaces::store::Store = &store;
+}

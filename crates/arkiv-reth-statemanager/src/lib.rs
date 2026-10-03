@@ -3,9 +3,13 @@
 //! `Database` to the raw seams, accumulating committed writes into the one
 //! `EvmState` diff reth commits. [`write_manager`] composes the two.
 
+pub mod accounts;
+pub mod host;
 pub mod manager;
 pub mod overlay;
 
+pub use accounts::{BalanceAccess, NonceAccess};
+pub use host::{HostError, HostStateView, HostStore};
 pub use manager::{MptError, MptStateView};
 pub use overlay::WriteOverlay;
 

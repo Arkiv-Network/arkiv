@@ -1654,6 +1654,7 @@ name = "arkiv-reth-statemanager"
 version = "0.5.1"
 dependencies = [
  "alloy-primitives",
+ "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-mpt-committed-store",
  "arkiv-reth-uncommitted-store",

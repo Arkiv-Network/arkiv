@@ -14,6 +14,7 @@ license.workspace = true
 [dependencies]
 # The StateManager trait family this crate implements.
 arkiv-interfaces.workspace = true
+arkiv-golemdb-state.workspace = true
 # The committed lanes: entities, index, balances, nonces, minting nonces.
 arkiv-reth-mpt-committed-store.workspace = true
 # The uncommitted lane(s): the pruning map.
