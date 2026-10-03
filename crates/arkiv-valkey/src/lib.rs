@@ -179,8 +179,12 @@ fn with_free_receipt<T>(value: T) -> Metered<T> {
 }
 
 /// A store handle is shared across threads, which is what the `&self` [`Store`]
-/// seam is for: a host wraps this in an `Arc` and hands it to every open view.
-/// `MemStore` cannot do this — it is a `RefCell` — so the property is pinned
+/// seam is for: a host wraps this in an `Arc` and gives it to every open view.
+///
+/// Note what is *not* here: no cell, no lock, no atomic. A write through this
+/// handle changes the server and leaves the handle untouched, which is why
+/// `&self` is the honest receiver rather than a concession. `MemStore` needs a
+/// `RefCell` only because it holds the data itself, so the property is pinned
 /// here, where the real store is.
 const _: () = {
     const fn shareable<T: Send + Sync>() {}

@@ -578,22 +578,34 @@ pub enum StoreError {
 /// Implementations: the in-memory reference (`arkiv-store-mem`), and the real
 /// store. Both are held to [`conformance`].
 ///
-/// # Every method takes `&self`
+/// # This is a handle, not the data
 ///
-/// Writes mutate the store, so an implementation needs interior mutability —
-/// a lock, a connection pool, or a `RefCell` for the reference one. That is
-/// deliberate, and the alternative is worse: with `&mut self`, a handle cannot
-/// be shared, and the one thing a host must do is open several views over one
-/// store. `StateView`'s reads are `&self` and its writes are `&mut self`, so a
-/// `&mut self` seam would force a `RefCell` into every *view* instead — the
-/// same interior mutability, one layer further from the thing that actually
-/// knows how to serialize access.
+/// Every method takes `&self`, writes included. A `Store` value is a *handle
+/// to a database that lives elsewhere* — out of process, for the real one.
+/// Writing through it changes the database, not the handle: `ValkeyStore`
+/// holds no cell, lock or atomic, and a write leaves every one of its bytes
+/// untouched.
 ///
-/// It also makes [`Arc<T>`](alloc::sync::Arc) a `Store`, which is how a host
-/// hands the same store to many views.
+/// So `&mut self` on a write was never describing mutation of the receiver.
+/// It was claiming exclusive access to the database, which a handle does not
+/// have and cannot get — the real store is a server, and this process is one
+/// of its clients.
 ///
-/// **An implementation must not deadlock or panic on re-entry** — nothing here
-/// calls back into the store, but a lock held across a call would.
+/// Concurrency control is therefore the store's own job, and it is already in
+/// this API: [`BranchVersion`] and [`StoreError::Conflict`]. `merge` fails if
+/// the parent moved; `commit` fails if head moved. A `&mut self` seam adds a
+/// compile-time exclusion on top of that, which is redundant where it holds
+/// and false where it matters — it cannot reach another process.
+///
+/// What it costs is the thing a host actually needs: [`Arc<T>`] is a `Store`,
+/// so one store can serve many concurrently open views.
+///
+/// Interior mutability is only needed by an implementation that *is* the
+/// data — the in-memory reference store, which holds it in-process and
+/// pays a `RefCell` for the pretence. That is a property of the reference
+/// implementation, not of this seam.
+///
+/// [`Arc<T>`]: alloc::sync::Arc
 pub trait Store {
     // -- commits and branches (unmetered) ----------------------------------
 
