@@ -60,10 +60,6 @@ pub enum AccountError {
     Store(StoreError),
     /// A cell was present but the wrong width to decode.
     Malformed(&'static str),
-    /// A balance change overflowed or underflowed.
-    ///
-    /// Not clamped: a balance that saturates silently is money created or destroyed.
-    BalanceOutOfRange,
 }
 
 impl From<StoreError> for AccountError {
@@ -202,12 +198,11 @@ impl<S: Store> GolemStateView<S> {
         amount: UserBalance,
     ) -> Result<UserBalance, AccountError> {
         let before = self.balance(account, ReadMode::ViewWithOverlay)?;
-        // `checked_`, never `saturating_`: a balance that clamps at the maximum has
-        // created money, and doing so silently is worse than refusing the write.
-        let after = before
-            .checked_add(amount)
-            .ok_or(AccountError::BalanceOutOfRange)?;
-        self.write_balance(account, after)?;
+        // Saturating, as the trait specifies, and as the MPT host does. Solvency
+        // is decided upstream by revm's fee checks — and deliberately skipped on
+        // `eth_call` / `eth_estimateGas`, where debiting an unfunded sender to
+        // zero is the wanted behaviour and an error would break the call.
+        self.write_balance(account, before.saturating_add(amount))?;
         Ok(before)
     }
 
@@ -218,10 +213,7 @@ impl<S: Store> GolemStateView<S> {
         amount: UserBalance,
     ) -> Result<UserBalance, AccountError> {
         let before = self.balance(account, ReadMode::ViewWithOverlay)?;
-        let after = before
-            .checked_sub(amount)
-            .ok_or(AccountError::BalanceOutOfRange)?;
-        self.write_balance(account, after)?;
+        self.write_balance(account, before.saturating_sub(amount))?;
         Ok(before)
     }
 
@@ -454,31 +446,29 @@ mod tests {
     }
 
     #[test]
-    fn an_overdraft_is_refused_not_clamped() {
-        // Saturating here would destroy money and leave no trace.
+    fn an_overdraft_clamps_at_zero() {
+        // Clamped, not refused: `eth_call` debits unfunded senders on purpose.
         let mut view = view();
         view.write_balance(ALICE, UserBalance::from_u64(10))
             .unwrap();
         assert_eq!(
-            view.sub_balance(ALICE, UserBalance::from_u64(11)),
-            Err(AccountError::BalanceOutOfRange)
+            view.sub_balance(ALICE, UserBalance::from_u64(11)).unwrap(),
+            UserBalance::from_u64(10),
+            "and still reports the balance before"
         );
         assert_eq!(
             view.balance(ALICE, ReadMode::ViewWithOverlay).unwrap(),
-            UserBalance::from_u64(10),
-            "and the balance is untouched"
+            UserBalance::from_u64(0),
         );
     }
 
     #[test]
-    fn an_overflow_is_refused_not_clamped() {
+    fn an_overflow_clamps_at_the_maximum() {
+        let max = UserBalance::from_be_bytes([0xff; 32]);
         let mut view = view();
-        view.write_balance(ALICE, UserBalance::from_be_bytes([0xff; 32]))
-            .unwrap();
-        assert_eq!(
-            view.add_balance(ALICE, UserBalance::from_u64(1)),
-            Err(AccountError::BalanceOutOfRange)
-        );
+        view.write_balance(ALICE, max).unwrap();
+        view.add_balance(ALICE, UserBalance::from_u64(1)).unwrap();
+        assert_eq!(view.balance(ALICE, ReadMode::ViewWithOverlay).unwrap(), max);
     }
 
     #[test]
