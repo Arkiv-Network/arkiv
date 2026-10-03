@@ -8,6 +8,7 @@
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
+use arkiv_reth_statemanager::HostStore;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder, PayloadTypes},
     builder::{DebugNode, Node, NodeAdapter, components::ComponentsBuilder},
@@ -22,9 +23,17 @@ use std::sync::Arc;
 
 /// The Arkiv node: Ethereum node types on [`ArkivChainSpec`], with the no-EVM
 /// executor in place of reth's EVM.
-#[derive(Debug, Clone, Copy, Default)]
-#[non_exhaustive]
-pub struct ArkivNode;
+#[derive(Debug, Clone)]
+pub struct ArkivNode {
+    store: HostStore,
+}
+
+impl ArkivNode {
+    /// The node over the store Arkiv's state lives in.
+    pub const fn new(store: HostStore) -> Self {
+        Self { store }
+    }
+}
 
 impl NodeTypes for ArkivNode {
     type Primitives = EthPrimitives;
@@ -53,8 +62,8 @@ where
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         EthereumNode::components()
-            .executor(ArkivExecutorBuilder::default())
-            .payload(ArkivPayloadServiceBuilder)
+            .executor(ArkivExecutorBuilder::new(self.store.clone()))
+            .payload(ArkivPayloadServiceBuilder::new(self.store.clone()))
     }
 
     fn add_ons(&self) -> Self::AddOns {

@@ -35,7 +35,12 @@ use arkiv_interfaces::statemanager::{
     EntityStore, EntityUpdates, EqualityIndexStore, PruningMeta, PruningStore, RangeIndexStore,
     ReadMode, SessionId, StateCommit, StateView, StoreKind,
 };
-use arkiv_interfaces::store::StoreExt;
+use arkiv_interfaces::store::{Store, StoreExt};
+use core::sync::atomic::{AtomicU64, Ordering};
+use reth_ethereum::evm::primitives::Database;
+use reth_ethereum::evm::revm::state::EvmState;
+
+use crate::WriteOverlay;
 use std::sync::Arc;
 
 use crate::accounts::{BalanceAccess, NonceAccess};
@@ -43,7 +48,10 @@ use crate::accounts::{BalanceAccess, NonceAccess};
 /// The erased store handle the host carries. `StoreExt` is object-safe, a trait
 /// object implements its supertrait `Store`, and `Arc<T: Store>` is a `Store` —
 /// so nothing downstream of here has to be generic over the store type.
-pub type HostStore = Arc<dyn StoreExt>;
+/// A node reaches its store from several threads, so the handle is `Send +
+/// Sync`. The real store is both; the reference store is too, since it holds a
+/// lock rather than a cell.
+pub type HostStore = Arc<dyn StoreExt + Send + Sync>;
 
 /// What can go wrong in a [`HostStateView`], over the account backend's error `E`.
 #[derive(Debug)]
@@ -440,6 +448,53 @@ where
             account_nonces: commitment,
             ..commit
         })
+    }
+}
+
+/// Open a view for one execution: a fresh GolemDB branch over the store's head,
+/// plus the revm overlay for the two account lanes.
+///
+/// The branch is where this execution's Arkiv writes go. Branches are volatile
+/// — only [`HostStateView::finish`] with `keep` can turn one into state — so an
+/// execution that is thrown away costs nothing and leaves nothing.
+pub fn host_manager<'a, DB: Database>(
+    store: &HostStore,
+    db: &'a mut DB,
+    parent: BlockRef,
+) -> Result<HostStateView<WriteOverlay<'a, DB>>, ViewError> {
+    let origin = store.head();
+    let branch = store.begin(Some(origin))?;
+    let golem = GolemStateView::new(store.clone(), branch, origin, parent, next_session());
+    Ok(HostStateView::new(golem, WriteOverlay::new(db)))
+}
+
+/// Session ids for host-opened views: a process-local counter, which is all a
+/// `SessionId` distinguishes.
+fn next_session() -> SessionId {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut bytes = [0u8; 16];
+    bytes[..4].copy_from_slice(&std::process::id().to_be_bytes());
+    bytes[8..].copy_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    SessionId(bytes)
+}
+
+impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
+    /// End the execution: promote the GolemDB branch to a commit when `keep`,
+    /// discard it otherwise, and hand back the account diff for reth.
+    ///
+    /// `keep` is false for everything speculative — `eth_call`, `eth_estimateGas`,
+    /// a reverted transaction — and discarding is exact, because a branch that is
+    /// never committed was never state.
+    pub fn finish(self, keep: bool) -> Result<EvmState, ViewError> {
+        let branch = self.golem.branch();
+        let store = self.golem.store().clone();
+        let state = self.into_base().into_state();
+        if keep {
+            store.commit(branch)?;
+        } else {
+            store.discard(branch)?;
+        }
+        Ok(state)
     }
 }
 

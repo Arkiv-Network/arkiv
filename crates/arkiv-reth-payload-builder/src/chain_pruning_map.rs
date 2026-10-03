@@ -212,6 +212,7 @@ impl ChainPruningMap {
     /// Whether the entities present at genesis have been folded in. They never
     /// appear in a block, so the per-block replay cannot discover them; a
     /// one-time walk of the genesis state does, and this records that it ran.
+    #[allow(dead_code)] // the genesis walk went with seeding
     pub(crate) async fn genesis_bootstrapped(&self) -> Result<bool> {
         let connection = self
             .database
@@ -237,6 +238,7 @@ impl ChainPruningMap {
 
     /// Where an unfinished genesis walk resumes: the first entity id it has
     /// not folded in yet. Zero before the walk starts.
+    #[allow(dead_code)] // the genesis walk went with seeding
     pub(crate) fn genesis_cursor_blocking(&self) -> Result<u64> {
         self.runtime.block_on(async {
             let connection = self
@@ -265,6 +267,7 @@ impl ChainPruningMap {
     /// A writer for the genesis walk: one connection kept for the whole walk.
     /// Called from a blocking thread, since walking the genesis state is
     /// synchronous provider work.
+    #[allow(dead_code)] // the genesis walk went with seeding
     pub(crate) fn genesis_bootstrap_writer_blocking(&self) -> Result<GenesisBootstrapWriter> {
         let connection = self
             .database
@@ -289,6 +292,7 @@ impl ChainPruningMap {
             .write_blocking(&mut entries.to_vec(), next_id)
     }
 
+    #[allow(dead_code)] // the genesis walk went with seeding
     pub(crate) async fn mark_genesis_bootstrapped(&self) -> Result<()> {
         let connection = self
             .database
@@ -307,6 +311,7 @@ impl ChainPruningMap {
 
 /// The genesis walk's connection; see
 /// [`ChainPruningMap::genesis_bootstrap_writer_blocking`].
+#[allow(dead_code)] // the genesis walk went with seeding
 pub(crate) struct GenesisBootstrapWriter {
     connection: Connection,
     runtime: Handle,
@@ -322,6 +327,7 @@ impl GenesisBootstrapWriter {
     /// page out again. The cost of a commit is therefore nearly the same for a
     /// batch of a hundred thousand rows as for one of a million: callers
     /// should make them large.
+    #[allow(dead_code)] // the genesis walk went with seeding
     pub(crate) fn write_blocking(
         &mut self,
         entries: &mut [PruningEntry],
