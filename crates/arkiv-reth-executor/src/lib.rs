@@ -63,7 +63,7 @@
 //! [`arkiv_interfaces::execution::TransactionExecutor`] interface. And the
 //! **state machinery** is not here either: all state — entities, the query
 //! index, minting nonces, sender balances and EOA nonces — is reached through
-//! one [`write_manager`] view (arkiv-reth-statemanager's `MptStateView` over
+//! one [`host_manager`] view (arkiv-reth-statemanager's `HostStateView` over
 //! its `WriteOverlay`), so a transaction's every effect lands in a single
 //! `EvmState` diff for reth to commit.
 
@@ -121,7 +121,7 @@ use arkiv_interfaces::statemanager::{
     AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore, EqualityIndexStore,
     RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_reth_statemanager::write_manager;
+use arkiv_reth_statemanager::{HostStore, host_manager};
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
@@ -288,6 +288,8 @@ impl FeeChecks {
 /// never invoked.
 pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     inner: EthEvm<DB, I, PrecompilesMap>,
+    /// Where Arkiv's own state lives. One erased handle, cloned per EVM.
+    store: HostStore,
 }
 
 impl<DB, I> Evm for ArkivEvm<DB, I>
@@ -337,7 +339,9 @@ where
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
+        let store = self.store.clone();
         let db = self.inner.db_mut();
+        let store = &store;
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
             && tx.data.starts_with(&purgeExpiredCall::SELECTOR);
         let is_protocol_purge = is_protocol_purge(&tx, block_number, chain_id);
@@ -350,7 +354,7 @@ where
             }
             validate_fees(db, &tx, fees.base_fee, fee_checks)?;
         }
-        arkiv_transact(db, block_number, fees, tx)
+        arkiv_transact(store, db, block_number, fees, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -504,6 +508,7 @@ fn validate_fees<DB: Database>(
 /// diff). The caller (`EthBlockExecutor::commit_transaction`) commits the diff
 /// into the `State`, producing the `BundleState` reth hashes into the state root.
 fn arkiv_transact<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     block_number: u64,
     fees: FeeEnv,
@@ -530,18 +535,18 @@ fn arkiv_transact<DB: Database>(
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
-            return arkiv_entity_nonce_call(db, &tx, block_number, &fees);
+            return arkiv_entity_nonce_call(store, db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::customAttributeNamesCall::SELECTOR {
-            return arkiv_custom_attribute_names_call(db, &tx, block_number, &fees);
+            return arkiv_custom_attribute_names_call(store, db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
-            return arkiv_attribute_type_id_call(db, &tx, block_number, &fees);
+            return arkiv_attribute_type_id_call(store, db, &tx, block_number, &fees);
         }
         if selector == purgeExpiredCall::SELECTOR {
-            return arkiv_purge_expired(db, block_number, &tx);
+            return arkiv_purge_expired(store, db, block_number, &tx);
         }
-        return arkiv_entity_transact(db, block_number, &fees, &tx);
+        return arkiv_entity_transact(store, db, block_number, &fees, &tx);
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
@@ -555,14 +560,17 @@ fn arkiv_transact<DB: Database>(
 
     // Sender debit + nonce bump and recipient credit, through one view — a
     // transfer stages the same way every other state change does.
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view =
+        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
     charge_sender(&mut view, &fees, tx.caller, value_out, gas_used, &tx)?;
     if to != tx.caller {
         view.fetch_add_balance(to.into_array(), as_balance(tx.value))
             .map_err(state_fault("credit recipient"))?;
     }
     StateView::commit(&mut view).map_err(state_fault("commit transfer"))?;
-    let state = view.into_base().into_state();
+    let state = view
+        .finish(fees.charge)
+        .map_err(state_fault("seal transfer"))?;
 
     let result = ExecutionResult::Success {
         reason: SuccessReason::Stop,
@@ -575,6 +583,7 @@ fn arkiv_transact<DB: Database>(
 }
 
 fn arkiv_purge_expired<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     block_number: u64,
     tx: &TxEnv,
@@ -593,7 +602,8 @@ fn arkiv_purge_expired<DB: Database>(
         )));
     }
     let purge_keys = call.entityKeys;
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view =
+        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
     let mut modeled_gas = 0u64;
     for key in &purge_keys {
         let key_bytes = key.0;
@@ -624,7 +634,7 @@ fn arkiv_purge_expired<DB: Database>(
         .apply_deltas(&deltas)
         .map_err(state_fault("purge range index"))?;
     StateView::commit(&mut view).map_err(state_fault("commit purge"))?;
-    let state = view.into_base().into_state();
+    let state = view.finish(true).map_err(state_fault("seal purge"))?;
     let gas_used = modeled_gas.max(intrinsic_gas(&tx.data));
     Ok(ResultAndState::new(
         ExecutionResult::Success {
@@ -655,6 +665,7 @@ fn out_of_gas() -> ResultAndState<HaltReason> {
 /// the sender's gas charge and nonce bump. A business-rule revert charges gas but
 /// stages no entity changes; a decode fault reverts likewise.
 fn arkiv_entity_transact<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     block_number: u64,
     fees: &FeeEnv,
@@ -688,7 +699,8 @@ fn arkiv_entity_transact<DB: Database>(
     // One view for the whole transaction: the entity phase and the sender
     // phase stage into the same overlay; a revert stages no entity changes, so
     // the one commit at the end flushes exactly what should land.
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view =
+        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
     let start_nonce = view
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;
@@ -710,7 +722,9 @@ fn arkiv_entity_transact<DB: Database>(
     let gas_used = outcome.gas_used.max(floor);
     charge_sender(&mut view, fees, caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit transaction"))?;
-    let evm_state = view.into_base().into_state();
+    let evm_state = view
+        .finish(fees.charge)
+        .map_err(state_fault("seal entity batch"))?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
@@ -739,6 +753,7 @@ fn arkiv_entity_transact<DB: Database>(
 /// meaningless for an `eth_call` (the diff is discarded), but it keeps reth's
 /// sender invariants intact if the call ever arrives as a mined transaction.
 fn arkiv_view_call<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
@@ -748,10 +763,11 @@ fn arkiv_view_call<DB: Database>(
     let output = answer(db)?;
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    let mut view = write_manager(db, parent_ref(block_number));
+    let mut view =
+        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
     charge_sender(&mut view, fees, tx.caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit view call"))?;
-    let state = view.into_base().into_state();
+    let state = view.finish(false).map_err(state_fault("seal view call"))?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match output {
@@ -777,13 +793,18 @@ fn bad_view_args(view: &str, e: impl core::fmt::Display) -> Vec<u8> {
 
 /// Read a committed entity for a view call.
 fn view_entity<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     key: B256,
     block_number: u64,
 ) -> Result<Option<arkiv_interfaces::entity::Entity>, EVMError<DB::Error>> {
-    write_manager(db, parent_ref(block_number))
+    let view =
+        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
+    let entity = view
         .get_entity(key.0, ReadMode::ViewOnBase)
-        .map_err(state_fault("read entity"))
+        .map_err(state_fault("read entity"))?;
+    view.finish(false).map_err(state_fault("close read view"))?;
+    Ok(entity)
 }
 
 /// `entityNonce(owner)`: the owner's entity-key minting nonce, as a `uint64`.
@@ -792,17 +813,19 @@ fn view_entity<DB: Database>(
 /// will mint (`derive_entity_address(chain_id, owner, nonce + i, salt)`), so it
 /// reads the same system-account slot the execute path mints from.
 fn arkiv_entity_nonce_call<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
         };
-        let nonce = write_manager(db, parent_ref(block_number))
+        let nonce = host_manager(store, db, parent_ref(block_number))
+            .map_err(state_fault("open view"))?
             .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
             .map_err(state_fault("read minting nonce"))?;
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
@@ -819,18 +842,21 @@ fn arkiv_entity_nonce_call<DB: Database>(
 /// with an empty list rather than reverting — "no attributes" is the truthful
 /// answer to "what does this entity have", and it keeps the view total.
 fn arkiv_custom_attribute_names_call<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
         };
-        let names = match live_entity(view_entity(db, call.entityKey, block_number)?, block_number)
-        {
+        let names = match live_entity(
+            view_entity(store, db, call.entityKey, block_number)?,
+            block_number,
+        ) {
             Some(e) => e.attributes.iter().map(|a| ident32_of(&a.key)).collect(),
             None => Vec::new(),
         };
@@ -847,25 +873,29 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
 /// tag that means "unset" on the wire — so "absent" reads the same here as it
 /// does in a patch. No type ever has id 0, so the answer stays unambiguous.
 fn arkiv_attribute_type_id_call<DB: Database>(
+    store: &HostStore,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
         };
         let wanted = strip_trailing_zeros(call.name.0.to_vec());
-        let type_id = live_entity(view_entity(db, call.entityKey, block_number)?, block_number)
-            .and_then(|e| {
-                e.attributes
-                    .iter()
-                    .find(|a| a.key == wanted)
-                    .map(|a| a.value.type_id())
-            })
-            .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
+        let type_id = live_entity(
+            view_entity(store, db, call.entityKey, block_number)?,
+            block_number,
+        )
+        .and_then(|e| {
+            e.attributes
+                .iter()
+                .find(|a| a.key == wanted)
+                .map(|a| a.value.type_id())
+        })
+        .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
         Ok(Ok(
             IEntityRegistry::attributeTypeIdCall::abi_encode_returns(&type_id),
         ))
@@ -1013,9 +1043,17 @@ fn entity_operation_log(effect: &OpEffect) -> Log {
 
 /// Custom EVM factory for Arkiv: builds [`ArkivEvm`] (the no-EVM engine) on top
 /// of reth's stock EVM context.
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct ArkivEvmFactory;
+#[derive(Debug, Clone)]
+pub struct ArkivEvmFactory {
+    store: HostStore,
+}
+
+impl ArkivEvmFactory {
+    /// Build a factory over the store Arkiv's state lives in.
+    pub const fn new(store: HostStore) -> Self {
+        Self { store }
+    }
+}
 
 impl EvmFactory for ArkivEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>, EthInterpreter>> = ArkivEvm<DB, I>;
@@ -1038,6 +1076,7 @@ impl EvmFactory for ArkivEvmFactory {
 
         ArkivEvm {
             inner: EthEvm::new(inner, false),
+            store: self.store.clone(),
         }
     }
 
@@ -1054,6 +1093,7 @@ impl EvmFactory for ArkivEvmFactory {
             .with_inspector(inspector);
         ArkivEvm {
             inner: EthEvm::new(inner, true),
+            store: self.store.clone(),
         }
     }
 }
@@ -1065,9 +1105,17 @@ impl EvmFactory for ArkivEvmFactory {
 /// Generic over the node's chain spec with the same bounds reth's own
 /// `EthereumExecutorBuilder` asks for, so the node can run on arkiv-reth-chainspec's
 /// `ArkivChainSpec` (the minimum-base-fee rule) as well as on reth's `ChainSpec`.
-#[derive(Debug, Default, Clone, Copy)]
-#[non_exhaustive]
-pub struct ArkivExecutorBuilder;
+#[derive(Debug, Clone)]
+pub struct ArkivExecutorBuilder {
+    store: HostStore,
+}
+
+impl ArkivExecutorBuilder {
+    /// Build the executor over the store Arkiv's state lives in.
+    pub const fn new(store: HostStore) -> Self {
+        Self { store }
+    }
+}
 
 impl<Node> ExecutorBuilder<Node> for ArkivExecutorBuilder
 where
@@ -1088,1046 +1136,7 @@ where
         );
         Ok(EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec(),
-            ArkivEvmFactory::default(),
+            ArkivEvmFactory::new(self.store.clone()),
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::Bytes;
-    use alloy_sol_types::SolCall;
-    use arkiv_bindings::{IEntityRegistry, Operation};
-    use arkiv_interfaces::primitives::EntityCreationNonce;
-    use arkiv_reth_mpt_committed_store::decode;
-    use arkiv_reth_mpt_committed_store::entities::layout::{
-        SYSTEM_ACCOUNT_ADDRESS, entity_leaf_address, nonce_slot,
-    };
-    use reth_ethereum::evm::revm::database_interface::EmptyDB;
-
-    /// A create with a purely relative lifetime of `min_lifetime` blocks,
-    /// carrying `payload` as the `$payload` triple.
-    fn create_calldata(min_lifetime: u64, payload: &'static [u8]) -> Bytes {
-        let payload_attr = arkiv_bindings::Attribute::from_value(
-            arkiv_bindings::Ident32::system("$payload").unwrap(),
-            &arkiv_interfaces::entity::AttributeValue::Bytes(payload.to_vec()),
-        )
-        .unwrap();
-        IEntityRegistry::executeCall {
-            ops: vec![Operation::create(0, 0, min_lifetime, 0, vec![payload_attr])],
-        }
-        .abi_encode()
-        .into()
-    }
-
-    /// No base fee, no beneficiary: the tests above are about entity semantics,
-    /// and `arkiv_tx` prices at zero, so nothing is charged or rewarded.
-    const NO_FEES: FeeEnv = FeeEnv {
-        base_fee: 0,
-        beneficiary: Address::ZERO,
-        charge: true,
-    };
-
-    fn arkiv_tx(caller: Address, data: Bytes) -> TxEnv {
-        TxEnv {
-            caller,
-            gas_limit: 1_000_000,
-            gas_price: 0,
-            kind: TxKind::Call(ARKIV_ADDRESS),
-            data,
-            chain_id: Some(1),
-            ..Default::default()
-        }
-    }
-
-    fn protocol_purge_tx(block: u64, keys: Vec<B256>) -> TxEnv {
-        use arkiv_bindings::{PURGE_CALLER, PURGE_GAS_LIMIT};
-
-        TxEnv {
-            tx_type: 2,
-            caller: PURGE_CALLER,
-            gas_limit: PURGE_GAS_LIMIT,
-            gas_price: u128::MAX,
-            kind: TxKind::Call(ARKIV_ADDRESS),
-            data: purgeExpiredCall { entityKeys: keys }.abi_encode().into(),
-            nonce: block,
-            chain_id: Some(1),
-            gas_priority_fee: Some(0),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn protocol_purge_requires_the_exact_envelope() {
-        let tx = protocol_purge_tx(10, Vec::new());
-        assert!(is_protocol_purge(&tx, 10, 1));
-
-        let mut user = tx.clone();
-        user.caller = Address::repeat_byte(0xAA);
-        assert!(!is_protocol_purge(&user, 10, 1));
-
-        let mut wrong_nonce = tx.clone();
-        wrong_nonce.nonce += 1;
-        assert!(!is_protocol_purge(&wrong_nonce, 10, 1));
-
-        let mut wrong_gas = tx;
-        wrong_gas.gas_limit -= 1;
-        assert!(!is_protocol_purge(&wrong_gas, 10, 1));
-    }
-
-    #[test]
-    fn malformed_and_oversized_purges_are_invalid_transactions() {
-        use alloy_evm::EvmError;
-
-        let mut db = EmptyDB::default();
-        let mut malformed = protocol_purge_tx(10, Vec::new());
-        malformed.data = purgeExpiredCall::SELECTOR.into();
-        let error = arkiv_purge_expired(&mut db, 10, &malformed).unwrap_err();
-        assert!(error.try_into_invalid_tx_err().is_ok());
-
-        let oversized = protocol_purge_tx(
-            10,
-            (0..=arkiv_bindings::MAX_PURGE_KEYS)
-                .map(|i| B256::repeat_byte(i as u8))
-                .collect(),
-        );
-        let error = arkiv_purge_expired(&mut db, 10, &oversized).unwrap_err();
-        assert!(error.try_into_invalid_tx_err().is_ok());
-    }
-
-    #[test]
-    fn protocol_purge_skips_a_live_entity() {
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let created = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_calldata(50, b"live")),
-        )
-        .unwrap();
-        db.commit(created.state);
-        let key = B256::from(derive_entity_address(
-            1,
-            &alice.into_array(),
-            EntityCreationNonce::new(0),
-            0,
-        ));
-
-        let purged = arkiv_purge_expired(&mut db, 11, &protocol_purge_tx(11, vec![key])).unwrap();
-        assert!(purged.result.is_success());
-        assert!(
-            !purged.state.contains_key(&entity_leaf_address(key.0)),
-            "a live entity must not be staged for deletion"
-        );
-    }
-
-    /// A create call through `arkiv_transact`: the entity is committed at its minted
-    /// key, the sender is charged/bumped, and the minting nonce advances — all in the
-    /// returned `EvmState`.
-    #[test]
-    fn entity_create_call_commits_the_entity() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_calldata(50, b"hello")),
-        )
-        .unwrap();
-
-        assert!(rs.result.is_success());
-
-        // The entity landed at the derived key, decodable, with env-resolved fields.
-        let key = derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(0), 0);
-        let acc = rs
-            .state
-            .get(&entity_leaf_address(key))
-            .expect("entity account in the diff");
-        let entity = decode(&acc.info.code.as_ref().unwrap().original_bytes()).unwrap();
-        assert_eq!(entity.owner, [0xAA; 20]);
-        assert_eq!(entity.expires_at, 60); // block 10 + minLifetime 50
-        assert_eq!(entity.payload, b"hello");
-
-        // The minting nonce advanced to 1 in the system account.
-        let sys = rs
-            .state
-            .get(&SYSTEM_ACCOUNT_ADDRESS)
-            .expect("system account");
-        let slot = U256::from_be_bytes(nonce_slot(alice).0);
-        assert_eq!(sys.storage.get(&slot).unwrap().present_value, U256::from(1));
-
-        // The sender is touched with its EOA nonce bumped.
-        let sender = rs.state.get(&alice).expect("sender account");
-        assert_eq!(sender.info.nonce, 1);
-
-        // One EntityCreated log was emitted for the create, at ARKIV_ADDRESS.
-        let logs = rs.result.logs();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].address, ARKIV_ADDRESS);
-        let event =
-            arkiv_bindings::IEntityRegistry::EntityCreated::decode_log_data(&logs[0].data).unwrap();
-        assert_eq!(event.entityKey, B256::from(key));
-        assert_eq!(event.owner, alice);
-        assert_eq!(event.expiresAt, 60);
-        assert_eq!(event.creationFlags, 0);
-    }
-
-    /// **Replay protection.** Re-submitting a transaction that has already been
-    /// mined must be rejected, not applied a second time.
-    ///
-    /// Without this check the whole `Operation[]` batch re-runs against
-    /// post-first-execution state. For a create that is not even idempotent: the
-    /// minting nonce has advanced, so the replay mints a *second* entity under a
-    /// different key from a single user intent.
-    #[test]
-    fn a_replayed_transaction_is_rejected() {
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        // CacheDB, not EmptyDB: the point is what the *second* application sees.
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let tx = arkiv_tx(alice, create_calldata(50, b"hello"));
-
-        // First submission: valid at nonce 0, and it advances the sender to 1.
-        validate_nonce(&mut db, &tx).expect("a fresh account's nonce 0 is valid");
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx.clone()).unwrap();
-        assert!(rs.result.is_success());
-        assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
-        db.commit(rs.state);
-
-        // The identical transaction, submitted again.
-        let err = validate_nonce(&mut db, &tx).expect_err("a replay must be rejected");
-        assert!(
-            matches!(
-                err,
-                EVMError::Transaction(InvalidTransaction::NonceTooLow { tx: 0, state: 1 })
-            ),
-            "expected NonceTooLow {{ tx: 0, state: 1 }}, got {err:?}",
-        );
-    }
-
-    /// A nonce ahead of the account's is rejected too — the gap has to be filled
-    /// before the transaction is executable.
-    #[test]
-    fn a_future_nonce_is_rejected() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let tx = TxEnv {
-            nonce: 7,
-            ..arkiv_tx(alice, create_calldata(50, b"hello"))
-        };
-
-        let err = validate_nonce(&mut db, &tx).expect_err("a nonce gap must be rejected");
-        assert!(
-            matches!(
-                err,
-                EVMError::Transaction(InvalidTransaction::NonceTooHigh { tx: 7, state: 0 })
-            ),
-            "expected NonceTooHigh {{ tx: 7, state: 0 }}, got {err:?}",
-        );
-    }
-
-    /// The rejection must be the *variant reth tests for*, not merely some error.
-    ///
-    /// reth's payload builder skips a transaction only when
-    /// `error.is_nonce_too_low()` holds, which requires the error to survive
-    /// `BlockExecutionError::evm`'s conversion into `BlockValidationError::InvalidTx`
-    /// — something [`EVMError::Custom`] does not do. Weaken this and a stale
-    /// transaction the pool has not evicted yet stops being skipped and starts
-    /// being built into a second block again.
-    #[test]
-    fn a_stale_nonce_is_the_error_reths_payload_builder_skips_on() {
-        use alloy_evm::{EvmError, InvalidTxError};
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let tx = arkiv_tx(alice, create_calldata(50, b"hello"));
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx.clone()).unwrap();
-        db.commit(rs.state);
-
-        let err = validate_nonce(&mut db, &tx).expect_err("a replay must be rejected");
-        let invalid = err
-            .try_into_invalid_tx_err()
-            .expect("must convert to an invalid-tx error, or reth aborts the block instead");
-        assert!(
-            invalid.is_nonce_too_low(),
-            "must satisfy is_nonce_too_low(), or reth stops skipping the duplicate",
-        );
-    }
-
-    /// **Contract creation is rejected as a typed invalid-tx error, not a fatal
-    /// one.** The stock pool accepts deployment transactions and never evicts an
-    /// unmined one, so the executor's rejection is what the payload builder
-    /// sees on every build — an error that fails
-    /// [`try_into_invalid_tx_err`](alloy_evm::EvmError::try_into_invalid_tx_err)
-    /// (as [`EVMError::Custom`] does) aborts the whole build, and one pooled
-    /// deploy tx stalls block production forever. Weaken this back to `Custom`
-    /// and that stall returns.
-    #[test]
-    fn a_create_transaction_is_rejected_as_invalid_not_fatal() {
-        use alloy_evm::{EvmError, InvalidTxError};
-
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let tx = TxEnv {
-            kind: TxKind::Create,
-            ..arkiv_tx(alice, Bytes::from_static(&[0x00]))
-        };
-
-        let err = arkiv_transact(&mut db, 10, NO_FEES, tx).expect_err("creates must be rejected");
-        let invalid = err.try_into_invalid_tx_err().expect(
-            "must convert to an invalid-tx error, or reth aborts the build instead of skipping",
-        );
-        assert!(
-            !invalid.is_nonce_too_low(),
-            "a create rejection is not a nonce problem",
-        );
-        assert!(
-            invalid
-                .to_string()
-                .contains("contract creation is disabled"),
-            "the rejection should say why, got: {invalid}",
-        );
-    }
-
-    /// A create commits the **index** alongside the entity: the new entity's id (0,
-    /// the first ever) lands in both the `$all` bucket and its `$owner` bucket, as
-    /// roaring bitmaps stored in those accounts' code — all in the one returned diff.
-    #[test]
-    fn entity_create_commits_index_accounts() {
-        use arkiv_interfaces::entity::{AttributeType, annotations};
-        use arkiv_reth_mpt_committed_store::{Bitmap, all_entities_bucket, pair_address};
-
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_calldata(50, b"hello")),
-        )
-        .unwrap();
-        assert!(rs.result.is_success());
-
-        // Reads the bitmap stored as an index account's code and checks it holds id 0.
-        let bitmap_at = |addr: Address| -> Bitmap {
-            let acc = rs
-                .state
-                .get(&addr)
-                .expect("index bucket account in the diff");
-            let code = acc
-                .info
-                .code
-                .as_ref()
-                .expect("bucket has code")
-                .original_bytes();
-            Bitmap::from_bytes(code.as_ref()).expect("valid bitmap bytes")
-        };
-
-        // Every live entity is in the $all bucket.
-        assert!(bitmap_at(all_entities_bucket()).contains(0));
-        // And in its owner's bucket (owner value = the 20-byte caller address).
-        assert!(
-            bitmap_at(pair_address(
-                annotations::OWNER,
-                AttributeType::EthereumAddress,
-                alice.as_slice()
-            ))
-            .contains(0)
-        );
-    }
-
-    fn nonces_calldata(owner: Address) -> Bytes {
-        IEntityRegistry::entityNonceCall { owner }
-            .abi_encode()
-            .into()
-    }
-
-    /// Decode the `uint64` a successful `entityNonce(address)` call returned.
-    fn nonce_from(rs: &ResultAndState<HaltReason>) -> u64 {
-        assert!(rs.result.is_success());
-        IEntityRegistry::entityNonceCall::abi_decode_returns(rs.result.output().unwrap())
-            .expect("uint64 return")
-    }
-
-    /// `nonces(owner)` on a fresh chain answers 0 — and stages nothing beyond
-    /// the sender, regardless of who asks about whom.
-    #[test]
-    fn nonces_call_returns_zero_for_fresh_owner() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let bob = Address::repeat_byte(0xBB);
-        let rs =
-            arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
-
-        assert_eq!(nonce_from(&rs), 0);
-        // Only the sender (charged/bumped) is in the diff.
-        assert_eq!(rs.state.len(), 1);
-        assert_eq!(rs.state.get(&bob).expect("sender").info.nonce, 1);
-    }
-
-    // ── Entity views ──────────────────────────────────────────────────
-
-    /// A create carrying two user attributes plus the system triples.
-    fn create_with_attrs_calldata(min_lifetime: u64) -> Bytes {
-        use arkiv_interfaces::entity::AttributeValue;
-        let attr = |n: &str, v: AttributeValue| {
-            arkiv_bindings::Attribute::from_value(arkiv_bindings::Ident32::encode(n).unwrap(), &v)
-                .unwrap()
-        };
-        IEntityRegistry::executeCall {
-            ops: vec![Operation::create(
-                0,
-                0,
-                min_lifetime,
-                0,
-                vec![
-                    attr("rank", AttributeValue::u256_from_u64(7)),
-                    attr("color", AttributeValue::Str("blue".into())),
-                ],
-            )],
-        }
-        .abi_encode()
-        .into()
-    }
-
-    fn names_from(rs: &ResultAndState<HaltReason>) -> Vec<String> {
-        assert!(rs.result.is_success());
-        IEntityRegistry::customAttributeNamesCall::abi_decode_returns(rs.result.output().unwrap())
-            .expect("Ident32[] return")
-            .iter()
-            .map(|n| arkiv_bindings::Ident32::from_word(*n).decode().unwrap())
-            .collect()
-    }
-
-    fn type_id_from(rs: &ResultAndState<HaltReason>) -> u8 {
-        assert!(rs.result.is_success());
-        IEntityRegistry::attributeTypeIdCall::abi_decode_returns(rs.result.output().unwrap())
-            .expect("uint8 return")
-    }
-
-    fn names_calldata(key: B256) -> Bytes {
-        IEntityRegistry::customAttributeNamesCall { entityKey: key }
-            .abi_encode()
-            .into()
-    }
-
-    fn type_id_calldata(key: B256, name: &str) -> Bytes {
-        IEntityRegistry::attributeTypeIdCall {
-            entityKey: key,
-            name: arkiv_bindings::Ident32::encode(name).unwrap().into_word(),
-        }
-        .abi_encode()
-        .into()
-    }
-
-    /// `customAttributeNames` enumerates the entity's *user* attributes, in the
-    /// stored ascending order — system attributes stay out, since they are the
-    /// same for every entity and would be pure noise.
-    #[test]
-    fn custom_attribute_names_lists_user_attributes_in_order() {
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_with_attrs_calldata(50)),
-        )
-        .unwrap();
-        assert!(rs.result.is_success());
-        db.commit(rs.state);
-
-        let key = B256::from(derive_entity_address(
-            1,
-            &[0xAA; 20],
-            EntityCreationNonce::new(0),
-            0,
-        ));
-        let rs =
-            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
-        assert_eq!(names_from(&rs), vec!["color", "rank"]);
-    }
-
-    /// `attributeTypeId` answers the stored `typeId`, and **0** for an
-    /// attribute that isn't set — the same tag that means "unset" in a patch,
-    /// so absence reads identically on both paths. No type has id 0.
-    #[test]
-    fn attribute_type_id_answers_zero_when_unset() {
-        use arkiv_interfaces::entity::{AttributeType, TOMBSTONE_TYPE_ID};
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_with_attrs_calldata(50)),
-        )
-        .unwrap();
-        assert!(rs.result.is_success());
-        db.commit(rs.state);
-
-        let key = B256::from(derive_entity_address(
-            1,
-            &[0xAA; 20],
-            EntityCreationNonce::new(0),
-            0,
-        ));
-
-        let rs = arkiv_transact(
-            &mut db,
-            11,
-            NO_FEES,
-            arkiv_tx(alice, type_id_calldata(key, "rank")),
-        )
-        .unwrap();
-        assert_eq!(type_id_from(&rs), AttributeType::U256.id());
-        let rs = arkiv_transact(
-            &mut db,
-            11,
-            NO_FEES,
-            arkiv_tx(alice, type_id_calldata(key, "color")),
-        )
-        .unwrap();
-        assert_eq!(type_id_from(&rs), AttributeType::Str.id());
-
-        // Never set on this entity.
-        let rs = arkiv_transact(
-            &mut db,
-            11,
-            NO_FEES,
-            arkiv_tx(alice, type_id_calldata(key, "absent")),
-        )
-        .unwrap();
-        assert_eq!(type_id_from(&rs), TOMBSTONE_TYPE_ID);
-    }
-
-    /// A missing entity answers empty / 0 rather than reverting: "nothing" is
-    /// the truthful answer to "what does this entity have", and it keeps both
-    /// views total so a client never has to distinguish revert-from-empty.
-    #[test]
-    fn views_are_total_for_a_missing_entity() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let ghost = B256::repeat_byte(0xEE);
-
-        let rs =
-            arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(alice, names_calldata(ghost))).unwrap();
-        assert!(names_from(&rs).is_empty());
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, type_id_calldata(ghost, "rank")),
-        )
-        .unwrap();
-        assert_eq!(type_id_from(&rs), 0);
-    }
-
-    /// Past its expiry an entity is invisible to the views too, matching the
-    /// `arkiv_*` read rule — otherwise these two would keep answering for
-    /// entities every other read path already treats as gone.
-    #[test]
-    fn views_hide_an_expired_entity() {
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        // Created at block 10 with a 50-block lifetime → expires_at 60.
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_with_attrs_calldata(50)),
-        )
-        .unwrap();
-        assert!(rs.result.is_success());
-        db.commit(rs.state);
-        let key = B256::from(derive_entity_address(
-            1,
-            &[0xAA; 20],
-            EntityCreationNonce::new(0),
-            0,
-        ));
-
-        // Last live block is 59.
-        let rs =
-            arkiv_transact(&mut db, 59, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
-        assert_eq!(names_from(&rs).len(), 2, "live at 59");
-
-        let rs =
-            arkiv_transact(&mut db, 60, NO_FEES, arkiv_tx(alice, names_calldata(key))).unwrap();
-        assert!(names_from(&rs).is_empty(), "expired at 60");
-        let rs = arkiv_transact(
-            &mut db,
-            60,
-            NO_FEES,
-            arkiv_tx(alice, type_id_calldata(key, "rank")),
-        )
-        .unwrap();
-        assert_eq!(type_id_from(&rs), 0, "expired at 60");
-    }
-
-    /// After a create, `nonces` reports 1 for the creator — and still 0 for
-    /// anyone else, proving the *decoded argument* is read, not the caller.
-    #[test]
-    fn nonces_call_reflects_minted_creates() {
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let bob = Address::repeat_byte(0xBB);
-
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_calldata(50, b"hello")),
-        )
-        .unwrap();
-        assert!(rs.result.is_success());
-        db.commit(rs.state);
-
-        let rs =
-            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(bob, nonces_calldata(alice))).unwrap();
-        assert_eq!(nonce_from(&rs), 1);
-        let rs =
-            arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, nonces_calldata(bob))).unwrap();
-        assert_eq!(nonce_from(&rs), 0);
-    }
-
-    /// The `nonces` selector with truncated arguments reverts.
-    #[test]
-    fn nonces_call_with_malformed_args_reverts() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let mut data = IEntityRegistry::entityNonceCall::SELECTOR.to_vec();
-        data.extend_from_slice(&[0x01, 0x02]);
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, arkiv_tx(alice, data.into())).unwrap();
-        assert!(!rs.result.is_success());
-    }
-
-    /// The reported gas never falls below the tx-pool's intrinsic minimum
-    /// (`max(21000 + 4·tokens, 21000 + 10·tokens)`), even when the cost model
-    /// prices the batch cheaper — otherwise eth_estimateGas quotes a limit the
-    /// pool rejects as IntrinsicGasTooLow.
-    #[test]
-    fn reported_gas_is_floored_at_the_intrinsic_minimum() {
-        use reth_ethereum::evm::revm::{DatabaseCommit, db::CacheDB};
-
-        let mut db = CacheDB::new(EmptyDB::default());
-        let alice = Address::repeat_byte(0xAA);
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, create_calldata(50, b"hello")),
-        )
-        .unwrap();
-        db.commit(rs.state);
-
-        // A patch batch: cheap in the cost model (40k base) but with calldata
-        // whose intrinsic floor exceeds it.
-        let key = B256::from(derive_entity_address(
-            1,
-            &[0xAA; 20],
-            EntityCreationNonce::new(0),
-            0,
-        ));
-        let big_payload = arkiv_bindings::Attribute::from_value(
-            arkiv_bindings::Ident32::system("$payload").unwrap(),
-            // 4k nonzero bytes → floor ≈ 181k
-            &arkiv_interfaces::entity::AttributeValue::Bytes(vec![0xAB; 4_000]),
-        )
-        .unwrap();
-        let update = IEntityRegistry::executeCall {
-            ops: vec![Operation::patch(key, vec![big_payload])],
-        }
-        .abi_encode();
-        let floor = intrinsic_gas(&update);
-        let rs = arkiv_transact(&mut db, 11, NO_FEES, arkiv_tx(alice, update.into())).unwrap();
-
-        assert!(rs.result.is_success());
-        assert!(
-            rs.result.tx_gas_used() >= floor,
-            "gas_used {} must cover the intrinsic floor {floor}",
-            rs.result.tx_gas_used(),
-        );
-    }
-
-    /// A gas limit below the intrinsic floor halts out-of-gas without staging
-    /// anything — the shape eth_estimateGas's binary search needs to raise its
-    /// lower bound.
-    #[test]
-    fn gas_limit_below_intrinsic_floor_halts() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let data = create_calldata(50, b"hello");
-        let mut tx = arkiv_tx(alice, data.clone());
-        tx.gas_limit = intrinsic_gas(&data) - 1;
-        let rs = arkiv_transact(&mut db, 10, NO_FEES, tx).unwrap();
-
-        assert!(matches!(
-            rs.result,
-            ExecutionResult::Halt {
-                reason: HaltReason::OutOfGas(_),
-                ..
-            }
-        ));
-        assert!(rs.state.is_empty(), "a below-floor probe stages nothing");
-    }
-
-    /// Undecodable calldata reverts, but the sender is still charged/bumped and no
-    /// entity is staged.
-    #[test]
-    fn undecodable_call_reverts_but_charges_sender() {
-        let mut db = EmptyDB::default();
-        let alice = Address::repeat_byte(0xAA);
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            NO_FEES,
-            arkiv_tx(alice, Bytes::from_static(&[0xDE, 0xAD])),
-        )
-        .unwrap();
-
-        assert!(!rs.result.is_success());
-        assert_eq!(rs.state.get(&alice).expect("sender").info.nonce, 1);
-        // Nothing else was staged (only the sender).
-        assert_eq!(rs.state.len(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Fee accounting: EIP-1559 as revm applies it
-    // -----------------------------------------------------------------------
-
-    use reth_ethereum::evm::revm::{db::CacheDB, state::AccountInfo};
-
-    const ETH: u128 = 1_000_000_000_000_000_000;
-
-    fn funded_db(accounts: &[(Address, u128)]) -> CacheDB<EmptyDB> {
-        let mut db = CacheDB::new(EmptyDB::default());
-        for (addr, wei) in accounts {
-            db.insert_account_info(
-                *addr,
-                AccountInfo {
-                    balance: U256::from(*wei),
-                    ..Default::default()
-                },
-            );
-        }
-        db
-    }
-
-    /// A 21k plain transfer. `priority` = Some makes it EIP-1559 with `max_fee` as
-    /// the fee cap; None makes it legacy with `max_fee` as the gas price.
-    fn transfer_tx(
-        from: Address,
-        to: Address,
-        value: u128,
-        max_fee: u128,
-        priority: Option<u128>,
-    ) -> TxEnv {
-        TxEnv {
-            tx_type: if priority.is_some() { 2 } else { 0 },
-            caller: from,
-            gas_limit: ARKIV_TX_GAS,
-            gas_price: max_fee,
-            gas_priority_fee: priority,
-            kind: TxKind::Call(to),
-            value: U256::from(value),
-            chain_id: Some(1),
-            ..Default::default()
-        }
-    }
-
-    fn balance_in(rs: &ResultAndState<HaltReason>, addr: Address) -> U256 {
-        rs.state
-            .get(&addr)
-            .map(|acc| acc.info.balance)
-            .unwrap_or_default()
-    }
-
-    const ALL_CHECKS: FeeChecks = FeeChecks {
-        base_fee: true,
-        priority_fee: true,
-        balance: true,
-        charge: true,
-    };
-
-    /// The sender pays `gas_used × min(max_fee, base_fee + tip)`, not the fee
-    /// cap; the base-fee share is burned and the tip reaches the beneficiary.
-    #[test]
-    fn eip1559_sender_pays_the_effective_price_and_the_tip_goes_to_the_beneficiary() {
-        let (alice, bob, carol) = (
-            Address::repeat_byte(0xAA),
-            Address::repeat_byte(0xBB),
-            Address::repeat_byte(0xCC),
-        );
-        let mut db = funded_db(&[(alice, ETH)]);
-        let fees = FeeEnv {
-            base_fee: 5,
-            beneficiary: bob,
-            charge: true,
-        };
-        let tx = transfer_tx(alice, carol, 100, 10, Some(3));
-        validate_fees(&mut db, &tx, fees.base_fee, ALL_CHECKS).unwrap();
-        let rs = arkiv_transact(&mut db, 10, fees, tx).unwrap();
-        assert!(rs.result.is_success());
-
-        // effective = min(10, 5 + 3) = 8 per gas; tip = 8 - 5 = 3 per gas.
-        let gas = u128::from(ARKIV_TX_GAS);
-        assert_eq!(balance_in(&rs, alice), U256::from(ETH - 100 - gas * 8));
-        assert_eq!(balance_in(&rs, carol), U256::from(100));
-        assert_eq!(balance_in(&rs, bob), U256::from(gas * 3));
-    }
-
-    /// A fee cap below `base_fee + tip` caps the price, and the tip shrinks to
-    /// whatever is left above the base fee.
-    #[test]
-    fn the_fee_cap_bounds_the_effective_price() {
-        let (alice, bob, carol) = (
-            Address::repeat_byte(0xAA),
-            Address::repeat_byte(0xBB),
-            Address::repeat_byte(0xCC),
-        );
-        let mut db = funded_db(&[(alice, ETH)]);
-        let fees = FeeEnv {
-            base_fee: 5,
-            beneficiary: bob,
-            charge: true,
-        };
-        let rs =
-            arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 6, Some(3))).unwrap();
-
-        let gas = u128::from(ARKIV_TX_GAS);
-        assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 6));
-        assert_eq!(balance_in(&rs, bob), U256::from(gas));
-    }
-
-    /// A legacy transaction pays its `gasPrice`; everything above the base fee
-    /// is the beneficiary's.
-    #[test]
-    fn a_legacy_transaction_pays_its_gas_price() {
-        let (alice, bob, carol) = (
-            Address::repeat_byte(0xAA),
-            Address::repeat_byte(0xBB),
-            Address::repeat_byte(0xCC),
-        );
-        let mut db = funded_db(&[(alice, ETH)]);
-        let fees = FeeEnv {
-            base_fee: 5,
-            beneficiary: bob,
-            charge: true,
-        };
-        let rs = arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 9, None)).unwrap();
-
-        let gas = u128::from(ARKIV_TX_GAS);
-        assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 9));
-        assert_eq!(balance_in(&rs, bob), U256::from(gas * 4));
-    }
-
-    /// A zero tip credits nothing: the beneficiary must not be touched into
-    /// existence as an empty account (which would change the state root).
-    #[test]
-    fn a_zero_tip_does_not_touch_the_beneficiary() {
-        let (alice, bob, carol) = (
-            Address::repeat_byte(0xAA),
-            Address::repeat_byte(0xBB),
-            Address::repeat_byte(0xCC),
-        );
-        let mut db = funded_db(&[(alice, ETH)]);
-        let fees = FeeEnv {
-            base_fee: 5,
-            beneficiary: bob,
-            charge: true,
-        };
-        let rs =
-            arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 5, Some(0))).unwrap();
-
-        assert_eq!(
-            balance_in(&rs, alice),
-            U256::from(ETH - u128::from(ARKIV_TX_GAS) * 5)
-        );
-        assert!(
-            !rs.state.contains_key(&bob),
-            "the beneficiary must not appear in the diff for a zero tip",
-        );
-    }
-
-    /// Entity calls settle the same way: the metered gas at the effective price,
-    /// with the tip credited.
-    #[test]
-    fn an_entity_call_is_priced_at_the_effective_price() {
-        let (alice, bob) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xBB));
-        let mut db = funded_db(&[(alice, ETH)]);
-        let fees = FeeEnv {
-            base_fee: 5,
-            beneficiary: bob,
-            charge: true,
-        };
-        let tx = TxEnv {
-            tx_type: 2,
-            gas_price: 10,
-            gas_priority_fee: Some(3),
-            ..arkiv_tx(alice, create_calldata(50, b"hello"))
-        };
-        let rs = arkiv_transact(&mut db, 10, fees, tx).unwrap();
-        assert!(rs.result.is_success());
-
-        let gas = u128::from(rs.result.tx_gas_used());
-        assert!(gas > 0);
-        assert_eq!(balance_in(&rs, alice), U256::from(ETH - gas * 8));
-        assert_eq!(balance_in(&rs, bob), U256::from(gas * 3));
-    }
-
-    /// A fee cap below the block base fee is rejected — as the typed error the
-    /// payload builder skips on — unless the base-fee check is disabled, which
-    /// reth does for `eth_call` / `eth_estimateGas`.
-    #[test]
-    fn a_fee_cap_below_the_base_fee_is_rejected_unless_disabled() {
-        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
-        let mut db = funded_db(&[(alice, ETH)]);
-        let tx = transfer_tx(alice, carol, 0, 4, Some(4));
-
-        let err = validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect_err("4 < base fee 5");
-        assert!(matches!(
-            err,
-            EVMError::Transaction(InvalidTransaction::GasPriceLessThanBasefee)
-        ));
-
-        // A legacy price below the base fee is rejected the same way.
-        let legacy = transfer_tx(alice, carol, 0, 4, None);
-        assert!(matches!(
-            validate_fees(&mut db, &legacy, 5, ALL_CHECKS),
-            Err(EVMError::Transaction(
-                InvalidTransaction::GasPriceLessThanBasefee
-            ))
-        ));
-
-        let relaxed = FeeChecks {
-            base_fee: false,
-            ..ALL_CHECKS
-        };
-        validate_fees(&mut db, &tx, 5, relaxed).expect("eth_call-style execution");
-    }
-
-    #[test]
-    fn a_priority_fee_above_the_fee_cap_is_rejected() {
-        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
-        let mut db = funded_db(&[(alice, ETH)]);
-        let tx = transfer_tx(alice, carol, 0, 10, Some(11));
-        assert!(matches!(
-            validate_fees(&mut db, &tx, 5, ALL_CHECKS),
-            Err(EVMError::Transaction(
-                InvalidTransaction::PriorityFeeGreaterThanMaxFee
-            ))
-        ));
-    }
-
-    /// A sender that cannot cover `gas_limit × max_fee + value` is rejected
-    /// before anything is charged — typed, so a pooled transaction whose sender
-    /// was drained since ingress is skipped rather than aborting the block. Before
-    /// this check the debit saturated and the transaction went through anyway.
-    #[test]
-    fn an_underfunded_sender_is_rejected_as_invalid_not_fatal() {
-        use alloy_evm::EvmError;
-
-        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
-        let gas = u128::from(ARKIV_TX_GAS);
-        // One wei short of gas_limit × max_fee + value.
-        let mut db = funded_db(&[(alice, gas * 10 + 100 - 1)]);
-        let tx = transfer_tx(alice, carol, 100, 10, Some(3));
-
-        let err = validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect_err("one wei short");
-        assert!(matches!(
-            err,
-            EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { .. })
-        ));
-        err.try_into_invalid_tx_err()
-            .expect("must convert to an invalid-tx error, or reth aborts the block instead");
-
-        // Exactly enough for the maximum spend passes, even though the effective
-        // charge will be lower.
-        let mut db = funded_db(&[(alice, gas * 10 + 100)]);
-        validate_fees(&mut db, &tx, 5, ALL_CHECKS).expect("can afford the max spend");
-
-        // And the check can be switched off (engine-tree payload prewarming).
-        let mut db = funded_db(&[(alice, 0)]);
-        let relaxed = FeeChecks {
-            balance: false,
-            ..ALL_CHECKS
-        };
-        validate_fees(&mut db, &tx, 5, relaxed).expect("balance check disabled");
-    }
-
-    /// With fee charging disabled (reth's `eth_call` / `eth_estimateGas`) the
-    /// sender need not afford the gas — revm skips that bound — but must still
-    /// cover the value, or the dry run would move value that does not exist.
-    #[test]
-    fn with_charging_disabled_only_the_value_must_be_covered() {
-        let (alice, carol) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xCC));
-        let dry_run = FeeChecks {
-            charge: false,
-            ..ALL_CHECKS
-        };
-        // Explicit gas and fee cap far beyond the sender's means, as a wallet's
-        // eth_call may carry; the value itself is covered exactly.
-        let tx = transfer_tx(alice, carol, 100, 1_000_000_000, Some(3));
-
-        let mut db = funded_db(&[(alice, 100)]);
-        validate_fees(&mut db, &tx, 5, dry_run).expect("gas is not charged, value is covered");
-        assert!(
-            validate_fees(&mut db, &tx, 5, ALL_CHECKS).is_err(),
-            "the same sender cannot afford the gas once it is charged",
-        );
-
-        let mut db = funded_db(&[(alice, 99)]);
-        let err = validate_fees(&mut db, &tx, 5, dry_run).expect_err("one wei short of the value");
-        assert!(matches!(
-            err,
-            EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance })
-                if *fee == U256::from(100) && *balance == U256::from(99)
-        ));
-    }
-
-    /// With charging disabled (reth's `eth_call` / `eth_estimateGas`) the value
-    /// still moves and the nonce still bumps, but no gas is debited and nothing
-    /// reaches the beneficiary.
-    #[test]
-    fn a_disabled_fee_charge_moves_value_only() {
-        let (alice, bob, carol) = (
-            Address::repeat_byte(0xAA),
-            Address::repeat_byte(0xBB),
-            Address::repeat_byte(0xCC),
-        );
-        let mut db = funded_db(&[(alice, ETH)]);
-        let fees = FeeEnv {
-            base_fee: 5,
-            beneficiary: bob,
-            charge: false,
-        };
-        let rs = arkiv_transact(
-            &mut db,
-            10,
-            fees,
-            transfer_tx(alice, carol, 100, 10, Some(3)),
-        )
-        .unwrap();
-
-        assert_eq!(balance_in(&rs, alice), U256::from(ETH - 100));
-        assert_eq!(balance_in(&rs, carol), U256::from(100));
-        assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
-        assert!(!rs.state.contains_key(&bob));
     }
 }

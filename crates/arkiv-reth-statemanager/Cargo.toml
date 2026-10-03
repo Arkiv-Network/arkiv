@@ -16,7 +16,6 @@ license.workspace = true
 arkiv-interfaces.workspace = true
 arkiv-golemdb-state.workspace = true
 # The committed lanes: entities, index, balances, nonces, minting nonces.
-arkiv-reth-mpt-committed-store.workspace = true
 # The uncommitted lane(s): the pruning map.
 arkiv-reth-uncommitted-store.workspace = true
 
