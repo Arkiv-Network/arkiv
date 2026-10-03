@@ -33,7 +33,7 @@ fn url() -> String {
 
 /// A view on a namespace nothing else is using.
 fn view() -> GolemStateView<ValkeyStore> {
-    let mut store = ValkeyStore::ephemeral(&url()).expect("connect to the valkey server");
+    let store = ValkeyStore::ephemeral(&url()).expect("connect to the valkey server");
     let origin = store.head();
     let branch = store.begin(Some(origin)).expect("begin");
     GolemStateView::new(
@@ -66,7 +66,7 @@ fn entity(key: u8, level: i32) -> Entity {
 /// Reopen the same view over the commit its writes landed in.
 fn commit_and_reopen(view: GolemStateView<ValkeyStore>) -> GolemStateView<ValkeyStore> {
     let branch = view.branch();
-    let mut store = view.into_store();
+    let store = view.into_store();
     let origin = store.commit(branch).expect("commit");
     let branch = store.begin(Some(origin)).expect("begin");
     GolemStateView::new(

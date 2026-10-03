@@ -296,7 +296,7 @@ mod tests {
 
     /// A store holding the given entities, committed.
     fn stored(entities: &[Entity]) -> (MemStore, CommitId) {
-        let mut store = MemStore::default();
+        let store = MemStore::default();
         let branch = store.begin(None).expect("begin");
         for entity in entities {
             store
