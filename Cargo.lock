@@ -1537,10 +1537,13 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-harness",
+ "arkiv-interfaces",
  "arkiv-reth-chainspec",
  "arkiv-reth-executor",
  "arkiv-reth-payload-builder",
  "arkiv-reth-rpc",
+ "arkiv-reth-statemanager",
+ "arkiv-valkey",
  "clap",
  "eyre",
  "reth",
@@ -1582,21 +1585,10 @@ dependencies = [
  "arkiv-bindings",
  "arkiv-golemdb-state",
  "arkiv-interfaces",
- "arkiv-reth-mpt-committed-store",
  "arkiv-reth-statemanager",
  "eyre",
  "reth-ethereum",
  "tracing",
-]
-
-[[package]]
-name = "arkiv-reth-mpt-committed-store"
-version = "0.5.1"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "arkiv-interfaces",
- "roaring",
 ]
 
 [[package]]
@@ -1613,8 +1605,8 @@ dependencies = [
  "arkiv-bindings",
  "arkiv-interfaces",
  "arkiv-reth-executor",
- "arkiv-reth-mpt-committed-store",
  "arkiv-reth-rpc",
+ "arkiv-reth-statemanager",
  "eyre",
  "futures-util",
  "reth-basic-payload-builder",
@@ -1639,7 +1631,7 @@ dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
  "arkiv-query",
- "arkiv-reth-mpt-committed-store",
+ "arkiv-reth-statemanager",
  "arkiv-rpc-types",
  "base64 0.23.1",
  "eyre",
@@ -1656,7 +1648,6 @@ dependencies = [
  "alloy-primitives",
  "arkiv-golemdb-state",
  "arkiv-interfaces",
- "arkiv-reth-mpt-committed-store",
  "arkiv-reth-uncommitted-store",
  "eyre",
  "reth-ethereum",
