@@ -115,12 +115,13 @@ use reth_ethereum::{
 use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
+use arkiv_interfaces::gas::CostModel;
 use arkiv_interfaces::primitives::{Hash, UserBalance};
 use arkiv_interfaces::statemanager::{
-    AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
-    EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
+    AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore, EqualityIndexStore,
+    RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_reth_statemanager::{WriteManager, write_manager};
+use arkiv_reth_statemanager::write_manager;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
@@ -215,14 +216,14 @@ impl FeeEnv {
 /// With [`FeeEnv::charge`] off only the value moves and the nonce bumps, as in
 /// revm with `disable_fee_charge`. Only gas actually used is charged; there is no
 /// up-front `gas_limit` debit and refund because nothing runs between the two.
-fn charge_sender<DB: Database>(
-    view: &mut WriteManager<'_, DB>,
+fn charge_sender<V: StateView, DBError>(
+    view: &mut V,
     fees: &FeeEnv,
     sender: Address,
     value_out: U256,
     gas_used: u64,
     tx: &TxEnv,
-) -> Result<(), EVMError<DB::Error>> {
+) -> Result<(), EVMError<DBError>> {
     let sender = sender.into_array();
     view.fetch_sub_balance(sender, as_balance(value_out))
         .map_err(state_fault("debit sender value"))?;
@@ -692,7 +693,10 @@ fn arkiv_entity_transact<DB: Database>(
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;
     let outcome = match decode_ops(&env, &tx.data, start_nonce) {
-        Ok(ops) => run_ops(&mut view, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
+        Ok(ops) => {
+            let costs = *view.cost_model();
+            run_ops(&mut view, costs, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?
+        }
         Err(e) => Outcome {
             gas_used: 0,
             revert: Some(revert::decode_revert_data(&e)),
@@ -896,7 +900,7 @@ fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
 /// What running an op batch produced: the gas metered, the ABI-encoded revert
 /// payload if the batch failed a business rule, and the `EntityOperation` logs
 /// to emit (empty on revert). The state itself needs no field here — it is
-/// staged in the [`WriteManager`] the batch ran over.
+/// staged in the view the batch ran over.
 struct Outcome {
     gas_used: u64,
     revert: Option<Bytes>,
@@ -906,8 +910,13 @@ struct Outcome {
 /// Run a decoded batch through the write view: on success, fold the staged
 /// deltas into the index stores and advance the minting nonce per create; on a
 /// revert nothing is staged.
-fn run_ops<DB: Database>(
-    view: &mut WriteManager<'_, DB>,
+///
+/// Generic over the view, so the same batch logic runs on any `StateView`
+/// backend. `costs` is passed rather than read off the view: a cost schedule is
+/// a property of the chain, not of whatever happens to be storing state.
+fn run_ops<V: StateView, C: CostModel>(
+    view: &mut V,
+    costs: C,
     env: &ExecEnv,
     ops: Vec<Op>,
 ) -> Result<Outcome, eyre::Report> {
@@ -917,7 +926,7 @@ fn run_ops<DB: Database>(
         .count() as u64;
 
     let mut effects = Vec::new();
-    let out = ArkivExecutor::with_cost(*view.cost_model())
+    let out = ArkivExecutor::with_cost(costs)
         .apply_with_effects(env, view, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
