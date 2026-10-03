@@ -14,6 +14,7 @@
 //! [`MemPruningStore`] unchanged rather than paying for store round-trips.
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::statemanager::{
@@ -36,6 +37,8 @@ pub enum ViewError {
     Store(StoreError),
     /// No commit carries that block's hash as its tag.
     UnknownBlock,
+    /// A frame was merged or discarded without one being open.
+    NoOpenFrame,
     /// The operation isn't available on this host.
     Unsupported(&'static str),
     /// The view cannot graduate — see [`StateView::graduate`].
@@ -78,6 +81,9 @@ pub struct GolemStateView<S: Store> {
     /// [`EntityStore::get_uncommitted_deltas`] promises.
     pub(crate) staged: BTreeMap<EntityAddress, EntityUpdates>,
     pub(crate) pruning: MemPruningStore,
+    /// Open transaction frames, innermost last: each entry is the branch and
+    /// delta log to restore if its frame is discarded.
+    frames: Vec<(BranchId, BTreeMap<EntityAddress, EntityUpdates>)>,
     block: BlockRef,
     session: SessionId,
     commitment: Option<Commitment>,
@@ -98,6 +104,7 @@ impl<S: Store> GolemStateView<S> {
             origin,
             staged: BTreeMap::new(),
             pruning: MemPruningStore::new(),
+            frames: Vec::new(),
             block,
             session,
             commitment: None,
@@ -125,6 +132,47 @@ impl<S: Store> GolemStateView<S> {
         }
     }
 
+    /// Open a transaction frame: writes go to a child branch until the frame is
+    /// merged or discarded.
+    ///
+    /// This is what makes a speculative execution safe. `eth_call`,
+    /// `eth_estimateGas` and the engine tree's payload prewarming all reach the
+    /// executor through the same entry point as a real transaction, and all of
+    /// them throw the result away. Writing straight to the view's branch would
+    /// let any one of them mutate chain state; inside a frame, discarding is
+    /// exact — the child branch and its share of the delta log both go.
+    ///
+    /// Frames nest, as `Store::fork` does.
+    pub fn begin_frame(&mut self) -> Result<(), ViewError> {
+        let child = self.store.fork(self.branch)?;
+        self.frames.push((self.branch, self.staged.clone()));
+        self.branch = child;
+        Ok(())
+    }
+
+    /// Fold the innermost frame into its parent; its writes become the parent's.
+    pub fn merge_frame(&mut self) -> Result<(), ViewError> {
+        let (parent, _) = self.frames.pop().ok_or(ViewError::NoOpenFrame)?;
+        self.store.merge(self.branch)?;
+        self.branch = parent;
+        Ok(())
+    }
+
+    /// Drop the innermost frame. The view is left exactly as it was before the
+    /// matching [`begin_frame`](Self::begin_frame) — no writes, no deltas.
+    pub fn discard_frame(&mut self) -> Result<(), ViewError> {
+        let (parent, staged) = self.frames.pop().ok_or(ViewError::NoOpenFrame)?;
+        self.store.discard(self.branch)?;
+        self.branch = parent;
+        self.staged = staged;
+        Ok(())
+    }
+
+    /// How many frames are open. Zero means writes land on the view's own branch.
+    pub fn open_frames(&self) -> usize {
+        self.frames.len()
+    }
+
     /// The index lookups for this view, or a refusal if `read` asks for an
     /// overlay the store's query engine cannot give.
     pub(crate) fn indices(&self, read: ReadMode) -> Result<StoreIndices<'_, S>, ViewError> {
@@ -142,7 +190,7 @@ impl<S: Store> GolemStateView<S> {
     }
 
     fn is_dirty(&self) -> bool {
-        !self.staged.is_empty() || self.pruning.is_dirty()
+        !self.staged.is_empty() || self.pruning.is_dirty() || !self.frames.is_empty()
     }
 
     /// Every store commits to the same value: the branch's content digest.
@@ -263,6 +311,108 @@ pub(crate) mod tests {
     #[test]
     fn conformance() {
         arkiv_interfaces::statemanager::conformance::run_all(&view);
+    }
+
+    /// The property that makes speculative execution safe: `eth_call` and
+    /// friends run through the same entry point as a real transaction, so a
+    /// discarded frame has to be indistinguishable from never having run.
+    #[test]
+    fn a_discarded_frame_leaves_no_trace() {
+        let mut view = view();
+        view.update_entity(EntityUpdates::create(entity_of(1)))
+            .unwrap();
+        let before = view.digest().unwrap();
+
+        view.begin_frame().unwrap();
+        view.update_entity(EntityUpdates::create(entity_of(2)))
+            .unwrap();
+        view.set_balance([0xaa; 20], UserBalance::from_u64(999))
+            .unwrap();
+        assert!(
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .is_some(),
+            "the frame sees its own writes"
+        );
+        view.discard_frame().unwrap();
+
+        assert_eq!(view.digest().unwrap(), before, "the digest is unmoved");
+        assert_eq!(
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay).unwrap(),
+            None,
+            "the frame's entity is gone"
+        );
+        assert_eq!(
+            view.get_balance([0xaa; 20], ReadMode::ViewWithOverlay)
+                .unwrap(),
+            UserBalance::from_u64(0),
+            "and so is its account write"
+        );
+        assert_eq!(
+            view.get_uncommitted_deltas().unwrap().len(),
+            1,
+            "the delta log is back to the one write outside the frame"
+        );
+    }
+
+    #[test]
+    fn a_merged_frame_keeps_its_writes() {
+        let mut view = view();
+        view.begin_frame().unwrap();
+        view.update_entity(EntityUpdates::create(entity_of(2)))
+            .unwrap();
+        view.merge_frame().unwrap();
+
+        assert_eq!(view.open_frames(), 0);
+        assert_eq!(
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay).unwrap(),
+            Some(entity_of(2)),
+        );
+        assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn frames_nest_and_an_inner_discard_spares_the_outer() {
+        let mut view = view();
+        view.begin_frame().unwrap();
+        view.update_entity(EntityUpdates::create(entity_of(1)))
+            .unwrap();
+
+        view.begin_frame().unwrap();
+        view.update_entity(EntityUpdates::create(entity_of(2)))
+            .unwrap();
+        assert_eq!(view.open_frames(), 2);
+        view.discard_frame().unwrap();
+
+        assert_eq!(
+            view.get_entity([1; 32], ReadMode::ViewWithOverlay).unwrap(),
+            Some(entity_of(1)),
+            "the outer frame's write survives the inner discard"
+        );
+        assert_eq!(
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay).unwrap(),
+            None,
+        );
+        view.merge_frame().unwrap();
+        assert_eq!(view.open_frames(), 0);
+    }
+
+    #[test]
+    fn a_view_with_an_open_frame_does_not_graduate() {
+        let mut view = view();
+        StateView::commit(&mut view).unwrap();
+        view.begin_frame().unwrap();
+        assert!(matches!(
+            view.graduate(BlockRef::new(11, [0x11; 32])),
+            Err(ViewError::Graduate(_)),
+        ));
+    }
+
+    #[test]
+    fn closing_a_frame_that_was_never_opened_is_an_error() {
+        let mut view = view();
+        assert!(matches!(view.merge_frame(), Err(ViewError::NoOpenFrame)));
+        assert!(matches!(view.discard_frame(), Err(ViewError::NoOpenFrame)));
     }
 
     #[test]
