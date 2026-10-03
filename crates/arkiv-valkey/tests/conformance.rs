@@ -57,7 +57,7 @@ fn committed_state_survives_reconnection() {
     let key = arkiv_interfaces::store::RecordKey([7u8; 32]);
 
     let committed = {
-        let mut store = ValkeyStore::connect(&url(), &namespace).expect("connect");
+        let store = ValkeyStore::connect(&url(), &namespace).expect("connect");
         let branch = store.begin(None).expect("begin");
         store
             .create(
