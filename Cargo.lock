@@ -1580,6 +1580,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "arkiv-bindings",
+ "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-mpt-committed-store",
  "arkiv-reth-statemanager",

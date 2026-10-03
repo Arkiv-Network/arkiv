@@ -35,8 +35,9 @@ tracing.workspace = true
 [dev-dependencies]
 # Integration tests wire calldata → decode_ops → apply → RethEntityStore →
 # CodeBackend → WriteOverlay → EvmState, and build calldata via the SDK bindings.
-arkiv-interfaces.workspace = true
 arkiv-bindings.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
+arkiv-golemdb-state.workspace = true
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
