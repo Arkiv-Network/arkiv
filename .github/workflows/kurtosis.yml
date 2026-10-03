@@ -8,33 +8,12 @@ name: kurtosis
 
 on:
   workflow_dispatch:
-    inputs:
-      seed_count:
-        description: "Entities to seed into the genesis state (0 for none)"
-        required: false
-        default: "1000"
-        type: string
-      seed_payload_size:
-        description: "Payload bytes per seeded entity"
-        required: false
-        default: "512"
-        type: string
   workflow_call:
     inputs:
       artifact:
         description: "Artifact holding a prebuilt arkiv-reth; empty builds from source"
         required: false
         default: ""
-        type: string
-      seed_count:
-        description: "Entities to seed into the genesis state (0 for none)"
-        required: false
-        default: "1000"
-        type: string
-      seed_payload_size:
-        description: "Payload bytes per seeded entity"
-        required: false
-        default: "512"
         type: string
 
 jobs:
@@ -54,12 +33,6 @@ jobs:
       CI: "true"
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
-      # up.py seeds the genesis state with this many entities before the
-      # enclave starts; the integration tests then check both nodes serve them.
-      # The seed rides in the Kurtosis package arguments (4 MiB cap): 1000 x
-      # 512 B is about 2.5 MiB of alloc.
-      ARKIV_SEED_COUNT: ${{ inputs.seed_count || '1000' }}
-      ARKIV_SEED_PAYLOAD_SIZE: ${{ inputs.seed_payload_size || '512' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -118,8 +91,7 @@ jobs:
           bun-version: latest
 
       # Drives the running enclave through the Arkiv SDK; see
-      # kurtosis/integration/README.md for what is covered. The seeded-genesis
-      # tests find the seed's manifest where up.py left it.
+      # kurtosis/integration/README.md for what is covered.
       - name: Run SDK integration tests
         working-directory: kurtosis/integration
         run: |
@@ -137,8 +109,6 @@ jobs:
           kurtosis enclave inspect arkiv-harness
           echo '--- Arkiv service logs ---'
           kurtosis service logs --all-services --num 200 arkiv-harness
-          echo '--- seed manifest ---'
-          cat kurtosis/.seed/manifest.json 2>/dev/null || echo '(no seed)'
 
       - name: Tear down Kurtosis enclave
         if: always()

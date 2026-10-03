@@ -45,20 +45,6 @@ reth-node-ethereum = { git = "ssh://git@github.com/Arkiv-Network/reth", branch =
 reth-ethereum = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
 reth-storage-api = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-# `init-state`'s argument struct and datadir setup, and the state-dump importer
-# behind it: arkiv-reth re-routes that one subcommand to make it work at genesis.
-reth-cli-commands = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-reth-db-common = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-# The parts of that importer arkiv-reth's streaming variant is assembled from:
-# the ETL collector, the tables and their codecs, the trie walk, the stage ids.
-reth-etl = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-reth-db-api = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-reth-trie = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-reth-trie-db = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-reth-stages-types = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-reth-config = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
-# `Layers`, to hang `init-state`'s progress layer onto reth's tracing setup.
-reth-tracing = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-basic-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-ethereum-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
@@ -79,9 +65,6 @@ alloy-rlp = "0.3"
 alloy-primitives = { version = "1.6", features = ["rlp"] }
 alloy-consensus = "2.5"
 alloy-evm = "0.39"
-# The keccak-MPT state-root helpers arkiv-seed derives a genesis `stateHash`
-# with. Same line reth v2.7.0 pins, so the root matches the chain spec's.
-alloy-trie = "0.9"
 
 # Roaring bitmaps back the auxiliary store's equality index. Pinned exactly: a
 # pair account's bitmap bytes are consensus state (its codeHash =
@@ -121,7 +104,6 @@ arkiv-valkey = { path = "crates/arkiv-valkey" }
 arkiv-rpc-types = { path = "crates/arkiv-rpc-types" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
-arkiv-seed = { path = "crates/arkiv-seed" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }

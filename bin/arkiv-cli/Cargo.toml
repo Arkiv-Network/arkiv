@@ -15,9 +15,6 @@ arkiv-interfaces.workspace = true
 # The node's own arkiv_* response types, rather than local restatements.
 arkiv-rpc-types.workspace = true
 arkiv-genesis.workspace = true
-# `seed-genesis`: the offline block-0 state builder.
-arkiv-seed.workspace = true
-
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 alloy-provider.workspace = true
