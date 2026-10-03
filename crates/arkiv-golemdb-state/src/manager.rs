@@ -27,7 +27,7 @@ use crate::view::{GolemStateView, ViewError};
 
 /// Mints [`GolemStateView`]s over one shared store.
 #[derive(Debug)]
-pub struct GolemStateManager<S, C = PlaceholderCost> {
+pub struct GolemStateManager<S: ?Sized, C = PlaceholderCost> {
     store: Arc<S>,
     costs: C,
     /// Session ids are a plain counter.
@@ -37,13 +37,13 @@ pub struct GolemStateManager<S, C = PlaceholderCost> {
     sessions: AtomicU64,
 }
 
-impl<S: StoreExt> GolemStateManager<S> {
+impl<S: StoreExt + ?Sized> GolemStateManager<S> {
     pub fn new(store: Arc<S>) -> Self {
         Self::with_cost_model(store, PlaceholderCost)
     }
 }
 
-impl<S: StoreExt, C> GolemStateManager<S, C> {
+impl<S: StoreExt + ?Sized, C> GolemStateManager<S, C> {
     pub const fn with_cost_model(store: Arc<S>, costs: C) -> Self {
         Self {
             store,
@@ -82,7 +82,7 @@ impl<S: StoreExt, C> GolemStateManager<S, C> {
     }
 }
 
-impl<S: StoreExt, C: CostModel> StateManager for GolemStateManager<S, C> {
+impl<S: StoreExt + ?Sized, C: CostModel> StateManager for GolemStateManager<S, C> {
     type Error = ViewError;
     type View = GolemStateView<Arc<S>>;
 

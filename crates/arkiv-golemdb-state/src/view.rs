@@ -185,7 +185,7 @@ impl<S: Store> GolemStateView<S> {
     }
 
     /// The branch's content digest, read fresh.
-    pub(crate) fn digest(&self) -> Result<Commitment, ViewError> {
+    pub fn digest(&self) -> Result<Commitment, ViewError> {
         Ok(self.store.branch_digest(self.branch)?)
     }
 

@@ -606,7 +606,7 @@ pub enum StoreError {
 /// implementation, not of this seam.
 ///
 /// [`Arc<T>`]: alloc::sync::Arc
-pub trait Store {
+pub trait Store: core::fmt::Debug {
     // -- commits and branches (unmetered) ----------------------------------
 
     /// The current canonical head.
