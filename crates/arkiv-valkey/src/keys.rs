@@ -90,6 +90,11 @@ impl Namespace {
         format!("{}:branch:{branch}:diff", self.0)
     }
 
+    /// One frame's saved diff: the branch's state when that frame opened.
+    pub(crate) fn branch_frame(&self, branch: u64, frame: u64) -> String {
+        format!("{}:branch:{branch}:frame:{frame}", self.0)
+    }
+
     pub(crate) fn next_branch(&self) -> String {
         format!("{}:nextbranch", self.0)
     }

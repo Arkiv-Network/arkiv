@@ -29,8 +29,8 @@ use std::sync::Mutex;
 use super::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Origin, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange,
-    RecordKey, RecordVersion, ScheduleVersion, Sort, SortDirection, Store, StoreError, StoreExt,
-    WriteOp, WriteOutcome, validate_cell_name,
+    RecordKey, RecordVersion, ScheduleVersion, SealedCommit, Sort, SortDirection, Store,
+    StoreError, StoreExt, WriteOp, WriteOutcome, validate_cell_name,
 };
 
 /// One record's stored form: its cells, plus the `#version` meta entry the
@@ -83,6 +83,16 @@ struct BranchState {
     /// This branch's whole view of the world: its origin's state with its own
     /// writes applied. See the crate docs on why this is a copy, not a layer.
     state: BTreeMap<RecordKey, RecordData>,
+    /// The state at the start of each frame that is still open, innermost
+    /// last. `begin` opens the first, `checkpoint` opens the next, and
+    /// `rollback` restores the top — which is why rolling back twice undoes
+    /// two frames.
+    ///
+    /// A copy per frame, like `state` itself: obviously correct, and a real
+    /// store layers a diff instead.
+    frames: Vec<BTreeMap<RecordKey, RecordData>>,
+    /// Set by `seal`. A sealed branch reads but refuses writes.
+    sealed: Option<SealedCommit>,
 }
 
 /// An in-memory [`Store`]. See the crate docs for what it is and is not.
@@ -176,6 +186,10 @@ impl Inner {
     /// true in exactly one place.
     fn begin_write(&mut self, branch: BranchId) -> Result<&mut BranchState, StoreError> {
         let state = self.branch_state_mut(branch)?;
+        // A sealed branch is frozen: it reads, it does not write.
+        if state.sealed.is_some() {
+            return Err(StoreError::HandleInvalid);
+        }
         state.version = BranchVersion(state.version.0 + 1);
         Ok(state)
     }
@@ -227,50 +241,50 @@ impl Inner {
                 origin: Origin::Commit(origin),
                 version: BranchVersion(0),
                 depth: 0,
+                // `begin` opens the branch *and its first frame*.
+                frames: alloc::vec![state.clone()],
                 state,
+                sealed: None,
             },
         );
         Ok(branch)
     }
 
-    fn fork(&mut self, parent: BranchId) -> Result<BranchId, StoreError> {
-        let parent_state = self.branch_state(parent)?;
-        let child_state = BranchState {
-            // Recording the parent's version here is what the merge guard
-            // later checks against.
-            origin: Origin::Branch(parent, parent_state.version),
-            version: BranchVersion(0),
-            depth: parent_state.depth + 1,
-            state: parent_state.state.clone(),
-        };
-
-        let child = BranchId(self.next_branch);
-        self.next_branch += 1;
-        self.branches.insert(child.0, child_state);
-        Ok(child)
+    fn checkpoint(&mut self, branch: BranchId) -> Result<(), StoreError> {
+        let state = self.branch_state(branch)?;
+        if state.sealed.is_some() {
+            return Err(StoreError::HandleInvalid);
+        }
+        let snapshot = state.state.clone();
+        self.branch_state_mut(branch)?.frames.push(snapshot);
+        Ok(())
     }
 
-    fn merge(&mut self, child: BranchId) -> Result<BranchVersion, StoreError> {
-        let child_state = self.branch_state(child)?.clone();
-        let Origin::Branch(parent, forked_at) = child_state.origin else {
-            // A root branch commits; it does not merge.
+    fn rollback(&mut self, branch: BranchId) -> Result<(), StoreError> {
+        let state = self.branch_state_mut(branch)?;
+        if state.sealed.is_some() {
             return Err(StoreError::HandleInvalid);
-        };
-
-        // The guard: the parent must not have moved since the fork. In
-        // blockchain mode this never fires — it asserts the sequential
-        // discipline rather than resolving contention.
-        if self.branch_state(parent)?.version != forked_at {
-            return Err(StoreError::Conflict);
         }
+        // Rolling back past the first frame is rolling back the branch itself.
+        let restored = state.frames.pop().ok_or(StoreError::HandleInvalid)?;
+        state.state = restored;
+        Ok(())
+    }
 
-        self.branches.remove(&child.0);
-        let parent_state = self.branch_state_mut(parent)?;
-        // The child started as a copy of the parent and diverged only by its
-        // own writes, so adopting its state wholesale *is* the fold.
-        parent_state.state = child_state.state;
-        parent_state.version = BranchVersion(parent_state.version.0 + 1);
-        Ok(parent_state.version)
+    fn seal(&mut self, branch: BranchId) -> Result<SealedCommit, StoreError> {
+        if let Some(sealed) = self.branch_state(branch)?.sealed {
+            // Idempotent: sealing twice is the same freeze, so a host that
+            // seals defensively and then commits does not pay twice.
+            return Ok(sealed);
+        }
+        let state = self.branch_state(branch)?;
+        let sealed = SealedCommit {
+            commit_nr: CommitId(self.head().0 + 1),
+            state_root: content_digest(&state.state),
+            index_root: index_digest(&state.state),
+        };
+        self.branch_state_mut(branch)?.sealed = Some(sealed);
+        Ok(sealed)
     }
 
     fn discard(&mut self, branch: BranchId) -> Result<(), StoreError> {
@@ -293,9 +307,13 @@ impl Inner {
     }
 
     fn commit(&mut self, root: BranchId) -> Result<CommitId, StoreError> {
+        // "Implies a final checkpoint, and a seal if none was taken."
+        if self.branch_state(root)?.sealed.is_none() {
+            self.checkpoint(root)?;
+            self.seal(root)?;
+        }
         let root_state = self.branch_state(root)?.clone();
         let Origin::Commit(origin) = root_state.origin else {
-            // Child branches may only merge or discard.
             return Err(StoreError::HandleInvalid);
         };
         // The no-fork guarantee: a branch whose origin has been overtaken
@@ -306,7 +324,10 @@ impl Inner {
 
         let previous = &self.commit_snapshot(origin)?.state;
         let changes = record_changes_between(previous, &root_state.state);
-        let hash = content_digest(&root_state.state);
+        // The seal already computed this; a commit writes what it froze.
+        let hash = root_state
+            .sealed
+            .map_or_else(|| content_digest(&root_state.state), |s| s.state_root);
 
         self.branches.remove(&root.0);
         self.commits.push(Snapshot {
@@ -474,7 +495,7 @@ impl Inner {
         ))
     }
 
-    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         Ok(content_digest(&self.branch_state(branch)?.state))
     }
 }
@@ -597,18 +618,25 @@ impl Store for MemStore {
             .begin(at)
     }
 
-    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
+    fn checkpoint(&self, branch: BranchId) -> Result<(), StoreError> {
         self.0
             .lock()
             .expect("the reference store's lock is never poisoned")
-            .fork(parent)
+            .checkpoint(branch)
     }
 
-    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
+    fn rollback(&self, branch: BranchId) -> Result<(), StoreError> {
         self.0
             .lock()
             .expect("the reference store's lock is never poisoned")
-            .merge(child)
+            .rollback(branch)
+    }
+
+    fn seal(&self, branch: BranchId) -> Result<SealedCommit, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .seal(branch)
     }
 
     fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
@@ -709,11 +737,11 @@ impl Store for MemStore {
             .count(at, filter, budget)
     }
 
-    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         self.0
             .lock()
             .expect("the reference store's lock is never poisoned")
-            .branch_digest(branch)
+            .branch_hash(branch)
     }
 }
 
@@ -883,6 +911,29 @@ fn record_changes_between(
 /// built from cells alone, so a write leaving content unchanged leaves the
 /// digest unchanged. Lengths are framed so that neighbouring names and values
 /// cannot be confused for one another.
+/// The index root: a digest over the **attribute** cells only.
+///
+/// Separate from [`content_digest`] on purpose — it is what a query answer is
+/// a function of, so it moves exactly when an indexed value does and stays put
+/// when an opaque field changes beside it.
+fn index_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    for (key, record) in state {
+        for (name, cell) in &record.cells {
+            if cell.kind != crate::store::CellKind::Attribute {
+                continue;
+            }
+            encoded.extend_from_slice(&key.0);
+            encoded.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(name.as_bytes());
+            encoded.push(cell.tag());
+            encoded.extend_from_slice(&(cell.value.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(&cell.value);
+        }
+    }
+    fold(&encoded)
+}
+
 fn content_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
     let mut encoded = Vec::new();
     for (key, record) in state {
@@ -896,6 +947,13 @@ fn content_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
         }
     }
 
+    fold(&encoded)
+}
+
+/// Four lanes of FNV-1a over the canonical encoding. Deterministic and enough
+/// to detect divergence between two implementations, which is all the suite
+/// asks; it is **not** collision-resistant and proves nothing.
+fn fold(encoded: &[u8]) -> [u8; 32] {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x100_0000_01b3;
     const SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -903,7 +961,7 @@ fn content_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
     let mut digest = [0u8; 32];
     for (lane, chunk) in digest.chunks_mut(8).enumerate() {
         let mut accumulator = FNV_OFFSET_BASIS ^ (lane as u64).wrapping_mul(SEED_STRIDE);
-        for byte in &encoded {
+        for byte in encoded {
             accumulator ^= *byte as u64;
             accumulator = accumulator.wrapping_mul(FNV_PRIME);
         }
