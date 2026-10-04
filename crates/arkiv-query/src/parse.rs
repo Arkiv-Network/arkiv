@@ -290,7 +290,6 @@ impl Parser {
             }
         };
         check_value_type(key, &value, position)?;
-        let value = normalize_builtin_value(key, value);
         Ok((value, position))
     }
 }
@@ -375,32 +374,13 @@ fn bare_str_value(
 ///
 /// For the block heights this is `u64`, which is what the spec's tag table says
 /// and what a query must spell. It is deliberately not the same thing as how
-/// the value is keyed in the index — see [`normalize_builtin_value`].
+/// the value is keyed in the store.
 fn builtin_type(field: BuiltIn) -> AttributeType {
     match field {
         BuiltIn::Owner | BuiltIn::Creator => AttributeType::EthereumAddress,
         BuiltIn::Key => AttributeType::EntityKey,
         BuiltIn::ExpiresAt | BuiltIn::CreatedAt => AttributeType::U64,
         BuiltIn::ContentType => AttributeType::Str,
-    }
-}
-
-/// Re-encode a system value from its surface type to the one the index is keyed
-/// on.
-///
-/// The block heights are `u64` to a client but are recorded as right-aligned
-/// `u256` words (`annotation::entity_annotations`), so a `u64(…)` literal has to
-/// become the same word the writer stored or it would hash to a different
-/// bucket and match nothing. This is the one place the surface and the index
-/// disagree, and it is confined here on purpose — `arkiv-engine.md` §2 allows
-/// internal representations to diverge from the wire.
-fn normalize_builtin_value(key: &AnnotKey, value: AnnotVal) -> AnnotVal {
-    match (key, &value) {
-        (
-            AnnotKey::BuiltIn(BuiltIn::ExpiresAt | BuiltIn::CreatedAt),
-            AttributeValue::U64(height),
-        ) => AttributeValue::u256_from_u64(*height),
-        _ => value,
     }
 }
 
@@ -762,9 +742,9 @@ mod tests {
             parse("$expiresAt < u64(1200000)").unwrap(),
             Query::Lt {
                 key: built_in(BuiltIn::ExpiresAt),
-                // Surface u64, but stored — and therefore queried — as the
-                // right-aligned word the writer indexed.
-                value: AttributeValue::u256_from_u64(1_200_000),
+                // A block height is a u64 on the surface and a U64 cell in
+                // the store, so the literal travels unchanged.
+                value: AttributeValue::U64(1_200_000),
             }
         );
         assert!(matches!(

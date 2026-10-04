@@ -541,13 +541,17 @@ impl BlockSeals {
     /// A block at `height` became canonical: commit its candidate and drop
     /// every other candidate at or below that height.
     ///
-    /// Which candidate? The first sealed at that height. One sequencer
-    /// producing one payload per height seals the same roots twice — once
-    /// building, once validating — so "first" is unambiguous there.
+    /// Which candidate? The **last** sealed at that height.
     ///
-    /// ponytail: first-at-height. Competing payloads need the header to carry
-    /// the Arkiv state root so the right seal can be named, which is what
-    /// installing a `StateRootStrategy` buys.
+    /// Not the first: a payload builder re-builds as transactions arrive, so a
+    /// height accumulates several candidates and the early ones are the
+    /// emptier ones. The last execution before a block goes canonical is reth
+    /// validating the block it chose, so its seal is the one that matches the
+    /// transactions actually in it.
+    ///
+    /// ponytail: last-at-height, which is ordering and not identity. Naming
+    /// the right seal outright needs the header to carry the Arkiv state root,
+    /// which is what installing a `StateRootStrategy` buys.
     pub fn adopt(
         &self,
         store: &HostStore,
@@ -563,21 +567,31 @@ impl BlockSeals {
             core::mem::replace(&mut *pending, future)
         };
 
-        let mut adopted = None;
+        let mut winner = None;
+        let mut losers = Vec::new();
         for (h, candidates) in stale {
-            for (branch, _) in candidates {
-                if adopted.is_none() && h == height {
-                    // Tagged with the block hash, which is how a historical
-                    // read finds the commit for a past block.
-                    adopted = Some(store.commit_tagged(branch, block_hash)?);
+            for (branch, sealed) in candidates {
+                if h == height {
+                    if let Some(previous) = winner.replace((branch, sealed)) {
+                        losers.push(previous.0);
+                    }
                 } else {
-                    // A candidate that lost, or a height reth passed over.
-                    // Discarding is exact: it was never state.
-                    let _ = store.discard(branch);
+                    // A height reth passed over.
+                    losers.push(branch);
                 }
             }
         }
-        Ok(adopted)
+        for branch in losers {
+            // Discarding is exact: a branch that never committed was never
+            // state.
+            let _ = store.discard(branch);
+        }
+        match winner {
+            // Tagged with the block hash, which is how a historical read finds
+            // the commit for a past block.
+            Some((branch, _)) => Ok(Some(store.commit_tagged(branch, block_hash)?)),
+            None => Ok(None),
+        }
     }
 
     /// Drop a candidate that will never be adopted — a speculative call.

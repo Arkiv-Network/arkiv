@@ -260,9 +260,17 @@ where
     let page_size =
         arkiv_rpc_types::method::resolve_limit(options.limit).map_err(invalid_params)?;
 
+    // Only a hex number or `latest` names a block whose state is settled.
+    // Anything else — `pending`, `safe`, `finalized` — would quietly answer
+    // from the tip, which is a wrong answer rather than a refused one.
     let at_block = match options.at_block {
+        None | Some(BlockNumberOrTag::Latest) => None,
         Some(BlockNumberOrTag::Number(n)) => Some(n),
-        _ => None,
+        Some(other) => {
+            return Err(invalid_params(format!(
+                "atBlock tag {other:?} not supported; use a hex block number or 'latest'"
+            )));
+        }
     };
     let (block_number, at) = resolve_at(provider, store, at_block)?;
     let binding = cursor::binding(q, block_number, &projection.fingerprint());
