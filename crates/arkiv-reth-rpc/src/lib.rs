@@ -173,7 +173,10 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
         Box::new(query),
         Box::new(Query::Gt {
             key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
-            value: AnnotVal::u256_from_u64(block),
+            // U64, not U256: `entity_records` stores `$expiration` as a
+            // U64 cell, and a predicate never crosses types — a U256 bound
+            // would silently match nothing.
+            value: AnnotVal::U64(block),
         }),
     )
 }

@@ -121,7 +121,9 @@ use arkiv_interfaces::statemanager::{
     AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore, EqualityIndexStore,
     RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_reth_statemanager::{HostStore, host_manager};
+use arkiv_interfaces::store::BranchId;
+use arkiv_reth_statemanager::{BlockSeals, HostStore, host_manager, open_block_branch};
+use std::sync::Arc;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
@@ -332,6 +334,15 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     inner: EthEvm<DB, I, PrecompilesMap>,
     /// Where Arkiv's own state lives. One erased handle, cloned per EVM.
     store: HostStore,
+    /// The sealed candidates, shared with the node that adopts one of them.
+    seals: Arc<BlockSeals>,
+    /// This block's branch. Every transaction in the block runs on it, in
+    /// order, so each sees the last one's writes.
+    branch: BranchId,
+    /// Whether any charged transaction ran. A speculative execution —
+    /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
+    /// is abandoned rather than sealed.
+    charged: core::cell::Cell<bool>,
 }
 
 impl<DB, I> Evm for ArkivEvm<DB, I>
@@ -382,7 +393,11 @@ where
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
+        if fees.charge {
+            self.charged.set(true);
+        }
         let store = self.store.clone();
+        let branch = self.branch;
         let db = self.inner.db_mut();
         let store = &store;
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
@@ -397,7 +412,7 @@ where
             }
             validate_fees(db, &tx, fees.base_fee, fee_checks)?;
         }
-        arkiv_transact(store, db, block_number, fees, tx)
+        arkiv_transact(store, branch, db, block_number, fees, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -423,7 +438,21 @@ where
         self.inner.components_mut()
     }
 
+    /// Block execution is over. Seal the branch as a candidate at this height
+    /// if a real block ran on it, and abandon it otherwise.
+    ///
+    /// Sealing computes the roots and writes nothing, so reth can execute this
+    /// block again — to validate what it just built — and get the same answer.
+    /// Only adoption commits.
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
+        let height = self.inner.block().number.saturating_to::<u64>();
+        if self.charged.get() {
+            if let Err(error) = self.seals.seal(&self.store, height, self.branch) {
+                tracing::error!(target: "arkiv::executor", ?error, height, "failed to seal the block's Arkiv state");
+            }
+        } else {
+            BlockSeals::abandon(&self.store, self.branch);
+        }
         self.inner.finish()
     }
 }
@@ -552,6 +581,7 @@ fn validate_fees<DB: Database>(
 /// into the `State`, producing the `BundleState` reth hashes into the state root.
 fn arkiv_transact<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     block_number: u64,
     fees: FeeEnv,
@@ -578,18 +608,18 @@ fn arkiv_transact<DB: Database>(
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
-            return arkiv_entity_nonce_call(store, db, &tx, block_number, &fees);
+            return arkiv_entity_nonce_call(store, branch, db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::customAttributeNamesCall::SELECTOR {
-            return arkiv_custom_attribute_names_call(store, db, &tx, block_number, &fees);
+            return arkiv_custom_attribute_names_call(store, branch, db, &tx, block_number, &fees);
         }
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
-            return arkiv_attribute_type_id_call(store, db, &tx, block_number, &fees);
+            return arkiv_attribute_type_id_call(store, branch, db, &tx, block_number, &fees);
         }
         if selector == purgeExpiredCall::SELECTOR {
-            return arkiv_purge_expired(store, db, block_number, &tx);
+            return arkiv_purge_expired(store, branch, db, block_number, &tx);
         }
-        return arkiv_entity_transact(store, db, block_number, &fees, &tx);
+        return arkiv_entity_transact(store, branch, db, block_number, &fees, &tx);
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
@@ -603,17 +633,15 @@ fn arkiv_transact<DB: Database>(
 
     // Sender debit + nonce bump and recipient credit, through one view — a
     // transfer stages the same way every other state change does.
-    let mut view =
-        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
+    let mut view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
     charge_sender(&mut view, &fees, tx.caller, value_out, gas_used, &tx)?;
     if to != tx.caller {
         view.fetch_add_balance(to.into_array(), as_balance(tx.value))
             .map_err(state_fault("credit recipient"))?;
     }
     StateView::commit(&mut view).map_err(state_fault("commit transfer"))?;
-    let state = view
-        .finish(fees.charge)
-        .map_err(state_fault("seal transfer"))?;
+    let state = view.finish().map_err(state_fault("close view"))?;
 
     let result = ExecutionResult::Success {
         reason: SuccessReason::Stop,
@@ -627,6 +655,7 @@ fn arkiv_transact<DB: Database>(
 
 fn arkiv_purge_expired<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     block_number: u64,
     tx: &TxEnv,
@@ -645,8 +674,8 @@ fn arkiv_purge_expired<DB: Database>(
         )));
     }
     let purge_keys = call.entityKeys;
-    let mut view =
-        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
+    let mut view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
     let mut modeled_gas = 0u64;
     for key in &purge_keys {
         let key_bytes = key.0;
@@ -677,7 +706,7 @@ fn arkiv_purge_expired<DB: Database>(
         .apply_deltas(&deltas)
         .map_err(state_fault("purge range index"))?;
     StateView::commit(&mut view).map_err(state_fault("commit purge"))?;
-    let state = view.finish(true).map_err(state_fault("seal purge"))?;
+    let state = view.finish().map_err(state_fault("close view"))?;
     let gas_used = modeled_gas.max(intrinsic_gas(&tx.data));
     Ok(ResultAndState::new(
         ExecutionResult::Success {
@@ -709,6 +738,7 @@ fn out_of_gas() -> ResultAndState<HaltReason> {
 /// stages no entity changes; a decode fault reverts likewise.
 fn arkiv_entity_transact<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     block_number: u64,
     fees: &FeeEnv,
@@ -742,8 +772,8 @@ fn arkiv_entity_transact<DB: Database>(
     // One view for the whole transaction: the entity phase and the sender
     // phase stage into the same overlay; a revert stages no entity changes, so
     // the one commit at the end flushes exactly what should land.
-    let mut view =
-        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
+    let mut view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
     let start_nonce = view
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;
@@ -765,9 +795,7 @@ fn arkiv_entity_transact<DB: Database>(
     let gas_used = outcome.gas_used.max(floor);
     charge_sender(&mut view, fees, caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit transaction"))?;
-    let evm_state = view
-        .finish(fees.charge)
-        .map_err(state_fault("seal entity batch"))?;
+    let evm_state = view.finish().map_err(state_fault("close view"))?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
@@ -797,6 +825,7 @@ fn arkiv_entity_transact<DB: Database>(
 /// sender invariants intact if the call ever arrives as a mined transaction.
 fn arkiv_view_call<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
@@ -806,11 +835,11 @@ fn arkiv_view_call<DB: Database>(
     let output = answer(db)?;
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    let mut view =
-        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
+    let mut view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
     charge_sender(&mut view, fees, tx.caller, U256::ZERO, gas_used, tx)?;
     StateView::commit(&mut view).map_err(state_fault("commit view call"))?;
-    let state = view.finish(false).map_err(state_fault("seal view call"))?;
+    let state = view.finish().map_err(state_fault("close view"))?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match output {
@@ -837,16 +866,17 @@ fn bad_view_args(view: &str, e: impl core::fmt::Display) -> Vec<u8> {
 /// Read a committed entity for a view call.
 fn view_entity<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     key: B256,
     block_number: u64,
 ) -> Result<Option<arkiv_interfaces::entity::Entity>, EVMError<DB::Error>> {
-    let view =
-        host_manager(store, db, parent_ref(block_number)).map_err(state_fault("open view"))?;
+    let view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
     let entity = view
         .get_entity(key.0, ReadMode::ViewOnBase)
         .map_err(state_fault("read entity"))?;
-    view.finish(false).map_err(state_fault("close read view"))?;
+    view.finish().map_err(state_fault("close view"))?;
     Ok(entity)
 }
 
@@ -857,17 +887,18 @@ fn view_entity<DB: Database>(
 /// reads the same system-account slot the execute path mints from.
 fn arkiv_entity_nonce_call<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(store, db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, branch, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
         };
-        let nonce = host_manager(store, db, parent_ref(block_number))
+        let nonce = host_manager(store, branch, db, parent_ref(block_number))
             .map_err(state_fault("open view"))?
             .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
             .map_err(state_fault("read minting nonce"))?;
@@ -886,18 +917,19 @@ fn arkiv_entity_nonce_call<DB: Database>(
 /// answer to "what does this entity have", and it keeps the view total.
 fn arkiv_custom_attribute_names_call<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(store, db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, branch, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
         };
         let names = match live_entity(
-            view_entity(store, db, call.entityKey, block_number)?,
+            view_entity(store, branch, db, call.entityKey, block_number)?,
             block_number,
         ) {
             Some(e) => e.attributes.iter().map(|a| ident32_of(&a.key)).collect(),
@@ -917,19 +949,20 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
 /// does in a patch. No type ever has id 0, so the answer stays unambiguous.
 fn arkiv_attribute_type_id_call<DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(store, db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, branch, db, tx, block_number, fees, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
         };
         let wanted = strip_trailing_zeros(call.name.0.to_vec());
         let type_id = live_entity(
-            view_entity(store, db, call.entityKey, block_number)?,
+            view_entity(store, branch, db, call.entityKey, block_number)?,
             block_number,
         )
         .and_then(|e| {
@@ -1089,12 +1122,14 @@ fn entity_operation_log(effect: &OpEffect) -> Log {
 #[derive(Debug, Clone)]
 pub struct ArkivEvmFactory {
     store: HostStore,
+    seals: Arc<BlockSeals>,
 }
 
 impl ArkivEvmFactory {
-    /// Build a factory over the store Arkiv's state lives in.
-    pub const fn new(store: HostStore) -> Self {
-        Self { store }
+    /// Build a factory over the store Arkiv's state lives in, parking each
+    /// block's sealed state in `seals` until one is adopted.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
     }
 }
 
@@ -1119,7 +1154,11 @@ impl EvmFactory for ArkivEvmFactory {
 
         ArkivEvm {
             inner: EthEvm::new(inner, false),
+            branch: open_block_branch(&self.store)
+                .expect("the Arkiv store refused to open a branch for this block"),
             store: self.store.clone(),
+            seals: self.seals.clone(),
+            charged: core::cell::Cell::new(false),
         }
     }
 
@@ -1129,14 +1168,15 @@ impl EvmFactory for ArkivEvmFactory {
         input: EvmEnv,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        let inner = self
-            .create_evm(db, input)
-            .inner
-            .into_inner()
-            .with_inspector(inspector);
+        let base = self.create_evm(db, input);
+        let (branch, charged) = (base.branch, base.charged.clone());
+        let inner = base.inner.into_inner().with_inspector(inspector);
         ArkivEvm {
             inner: EthEvm::new(inner, true),
             store: self.store.clone(),
+            seals: self.seals.clone(),
+            branch,
+            charged,
         }
     }
 }
@@ -1151,12 +1191,13 @@ impl EvmFactory for ArkivEvmFactory {
 #[derive(Debug, Clone)]
 pub struct ArkivExecutorBuilder {
     store: HostStore,
+    seals: Arc<BlockSeals>,
 }
 
 impl ArkivExecutorBuilder {
     /// Build the executor over the store Arkiv's state lives in.
-    pub const fn new(store: HostStore) -> Self {
-        Self { store }
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
     }
 }
 
@@ -1179,7 +1220,7 @@ where
         );
         Ok(EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec(),
-            ArkivEvmFactory::new(self.store.clone()),
+            ArkivEvmFactory::new(self.store.clone(), self.seals.clone()),
         ))
     }
 }

@@ -8,7 +8,7 @@
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
-use arkiv_reth_statemanager::HostStore;
+use arkiv_reth_statemanager::{BlockSeals, HostStore};
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder, PayloadTypes},
     builder::{DebugNode, Node, NodeAdapter, components::ComponentsBuilder},
@@ -26,12 +26,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ArkivNode {
     store: HostStore,
+    seals: Arc<BlockSeals>,
 }
 
 impl ArkivNode {
     /// The node over the store Arkiv's state lives in.
-    pub const fn new(store: HostStore) -> Self {
-        Self { store }
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
     }
 }
 
@@ -62,8 +63,14 @@ where
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         EthereumNode::components()
-            .executor(ArkivExecutorBuilder::new(self.store.clone()))
-            .payload(ArkivPayloadServiceBuilder::new(self.store.clone()))
+            .executor(ArkivExecutorBuilder::new(
+                self.store.clone(),
+                self.seals.clone(),
+            ))
+            .payload(ArkivPayloadServiceBuilder::new(
+                self.store.clone(),
+                self.seals.clone(),
+            ))
     }
 
     fn add_ons(&self) -> Self::AddOns {
