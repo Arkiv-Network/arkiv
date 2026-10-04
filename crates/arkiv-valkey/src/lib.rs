@@ -43,8 +43,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange, RecordKey,
-    RecordVersion, ScheduleVersion, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp,
-    WriteOutcome,
+    RecordVersion, ScheduleVersion, SealedCommit, Sort, SortDirection, Store, StoreError, StoreExt,
+    WriteOp, WriteOutcome,
 };
 use fred::prelude::*;
 
@@ -204,12 +204,16 @@ impl Store for ValkeyStore {
         self.call(move |backend| async move { backend.begin(at).await })
     }
 
-    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
-        self.call(move |backend| async move { backend.fork(parent).await })
+    fn checkpoint(&self, branch: BranchId) -> Result<(), StoreError> {
+        self.call(move |backend| async move { backend.checkpoint(branch).await })
     }
 
-    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
-        self.call(move |backend| async move { backend.merge(child).await })
+    fn rollback(&self, branch: BranchId) -> Result<(), StoreError> {
+        self.call(move |backend| async move { backend.rollback(branch).await })
+    }
+
+    fn seal(&self, branch: BranchId) -> Result<SealedCommit, StoreError> {
+        self.call(move |backend| async move { backend.seal(branch).await })
     }
 
     fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
@@ -337,8 +341,8 @@ impl Store for ValkeyStore {
         .map(with_free_receipt)
     }
 
-    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
-        self.call(move |backend| async move { backend.branch_digest(branch).await })
+    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        self.call(move |backend| async move { backend.branch_hash(branch).await })
     }
 }
 

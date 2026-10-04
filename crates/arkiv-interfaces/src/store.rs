@@ -514,6 +514,18 @@ pub struct QueryResult {
     pub total_matched: Option<u64>,
 }
 
+/// What a [`seal`](Store::seal) computes: the commit this branch *would*
+/// become, with nothing written yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedCommit {
+    /// The commit number this branch would take — `head + 1` at seal time.
+    pub commit_nr: CommitId,
+    /// The resulting state root. This is the block's state root.
+    pub state_root: [u8; 32],
+    /// The resulting index root.
+    pub index_root: [u8; 32],
+}
+
 /// A branch's origin, fixed at creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -592,8 +604,9 @@ pub enum StoreError {
 /// of its clients.
 ///
 /// Concurrency control is therefore the store's own job, and it is already in
-/// this API: [`BranchVersion`] and [`StoreError::Conflict`]. `merge` fails if
-/// the parent moved; `commit` fails if head moved. A `&mut self` seam adds a
+/// this API: [`StoreError::Conflict`]. `commit` fails if head moved, and the
+/// lineage never forks — competing candidates are branches until one commits.
+/// A `&mut self` seam adds a
 /// compile-time exclusion on top of that, which is redundant where it holds
 /// and false where it matters — it cannot reach another process.
 ///
@@ -619,24 +632,43 @@ pub trait Store: core::fmt::Debug {
     /// lets a host validate competing payloads at one height.
     fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError>;
 
-    /// An O(1) child branch, snapshotting `parent` at its current version. The
-    /// parent may advance afterwards without affecting the child. Child
-    /// branches may only `merge` or `discard`.
-    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError>;
+    /// Seal the open frame and open the next. `O(1)`.
+    ///
+    /// Frames are the unit [`rollback`](Self::rollback) steps back over, which
+    /// is how a host gets call-level atomicity: checkpoint before an operation,
+    /// roll back if it fails, and nothing it wrote applies.
+    fn checkpoint(&self, branch: BranchId) -> Result<(), StoreError>;
 
-    /// Fold `child`'s diff into its parent, consuming the handle. The parent's
-    /// version must still equal the child's fork-time version, else
-    /// [`StoreError::Conflict`]. Returns the parent's new version.
-    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError>;
+    /// Step back one checkpoint boundary, undoing the open frame.
+    ///
+    /// **Not idempotent**: calling it twice undoes two frames. Rolling back
+    /// past the branch's first frame is [`StoreError::HandleInvalid`].
+    fn rollback(&self, branch: BranchId) -> Result<(), StoreError>;
 
-    /// Drop a branch and its open descendants; the parent is untouched.
-    /// Receipts already returned stay valid — cost is a return value, never
-    /// state.
+    /// Freeze the branch and compute its roots, **persisting nothing**.
+    ///
+    /// This is the half of a commit that a host needs *before* it knows whether
+    /// the block will be adopted: it performs the merkleization a commit would,
+    /// and stops short of writing. The branch stays readable and rejects
+    /// writes afterwards.
+    ///
+    /// Any number of branches may be sealed over one head; whichever is adopted
+    /// commits, and the rest leave no trace. That is what lets a host compute a
+    /// block's state root while building it, compute the same root again while
+    /// validating it, and only then decide.
+    fn seal(&self, branch: BranchId) -> Result<SealedCommit, StoreError>;
+
+    /// Drop a branch wholesale. Receipts already returned stay valid — cost is
+    /// a return value, never state.
     fn discard(&self, branch: BranchId) -> Result<(), StoreError>;
 
-    /// Seal a root branch: assigns `head + 1`, writes history, persists
-    /// durably, consumes the handle. The origin commit must still be head,
-    /// else [`StoreError::Conflict`].
+    /// Promote a branch to the canonical head: implies a final
+    /// [`checkpoint`](Self::checkpoint), and a [`seal`](Self::seal) if none was
+    /// taken. The origin must still be head, else [`StoreError::Conflict`].
+    /// Assigns `head + 1` atomically and consumes the handle.
+    ///
+    /// **There is no rewind.** A commit cannot be undone, so a host commits
+    /// only blocks it will not reorg.
     fn commit(&self, root: BranchId) -> Result<CommitId, StoreError>;
 
     fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError>;
@@ -704,12 +736,16 @@ pub trait Store: core::fmt::Debug {
 
     // -- introspection (unmetered) -----------------------------------------
 
-    /// The branch's incrementally maintained content digest — the value that
-    /// becomes the block's state root. `~O(1)`.
+    /// The branch's current content digest, computed on demand from the
+    /// overlay. **Not incremental, and not `O(1)`.**
     ///
     /// A pure function of logical record content: `#`-prefixed meta entries,
     /// [`RecordVersion`] included, are **excluded**.
-    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError>;
+    ///
+    /// This is a debugging and differential-testing tool, not the block's state
+    /// root — that is [`SealedCommit::state_root`], which only a
+    /// [`seal`](Self::seal) produces.
+    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError>;
 }
 
 /// Host-facing additions this seam needs and `golem-db-api.md` does not yet
@@ -789,12 +825,16 @@ impl<T: Store + ?Sized> Store for alloc::sync::Arc<T> {
         (**self).begin(at)
     }
 
-    fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
-        (**self).fork(parent)
+    fn checkpoint(&self, branch: BranchId) -> Result<(), StoreError> {
+        (**self).checkpoint(branch)
     }
 
-    fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
-        (**self).merge(child)
+    fn rollback(&self, branch: BranchId) -> Result<(), StoreError> {
+        (**self).rollback(branch)
+    }
+
+    fn seal(&self, branch: BranchId) -> Result<SealedCommit, StoreError> {
+        (**self).seal(branch)
     }
 
     fn discard(&self, branch: BranchId) -> Result<(), StoreError> {
@@ -868,8 +908,8 @@ impl<T: Store + ?Sized> Store for alloc::sync::Arc<T> {
         (**self).count(at, filter, budget)
     }
 
-    fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
-        (**self).branch_digest(branch)
+    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        (**self).branch_hash(branch)
     }
 }
 
