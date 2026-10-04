@@ -14,12 +14,42 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arkiv_interfaces::store::{
-    BranchId, BranchInfo, BranchVersion, Cell, CellChange, CellName, CommitId, Origin, ReadTarget,
-    RecordChange, RecordKey, RecordVersion, StoreError, validate_cell_name,
+    BranchId, BranchInfo, BranchVersion, Cell, CellChange, CellKind, CellName, CommitId, Origin,
+    ReadTarget, RecordChange, RecordKey, RecordVersion, SealedCommit, StoreError,
+    validate_cell_name,
 };
 use fred::prelude::*;
 
 use crate::codec::{self, Stored};
+
+/// Roots live in a Redis hash, so they travel as hex.
+fn hex_of(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&alloc_hex(*byte));
+    }
+    out
+}
+
+fn alloc_hex(byte: u8) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let hi = DIGITS[(byte >> 4) as usize] as char;
+    let lo = DIGITS[(byte & 0x0f) as usize] as char;
+    [hi, lo].iter().collect()
+}
+
+fn bytes_of(text: &str) -> Result<[u8; 32], StoreError> {
+    if text.len() != 64 {
+        return Err(StoreError::Internal);
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(text.as_bytes().chunks(2)) {
+        let hi = (pair[0] as char).to_digit(16).ok_or(StoreError::Internal)?;
+        let lo = (pair[1] as char).to_digit(16).ok_or(StoreError::Internal)?;
+        *slot = ((hi << 4) | lo) as u8;
+    }
+    Ok(out)
+}
 use crate::keys::{self, Namespace, VERSION_FIELD};
 
 /// A cloneable handle to one namespaced store on one server.
@@ -219,6 +249,7 @@ impl Backend {
         key: RecordKey,
         record: Option<&Stored>,
     ) -> Result<(), StoreError> {
+        self.reject_if_sealed(branch).await?;
         let _: u64 = self
             .client
             .hset(
@@ -284,23 +315,150 @@ impl Backend {
         self.open_branch(Origin::Commit(origin), 0).await
     }
 
-    /// Open a child branch over `parent`, copying its staged writes.
+    /// Seal the open frame and open the next.
     ///
-    /// The spec makes `fork` O(1) and the child's view immune to later parent
-    /// writes. Copying gets the second property — which is the observable one
-    /// — at the cost of the first. A block's diff is bounded by that block's
-    /// writes, so the copy is small; a real store layers instead.
-    pub(crate) async fn fork(&self, parent: BranchId) -> Result<BranchId, StoreError> {
-        let info = self.branch_info(parent).await?;
-        let child = self
-            .open_branch(Origin::Branch(parent, info.version), info.depth + 1)
-            .await?;
+    /// A frame is the branch's diff as it stood when the frame opened, copied
+    /// aside under its own key. `rollback` restores the top one. A real store
+    /// layers instead of copying; a block's diff is bounded by that block's
+    /// writes, so the copy is small.
+    pub(crate) async fn checkpoint(&self, branch: BranchId) -> Result<(), StoreError> {
+        self.reject_if_sealed(branch).await?;
+        let depth = self.frame_depth(branch).await?;
+        self.save_frame(branch, depth).await?;
+        self.set_frame_depth(branch, depth + 1).await
+    }
 
-        let diff = self.branch_diff(parent).await?;
-        for (key, record) in diff {
-            self.stage(child, key, record.as_ref()).await?;
+    /// Step back one checkpoint boundary. Not idempotent.
+    pub(crate) async fn rollback(&self, branch: BranchId) -> Result<(), StoreError> {
+        self.reject_if_sealed(branch).await?;
+        let depth = self.frame_depth(branch).await?;
+        // `begin` opens the first frame, so depth 0 means there is none left.
+        let frame = depth.checked_sub(1).ok_or(StoreError::HandleInvalid)?;
+        self.restore_frame(branch, frame).await?;
+        self.set_frame_depth(branch, frame).await
+    }
+
+    /// Freeze the branch and compute its roots, writing no commit.
+    pub(crate) async fn seal(&self, branch: BranchId) -> Result<SealedCommit, StoreError> {
+        if let Some(sealed) = self.sealed_roots(branch).await? {
+            return Ok(sealed);
         }
-        Ok(child)
+        let sealed = SealedCommit {
+            commit_nr: CommitId(self.head().await? + 1),
+            state_root: self.branch_hash(branch).await?,
+            index_root: self.index_hash(branch).await?,
+        };
+        let _: u64 = self
+            .client
+            .hset(
+                self.namespace.branch_meta(branch.0),
+                vec![
+                    ("sealed_nr", sealed.commit_nr.0.to_string()),
+                    ("sealed_state", hex_of(&sealed.state_root)),
+                    ("sealed_index", hex_of(&sealed.index_root)),
+                ],
+            )
+            .await
+            .map_err(internal)?;
+        Ok(sealed)
+    }
+
+    async fn reject_if_sealed(&self, branch: BranchId) -> Result<(), StoreError> {
+        if self.sealed_roots(branch).await?.is_some() {
+            return Err(StoreError::HandleInvalid);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn sealed_roots(
+        &self,
+        branch: BranchId,
+    ) -> Result<Option<SealedCommit>, StoreError> {
+        let meta: HashMap<String, String> = self
+            .client
+            .hgetall(self.namespace.branch_meta(branch.0))
+            .await
+            .map_err(internal)?;
+        if meta.is_empty() {
+            return Err(StoreError::HandleInvalid);
+        }
+        let (Some(nr), Some(state), Some(index)) = (
+            meta.get("sealed_nr"),
+            meta.get("sealed_state"),
+            meta.get("sealed_index"),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(SealedCommit {
+            commit_nr: CommitId(nr.parse().map_err(|_| StoreError::Internal)?),
+            state_root: bytes_of(state)?,
+            index_root: bytes_of(index)?,
+        }))
+    }
+
+    async fn frame_depth(&self, branch: BranchId) -> Result<u64, StoreError> {
+        let raw: Option<String> = self
+            .client
+            .hget(self.namespace.branch_meta(branch.0), "frames")
+            .await
+            .map_err(internal)?;
+        match raw {
+            // `begin` opens the first frame.
+            None => Ok(1),
+            Some(text) => text.parse().map_err(|_| StoreError::Internal),
+        }
+    }
+
+    async fn set_frame_depth(&self, branch: BranchId, depth: u64) -> Result<(), StoreError> {
+        let _: u64 = self
+            .client
+            .hset(
+                self.namespace.branch_meta(branch.0),
+                vec![("frames", depth.to_string())],
+            )
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    async fn save_frame(&self, branch: BranchId, frame: u64) -> Result<(), StoreError> {
+        let diff: HashMap<String, Vec<u8>> = self
+            .client
+            .hgetall(self.namespace.branch_diff(branch.0))
+            .await
+            .map_err(internal)?;
+        let key = self.namespace.branch_frame(branch.0, frame);
+        let _: u64 = self.client.del(key.clone()).await.map_err(internal)?;
+        if !diff.is_empty() {
+            let _: u64 = self
+                .client
+                .hset(key, diff.into_iter().collect::<Vec<_>>())
+                .await
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    async fn restore_frame(&self, branch: BranchId, frame: u64) -> Result<(), StoreError> {
+        let key = self.namespace.branch_frame(branch.0, frame);
+        let saved: HashMap<String, Vec<u8>> = self.client.hgetall(&key).await.map_err(internal)?;
+        let _: u64 = self
+            .client
+            .del(self.namespace.branch_diff(branch.0))
+            .await
+            .map_err(internal)?;
+        if !saved.is_empty() {
+            let _: u64 = self
+                .client
+                .hset(
+                    self.namespace.branch_diff(branch.0),
+                    saved.into_iter().collect::<Vec<_>>(),
+                )
+                .await
+                .map_err(internal)?;
+        }
+        let _: u64 = self.client.del(key).await.map_err(internal)?;
+        Ok(())
     }
 
     async fn open_branch(&self, origin: Origin, depth: u32) -> Result<BranchId, StoreError> {
@@ -336,33 +494,6 @@ impl Backend {
             .await
             .map_err(internal)?;
         Ok(branch)
-    }
-
-    /// Fold a child's staged writes into its parent and consume the handle.
-    pub(crate) async fn merge(&self, child: BranchId) -> Result<BranchVersion, StoreError> {
-        let info = self.branch_info(child).await?;
-        let Origin::Branch(parent, forked_at) = info.origin else {
-            // A root branch commits; it does not merge.
-            return Err(StoreError::HandleInvalid);
-        };
-        if self.branch_info(parent).await?.version != forked_at {
-            return Err(StoreError::Conflict);
-        }
-
-        // The child began as a copy of the parent and diverged only by its own
-        // writes, so adopting its diff wholesale is the fold.
-        let diff = self.branch_diff(child).await?;
-        let _: u64 = self
-            .client
-            .del(self.namespace.branch_diff(parent.0))
-            .await
-            .map_err(internal)?;
-        for (key, record) in diff {
-            self.stage(parent, key, record.as_ref()).await?;
-        }
-
-        self.drop_branch(child).await?;
-        self.bump_version(parent).await
     }
 
     /// Drop a branch and every open descendant.
@@ -736,7 +867,37 @@ impl Backend {
 
     /// A branch's digest: the state it is grounded on, with its staged writes
     /// folded in. Linear in the size of the diff, not of the state.
-    pub(crate) async fn branch_digest(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+    /// The index root: the same fold, over **attribute** cells alone.
+    pub(crate) async fn index_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        let origin = self.grounding_commit(branch).await?;
+        let mut state = self.state_at(origin).await?;
+        for (key, after) in self.branch_diff(branch).await? {
+            match after {
+                Some(record) => state.insert(key, record),
+                None => state.remove(&key),
+            };
+        }
+        let mut digest = [0u8; 32];
+        for (key, record) in &state {
+            let indexed: Vec<_> = record
+                .cells
+                .iter()
+                .filter(|(_, cell)| cell.kind == CellKind::Attribute)
+                .map(|(n, c)| (n.clone(), c.clone()))
+                .collect();
+            if indexed.is_empty() {
+                continue;
+            }
+            let only_indexed = Stored {
+                cells: indexed.into_iter().collect(),
+                ..record.clone()
+            };
+            codec::fold_digest(&mut digest, codec::record_digest(*key, &only_indexed));
+        }
+        Ok(digest)
+    }
+
+    pub(crate) async fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         let origin = self.grounding_commit(branch).await?;
         let mut digest = if origin.0 == self.head().await? {
             self.digest().await?

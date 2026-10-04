@@ -81,9 +81,9 @@ pub struct GolemStateView<S: Store> {
     /// [`EntityStore::get_uncommitted_deltas`] promises.
     pub(crate) staged: BTreeMap<EntityAddress, EntityUpdates>,
     pub(crate) pruning: MemPruningStore,
-    /// Open transaction frames, innermost last: each entry is the branch and
-    /// delta log to restore if its frame is discarded.
-    frames: Vec<(BranchId, BTreeMap<EntityAddress, EntityUpdates>)>,
+    /// The delta log as it stood when each open frame began, innermost last.
+    /// The store keeps the record side; this is the half only the view has.
+    frames: Vec<BTreeMap<EntityAddress, EntityUpdates>>,
     block: BlockRef,
     session: SessionId,
     commitment: Option<Commitment>,
@@ -135,35 +135,33 @@ impl<S: Store> GolemStateView<S> {
     /// Open a transaction frame: writes go to a child branch until the frame is
     /// merged or discarded.
     ///
-    /// This is what makes a speculative execution safe. `eth_call`,
-    /// `eth_estimateGas` and the engine tree's payload prewarming all reach the
-    /// executor through the same entry point as a real transaction, and all of
-    /// them throw the result away. Writing straight to the view's branch would
-    /// let any one of them mutate chain state; inside a frame, discarding is
-    /// exact — the child branch and its share of the delta log both go.
+    /// This is the store's [`checkpoint`](Store::checkpoint)/
+    /// [`rollback`](Store::rollback) pair, with the view's own delta log
+    /// stacked alongside: the store cannot know about that log, and a rolled
+    /// back frame has to lose both halves or the index stores fold in writes
+    /// that no longer exist.
     ///
-    /// Frames nest, as `Store::fork` does.
+    /// A reverted transaction keeps its fee accounting and loses its entity
+    /// ops, which is a checkpoint between the two and a rollback that reaches
+    /// only the ops.
     pub fn begin_frame(&mut self) -> Result<(), ViewError> {
-        let child = self.store.fork(self.branch)?;
-        self.frames.push((self.branch, self.staged.clone()));
-        self.branch = child;
+        self.store.checkpoint(self.branch)?;
+        self.frames.push(self.staged.clone());
         Ok(())
     }
 
-    /// Fold the innermost frame into its parent; its writes become the parent's.
+    /// Keep the innermost frame: its writes stand.
     pub fn merge_frame(&mut self) -> Result<(), ViewError> {
-        let (parent, _) = self.frames.pop().ok_or(ViewError::NoOpenFrame)?;
-        self.store.merge(self.branch)?;
-        self.branch = parent;
+        self.frames.pop().ok_or(ViewError::NoOpenFrame)?;
         Ok(())
     }
 
-    /// Drop the innermost frame. The view is left exactly as it was before the
-    /// matching [`begin_frame`](Self::begin_frame) — no writes, no deltas.
+    /// Roll the innermost frame back. The view is left exactly as it was
+    /// before the matching [`begin_frame`](Self::begin_frame) — no writes, no
+    /// deltas.
     pub fn discard_frame(&mut self) -> Result<(), ViewError> {
-        let (parent, staged) = self.frames.pop().ok_or(ViewError::NoOpenFrame)?;
-        self.store.discard(self.branch)?;
-        self.branch = parent;
+        let staged = self.frames.pop().ok_or(ViewError::NoOpenFrame)?;
+        self.store.rollback(self.branch)?;
         self.staged = staged;
         Ok(())
     }
@@ -186,7 +184,7 @@ impl<S: Store> GolemStateView<S> {
 
     /// The branch's content digest, read fresh.
     pub fn digest(&self) -> Result<Commitment, ViewError> {
-        Ok(self.store.branch_digest(self.branch)?)
+        Ok(self.store.branch_hash(self.branch)?)
     }
 
     fn is_dirty(&self) -> bool {
