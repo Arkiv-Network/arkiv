@@ -7,6 +7,7 @@ extern crate alloc;
 
 pub mod constants;
 pub mod entity;
+pub mod entity_records;
 pub mod execution;
 pub mod gas;
 pub mod primitives;
