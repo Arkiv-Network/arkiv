@@ -22,6 +22,22 @@
 //! | [`CELL_NONCE`]  | `U64`  | the transaction nonce               |
 //! | [`CELL_MINTED`] | `U64`  | the entity-creation nonce           |
 //!
+//! # Why the names carry `$`
+//!
+//! All three are Arkiv's, not the caller's. GolemDB's cell-name grammar excludes
+//! the engine's own `#` (system) and `@` (admin) prefixes outright, and gives a
+//! host exactly one marker of its own: a single leading `$`, which "has no special
+//! engine meaning" and which "host protocols may reserve for their own cells and
+//! enforce their own write policy". Arkiv does reserve it —
+//! [`annotations::SYSTEM_PREFIX`] is `$`, and `entity_records` already refuses any
+//! user attribute that starts with one.
+//!
+//! Account cells sit behind the reserved key namespace, so no caller can address
+//! the record in the first place; the prefix is the second lock, and it means one
+//! rule covers every cell Arkiv owns rather than two rules with an exception.
+//!
+//! [`annotations::SYSTEM_PREFIX`]: arkiv_interfaces::entity::annotations::SYSTEM_PREFIX
+//!
 //! Reading balance and nonce together — which every transaction does, to check the
 //! sender can pay — is then one `get` rather than two. `patch` updates a single cell,
 //! so writing one value does not rewrite the others.
@@ -47,11 +63,11 @@ use arkiv_interfaces::store::{
 use crate::view::{GolemStateView, ViewError};
 
 /// The account's balance.
-pub const CELL_BALANCE: &str = "bal";
+pub const CELL_BALANCE: &str = "$balance";
 /// The account's transaction nonce.
-pub const CELL_NONCE: &str = "non";
+pub const CELL_NONCE: &str = "$nonce";
 /// The account's entity-creation nonce.
-pub const CELL_MINTED: &str = "mnt";
+pub const CELL_MINTED: &str = "$minted";
 
 /// Why an account operation failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +520,32 @@ mod tests {
             view.balance(ALICE, ReadMode::ViewOnBase).unwrap(),
             UserBalance::from_u64(0)
         );
+    }
+
+    /// Every cell Arkiv owns is marked as Arkiv's. A name without the prefix is
+    /// one a caller could legitimately choose, and the reserved key namespace
+    /// would then be the only thing keeping them apart.
+    #[test]
+    fn every_account_cell_is_system_prefixed() {
+        for name in [CELL_BALANCE, CELL_NONCE, CELL_MINTED] {
+            assert_eq!(
+                name.as_bytes().first(),
+                Some(&arkiv_interfaces::entity::annotations::SYSTEM_PREFIX),
+                "{name} is not marked as Arkiv's"
+            );
+        }
+    }
+
+    /// GolemDB's grammar excludes its own prefixes; a cell named `#balance` or
+    /// `@balance` is `InvalidArgument`, not a stricter version of `$balance`.
+    #[test]
+    fn account_cells_do_not_use_the_engines_own_prefixes() {
+        for name in [CELL_BALANCE, CELL_NONCE, CELL_MINTED] {
+            assert!(
+                !name.starts_with('#') && !name.starts_with('@'),
+                "{name} uses a prefix the engine reserves for itself"
+            );
+        }
     }
 
     #[test]
