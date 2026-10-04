@@ -458,7 +458,7 @@ fn seal_is_idempotent<S: Store>(store_generator: &dyn Fn() -> S) {
 }
 
 fn a_sealed_branch_refuses_writes<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+    let store = store_generator();
     let branch = store.begin(None).unwrap();
     store.seal(branch).unwrap();
 

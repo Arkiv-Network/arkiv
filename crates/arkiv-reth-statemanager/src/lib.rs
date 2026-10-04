@@ -16,5 +16,5 @@ pub mod host;
 pub mod overlay;
 
 pub use accounts::{BalanceAccess, NonceAccess};
-pub use host::{HostError, HostStateView, HostStore, host_manager};
+pub use host::{BlockSeals, HostError, HostStateView, HostStore, host_manager, open_block_branch};
 pub use overlay::WriteOverlay;
