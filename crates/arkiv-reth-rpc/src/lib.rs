@@ -22,7 +22,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query};
-use arkiv_interfaces::store::Store;
+use arkiv_interfaces::store::{CommitId, Store, StoreExt};
 use arkiv_reth_statemanager::HostStore;
 use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
 use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
@@ -139,23 +139,40 @@ where
     Ok(module)
 }
 
-/// The block a read answers for: the tip when `block` is `None`, else that
-/// block. Ahead of the tip is unanswerable.
-fn resolve_block<Provider>(
+/// The block a read answers for and the store commit that holds its state:
+/// the tip when `block` is `None`, else that block.
+///
+/// Each adopted commit is tagged with its block hash, so a past block resolves
+/// to a past commit — history without any per-store history machinery, and
+/// bounded by the store's retention rather than by reth's pruning.
+fn resolve_at<Provider>(
     provider: &Provider,
+    store: &HostStore,
     block: Option<u64>,
-) -> Result<BlockNumber, ErrorObjectOwned>
+) -> Result<(BlockNumber, CommitId), ErrorObjectOwned>
 where
-    Provider: BlockNumReader,
+    Provider: BlockNumReader + HeaderProvider,
 {
     let tip = provider
         .best_block_number()
         .map_err(|e| internal_error(format!("best_block_number: {e:?}")))?;
-    match block {
-        None => Ok(tip),
-        Some(n) if n <= tip => Ok(n),
-        Some(n) => Err(block_unavailable(n, tip, "ahead of the chain tip")),
+    let number = match block {
+        None => tip,
+        Some(n) if n <= tip => n,
+        Some(n) => return Err(block_unavailable(n, tip, "ahead of the chain tip")),
+    };
+    if number == tip {
+        return Ok((number, store.head()));
     }
+    let hash = provider
+        .block_hash(number)
+        .map_err(|e| internal_error(format!("block_hash({number}): {e:?}")))?
+        .ok_or_else(|| block_unavailable(number, tip, "no header for this block"))?;
+    let commit = store
+        .commit_by_tag(hash.0)
+        .map_err(|e| internal_error(format!("resolve commit for block {number}: {e:?}")))?
+        .ok_or_else(|| block_unavailable(number, tip, "state for this block is not retained"))?;
+    Ok((number, commit))
 }
 
 /// The rule: an entity is live at `block` while its expiry block is still ahead.
@@ -194,10 +211,10 @@ fn read_entity<Provider>(
     block: Option<u64>,
 ) -> Result<Option<EntityData>, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory + BlockNumReader,
+    Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
 {
-    let block_number = resolve_block(provider, block)?;
-    let entity = store_reads::entity(&**store, store.head(), key.0)
+    let (block_number, at) = resolve_at(provider, store, block)?;
+    let entity = store_reads::entity(&**store, at, key.0)
         .map_err(|e| internal_error(format!("get entity: {e}")))?;
     Ok(entity
         .filter(|e| is_live(e.expires_at, block_number))
@@ -212,10 +229,10 @@ fn entity_exists_unfiltered<Provider>(
     block: Option<u64>,
 ) -> Result<bool, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory + BlockNumReader,
+    Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
 {
-    let _ = resolve_block(provider, block)?;
-    Ok(store_reads::entity(&**store, store.head(), key.0)
+    let (_, at) = resolve_at(provider, store, block)?;
+    Ok(store_reads::entity(&**store, at, key.0)
         .map_err(|e| internal_error(format!("get entity: {e}")))?
         .is_some())
 }
@@ -236,7 +253,7 @@ fn run_query<Provider>(
     options: &QueryOptions,
 ) -> Result<QueryResponse, ErrorObjectOwned>
 where
-    Provider: BlockNumReader,
+    Provider: BlockNumReader + HeaderProvider,
 {
     let query = arkiv_query::parse(q).map_err(|e| query_error(&e))?;
     let projection = Projection::resolve(options.select.as_ref()).map_err(invalid_params)?;
@@ -247,7 +264,7 @@ where
         Some(BlockNumberOrTag::Number(n)) => Some(n),
         _ => None,
     };
-    let block_number = resolve_block(provider, at_block)?;
+    let (block_number, at) = resolve_at(provider, store, at_block)?;
     let binding = cursor::binding(q, block_number, &projection.fingerprint());
     let offset = match options.cursor.as_deref() {
         None => 0,
@@ -255,14 +272,8 @@ where
     };
 
     let limit = page_size;
-    let entities = store_reads::query(
-        &**store,
-        store.head(),
-        &live_at(query, block_number),
-        offset,
-        limit,
-    )
-    .map_err(|e| internal_error(format!("query: {e}")))?;
+    let entities = store_reads::query(&**store, at, &live_at(query, block_number), offset, limit)
+        .map_err(|e| internal_error(format!("query: {e}")))?;
 
     // A full page may have more behind it; a short one is the end.
     let more = entities.len() as u64 == limit;
@@ -291,14 +302,14 @@ fn entity_count<Provider>(
     request: CountRequest,
 ) -> Result<u64, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory + BlockNumReader,
+    Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
 {
     let query = match &request.query {
         Some(text) => arkiv_query::parse(text).map_err(|e| query_error(&e))?,
         None => Query::All,
     };
-    let block_number = resolve_block(provider, request.block)?;
-    store_reads::count(&**store, store.head(), &live_at(query, block_number))
+    let (block_number, at) = resolve_at(provider, store, request.block)?;
+    store_reads::count(&**store, at, &live_at(query, block_number))
         .map_err(|e| internal_error(format!("count: {e}")))
 }
 

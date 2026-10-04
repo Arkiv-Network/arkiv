@@ -458,6 +458,12 @@ where
 /// The branch belongs to the *block*, not the transaction: reth executes a
 /// block's transactions in order and each must see the last one's writes, so
 /// they share one branch and the frames inside it separate them.
+///
+/// The base is always head, whatever block `parent` names. A simulation
+/// against an older block — `eth_call` with a block number — runs against head
+/// too: writes only ever extend the tip, and a branch over an older commit
+/// could never be adopted. Reading the past is a commit-targeted read, which
+/// takes no branch at all.
 pub fn host_manager<'a, DB: Database>(
     store: &HostStore,
     branch: BranchId,
@@ -542,7 +548,12 @@ impl BlockSeals {
     /// ponytail: first-at-height. Competing payloads need the header to carry
     /// the Arkiv state root so the right seal can be named, which is what
     /// installing a `StateRootStrategy` buys.
-    pub fn adopt(&self, store: &HostStore, height: u64) -> Result<Option<CommitId>, ViewError> {
+    pub fn adopt(
+        &self,
+        store: &HostStore,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Option<CommitId>, ViewError> {
         let stale: BTreeMap<u64, Vec<(BranchId, SealedCommit)>> = {
             let mut pending = self
                 .pending
@@ -556,7 +567,9 @@ impl BlockSeals {
         for (h, candidates) in stale {
             for (branch, _) in candidates {
                 if adopted.is_none() && h == height {
-                    adopted = Some(store.commit(branch)?);
+                    // Tagged with the block hash, which is how a historical
+                    // read finds the commit for a past block.
+                    adopted = Some(store.commit_tagged(branch, block_hash)?);
                 } else {
                     // A candidate that lost, or a height reth passed over.
                     // Discarding is exact: it was never state.
