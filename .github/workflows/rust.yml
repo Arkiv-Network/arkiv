@@ -61,10 +61,11 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked
 
-  # The arkiv-valkey conformance suite needs a real server, so it is #[ignore]
-  # by default and runs here against a service container. A fake backend would
-  # only prove our model of Valkey is self-consistent, which MemStore already
-  # does without a network.
+  # The suites that need a real server are #[ignore] by default and run here
+  # against a service container: arkiv-valkey's store conformance, and
+  # arkiv-golemdb-state's view over it. A fake backend would only prove our
+  # model of Valkey is self-consistent, which MemStore already does without a
+  # network.
   valkey:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -84,9 +85,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      # Only this crate and its dependencies, so the job does not pay for the
-      # reth build the other jobs already cover.
-      - run: cargo test -p arkiv-valkey --locked -- --ignored
+      # Only these crates and their dependencies, so the job does not pay for
+      # the reth build the other jobs already cover.
+      - run: cargo test -p arkiv-valkey -p arkiv-golemdb-state --locked -- --ignored
 
   udeps:
     runs-on: ubuntu-latest

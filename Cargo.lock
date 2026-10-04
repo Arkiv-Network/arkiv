@@ -1488,6 +1488,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-golemdb-state"
+version = "0.5.1"
+dependencies = [
+ "arkiv-interfaces",
+ "arkiv-reth-uncommitted-store",
+ "arkiv-valkey",
+]
+
+[[package]]
 name = "arkiv-harness"
 version = "0.5.1"
 dependencies = [

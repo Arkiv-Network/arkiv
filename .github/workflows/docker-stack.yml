@@ -134,19 +134,19 @@ jobs:
           # a count is the cheapest call that touches the index.
           rpc arkiv_getEntityCount '[{}]'
 
-      # arkiv-valkey pulls in neither reth nor the Solidity bindings, so this
-      # compiles a handful of crates rather than the workspace.
+      # Neither crate pulls in reth or the Solidity bindings, so this compiles
+      # a handful of crates rather than the workspace.
       - uses: Swatinem/rust-cache@v2
         with:
           key: docker-stack
 
-      - name: Run the arkiv-valkey conformance suite against the stack
+      - name: Run the live-store suites against the stack
         run: |
           set -euxo pipefail
-          # Same suite rust.yml runs against a service container; here it runs
+          # Same suites rust.yml runs against a service container; here they run
           # against the compose Valkey, which also proves the compose service is
           # reachable from the runner.
-          cargo test -p arkiv-valkey --locked -- --ignored --nocapture
+          cargo test -p arkiv-valkey -p arkiv-golemdb-state --locked -- --ignored --nocapture
 
       # Unconditional, and after the tests: the point is to see what happened,
       # not only to debug failures.
