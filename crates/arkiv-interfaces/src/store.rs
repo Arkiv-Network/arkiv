@@ -625,11 +625,18 @@ pub trait Store: core::fmt::Debug {
     /// The current canonical head.
     fn head(&self) -> CommitId;
 
-    /// Open a root branch over canonical state. `at` defaults to head and must
-    /// lie within the retention window. Root branches may [`commit`](Self::commit).
+    /// Open a branch, and its first frame, over canonical state. `at` defaults
+    /// to head and must lie within the retention window.
     ///
     /// Any number may be open concurrently over the same origin — which is what
     /// lets a host validate competing payloads at one height.
+    ///
+    /// **Arkiv always passes `None`.** The spec permits a branch over any
+    /// retained commit, but the lineage never forks and there is no rewind, so
+    /// a branch over an older commit could never be adopted. Reaching into the
+    /// past is a commit-targeted [`get`](Self::get) or [`query`](Self::query),
+    /// which needs no branch; a simulation against an older block runs against
+    /// head.
     fn begin(&self, at: Option<CommitId>) -> Result<BranchId, StoreError>;
 
     /// Seal the open frame and open the next. `O(1)`.

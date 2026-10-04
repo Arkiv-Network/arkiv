@@ -87,11 +87,22 @@ impl<S: StoreExt + ?Sized, C: CostModel> StateManager for GolemStateManager<S, C
     type View = GolemStateView<Arc<S>>;
 
     fn view(&self, at: BlockRef) -> Result<Self::View, ViewError> {
-        let origin = self
+        // A branch is always over head. `at` names the block being built on,
+        // and the only block that can be built on is the tip: the lineage
+        // never forks, and there is no rewind, so a branch over an older
+        // commit could never be adopted.
+        //
+        // Reading the past is a different operation — a commit-targeted `get`
+        // or `query` — and needs no branch at all.
+        let origin = self.store.head();
+        let tip = self
             .store
             .commit_by_tag(at.hash)?
             .ok_or(ViewError::UnknownBlock)?;
-        let branch = self.store.begin(Some(origin))?;
+        if tip != origin {
+            return Err(ViewError::NotTheTip);
+        }
+        let branch = self.store.begin(None)?;
         Ok(GolemStateView::new(
             Arc::clone(&self.store),
             branch,
@@ -200,6 +211,25 @@ mod tests {
                 .expect("read")
                 .is_none(),
         );
+    }
+
+    /// Writes only ever extend head. A view over an older block would be a
+    /// branch that could never be adopted, so it is refused outright rather
+    /// than opened and later rejected at commit.
+    #[test]
+    fn a_view_is_refused_over_anything_but_the_tip() {
+        let manager = manager();
+        let mut view = manager.view(GENESIS).expect("view at the tip");
+        view.update_entity(EntityUpdates::create(entity(1)))
+            .expect("create");
+        StateView::commit(&mut view).expect("commit");
+        manager.seal(view, ONE).expect("seal");
+
+        assert!(
+            matches!(manager.view(GENESIS), Err(ViewError::NotTheTip)),
+            "genesis is no longer the tip",
+        );
+        manager.view(ONE).expect("but the new tip opens");
     }
 
     #[test]

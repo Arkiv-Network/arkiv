@@ -124,8 +124,9 @@ where
                     // The block is canonical, so its Arkiv state is no longer
                     // speculative: promote the seal to a commit. This is the
                     // only place anything is written.
-                    let height = notification.tip().number;
-                    match seals.adopt(&store, height) {
+                    let tip = notification.tip();
+                    let height = tip.number;
+                    match seals.adopt(&store, height, tip.hash().0) {
                         Ok(Some(commit)) => {
                             debug!(target: "arkiv-reth", height, commit = commit.0, "adopted the block's Arkiv state")
                         }

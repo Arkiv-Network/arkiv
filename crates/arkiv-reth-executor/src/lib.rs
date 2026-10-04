@@ -170,8 +170,10 @@ fn state_fault<T: core::fmt::Debug, DBError>(
     move |e| EVMError::Custom(format!("{context}: {e:?}"))
 }
 
-/// The parent-height ref a write view is opened at. reth owns canonicality on
-/// this host, so the hash is not threaded through and stays zero.
+/// The parent-height ref a write view reports as its base. reth owns
+/// canonicality on this host, so the hash is not threaded through and stays
+/// zero — and the branch itself is always over head regardless, so this is a
+/// label on the view rather than a choice of base.
 fn parent_ref(block_number: u64) -> BlockRef {
     BlockRef::new(block_number.saturating_sub(1), Hash::default())
 }
