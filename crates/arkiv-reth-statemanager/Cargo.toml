@@ -23,3 +23,6 @@ alloy-primitives.workspace = true
 # WriteOverlay reads through revm's Database and stages an EvmState diff.
 reth-ethereum = { workspace = true, features = ["evm"] }
 eyre.workspace = true
+
+[dev-dependencies]
+arkiv-interfaces = { workspace = true, features = ["conformance"] }

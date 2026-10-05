@@ -722,6 +722,13 @@ mod tests {
         View::new(MemState::default(), BlockRef::new(10, [0xBB; 32]))
     }
 
+    /// The shared `StateView` contract, the same suite the GolemDB host runs.
+    /// Two implementations that both pass cannot disagree about state.
+    #[test]
+    fn conformance() {
+        arkiv_interfaces::statemanager::conformance::run_all(&view);
+    }
+
     fn key_of(byte: u8) -> EntityAddress {
         [byte; 32]
     }

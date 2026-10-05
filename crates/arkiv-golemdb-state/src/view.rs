@@ -34,6 +34,8 @@ pub enum ViewError {
     Account(AccountError),
     Index(IndexError),
     Store(StoreError),
+    /// No commit carries that block's hash as its tag.
+    UnknownBlock,
     /// The operation isn't available on this host.
     Unsupported(&'static str),
     /// The view cannot graduate — see [`StateView::graduate`].
@@ -238,7 +240,7 @@ pub(crate) mod tests {
     use arkiv_interfaces::store::reference::MemStore;
 
     pub(crate) fn view() -> GolemStateView<MemStore> {
-        let mut store = MemStore::new();
+        let store = MemStore::new();
         let origin = store.head();
         let branch = store.begin(Some(origin)).unwrap();
         GolemStateView::new(
@@ -255,6 +257,12 @@ pub(crate) mod tests {
             key: [key; 32],
             ..Entity::default()
         }
+    }
+
+    /// The shared `StateView` contract, the same suite the MPT host runs.
+    #[test]
+    fn conformance() {
+        arkiv_interfaces::statemanager::conformance::run_all(&view);
     }
 
     #[test]
