@@ -27,9 +27,7 @@ alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 eyre.workspace = true
-# The `--chain` parser reads the genesis JSON itself, for the `stateHash`
-# field the alloy `Genesis` type does not carry.
-serde.workspace = true
+# The `--chain` parser reads the genesis JSON itself.
 serde_json.workspace = true
 
 [dev-dependencies]
