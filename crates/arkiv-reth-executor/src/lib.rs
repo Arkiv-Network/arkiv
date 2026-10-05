@@ -116,7 +116,7 @@ use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::gas::CostModel;
-use arkiv_interfaces::primitives::{Hash, UserBalance};
+use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore, EqualityIndexStore,
     RangeIndexStore, ReadMode, StateView,
@@ -189,6 +189,12 @@ pub struct FeeEnv {
     /// Whether gas is charged at all. reth turns this off (`disable_fee_charge`)
     /// for `eth_call` and `eth_estimateGas`; a mined transaction always pays.
     pub charge: bool,
+    /// Whether [`validate_fees`] proved the sender could cover this transaction.
+    ///
+    /// On every path but engine-tree payload prewarming it did, which makes a
+    /// clamped debit in [`charge_sender`] a broken invariant rather than a poor
+    /// sender — see [`debit`].
+    pub solvency_checked: bool,
 }
 
 impl FeeEnv {
@@ -198,6 +204,7 @@ impl FeeEnv {
             base_fee: block.basefee,
             beneficiary: block.beneficiary,
             charge: true,
+            solvency_checked: true,
         }
     }
 
@@ -206,6 +213,43 @@ impl FeeEnv {
     fn effective_gas_price(&self, tx: &TxEnv) -> u128 {
         tx.effective_gas_price(u128::from(self.base_fee))
     }
+}
+
+/// Debit `amount` from `sender`, and refuse to let a clamp pass unnoticed.
+///
+/// [`UserBalance`] arithmetic saturates, because accounting must not fail in the
+/// middle of a block once a transaction has been admitted. That is the right
+/// contract for the primitive and the wrong place to decide solvency: by the time
+/// a debit runs, [`validate_fees`] has already proved the sender covers
+/// `gas_limit × max_fee + value` — or, with fee charging off, the value alone.
+///
+/// So whenever that check ran, `before < amount` cannot happen, and if it does the
+/// bound and the debit have drifted apart. Saturating silently would destroy the
+/// difference and leave nothing behind; this reports it instead, as the same typed
+/// error the bound itself raises, so the payload builder skips the transaction
+/// rather than aborting the block.
+///
+/// Engine-tree payload prewarming is the one path that disables the balance check.
+/// There the clamp is intended and the result is cache-only, so it is allowed.
+fn debit<V: StateView, DBError>(
+    view: &mut V,
+    fees: &FeeEnv,
+    sender: UserAddress,
+    amount: U256,
+    context: &'static str,
+) -> Result<(), EVMError<DBError>> {
+    let before = view
+        .fetch_sub_balance(sender, as_balance(amount))
+        .map_err(state_fault(context))?;
+    if fees.solvency_checked && before < as_balance(amount) {
+        return Err(EVMError::Transaction(
+            InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::new(amount),
+                balance: Box::new(U256::from_be_bytes(before.to_be_bytes())),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Settle `gas_used` gas of `sender`'s transaction the way revm's post-execution
@@ -229,8 +273,7 @@ fn charge_sender<V: StateView, DBError>(
     tx: &TxEnv,
 ) -> Result<(), EVMError<DBError>> {
     let sender = sender.into_array();
-    view.fetch_sub_balance(sender, as_balance(value_out))
-        .map_err(state_fault("debit sender value"))?;
+    debit(view, fees, sender, value_out, "debit sender value")?;
     view.fetch_increment_acc_nonce(sender)
         .map_err(state_fault("bump sender nonce"))?;
     if !fees.charge {
@@ -239,8 +282,7 @@ fn charge_sender<V: StateView, DBError>(
 
     let price = fees.effective_gas_price(tx);
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(price));
-    view.fetch_sub_balance(sender, as_balance(gas_cost))
-        .map_err(state_fault("debit sender gas"))?;
+    debit(view, fees, sender, gas_cost, "debit sender gas")?;
 
     let tip = price.saturating_sub(u128::from(fees.base_fee));
     if tip > 0 {
@@ -349,6 +391,7 @@ where
         let fee_checks = FeeChecks::from_cfg(self.cfg_env());
         let fees = FeeEnv {
             charge: fee_checks.charge,
+            solvency_checked: fee_checks.balance,
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
@@ -1181,5 +1224,98 @@ where
             ctx.chain_spec(),
             ArkivEvmFactory::new(self.store.clone(), self.seals.clone()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkiv_golemdb_state::{GolemStateManager, GolemStateView};
+    use arkiv_interfaces::statemanager::{AccountBalancesStore, BlockRef, ReadMode, StateManager};
+    use arkiv_interfaces::store::reference::MemStore;
+    use arkiv_interfaces::store::{Store, StoreExt};
+    use std::sync::Arc;
+
+    const ALICE: UserAddress = [0xaa; 20];
+    const GENESIS: BlockRef = BlockRef {
+        height: 0,
+        hash: [0; 32],
+    };
+
+    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+    fn funded(amount: u64) -> GolemStateView<Arc<MemStore>> {
+        let store = Arc::new(MemStore::new());
+        let branch = store.begin(None).expect("begin");
+        store
+            .commit_tagged(branch, GENESIS.hash)
+            .expect("tag genesis");
+        let mut view = GolemStateManager::new(store).view(GENESIS).expect("view");
+        view.fetch_add_balance(ALICE, UserBalance::from_u64(amount))
+            .expect("fund");
+        view
+    }
+
+    fn fees(solvency_checked: bool) -> FeeEnv {
+        FeeEnv {
+            base_fee: 0,
+            beneficiary: Address::ZERO,
+            charge: true,
+            solvency_checked,
+        }
+    }
+
+    /// `validate_fees` has already proved the sender covers this, so a clamp means
+    /// the bound and the debit disagree. Saturating would destroy the difference
+    /// silently; the drift has to surface.
+    #[test]
+    fn a_clamped_debit_is_reported_when_solvency_was_checked() {
+        let mut view = funded(10);
+        let outcome = debit::<_, core::convert::Infallible>(
+            &mut view,
+            &fees(true),
+            ALICE,
+            U256::from(11),
+            "test",
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(EVMError::Transaction(
+                    InvalidTransaction::LackOfFundForMaxFee { .. }
+                ))
+            ),
+            "a clamped debit passed unnoticed: {outcome:?}"
+        );
+    }
+
+    /// Engine-tree payload prewarming disables the balance check deliberately and
+    /// discards what it computes, so clamping there is intended.
+    #[test]
+    fn a_clamped_debit_is_allowed_when_solvency_was_not_checked() {
+        let mut view = funded(10);
+        debit::<_, core::convert::Infallible>(
+            &mut view,
+            &fees(false),
+            ALICE,
+            U256::from(11),
+            "test",
+        )
+        .expect("prewarming may clamp");
+        assert_eq!(
+            view.get_balance(ALICE, ReadMode::ViewWithOverlay).unwrap(),
+            UserBalance::ZERO
+        );
+    }
+
+    /// The ordinary path still just moves money.
+    #[test]
+    fn a_covered_debit_passes() {
+        let mut view = funded(10);
+        debit::<_, core::convert::Infallible>(&mut view, &fees(true), ALICE, U256::from(4), "test")
+            .expect("covered");
+        assert_eq!(
+            view.get_balance(ALICE, ReadMode::ViewWithOverlay).unwrap(),
+            UserBalance::from_u64(6)
+        );
     }
 }
