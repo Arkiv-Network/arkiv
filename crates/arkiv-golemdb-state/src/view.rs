@@ -37,6 +37,9 @@ pub enum ViewError {
     Store(StoreError),
     /// No commit carries that block's hash as its tag.
     UnknownBlock,
+    /// A view was asked for over a block that is not the tip. Writes only ever
+    /// extend head; reading the past is a commit-targeted read, not a branch.
+    NotTheTip,
     /// A frame was merged or discarded without one being open.
     NoOpenFrame,
     /// The operation isn't available on this host.

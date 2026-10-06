@@ -16,7 +16,7 @@ use arkiv_bindings::{
 use arkiv_interfaces::store::Store;
 use arkiv_reth_executor::ARKIV_ADDRESS;
 use arkiv_reth_rpc::store_reads;
-use arkiv_reth_statemanager::HostStore;
+use arkiv_reth_statemanager::{BlockSeals, HostStore};
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
@@ -51,12 +51,14 @@ const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c
 #[derive(Debug, Clone)]
 pub struct ArkivPayloadServiceBuilder {
     store: HostStore,
+    seals: Arc<BlockSeals>,
 }
 
 impl ArkivPayloadServiceBuilder {
-    /// The payload service over the store Arkiv's state lives in.
-    pub const fn new(store: HostStore) -> Self {
-        Self { store }
+    /// The payload service over the store Arkiv's state lives in, adopting a
+    /// sealed candidate as each block becomes canonical.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
     }
 }
 
@@ -111,12 +113,28 @@ where
         );
         let provider = ctx.provider().clone();
         let store = self.store.clone();
+        let seals = self.seals.clone();
         let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
             move |notification| {
                 let provider = provider.clone();
                 let store = store.clone();
+                let seals = seals.clone();
                 let pruning_map = pruning_map.clone();
                 async move {
+                    // The block is canonical, so its Arkiv state is no longer
+                    // speculative: promote the seal to a commit. This is the
+                    // only place anything is written.
+                    let tip = notification.tip();
+                    let height = tip.number;
+                    match seals.adopt(&store, height, tip.hash().0) {
+                        Ok(Some(commit)) => {
+                            debug!(target: "arkiv-reth", height, commit = commit.0, "adopted the block's Arkiv state")
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(target: "arkiv-reth", ?error, height, "failed to adopt the block's Arkiv state")
+                        }
+                    }
                     if let Err(error) = catch_up(provider, store, pruning_map).await {
                         warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
                     }

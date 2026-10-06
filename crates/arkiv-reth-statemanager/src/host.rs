@@ -35,10 +35,11 @@ use arkiv_interfaces::statemanager::{
     EntityStore, EntityUpdates, EqualityIndexStore, PruningMeta, PruningStore, RangeIndexStore,
     ReadMode, SessionId, StateCommit, StateView, StoreKind,
 };
-use arkiv_interfaces::store::{Store, StoreExt};
+use arkiv_interfaces::store::{BranchId, CommitId, SealedCommit, Store, StoreExt};
 use core::sync::atomic::{AtomicU64, Ordering};
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::state::EvmState;
+use std::sync::Mutex;
 
 use crate::WriteOverlay;
 use std::sync::Arc;
@@ -451,21 +452,32 @@ where
     }
 }
 
-/// Open a view for one execution: a fresh GolemDB branch over the store's head,
-/// plus the revm overlay for the two account lanes.
+/// Open a view over `branch` for one transaction, plus the revm overlay for
+/// the two account lanes.
 ///
-/// The branch is where this execution's Arkiv writes go. Branches are volatile
-/// — only [`HostStateView::finish`] with `keep` can turn one into state — so an
-/// execution that is thrown away costs nothing and leaves nothing.
+/// The branch belongs to the *block*, not the transaction: reth executes a
+/// block's transactions in order and each must see the last one's writes, so
+/// they share one branch and the frames inside it separate them.
+///
+/// The base is always head, whatever block `parent` names. A simulation
+/// against an older block — `eth_call` with a block number — runs against head
+/// too: writes only ever extend the tip, and a branch over an older commit
+/// could never be adopted. Reading the past is a commit-targeted read, which
+/// takes no branch at all.
 pub fn host_manager<'a, DB: Database>(
     store: &HostStore,
+    branch: BranchId,
     db: &'a mut DB,
     parent: BlockRef,
 ) -> Result<HostStateView<WriteOverlay<'a, DB>>, ViewError> {
     let origin = store.head();
-    let branch = store.begin(Some(origin))?;
     let golem = GolemStateView::new(store.clone(), branch, origin, parent, next_session());
     Ok(HostStateView::new(golem, WriteOverlay::new(db)))
+}
+
+/// Open the branch a block's execution runs on.
+pub fn open_block_branch(store: &HostStore) -> Result<BranchId, ViewError> {
+    Ok(store.begin(Some(store.head()))?)
 }
 
 /// Session ids for host-opened views: a process-local counter, which is all a
@@ -479,22 +491,112 @@ fn next_session() -> SessionId {
 }
 
 impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
-    /// End the execution: promote the GolemDB branch to a commit when `keep`,
-    /// discard it otherwise, and hand back the account diff for reth.
+    /// End one transaction: hand back the account diff for reth, leaving the
+    /// block's branch open for the next transaction.
     ///
-    /// `keep` is false for everything speculative — `eth_call`, `eth_estimateGas`,
-    /// a reverted transaction — and discarding is exact, because a branch that is
-    /// never committed was never state.
-    pub fn finish(self, keep: bool) -> Result<EvmState, ViewError> {
-        let branch = self.golem.branch();
-        let store = self.golem.store().clone();
-        let state = self.into_base().into_state();
-        if keep {
-            store.commit(branch)?;
-        } else {
-            store.discard(branch)?;
+    /// Nothing is committed here. A transaction is not a commit — the block
+    /// is — and reth executes every block at least twice (once to build the
+    /// payload, once to validate it). Committing mid-execution would make the
+    /// second pass read state the first had already advanced, which is a
+    /// receipt-root mismatch and a stalled chain.
+    pub fn finish(self) -> Result<EvmState, ViewError> {
+        Ok(self.into_base().into_state())
+    }
+}
+
+/// The sealed candidates for each block height.
+///
+/// reth executes a block to build it and again to validate it, and may build
+/// several candidates at one height. Each execution seals its branch — roots
+/// computed, nothing written — and parks it here. When a block becomes
+/// canonical its seal commits and the rest are discarded, which is exactly the
+/// spec's "whichever is adopted commits and the rest leave no trace".
+#[derive(Debug, Default)]
+pub struct BlockSeals {
+    pending: Mutex<BTreeMap<u64, Vec<(BranchId, SealedCommit)>>>,
+}
+
+impl BlockSeals {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seal `branch` as a candidate for `height`.
+    pub fn seal(
+        &self,
+        store: &HostStore,
+        height: u64,
+        branch: BranchId,
+    ) -> Result<SealedCommit, ViewError> {
+        let sealed = store.seal(branch)?;
+        self.pending
+            .lock()
+            .expect("the seal registry's lock is never poisoned")
+            .entry(height)
+            .or_default()
+            .push((branch, sealed));
+        Ok(sealed)
+    }
+
+    /// A block at `height` became canonical: commit its candidate and drop
+    /// every other candidate at or below that height.
+    ///
+    /// Which candidate? The **last** sealed at that height.
+    ///
+    /// Not the first: a payload builder re-builds as transactions arrive, so a
+    /// height accumulates several candidates and the early ones are the
+    /// emptier ones. The last execution before a block goes canonical is reth
+    /// validating the block it chose, so its seal is the one that matches the
+    /// transactions actually in it.
+    ///
+    /// ponytail: last-at-height, which is ordering and not identity. Naming
+    /// the right seal outright needs the header to carry the Arkiv state root,
+    /// which is what installing a `StateRootStrategy` buys.
+    pub fn adopt(
+        &self,
+        store: &HostStore,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Option<CommitId>, ViewError> {
+        let stale: BTreeMap<u64, Vec<(BranchId, SealedCommit)>> = {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("the seal registry's lock is never poisoned");
+            let future = pending.split_off(&(height + 1));
+            core::mem::replace(&mut *pending, future)
+        };
+
+        let mut winner = None;
+        let mut losers = Vec::new();
+        for (h, candidates) in stale {
+            for (branch, sealed) in candidates {
+                if h == height {
+                    if let Some(previous) = winner.replace((branch, sealed)) {
+                        losers.push(previous.0);
+                    }
+                } else {
+                    // A height reth passed over.
+                    losers.push(branch);
+                }
+            }
         }
-        Ok(state)
+        for branch in losers {
+            // Discarding is exact: a branch that never committed was never
+            // state.
+            let _ = store.discard(branch);
+        }
+        match winner {
+            // Tagged with the block hash, which is how a historical read finds
+            // the commit for a past block.
+            Some((branch, _)) => Ok(Some(store.commit_tagged(branch, block_hash)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a candidate that will never be adopted — a speculative call.
+    pub fn abandon(store: &HostStore, branch: BranchId) {
+        let _ = store.discard(branch);
     }
 }
 

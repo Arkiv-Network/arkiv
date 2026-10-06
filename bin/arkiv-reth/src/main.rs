@@ -32,7 +32,7 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
 use arkiv_reth_chainspec::ArkivChainSpecParser;
 use arkiv_reth_executor::ArkivEvmFactory;
-use arkiv_reth_statemanager::HostStore;
+use arkiv_reth_statemanager::{BlockSeals, HostStore};
 use clap::Parser;
 use node::ArkivNode;
 use reth::{beacon_consensus::EthBeaconConsensus, cli::Cli};
@@ -88,13 +88,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let seals = Arc::new(BlockSeals::new());
     let factory_store = store.clone();
+    let factory_seals = seals.clone();
     let result = Cli::<ArkivChainSpecParser>::parse().run_with_components::<ArkivNode>(
         move |spec| {
             (
                 EthEvmConfig::new_with_evm_factory(
                     spec.clone(),
-                    ArkivEvmFactory::new(factory_store.clone()),
+                    ArkivEvmFactory::new(factory_store.clone(), factory_seals.clone()),
                 ),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
@@ -104,7 +106,7 @@ fn main() {
             let rpc_store = store.clone();
             let handle = builder
                 // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
-                .node(ArkivNode::new(store.clone()))
+                .node(ArkivNode::new(store.clone(), seals.clone()))
                 // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
                 .extend_rpc_modules(move |ctx| {
                     let module =
