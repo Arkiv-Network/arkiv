@@ -40,13 +40,18 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     create_recordid_collision_is_failure(store_generator);
     commit_advances_head_by_exactly_one(store_generator);
     committed_state_is_readable_at_commit(store_generator);
-    branch_writes_invisible_to_parent_commit(store_generator);
-    branch_drop_invisible_to_parent_commit(store_generator);
-    merge_folds_child_branch_into_parent_branch(store_generator);
-    merge_guard_fires_when_parent_advanced(store_generator);
+    branch_writes_invisible_to_other_branches(store_generator);
+    branch_drop_leaves_no_trace(store_generator);
+    rollback_undoes_the_open_frame(store_generator);
+    rollback_is_not_idempotent(store_generator);
+    rollback_past_the_first_frame_is_refused(store_generator);
+    seal_computes_roots_without_persisting(store_generator);
+    seal_is_idempotent(store_generator);
+    a_sealed_branch_refuses_writes(store_generator);
+    two_branches_over_one_head_seal_independently(store_generator);
+    commit_seals_if_the_host_did_not(store_generator);
     commit_guard_rejects_second_branch_committal(store_generator);
     committed_branchid_becomes_invalid(store_generator);
-    nested_branch_cannot_commit_to_grandparent(store_generator);
     concurrent_branches_have_independent_views(store_generator);
     patch_bumps_record_version(store_generator);
     patch_version_guard_rejects_patch_on_state_view(store_generator);
@@ -56,8 +61,8 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     reserved_cell_name_rejected(store_generator);
     field_only_type_cannot_be_attribute(store_generator); // I do not understand this
     invalid_type_id_rejected(store_generator);
-    branch_digest_doesnt_include_record_version(store_generator);
-    branch_digest_tracks_content(store_generator);
+    branch_hash_doesnt_include_record_version(store_generator);
+    branch_hash_tracks_content(store_generator);
     query_sees_committed_state(store_generator);
     query_dnf_unions_and_dedups(store_generator);
     query_defaults_to_key_order(store_generator);
@@ -66,8 +71,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     genesis_refuses_to_apply_twice(store_generator);
     genesis_is_readable_at_its_commit(store_generator);
     genesis_is_all_or_nothing(store_generator);
-    block_lifecycle_at_depth_three(store_generator);
-    discard_drops_descendants(store_generator);
+    block_lifecycle_in_frames(store_generator);
     branch_reads_its_origin_not_the_head(store_generator);
     projection_limits_returned_cells(store_generator);
     query_and_group_intersects_predicates(store_generator);
@@ -168,7 +172,7 @@ fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
 /// without needing [`StoreExt::commit_hash`].
 fn committed_digest<S: Store>(store: &mut S) -> [u8; 32] {
     let probe = store.begin(None).expect("open a probe branch");
-    let digest = store.branch_digest(probe).expect("read its digest");
+    let digest = store.branch_hash(probe).expect("read its digest");
     store.discard(probe).expect("and drop it again");
     digest
 }
@@ -293,77 +297,228 @@ fn committed_state_is_readable_at_commit<S: Store>(store_generator: &dyn Fn() ->
     assert_eq!(found.cell("n"), Some(&u64_attribute(7)));
 }
 
-/// A child sees its parent's state at fork time, and the parent does not see
-/// the child's writes until they are merged.
-fn branch_writes_invisible_to_parent_commit<S: Store>(store_generator: &dyn Fn() -> S) {
+/// Branches over one head are independent: neither sees the other's writes.
+/// This is what lets a host validate competing payloads at one height.
+fn branch_writes_invisible_to_other_branches<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
-    let parent = store.begin(None).unwrap();
+    let a = store.begin(None).unwrap();
+    let b = store.begin(None).unwrap();
+
+    create_record(&mut store, a, record_key(1), &[("n", u64_attribute(1))]);
+    create_record(&mut store, b, record_key(2), &[("n", u64_attribute(2))]);
+
+    assert!(read_record(&store, ReadTarget::Branch(a), record_key(2)).is_none());
+    assert!(read_record(&store, ReadTarget::Branch(b), record_key(1)).is_none());
+}
+
+/// Discarding a branch throws its writes away and leaves the commit untouched.
+fn branch_drop_leaves_no_trace<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let head = store.head();
+    let branch = store.begin(None).unwrap();
     create_record(
         &mut store,
-        parent,
+        branch,
+        record_key(2),
+        &[("n", u64_attribute(2))],
+    );
+    store.discard(branch).unwrap();
+
+    assert_eq!(store.head(), head, "a discard does not move head");
+    assert!(read_record(&store, ReadTarget::Commit(head), record_key(2)).is_none());
+}
+
+/// `rollback` undoes everything written since the last checkpoint — the revert
+/// half of a failed operation.
+fn rollback_undoes_the_open_frame<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
+    store.checkpoint(branch).unwrap();
+
+    create_record(
+        &mut store,
+        branch,
+        record_key(2),
+        &[("n", u64_attribute(2))],
+    );
+    store.rollback(branch).unwrap();
+
+    assert!(
+        read_record(&store, ReadTarget::Branch(branch), record_key(1)).is_some(),
+        "the checkpointed frame survives"
+    );
+    assert!(
+        read_record(&store, ReadTarget::Branch(branch), record_key(2)).is_none(),
+        "the open frame is undone"
+    );
+}
+
+/// **Not idempotent**: calling it twice undoes two frames.
+fn rollback_is_not_idempotent<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
+    store.checkpoint(branch).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(2),
+        &[("n", u64_attribute(2))],
+    );
+    store.checkpoint(branch).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(3),
+        &[("n", u64_attribute(3))],
+    );
+
+    store.rollback(branch).unwrap();
+    store.rollback(branch).unwrap();
+
+    assert!(read_record(&store, ReadTarget::Branch(branch), record_key(1)).is_some());
+    assert!(
+        read_record(&store, ReadTarget::Branch(branch), record_key(2)).is_none(),
+        "two rollbacks undo two frames"
+    );
+    assert!(read_record(&store, ReadTarget::Branch(branch), record_key(3)).is_none());
+}
+
+/// `begin` opens the first frame, so there is exactly one more frame to roll
+/// back than the host checkpointed. Past that is the branch itself.
+fn rollback_past_the_first_frame_is_refused<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
         record_key(1),
         &[("n", u64_attribute(1))],
     );
 
-    let child = store.fork(parent).unwrap();
-    create_record(&mut store, child, record_key(2), &[("n", u64_attribute(2))]);
-
-    assert!(
-        read_record(&store, ReadTarget::Branch(child), record_key(1)).is_some(),
-        "child sees the parent's state as of the fork"
-    );
-    assert!(
-        read_record(&store, ReadTarget::Branch(parent), record_key(2)).is_none(),
-        "parent does not see the child's writes before merge"
+    store.rollback(branch).expect("the first frame rolls back");
+    assert!(read_record(&store, ReadTarget::Branch(branch), record_key(1)).is_none());
+    assert_eq!(
+        store.rollback(branch).unwrap_err(),
+        StoreError::HandleInvalid,
+        "there is nothing left to roll back"
     );
 }
 
-/// Discarding a child throws its writes away and leaves the parent untouched —
-/// the revert half of a failed transaction.
-fn branch_drop_invisible_to_parent_commit<S: Store>(store_generator: &dyn Fn() -> S) {
+/// The half of a commit a host needs before it knows whether the block will be
+/// adopted: roots computed, nothing written.
+fn seal_computes_roots_without_persisting<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
-    let parent = store.begin(None).unwrap();
-    let child = store.fork(parent).unwrap();
-    create_record(&mut store, child, record_key(2), &[("n", u64_attribute(2))]);
-    store.discard(child).unwrap();
+    let head = store.head();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
 
-    assert!(read_record(&store, ReadTarget::Branch(parent), record_key(2)).is_none());
+    let sealed = store.seal(branch).expect("seal");
+    assert_eq!(sealed.commit_nr.0, head.0 + 1, "the commit it would take");
+    assert_eq!(store.head(), head, "but head has not moved");
+    assert!(
+        read_record(&store, ReadTarget::Commit(head), record_key(1)).is_none(),
+        "and nothing was written"
+    );
+    assert!(
+        read_record(&store, ReadTarget::Branch(branch), record_key(1)).is_some(),
+        "a sealed branch is still readable"
+    );
 }
 
-/// Merging folds the child's diff into the parent and counts as exactly one
-/// batch, however many writes the child absorbed.
-fn merge_folds_child_branch_into_parent_branch<S: Store>(store_generator: &dyn Fn() -> S) {
+/// Sealing twice is the same freeze, so a host that seals defensively and then
+/// commits gets one answer.
+fn seal_is_idempotent<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
-    let parent = store.begin(None).unwrap();
-    let before = store.branch_info(parent).unwrap().version;
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
 
-    let child = store.fork(parent).unwrap();
-    create_record(&mut store, child, record_key(2), &[("n", u64_attribute(2))]);
-    let after = store.merge(child).unwrap();
+    assert_eq!(store.seal(branch).unwrap(), store.seal(branch).unwrap());
+}
+
+fn a_sealed_branch_refuses_writes<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    store.seal(branch).unwrap();
 
     assert_eq!(
-        after.0,
-        before.0 + 1,
-        "a merged child counts as exactly one batch"
+        store
+            .create(
+                branch,
+                record_key(1),
+                vec![(CellName::from("n"), u64_attribute(1))],
+                None,
+            )
+            .unwrap_err(),
+        StoreError::HandleInvalid,
     );
-    assert!(read_record(&store, ReadTarget::Branch(parent), record_key(2)).is_some());
 }
 
-/// A parent that advanced after the fork refuses the merge. In blockchain mode
-/// this never fires — it asserts the sequential discipline.
-fn merge_guard_fires_when_parent_advanced<S: Store>(store_generator: &dyn Fn() -> S) {
+/// The property a host builds blocks on: any number of branches may be sealed
+/// over one head, and whichever is adopted commits while the rest leave no
+/// trace. Two branches with the same writes seal to the same roots, which is
+/// what makes building a block and re-validating it agree.
+fn two_branches_over_one_head_seal_independently<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
-    let parent = store.begin(None).unwrap();
-    let child = store.fork(parent).unwrap();
+    let head = store.head();
 
+    let a = store.begin(None).unwrap();
+    create_record(&mut store, a, record_key(1), &[("n", u64_attribute(1))]);
+    let sealed_a = store.seal(a).unwrap();
+
+    let b = store.begin(None).unwrap();
+    create_record(&mut store, b, record_key(1), &[("n", u64_attribute(1))]);
+    let sealed_b = store.seal(b).unwrap();
+
+    assert_eq!(
+        sealed_a, sealed_b,
+        "the same writes over the same head seal to the same roots"
+    );
+    assert_eq!(store.head(), head, "neither seal moved head");
+
+    store.commit(a).expect("one is adopted");
+    store.discard(b).expect("the other leaves no trace");
+    assert_eq!(store.head().0, head.0 + 1);
+}
+
+/// "Implies a final checkpoint, and a seal if none was taken."
+fn commit_seals_if_the_host_did_not<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let head = store.head();
+    let branch = store.begin(None).unwrap();
     create_record(
         &mut store,
-        parent,
+        branch,
         record_key(1),
         &[("n", u64_attribute(1))],
     );
 
-    assert_eq!(store.merge(child).unwrap_err(), StoreError::Conflict);
+    let commit = store
+        .commit(branch)
+        .expect("commit without an explicit seal");
+    assert_eq!(commit.0, head.0 + 1);
+    assert!(read_record(&store, ReadTarget::Commit(commit), record_key(1)).is_some());
 }
 
 /// A root branch whose origin is no longer head cannot commit. This is the
@@ -406,16 +561,6 @@ fn committed_branchid_becomes_invalid<S: Store>(store_generator: &dyn Fn() -> S)
             .unwrap_err(),
         StoreError::HandleInvalid
     );
-}
-
-/// Capability follows the constructor: only root branches commit, and a child
-/// may merge or discard but never promote.
-fn nested_branch_cannot_commit_to_grandparent<S: Store>(store_generator: &dyn Fn() -> S) {
-    let store = store_generator();
-    let parent = store.begin(None).unwrap();
-    let child = store.fork(parent).unwrap();
-
-    assert_eq!(store.commit(child).unwrap_err(), StoreError::HandleInvalid);
 }
 
 /// Several root branches may be open over one commit at once, mutually
@@ -640,7 +785,7 @@ fn invalid_type_id_rejected<S: Store>(store_generator: &dyn Fn() -> S) {
 
 /// Record versions are coordination metadata, excluded from the digest: a
 /// write that leaves content unchanged must not move it.
-fn branch_digest_doesnt_include_record_version<S: Store>(store_generator: &dyn Fn() -> S) {
+fn branch_hash_doesnt_include_record_version<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     create_record(
@@ -649,7 +794,7 @@ fn branch_digest_doesnt_include_record_version<S: Store>(store_generator: &dyn F
         record_key(1),
         &[("n", u64_attribute(1))],
     );
-    let before = store.branch_digest(branch).unwrap();
+    let before = store.branch_hash(branch).unwrap();
 
     store
         .patch(
@@ -662,7 +807,7 @@ fn branch_digest_doesnt_include_record_version<S: Store>(store_generator: &dyn F
         .unwrap();
 
     assert_eq!(
-        store.branch_digest(branch).unwrap(),
+        store.branch_hash(branch).unwrap(),
         before,
         "versions are coordination metadata, excluded from the commitment"
     );
@@ -670,10 +815,10 @@ fn branch_digest_doesnt_include_record_version<S: Store>(store_generator: &dyn F
 
 /// The digest is a pure function of content, not of history: it moves when
 /// content moves, and returns when content returns.
-fn branch_digest_tracks_content<S: Store>(store_generator: &dyn Fn() -> S) {
+fn branch_hash_tracks_content<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
-    let empty = store.branch_digest(branch).unwrap();
+    let empty = store.branch_hash(branch).unwrap();
 
     create_record(
         &mut store,
@@ -681,7 +826,7 @@ fn branch_digest_tracks_content<S: Store>(store_generator: &dyn Fn() -> S) {
         record_key(1),
         &[("n", u64_attribute(1))],
     );
-    let one_record = store.branch_digest(branch).unwrap();
+    let one_record = store.branch_hash(branch).unwrap();
     assert_ne!(one_record, empty);
 
     store
@@ -693,11 +838,11 @@ fn branch_digest_tracks_content<S: Store>(store_generator: &dyn Fn() -> S) {
             None,
         )
         .unwrap();
-    assert_ne!(store.branch_digest(branch).unwrap(), one_record);
+    assert_ne!(store.branch_hash(branch).unwrap(), one_record);
 
     store.delete(branch, record_key(1), None, None).unwrap();
     assert_eq!(
-        store.branch_digest(branch).unwrap(),
+        store.branch_hash(branch).unwrap(),
         empty,
         "returning to the same content returns to the same digest"
     );
@@ -952,54 +1097,48 @@ fn genesis_is_all_or_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
-/// The block lifecycle the blockchain profile specifies, end to end: a block
-/// branch, a transaction frame per transaction, and an op-batch frame inside
-/// each one.
+/// The block lifecycle in frames — the only sequence Arkiv actually runs.
 ///
-/// This is the assertion that matters most, because it is the only sequence
-/// Arkiv actually runs. The load-bearing rule is the **two rollback scopes**: a
-/// reverted transaction loses its entity ops but keeps its fee accounting, so
-/// the op frame is discarded while the transaction frame is merged either way.
-fn block_lifecycle_at_depth_three<S: Store>(store_generator: &dyn Fn() -> S) {
+/// The load-bearing rule is the **two rollback scopes**: a reverted
+/// transaction loses its entity ops but keeps its fee accounting. With frames
+/// that is a checkpoint between the two, and a rollback that reaches only the
+/// ops.
+fn block_lifecycle_in_frames<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let block = store.begin(None).unwrap();
 
-    // Transaction one succeeds: fee frame and op frame both land.
-    let succeeding = store.fork(block).unwrap();
+    // Transaction one succeeds: fee and ops both land.
     create_record(
         &mut store,
-        succeeding,
+        block,
         record_key(1),
         &[("fee", u64_attribute(21))],
     );
-    let ops = store.fork(succeeding).unwrap();
+    store.checkpoint(block).unwrap();
     create_record(
         &mut store,
-        ops,
+        block,
         record_key(10),
         &[("entity", u64_attribute(1))],
     );
-    store.merge(ops).unwrap();
-    store.merge(succeeding).unwrap();
+    store.checkpoint(block).unwrap();
 
-    // Transaction two reverts: the op frame is discarded, the fee frame is
-    // merged regardless.
-    let reverting = store.fork(block).unwrap();
+    // Transaction two reverts: the fee is checkpointed before the ops run, so
+    // rolling the ops back leaves it standing.
     create_record(
         &mut store,
-        reverting,
+        block,
         record_key(2),
         &[("fee", u64_attribute(21))],
     );
-    let doomed = store.fork(reverting).unwrap();
+    store.checkpoint(block).unwrap();
     create_record(
         &mut store,
-        doomed,
+        block,
         record_key(20),
         &[("entity", u64_attribute(2))],
     );
-    store.discard(doomed).unwrap();
-    store.merge(reverting).unwrap();
+    store.rollback(block).unwrap();
 
     let committed = store.commit(block).unwrap();
     let present = |key| read_record(&store, ReadTarget::Commit(committed), key).is_some();
@@ -1012,29 +1151,7 @@ fn block_lifecycle_at_depth_three<S: Store>(store_generator: &dyn Fn() -> S) {
     );
     assert!(
         !present(record_key(20)),
-        "but its entity writes were discarded"
-    );
-}
-
-/// Discarding a branch takes its open descendants with it: they are grounded on
-/// a handle that no longer exists, so continuing to use them would read from a
-/// parent that is gone.
-fn discard_drops_descendants<S: Store>(store_generator: &dyn Fn() -> S) {
-    let store = store_generator();
-    let block = store.begin(None).unwrap();
-    let transaction = store.fork(block).unwrap();
-    let ops = store.fork(transaction).unwrap();
-
-    store.discard(transaction).unwrap();
-
-    assert_eq!(
-        store.branch_info(ops).unwrap_err(),
-        StoreError::HandleInvalid,
-        "the grandchild went with its parent"
-    );
-    assert!(
-        store.branch_info(block).is_ok(),
-        "but the grandparent is untouched"
+        "but its entity writes were rolled back"
     );
 }
 
@@ -1386,7 +1503,7 @@ fn commit_applies_every_record_or_none<S: Store>(store_generator: &dyn Fn() -> S
             &[("n", u64_attribute(u64::from(ordinal)))],
         );
     }
-    let expected_digest = store.branch_digest(branch).unwrap();
+    let expected_digest = store.branch_hash(branch).unwrap();
     let committed = store.commit(branch).unwrap();
 
     for ordinal in ordinals {
@@ -1536,7 +1653,7 @@ fn digest_same_on_branch_committal<S: StoreExt>(store_generator: &dyn Fn() -> S)
         &[("n", u64_attribute(1))],
     );
 
-    let at_commit_time = store.branch_digest(branch).unwrap();
+    let at_commit_time = store.branch_hash(branch).unwrap();
     let committed = store.commit(branch).unwrap();
 
     assert_eq!(
@@ -1642,8 +1759,8 @@ fn apply_batch_matches_individual_writes<S: StoreExt>(store_generator: &dyn Fn()
         .unwrap();
 
     assert_eq!(
-        batched.branch_digest(batched_branch).unwrap(),
-        serial.branch_digest(serial_branch).unwrap()
+        batched.branch_hash(batched_branch).unwrap(),
+        serial.branch_hash(serial_branch).unwrap()
     );
 }
 
