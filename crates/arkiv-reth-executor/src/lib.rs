@@ -115,12 +115,13 @@ use reth_ethereum::{
 use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
-use arkiv_interfaces::primitives::{Hash, UserBalance};
+use arkiv_interfaces::gas::CostModel;
+use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
-    AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
-    EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
+    AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore, EqualityIndexStore,
+    RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_reth_statemanager::{WriteManager, write_manager};
+use arkiv_reth_statemanager::write_manager;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
 ///
@@ -184,6 +185,12 @@ pub struct FeeEnv {
     /// Whether gas is charged at all. reth turns this off (`disable_fee_charge`)
     /// for `eth_call` and `eth_estimateGas`; a mined transaction always pays.
     pub charge: bool,
+    /// Whether [`validate_fees`] proved the sender could cover this transaction.
+    ///
+    /// On every path but engine-tree payload prewarming it did, which makes a
+    /// clamped debit in [`charge_sender`] a broken invariant rather than a poor
+    /// sender — see [`debit`].
+    pub solvency_checked: bool,
 }
 
 impl FeeEnv {
@@ -193,6 +200,7 @@ impl FeeEnv {
             base_fee: block.basefee,
             beneficiary: block.beneficiary,
             charge: true,
+            solvency_checked: true,
         }
     }
 
@@ -201,6 +209,43 @@ impl FeeEnv {
     fn effective_gas_price(&self, tx: &TxEnv) -> u128 {
         tx.effective_gas_price(u128::from(self.base_fee))
     }
+}
+
+/// Debit `amount` from `sender`, and refuse to let a clamp pass unnoticed.
+///
+/// [`UserBalance`] arithmetic saturates, because accounting must not fail in the
+/// middle of a block once a transaction has been admitted. That is the right
+/// contract for the primitive and the wrong place to decide solvency: by the time
+/// a debit runs, [`validate_fees`] has already proved the sender covers
+/// `gas_limit × max_fee + value` — or, with fee charging off, the value alone.
+///
+/// So whenever that check ran, `before < amount` cannot happen, and if it does the
+/// bound and the debit have drifted apart. Saturating silently would destroy the
+/// difference and leave nothing behind; this reports it instead, as the same typed
+/// error the bound itself raises, so the payload builder skips the transaction
+/// rather than aborting the block.
+///
+/// Engine-tree payload prewarming is the one path that disables the balance check.
+/// There the clamp is intended and the result is cache-only, so it is allowed.
+fn debit<V: StateView, DBError>(
+    view: &mut V,
+    fees: &FeeEnv,
+    sender: UserAddress,
+    amount: U256,
+    context: &'static str,
+) -> Result<(), EVMError<DBError>> {
+    let before = view
+        .fetch_sub_balance(sender, as_balance(amount))
+        .map_err(state_fault(context))?;
+    if fees.solvency_checked && before < as_balance(amount) {
+        return Err(EVMError::Transaction(
+            InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::new(amount),
+                balance: Box::new(U256::from_be_bytes(before.to_be_bytes())),
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Settle `gas_used` gas of `sender`'s transaction the way revm's post-execution
@@ -215,17 +260,16 @@ impl FeeEnv {
 /// With [`FeeEnv::charge`] off only the value moves and the nonce bumps, as in
 /// revm with `disable_fee_charge`. Only gas actually used is charged; there is no
 /// up-front `gas_limit` debit and refund because nothing runs between the two.
-fn charge_sender<DB: Database>(
-    view: &mut WriteManager<'_, DB>,
+fn charge_sender<V: StateView, DBError>(
+    view: &mut V,
     fees: &FeeEnv,
     sender: Address,
     value_out: U256,
     gas_used: u64,
     tx: &TxEnv,
-) -> Result<(), EVMError<DB::Error>> {
+) -> Result<(), EVMError<DBError>> {
     let sender = sender.into_array();
-    view.fetch_sub_balance(sender, as_balance(value_out))
-        .map_err(state_fault("debit sender value"))?;
+    debit(view, fees, sender, value_out, "debit sender value")?;
     view.fetch_increment_acc_nonce(sender)
         .map_err(state_fault("bump sender nonce"))?;
     if !fees.charge {
@@ -234,8 +278,7 @@ fn charge_sender<DB: Database>(
 
     let price = fees.effective_gas_price(tx);
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(price));
-    view.fetch_sub_balance(sender, as_balance(gas_cost))
-        .map_err(state_fault("debit sender gas"))?;
+    debit(view, fees, sender, gas_cost, "debit sender gas")?;
 
     let tip = price.saturating_sub(u128::from(fees.base_fee));
     if tip > 0 {
@@ -333,6 +376,7 @@ where
         let fee_checks = FeeChecks::from_cfg(self.cfg_env());
         let fees = FeeEnv {
             charge: fee_checks.charge,
+            solvency_checked: fee_checks.balance,
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
@@ -692,7 +736,10 @@ fn arkiv_entity_transact<DB: Database>(
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;
     let outcome = match decode_ops(&env, &tx.data, start_nonce) {
-        Ok(ops) => run_ops(&mut view, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?,
+        Ok(ops) => {
+            let costs = *view.cost_model();
+            run_ops(&mut view, costs, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?
+        }
         Err(e) => Outcome {
             gas_used: 0,
             revert: Some(revert::decode_revert_data(&e)),
@@ -896,7 +943,7 @@ fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
 /// What running an op batch produced: the gas metered, the ABI-encoded revert
 /// payload if the batch failed a business rule, and the `EntityOperation` logs
 /// to emit (empty on revert). The state itself needs no field here — it is
-/// staged in the [`WriteManager`] the batch ran over.
+/// staged in the view the batch ran over.
 struct Outcome {
     gas_used: u64,
     revert: Option<Bytes>,
@@ -906,8 +953,13 @@ struct Outcome {
 /// Run a decoded batch through the write view: on success, fold the staged
 /// deltas into the index stores and advance the minting nonce per create; on a
 /// revert nothing is staged.
-fn run_ops<DB: Database>(
-    view: &mut WriteManager<'_, DB>,
+///
+/// Generic over the view, so the same batch logic runs on any `StateView`
+/// backend. `costs` is passed rather than read off the view: a cost schedule is
+/// a property of the chain, not of whatever happens to be storing state.
+fn run_ops<V: StateView, C: CostModel>(
+    view: &mut V,
+    costs: C,
     env: &ExecEnv,
     ops: Vec<Op>,
 ) -> Result<Outcome, eyre::Report> {
@@ -917,7 +969,7 @@ fn run_ops<DB: Database>(
         .count() as u64;
 
     let mut effects = Vec::new();
-    let out = ArkivExecutor::with_cost(*view.cost_model())
+    let out = ArkivExecutor::with_cost(costs)
         .apply_with_effects(env, view, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
@@ -1118,6 +1170,7 @@ mod tests {
         base_fee: 0,
         beneficiary: Address::ZERO,
         charge: true,
+        solvency_checked: true,
     };
 
     fn arkiv_tx(caller: Address, data: Bytes) -> TxEnv {
@@ -1870,6 +1923,7 @@ mod tests {
             base_fee: 5,
             beneficiary: bob,
             charge: true,
+            solvency_checked: true,
         };
         let tx = transfer_tx(alice, carol, 100, 10, Some(3));
         validate_fees(&mut db, &tx, fees.base_fee, ALL_CHECKS).unwrap();
@@ -1897,6 +1951,7 @@ mod tests {
             base_fee: 5,
             beneficiary: bob,
             charge: true,
+            solvency_checked: true,
         };
         let rs =
             arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 6, Some(3))).unwrap();
@@ -1920,6 +1975,7 @@ mod tests {
             base_fee: 5,
             beneficiary: bob,
             charge: true,
+            solvency_checked: true,
         };
         let rs = arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 9, None)).unwrap();
 
@@ -1942,6 +1998,7 @@ mod tests {
             base_fee: 5,
             beneficiary: bob,
             charge: true,
+            solvency_checked: true,
         };
         let rs =
             arkiv_transact(&mut db, 10, fees, transfer_tx(alice, carol, 0, 5, Some(0))).unwrap();
@@ -1966,6 +2023,7 @@ mod tests {
             base_fee: 5,
             beneficiary: bob,
             charge: true,
+            solvency_checked: true,
         };
         let tx = TxEnv {
             tx_type: 2,
@@ -2107,6 +2165,7 @@ mod tests {
             base_fee: 5,
             beneficiary: bob,
             charge: false,
+            solvency_checked: true,
         };
         let rs = arkiv_transact(
             &mut db,
@@ -2120,5 +2179,107 @@ mod tests {
         assert_eq!(balance_in(&rs, carol), U256::from(100));
         assert_eq!(rs.state.get(&alice).unwrap().info.nonce, 1);
         assert!(!rs.state.contains_key(&bob));
+    }
+
+    // --- the clamp guard -------------------------------------------------
+
+    const CLAMP_ALICE: UserAddress = [0xaa; 20];
+    const CLAMP_GENESIS: BlockRef = BlockRef {
+        height: 0,
+        hash: [0; 32],
+    };
+
+    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+    fn clamp_view(
+        amount: u64,
+    ) -> arkiv_golemdb_state::GolemStateView<
+        std::sync::Arc<arkiv_interfaces::store::reference::MemStore>,
+    > {
+        use arkiv_interfaces::statemanager::StateManager;
+        use arkiv_interfaces::store::{Store, StoreExt};
+
+        let store = std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
+        let branch = store.begin(None).expect("begin");
+        store
+            .commit_tagged(branch, CLAMP_GENESIS.hash)
+            .expect("tag genesis");
+        let mut view = arkiv_golemdb_state::GolemStateManager::new(store)
+            .view(CLAMP_GENESIS)
+            .expect("view");
+        view.fetch_add_balance(CLAMP_ALICE, UserBalance::from_u64(amount))
+            .expect("fund");
+        view
+    }
+
+    fn clamp_fees(solvency_checked: bool) -> FeeEnv {
+        FeeEnv {
+            base_fee: 0,
+            beneficiary: Address::ZERO,
+            charge: true,
+            solvency_checked,
+        }
+    }
+
+    /// `validate_fees` has already proved the sender covers this, so a clamp means
+    /// the bound and the debit disagree. Saturating would destroy the difference
+    /// silently; the drift has to surface.
+    #[test]
+    fn a_clamped_debit_is_reported_when_solvency_was_checked() {
+        let mut view = clamp_view(10);
+        let outcome = debit::<_, core::convert::Infallible>(
+            &mut view,
+            &clamp_fees(true),
+            CLAMP_ALICE,
+            U256::from(11),
+            "test",
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(EVMError::Transaction(
+                    InvalidTransaction::LackOfFundForMaxFee { .. }
+                ))
+            ),
+            "a clamped debit passed unnoticed: {outcome:?}"
+        );
+    }
+
+    /// Engine-tree payload prewarming disables the balance check deliberately and
+    /// discards what it computes, so clamping there is intended.
+    #[test]
+    fn a_clamped_debit_is_allowed_when_solvency_was_not_checked() {
+        let mut view = clamp_view(10);
+        debit::<_, core::convert::Infallible>(
+            &mut view,
+            &clamp_fees(false),
+            CLAMP_ALICE,
+            U256::from(11),
+            "test",
+        )
+        .expect("prewarming may clamp");
+        assert_eq!(
+            view.get_balance(CLAMP_ALICE, ReadMode::ViewWithOverlay)
+                .unwrap(),
+            UserBalance::ZERO
+        );
+    }
+
+    /// The ordinary path still just moves money.
+    #[test]
+    fn a_covered_debit_passes() {
+        let mut view = clamp_view(10);
+        debit::<_, core::convert::Infallible>(
+            &mut view,
+            &clamp_fees(true),
+            CLAMP_ALICE,
+            U256::from(4),
+            "test",
+        )
+        .expect("covered");
+        assert_eq!(
+            view.get_balance(CLAMP_ALICE, ReadMode::ViewWithOverlay)
+                .unwrap(),
+            UserBalance::from_u64(6)
+        );
     }
 }
