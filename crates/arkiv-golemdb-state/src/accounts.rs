@@ -46,11 +46,16 @@
 //! Arkiv query language, so indexing them would be paid for and never used.
 //!
 //! An absent cell reads as zero, which is the Ethereum convention and what a
-//! never-before-seen account must look like. Every cell is written on creation so
-//! that absent-versus-zero never has to be distinguished on the read path.
+//! never-before-seen account must look like. Only the cell being written is
+//! written: the record is created by whichever lane touches the account first,
+//! and that lane has no business asserting a value for the other two. Under
+//! [`HostStateView`] that is the normal case rather than a corner — minting
+//! nonces come here while balances and nonces stay on reth, so most account
+//! records hold `$minted` alone.
+//!
+//! [`HostStateView`]: https://github.com/Arkiv-Network/arkiv/blob/golemdb-base/crates/arkiv-reth-statemanager/src/host.rs
 
 use alloc::vec;
-use alloc::vec::Vec;
 
 use arkiv_interfaces::primitives::{EntityCreationNonce, UserAddress, UserBalance, UserNonce};
 use arkiv_interfaces::statemanager::{
@@ -87,28 +92,6 @@ impl From<StoreError> for AccountError {
 /// The record key for an account. See the module docs on the reserved namespace.
 pub const fn record_key(account: UserAddress) -> RecordKey {
     RecordKey::from_address(account)
-}
-
-/// The cells of a fresh account record, all three written explicitly.
-fn fresh_cells(
-    balance: UserBalance,
-    nonce: UserNonce,
-    minted: EntityCreationNonce,
-) -> Vec<(CellName, Cell)> {
-    vec![
-        (
-            CellName::from(CELL_BALANCE),
-            Cell::field(TypeId::U256, balance.to_be_bytes().to_vec()),
-        ),
-        (
-            CellName::from(CELL_NONCE),
-            Cell::field(TypeId::U64, nonce.get().to_be_bytes().to_vec()),
-        ),
-        (
-            CellName::from(CELL_MINTED),
-            Cell::field(TypeId::U64, minted.get().to_be_bytes().to_vec()),
-        ),
-    ]
 }
 
 fn u64_cell(record: Option<&Record>, name: &'static str) -> Result<u64, AccountError> {
@@ -172,19 +155,15 @@ impl<S: Store> GolemStateView<S> {
     ) -> Result<(), AccountError> {
         let key = record_key(account);
         if self.read(account, ReadMode::ViewWithOverlay)?.is_none() {
-            // New account: write all three cells so the read path never has to tell
-            // an absent cell from a zero one.
-            let mut cells = fresh_cells(
-                UserBalance::from_u64(0),
-                UserNonce::new(0),
-                EntityCreationNonce::new(0),
-            );
-            for (existing, value) in &mut cells {
-                if existing == name {
-                    *value = cell.clone();
-                }
-            }
-            self.store.create(self.branch, key, cells, None)?;
+            // Only the cell being written. The other two are left absent rather
+            // than zeroed: every reader here already treats absent as zero, so
+            // writing them buys nothing, and a zero that looks like a value is
+            // worse than no value at all. `HostStateView` keeps balances and
+            // nonces on reth while minting nonces come here, so an account
+            // record is routinely created by a path that has no business
+            // claiming the account's balance is zero.
+            self.store
+                .create(self.branch, key, vec![(CellName::from(name), cell)], None)?;
             return Ok(());
         }
         self.store.patch(
@@ -353,6 +332,7 @@ impl<S: Store> EntityCreationNoncesStore for GolemStateView<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use arkiv_interfaces::entity_records;
 
     const ALICE: UserAddress = [0xaa; 20];
@@ -519,6 +499,32 @@ mod tests {
         assert_eq!(
             view.balance(ALICE, ReadMode::ViewOnBase).unwrap(),
             UserBalance::from_u64(0)
+        );
+    }
+
+    /// Creating a record through one lane must not plant values for the others.
+    ///
+    /// `HostStateView` keeps balances and nonces on reth and sends only minting
+    /// nonces here, so a zero `$balance` written as a side effect of minting is
+    /// a lie that reads as "no funds" the moment anything trusts this record.
+    #[test]
+    fn writing_one_cell_leaves_the_others_absent() {
+        let mut view = view();
+        view.fetch_increment_minted(ALICE).unwrap();
+
+        let record = view.read(ALICE, ReadMode::ViewWithOverlay).unwrap();
+        let record = record.expect("the record exists");
+        let present: Vec<_> = record.cells.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(present, [CELL_MINTED], "only the written cell is stored");
+
+        // Absent still reads as zero, which is why writing them was never needed.
+        assert_eq!(
+            view.balance(ALICE, ReadMode::ViewWithOverlay).unwrap(),
+            UserBalance::from_u64(0)
+        );
+        assert_eq!(
+            view.nonce(ALICE, ReadMode::ViewWithOverlay).unwrap(),
+            UserNonce::new(0)
         );
     }
 
