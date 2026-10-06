@@ -14,7 +14,9 @@
 pub mod accounts;
 pub mod host;
 pub mod overlay;
+pub mod provider;
 
 pub use accounts::{BalanceAccess, NonceAccess};
 pub use host::{BlockSeals, HostError, HostStateView, HostStore, host_manager, open_block_branch};
 pub use overlay::WriteOverlay;
+pub use provider::{AccountReadError, GolemAccounts, StoredAccount};
