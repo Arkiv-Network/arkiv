@@ -133,13 +133,17 @@ def spend_something(rpc_port, out):
     out_file = out / "transfer.log"
     result = subprocess.run(
         [
-            "cast", "send",
-            "--rpc-url", f"http://127.0.0.1:{rpc_port}",
-            "--private-key", DEV_KEY,
+            "cast",
+            "send",
+            "--rpc-url",
+            f"http://127.0.0.1:{rpc_port}",
+            "--private-key",
+            DEV_KEY,
             # Somewhere to send it. The recipient does not matter; the point
             # is that the sender is debited.
             "0x000000000000000000000000000000000000dEaD",
-            "--value", "1ether",
+            "--value",
+            "1ether",
         ],
         capture_output=True,
         text=True,
@@ -164,9 +168,9 @@ def dump_store(port, namespace, out, spend):
     kinds = {}
     for key in keys:
         parts = key.split(":")
-        kinds[parts[1] if len(parts) > 1 else key] = kinds.get(
-            parts[1] if len(parts) > 1 else key, 0
-        ) + 1
+        kinds[parts[1] if len(parts) > 1 else key] = (
+            kinds.get(parts[1] if len(parts) > 1 else key, 0) + 1
+        )
 
     lines = [f"total keys: {len(keys)}", f"transfer: {spend}", ""]
     lines += ["by kind:"] + [f"  {n:>4}  {k}" for k, n in sorted(kinds.items())]
@@ -245,12 +249,16 @@ def main():
                 subprocess.Popen(
                     [
                         "valkey-server",
-                        "--port", str(valkey_port),
-                        "--dir", str(scratch / "valkey"),
+                        "--port",
+                        str(valkey_port),
+                        "--dir",
+                        str(scratch / "valkey"),
                         # No snapshotting: this data is scrap and a stray
                         # dump.rdb in the repo would be worse than useless.
-                        "--save", "",
-                        "--appendonly", "no",
+                        "--save",
+                        "",
+                        "--appendonly",
+                        "no",
                     ],
                     stdout=valkey_log,
                     stderr=subprocess.STDOUT,
@@ -271,15 +279,20 @@ def main():
                 subprocess.Popen(
                     [
                         str(node_bin),
-                        "node", "--dev",
-                        "--dev.block-time", "1sec",
-                        "--datadir", str(scratch / "chain"),
+                        "node",
+                        "--dev",
+                        "--dev.block-time",
+                        "1sec",
+                        "--datadir",
+                        str(scratch / "chain"),
                         "--http",
                         # `arkiv` is not a selectable module: the arkiv_*
                         # namespace is merged by extend_rpc_modules and rides
                         # on whichever transports are already on.
-                        "--http.api", "eth,net,web3",
-                        "--http.port", str(rpc_port),
+                        "--http.api",
+                        "eth,net,web3",
+                        "--http.port",
+                        str(rpc_port),
                     ],
                     env={
                         **os.environ,
@@ -313,9 +326,7 @@ def main():
                     "block": int(block, 16) if block else None,
                     "entities": rpc(rpc_port, "arkiv_getEntityCount"),
                     "keys": len(
-                        valkey(
-                            valkey_port, "--scan", "--pattern", f"{namespace}:*"
-                        ).splitlines()
+                        valkey(valkey_port, "--scan", "--pattern", f"{namespace}:*").splitlines()
                     ),
                 }
             )

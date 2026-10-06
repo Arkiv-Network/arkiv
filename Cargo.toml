@@ -45,6 +45,25 @@ reth-node-ethereum = { git = "ssh://git@github.com/Arkiv-Network/reth", branch =
 reth-ethereum = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
 reth-storage-api = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+# The provider stack `ArkivProvider` delegates to while it is still reth's.
+reth-provider = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-chain-state = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-node-types = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-primitives-traits = { version = "0.8.1", default-features = false }
+# Named in `RocksDBProviderFactory`'s signature; same version reth pins.
+rocksdb = "0.24"
+reth-node-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-db = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-db-api = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-execution-types = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-prune-types = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-stages-types = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-static-file-types = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-storage-errors = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-chainspec = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-trie = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-storage-overlay = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+arkiv-reth-golemdbprovider = { path = "crates/arkiv-reth-golemdbprovider" }
 reth-basic-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-ethereum-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
@@ -137,3 +156,4 @@ lto = "off"
 codegen-units = 16
 # `release` already carries no debug info; this drops the symbol table too.
 strip = "symbols"
+
