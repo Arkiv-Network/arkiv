@@ -107,7 +107,6 @@ arkiv-genesis = { path = "crates/arkiv-genesis" }
 arkiv-harness = { path = "crates/arkiv-harness" }
 arkiv-reth-executor = { path = "crates/arkiv-reth-executor" }
 arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }
-arkiv-reth-mpt-committed-store = { path = "crates/arkiv-reth-mpt-committed-store" }
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }

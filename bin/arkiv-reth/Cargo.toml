@@ -25,6 +25,11 @@ reth-storage-api.workspace = true
 arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
+arkiv-reth-statemanager.workspace = true
+# The node's backing store: the reference one in-process by default, Valkey
+# when ARKIV_STORE_URL names a server.
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
+arkiv-valkey.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true

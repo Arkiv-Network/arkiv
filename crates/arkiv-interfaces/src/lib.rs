@@ -5,6 +5,12 @@
 
 extern crate alloc;
 
+// The reference store is the node's default in-process backing store, so it
+// has to be `Sync` — which needs a real lock, which needs `std`. Only the
+// reference implementation pulls this in; the seam itself stays `no_std`.
+#[cfg(feature = "conformance")]
+extern crate std;
+
 pub mod constants;
 pub mod entity;
 pub mod entity_records;
