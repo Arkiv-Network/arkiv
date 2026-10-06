@@ -98,25 +98,40 @@ impl<S: Store> GolemAccounts<S> {
             .into_value())
     }
 
-    /// The account at `address`, or `None` if the store holds no record for it.
+    /// The account at `address`, or `None` if there is no such Ethereum account.
     ///
-    /// `None` means "no record", which is not yet the same as "no such Ethereum
-    /// account" -- a record can exist holding only the minting nonce, written
-    /// by a lane that knows nothing about the account's balance. Deciding what
-    /// existence means once reth is no longer the authority is tracked in #145;
-    /// until then this reports what the store actually holds and leaves the
-    /// interpretation to the caller.
+    /// Existence is not the record's existence. A record can hold `$minted`
+    /// alone, written by the minting lane, which knows nothing about the
+    /// account's balance — that is a place Arkiv counted entity creations, not
+    /// an Ethereum account. Reporting it as one would make every entity creator
+    /// look like a funded account holding zero.
+    ///
+    /// So: an Ethereum account exists exactly when the record carries
+    /// `$balance` or `$nonce`. Both are written explicitly by the lanes that
+    /// own them, and a genuinely zero balance is a written zero rather than an
+    /// absent cell, so an emptied account still reads as existing — which is
+    /// what Ethereum means by an account with nothing in it.
+    ///
+    /// The distinction matters to EIP-161 reaping, to nonce and codehash
+    /// handling, and to the state root, all of which tell apart "holds nothing"
+    /// from "is not there".
     pub fn account(&self, address: Address) -> Result<Option<StoredAccount>, AccountReadError> {
         let Some(record) = self.record(address)? else {
             return Ok(None);
         };
+        if !is_account(&record) {
+            return Ok(None);
+        }
         Ok(Some(StoredAccount {
             balance: balance_of(&record)?,
             nonce: nonce_of(&record)?,
         }))
     }
 
-    /// Whether the store holds any record for `address`.
+    /// Whether the store holds any record at this address, Ethereum account or
+    /// not. [`account`](Self::account) is the question almost every caller
+    /// means; this one exists for the minting lane, which owns records that are
+    /// deliberately not accounts.
     pub fn has_record(&self, address: Address) -> Result<bool, AccountReadError> {
         Ok(self.record(address)?.is_some())
     }
@@ -134,6 +149,16 @@ impl<S: Store> GolemAccounts<S> {
     pub const fn storage(&self, _address: Address, _key: B256) -> Option<U256> {
         None
     }
+}
+
+/// Whether this record is an Ethereum account, as opposed to a record that
+/// merely shares the account's key.
+///
+/// The two lanes that own Ethereum account state are the only ones that write
+/// `$balance` and `$nonce`, so their presence is the signal. `$minted` is not:
+/// the minting lane counts entity creations and has no view of the account.
+fn is_account(record: &Record) -> bool {
+    record.cell(CELL_BALANCE).is_some() || record.cell(CELL_NONCE).is_some()
 }
 
 /// The balance cell, or zero when absent.
@@ -245,22 +270,75 @@ mod tests {
         );
     }
 
-    /// The case #145 has to resolve: a record written by the minting lane says
-    /// nothing about the account's balance, but it is still a record.
+    /// A record the minting lane created is not an Ethereum account. Reporting
+    /// it as one would make every entity creator look like a funded account
+    /// holding zero.
     #[test]
-    fn a_minting_only_record_reads_as_zero_but_exists() {
+    fn a_minting_only_record_is_not_an_account() {
         let accounts = committed(|view| {
             view.fetch_increment_entity_creation_nonce(ALICE.into_array())
                 .unwrap();
         });
-        assert!(accounts.has_record(ALICE).unwrap());
+        assert!(
+            accounts.has_record(ALICE).unwrap(),
+            "the record is there -- minting wrote it"
+        );
+        assert_eq!(
+            accounts.account(ALICE).unwrap(),
+            None,
+            "but it is not an Ethereum account"
+        );
+    }
+
+    /// An account emptied to zero still exists. The zero is written, not
+    /// absent, which is exactly how Ethereum tells "holds nothing" from
+    /// "is not there".
+    #[test]
+    fn an_account_holding_zero_still_exists() {
+        let accounts = committed(|view| {
+            view.set_balance(ALICE.into_array(), UserBalance::from_u64(0))
+                .unwrap();
+        });
         assert_eq!(
             accounts.account(ALICE).unwrap(),
             Some(StoredAccount {
                 balance: U256::ZERO,
                 nonce: 0
-            }),
-            "absent cells read as zero; whether that is an Ethereum account is #145"
+            })
+        );
+    }
+
+    /// Minting alongside real account state does not hide the account.
+    #[test]
+    fn minting_does_not_mask_a_real_account() {
+        let accounts = committed(|view| {
+            view.set_balance(ALICE.into_array(), UserBalance::from_u64(5))
+                .unwrap();
+            view.fetch_increment_entity_creation_nonce(ALICE.into_array())
+                .unwrap();
+        });
+        assert_eq!(
+            accounts.account(ALICE).unwrap(),
+            Some(StoredAccount {
+                balance: U256::from(5),
+                nonce: 0
+            })
+        );
+    }
+
+    /// A nonce alone is enough: an account that has sent a transaction exists
+    /// even if it has since been drained.
+    #[test]
+    fn a_nonce_alone_makes_an_account() {
+        let accounts = committed(|view| {
+            view.fetch_increment_acc_nonce(ALICE.into_array()).unwrap();
+        });
+        assert_eq!(
+            accounts.account(ALICE).unwrap(),
+            Some(StoredAccount {
+                balance: U256::ZERO,
+                nonce: 1
+            })
         );
     }
 
