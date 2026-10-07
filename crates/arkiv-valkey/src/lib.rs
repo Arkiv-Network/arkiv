@@ -355,6 +355,10 @@ impl StoreExt for ValkeyStore {
         self.call(move |backend| async move { backend.commit_by_tag(tag).await })
     }
 
+    fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError> {
+        self.call(move |backend| async move { backend.tag_of(commit).await })
+    }
+
     fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {
         self.call(move |backend| async move { backend.changes(commit).await })
     }
