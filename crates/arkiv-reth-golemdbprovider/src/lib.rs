@@ -22,6 +22,7 @@ use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, TxHash, TxNumber};
 use alloy_rpc_types_engine::ForkchoiceState;
+use arkiv_reth_statemanager::HostStore;
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
     ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
@@ -62,17 +63,28 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct ArkivProvider<N: ProviderNodeTypes> {
     inner: BlockchainProvider<N>,
+    store: HostStore,
 }
 
 impl<N: ProviderNodeTypes> ArkivProvider<N> {
-    /// Wrap reth's provider.
-    pub const fn new(inner: BlockchainProvider<N>) -> Self {
-        Self { inner }
+    /// Wrap reth's provider, over the store the answers will come from.
+    pub const fn new(inner: BlockchainProvider<N>, store: HostStore) -> Self {
+        Self { inner, store }
     }
 
     /// The provider being delegated to. Shrinks as trait groups move across.
     pub const fn inner(&self) -> &BlockchainProvider<N> {
         &self.inner
+    }
+
+    /// The store the migrated traits read from.
+    ///
+    /// Carried now, used by none of the impls yet: a trait group cannot move
+    /// across until the provider can reach the store, and threading it through
+    /// the builder and the node is a change worth making on its own rather
+    /// than inside the first migration.
+    pub const fn store(&self) -> &HostStore {
+        &self.store
     }
 }
 
@@ -82,6 +94,7 @@ impl<N: ProviderNodeTypes> Clone for ArkivProvider<N> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            store: self.store.clone(),
         }
     }
 }
@@ -683,13 +696,25 @@ const fn _satisfies_full_provider<N: ProviderNodeTypes>() {
 /// which needs an open database, which needs the datadir only the launcher
 /// has. So it builds one, and this says what to build. Pair it with
 /// `NodeBuilder::with_types_and_provider`, which sets `T::Provider` to match.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ArkivProviderBuilder;
+#[derive(Debug, Clone)]
+pub struct ArkivProviderBuilder {
+    store: HostStore,
+}
+
+impl ArkivProviderBuilder {
+    /// Build providers over this store.
+    pub const fn new(store: HostStore) -> Self {
+        Self { store }
+    }
+}
 
 impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for ArkivProviderBuilder {
     type Provider = ArkivProvider<N>;
 
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
-        Ok(ArkivProvider::new(BlockchainProvider::new(factory)?))
+        Ok(ArkivProvider::new(
+            BlockchainProvider::new(factory)?,
+            self.store,
+        ))
     }
 }

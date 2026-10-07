@@ -1601,6 +1601,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "arkiv-reth-statemanager",
  "eyre",
  "reth-chain-state",
  "reth-chainspec",
