@@ -48,12 +48,12 @@
 //! An absent cell reads as zero, which is the Ethereum convention and what a
 //! never-before-seen account must look like. Only the cell being written is
 //! written: the record is created by whichever lane touches the account first,
-//! and that lane has no business asserting a value for the other two. Under
-//! [`HostStateView`] that is the normal case rather than a corner — minting
-//! nonces come here while balances and nonces stay on reth, so most account
-//! records hold `$minted` alone.
+//! and that lane has no business asserting a value for the other two.
 //!
-//! [`HostStateView`]: https://github.com/Arkiv-Network/arkiv/blob/golemdb-base/crates/arkiv-reth-statemanager/src/host.rs
+//! That is load-bearing rather than tidy. An Ethereum account **exists**
+//! exactly when its record carries `$balance` or `$nonce`, so a zero
+//! `$balance` planted by the minting lane would turn every entity creator into
+//! a funded account holding nothing — see `GolemAccounts::account`.
 
 use alloc::vec;
 
@@ -158,10 +158,9 @@ impl<S: Store> GolemStateView<S> {
             // Only the cell being written. The other two are left absent rather
             // than zeroed: every reader here already treats absent as zero, so
             // writing them buys nothing, and a zero that looks like a value is
-            // worse than no value at all. `HostStateView` keeps balances and
-            // nonces on reth while minting nonces come here, so an account
-            // record is routinely created by a path that has no business
-            // claiming the account's balance is zero.
+            // worse than no value at all: the presence of `$balance` or
+            // `$nonce` is what makes a record an Ethereum account, and the
+            // minting lane has no business claiming this address is one.
             self.store
                 .create(self.branch, key, vec![(CellName::from(name), cell)], None)?;
             return Ok(());
@@ -504,9 +503,9 @@ mod tests {
 
     /// Creating a record through one lane must not plant values for the others.
     ///
-    /// `HostStateView` keeps balances and nonces on reth and sends only minting
-    /// nonces here, so a zero `$balance` written as a side effect of minting is
-    /// a lie that reads as "no funds" the moment anything trusts this record.
+    /// A zero `$balance` written as a side effect of minting would make the
+    /// record read as an Ethereum account holding nothing, which is what
+    /// decides EIP-161 reaping and whether a sender can pay.
     #[test]
     fn writing_one_cell_leaves_the_others_absent() {
         let mut view = view();

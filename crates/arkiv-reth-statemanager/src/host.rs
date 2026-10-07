@@ -1,26 +1,22 @@
 //! [`HostStateView`] — the reth host's `StateView`, on GolemDB.
 //!
-//! Entities, the query index, the pruning set and the entity-minting nonces
-//! live in a GolemDB [`Store`](arkiv_interfaces::store::Store), reached through
-//! [`GolemStateView`]. Balances and transaction nonces stay in reth's accounts,
-//! staged into the [`EvmState`](crate::WriteOverlay) diff the block executor
-//! commits.
+//! Every lane is GolemDB's: entities, the query index, the pruning set, the
+//! entity-minting nonces, and — since the accounts cutover — balances and
+//! transaction nonces too. All of it goes through [`GolemStateView`].
 //!
-//! # Why accounts are still reth's, for now
+//! # Why the `EvmState` diff is still here
 //!
-//! An Arkiv `UserBalance` *is* the Ethereum account balance, and a `UserNonce`
-//! *is* the account nonce — the same values the txpool checks and
-//! `eth_getBalance` returns, both of which read reth's state provider rather
-//! than anything of ours. Until that provider is served from GolemDB, reth's
-//! accounts have to keep moving or the node lies about balances.
+//! Account writes are *mirrored* into the [`EvmState`](crate::WriteOverlay)
+//! diff reth's block executor commits. The diff is no longer where the values
+//! live — reads never consult it — but reth executes a block's transactions
+//! over a revm `State` that caches every account it loads. Without the diff,
+//! the second transaction from a sender would see the first one's nonce and
+//! balance unchanged, because nothing told reth's cache they moved.
 //!
-//! So this is a transition, and a bounded one: the two account lanes are the
-//! only thing left on the reth side, and they collapse into
-//! [`GolemStateView`]'s own `bal` and `non` cells — already written and tested
-//! — the moment the provider lands.
+//! So the mirror is write-only, and it stays until reth stops running the
+//! block loop over a cache of its own. The state root does not retire it.
 
 use core::cell::RefCell;
-use core::mem;
 use core::ops::Bound;
 use std::collections::BTreeMap;
 
@@ -71,8 +67,8 @@ impl<E> From<ViewError> for HostError<E> {
     }
 }
 
-/// One view over Arkiv's state for one block: GolemDB for everything Arkiv
-/// owns, reth's accounts for the two lanes Ethereum also reads.
+/// One view over Arkiv's state for one block: GolemDB throughout, with the
+/// two account lanes mirrored into reth's `EvmState` diff on the way past.
 #[derive(Debug)]
 pub struct HostStateView<B, C = PlaceholderCost> {
     golem: GolemStateView<HostStore>,
@@ -80,8 +76,6 @@ pub struct HostStateView<B, C = PlaceholderCost> {
     // seams read with `&mut` (caches). Borrows never overlap: one per method.
     base: RefCell<B>,
     costs: C,
-    balances: BTreeMap<UserAddress, UserBalance>,
-    account_nonces: BTreeMap<UserAddress, UserNonce>,
     commitment: Option<Commitment>,
 }
 
@@ -97,8 +91,6 @@ impl<B, C> HostStateView<B, C> {
             golem,
             base: RefCell::new(base),
             costs,
-            balances: BTreeMap::new(),
-            account_nonces: BTreeMap::new(),
             commitment: None,
         }
     }
@@ -122,10 +114,6 @@ impl<B, C> HostStateView<B, C> {
 
     pub const fn golem_mut(&mut self) -> &mut GolemStateView<HostStore> {
         &mut self.golem
-    }
-
-    fn accounts_dirty(&self) -> bool {
-        !self.balances.is_empty() || !self.account_nonces.is_empty()
     }
 }
 
@@ -288,11 +276,45 @@ where
     }
 }
 
-// ── The two lanes Ethereum also reads: staged into reth's accounts ──────────
+// ── The two lanes Ethereum also reads: GolemDB, mirrored into reth's diff ───
+
+impl<B, C, E> HostStateView<B, C>
+where
+    B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
+    E: core::fmt::Debug,
+{
+    /// Copy the account's current balance into reth's diff.
+    ///
+    /// Read back from GolemDB rather than recomputed here: the store decides
+    /// what a write means — `fetch_sub_balance` saturates, `create` leaves an
+    /// untouched cell absent — and a second opinion about that is how the two
+    /// sides drift apart.
+    fn mirror_balance(&mut self, account: UserAddress) -> Result<(), HostError<E>> {
+        let balance = self.golem.get_balance(account, ReadMode::ViewWithOverlay)?;
+        self.base
+            .get_mut()
+            .set_balance(
+                account.into(),
+                alloy_primitives::U256::from_be_bytes(balance.to_be_bytes()),
+            )
+            .map_err(HostError::Backend)
+    }
+
+    /// Copy the account's current nonce into reth's diff.
+    fn mirror_nonce(&mut self, account: UserAddress) -> Result<(), HostError<E>> {
+        let nonce = self
+            .golem
+            .get_acc_nonce(account, ReadMode::ViewWithOverlay)?;
+        self.base
+            .get_mut()
+            .set_nonce(account.into(), nonce.get())
+            .map_err(HostError::Backend)
+    }
+}
 
 impl<B, C, E> AccountBalancesStore for HostStateView<B, C>
 where
-    B: BalanceAccess<Error = E>,
+    B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
 {
     type Error = HostError<E>;
@@ -302,16 +324,7 @@ where
         account: UserAddress,
         read: ReadMode,
     ) -> Result<UserBalance, Self::Error> {
-        if read == ReadMode::ViewWithOverlay
-            && let Some(balance) = self.balances.get(&account)
-        {
-            return Ok(*balance);
-        }
-        self.base
-            .borrow_mut()
-            .get_balance(account.into())
-            .map(|v| UserBalance::from_be_bytes(v.to_be_bytes()))
-            .map_err(HostError::Backend)
+        Ok(self.golem.get_balance(account, read)?)
     }
 
     fn fetch_add_balance(
@@ -319,10 +332,9 @@ where
         account: UserAddress,
         amount: UserBalance,
     ) -> Result<UserBalance, Self::Error> {
-        let current = self.get_balance(account, ReadMode::ViewWithOverlay)?;
-        self.balances
-            .insert(account, current.saturating_add(amount));
-        Ok(current)
+        let before = self.golem.fetch_add_balance(account, amount)?;
+        self.mirror_balance(account)?;
+        Ok(before)
     }
 
     fn fetch_sub_balance(
@@ -330,10 +342,9 @@ where
         account: UserAddress,
         amount: UserBalance,
     ) -> Result<UserBalance, Self::Error> {
-        let current = self.get_balance(account, ReadMode::ViewWithOverlay)?;
-        self.balances
-            .insert(account, current.saturating_sub(amount));
-        Ok(current)
+        let before = self.golem.fetch_sub_balance(account, amount)?;
+        self.mirror_balance(account)?;
+        Ok(before)
     }
 
     fn compare_set_balance(
@@ -342,10 +353,10 @@ where
         current: UserBalance,
         new: UserBalance,
     ) -> Result<bool, Self::Error> {
-        if self.get_balance(account, ReadMode::ViewWithOverlay)? != current {
+        if !self.golem.compare_set_balance(account, current, new)? {
             return Ok(false);
         }
-        self.balances.insert(account, new);
+        self.mirror_balance(account)?;
         Ok(true)
     }
 
@@ -354,27 +365,18 @@ where
         account: UserAddress,
         balance: UserBalance,
     ) -> Result<(), Self::Error> {
-        self.balances.insert(account, balance);
-        Ok(())
+        self.golem.set_balance(account, balance)?;
+        self.mirror_balance(account)
     }
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
-        for (account, balance) in mem::take(&mut self.balances) {
-            self.base
-                .get_mut()
-                .set_balance(
-                    account.into(),
-                    alloy_primitives::U256::from_be_bytes(balance.to_be_bytes()),
-                )
-                .map_err(HostError::Backend)?;
-        }
-        Ok(self.commitment.unwrap_or_default())
+        Ok(AccountBalancesStore::commit_store(&mut self.golem)?)
     }
 }
 
 impl<B, C, E> AccountNoncesStore for HostStateView<B, C>
 where
-    B: NonceAccess<Error = E>,
+    B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
 {
     type Error = HostError<E>;
@@ -384,35 +386,20 @@ where
         account: UserAddress,
         read: ReadMode,
     ) -> Result<UserNonce, Self::Error> {
-        if read == ReadMode::ViewWithOverlay
-            && let Some(nonce) = self.account_nonces.get(&account)
-        {
-            return Ok(*nonce);
-        }
-        self.base
-            .borrow_mut()
-            .get_nonce(account.into())
-            .map(UserNonce::new)
-            .map_err(HostError::Backend)
+        Ok(self.golem.get_acc_nonce(account, read)?)
     }
 
     fn fetch_increment_acc_nonce(
         &mut self,
         account: UserAddress,
     ) -> Result<UserNonce, Self::Error> {
-        let current = self.get_acc_nonce(account, ReadMode::ViewWithOverlay)?;
-        self.account_nonces.insert(account, current.next());
-        Ok(current)
+        let before = self.golem.fetch_increment_acc_nonce(account)?;
+        self.mirror_nonce(account)?;
+        Ok(before)
     }
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
-        for (account, nonce) in mem::take(&mut self.account_nonces) {
-            self.base
-                .get_mut()
-                .set_nonce(account.into(), nonce.get())
-                .map_err(HostError::Backend)?;
-        }
-        Ok(self.commitment.unwrap_or_default())
+        Ok(AccountNoncesStore::commit_store(&mut self.golem)?)
     }
 }
 
@@ -436,19 +423,7 @@ where
     }
 
     fn graduate(self, block: BlockRef) -> Result<StateCommit, <Self as StateView>::Error> {
-        if self.accounts_dirty() {
-            return Err(HostError::Graduate("staged account writes remain"));
-        }
-        let commitment = self.commitment;
-        let commit = self.golem.graduate(block)?;
-        // The account lanes commit to the same digest the entities do: on this
-        // host they are one branch, and reth's accounts are a mirror of it.
-        let commitment = commitment.unwrap_or(commit.entities);
-        Ok(StateCommit {
-            balances: commitment,
-            account_nonces: commitment,
-            ..commit
-        })
+        Ok(self.golem.graduate(block)?)
     }
 }
 
@@ -674,33 +649,71 @@ mod tests {
         arkiv_interfaces::statemanager::conformance::run_all(&view);
     }
 
-    /// The split itself: entities reach GolemDB, balances reach reth's accounts.
+    /// A balance lands in GolemDB, and the same value reaches reth's diff.
+    ///
+    /// Both halves matter. GolemDB is where the value lives and where every
+    /// read comes from; the diff is what keeps reth's per-block account cache
+    /// from serving the second transaction a stale sender.
     #[test]
-    fn each_lane_lands_in_its_own_backend() {
+    fn a_balance_lands_in_golemdb_and_is_mirrored_into_reths_diff() {
         let mut view = view();
-        view.update_entity(EntityUpdates::create(Entity {
-            key: [1; 32],
-            ..Entity::default()
-        }))
-        .expect("create");
         view.set_balance([0xaa; 20], UserBalance::from_u64(500))
             .expect("balance");
 
-        EntityStore::commit_store(&mut view).expect("entities");
-        AccountBalancesStore::commit_store(&mut view).expect("balances");
-
+        assert_eq!(
+            view.golem()
+                .get_balance([0xaa; 20], ReadMode::ViewWithOverlay)
+                .expect("golem read"),
+            UserBalance::from_u64(500),
+            "the balance is in the store, where every read now goes",
+        );
         assert_eq!(
             view.base
                 .borrow_mut()
                 .get_balance([0xaa; 20].into())
                 .unwrap(),
             U256::from(500),
-            "the balance is in reth's account, where eth_getBalance reads",
+            "and the same value is in reth's diff, for its own block cache",
         );
-        assert_ne!(
-            view.golem().digest().expect("digest"),
-            [0u8; 32],
-            "and the entity moved the store's digest",
+    }
+
+    /// The mirror follows the store's arithmetic rather than repeating it.
+    /// Debiting more than an account holds saturates at zero in GolemDB, and
+    /// reth's diff has to say zero too — a mirror that recomputed the
+    /// subtraction itself would be the place the two sides drift apart.
+    #[test]
+    fn an_oversized_debit_saturates_on_both_sides() {
+        let mut view = view();
+        view.set_balance([0xbb; 20], UserBalance::from_u64(10))
+            .expect("fund");
+        view.fetch_sub_balance([0xbb; 20], UserBalance::from_u64(999))
+            .expect("debit");
+
+        assert_eq!(
+            view.get_balance([0xbb; 20], ReadMode::ViewWithOverlay)
+                .expect("read"),
+            UserBalance::from_u64(0),
         );
+        assert_eq!(
+            view.base
+                .borrow_mut()
+                .get_balance([0xbb; 20].into())
+                .unwrap(),
+            U256::ZERO,
+        );
+    }
+
+    /// Entities still reach the store; the accounts cutover did not disturb them.
+    #[test]
+    fn an_entity_still_moves_the_stores_digest() {
+        let mut view = view();
+        view.update_entity(EntityUpdates::create(Entity {
+            key: [1; 32],
+            ..Entity::default()
+        }))
+        .expect("create");
+        EntityStore::commit_store(&mut view).expect("entities");
+
+        assert_ne!(view.golem().digest().expect("digest"), [0u8; 32]);
     }
 }

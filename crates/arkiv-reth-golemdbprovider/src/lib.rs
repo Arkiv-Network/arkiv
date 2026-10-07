@@ -18,16 +18,21 @@
 //!
 //! [`BlockchainProvider`]: reth_provider::providers::BlockchainProvider
 
+pub mod state;
+
+pub use state::ArkivStateProvider;
+
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, TxHash, TxNumber};
 use alloy_rpc_types_engine::ForkchoiceState;
-use arkiv_reth_statemanager::HostStore;
+use arkiv_interfaces::store::{CommitId, Store};
+use arkiv_reth_statemanager::{GolemAccounts, HostStore, seed_genesis};
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
     ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
 };
-use reth_chainspec::ChainInfo;
+use reth_chainspec::{ChainInfo, EthChainSpec};
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
 use reth_execution_types::{ExecutionOutcome, RecoveredBlockAndExecutionOutput};
 use reth_node_builder::EngineProviderBuilder;
@@ -53,7 +58,7 @@ use reth_storage_api::{
     BalStoreHandle, BlockBodyIndicesProvider, NodePrimitivesProvider, StateRangeProviderFactory,
     StateRangeView, StorageChangeSetReader,
 };
-use reth_storage_errors::provider::ProviderResult;
+use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::ops::{RangeBounds, RangeInclusive};
 use std::sync::Arc;
 use std::time::Instant;
@@ -472,11 +477,53 @@ impl<N: ProviderNodeTypes> ChainSpecProvider for ArkivProvider<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> ArkivProvider<N> {
+    /// Wrap one of reth's state providers so its accounts come from the store
+    /// at `commit`.
+    fn with_accounts(
+        &self,
+        inner: StateProviderBox,
+        commit: CommitId,
+    ) -> ProviderResult<StateProviderBox> {
+        Ok(Box::new(ArkivStateProvider::new(
+            inner,
+            GolemAccounts::new(self.store.clone(), commit),
+        )))
+    }
+
+    /// The commit a block hash names, through the commit's host tag.
+    ///
+    /// A hash the store does not know is `StateForHashNotFound` rather than an
+    /// empty state: it means the block is outside the retention window or was
+    /// never adopted, and answering "every account is absent" would be a
+    /// confident lie about a block we simply cannot see.
+    fn commit_of(&self, hash: BlockHash) -> ProviderResult<CommitId> {
+        self.store
+            .commit_by_tag(hash.0)
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb commit_by_tag: {e:?}"
+                )))
+            })?
+            .ok_or(ProviderError::StateForHashNotFound(hash))
+    }
+
+    /// The commit a block number names: reth's hash for that number, then the
+    /// tag. Never `commit = number + anything` — see [`state`](crate::state).
+    fn commit_of_number(&self, number: BlockNumber) -> ProviderResult<CommitId> {
+        let hash = self
+            .inner
+            .block_hash(number)?
+            .ok_or(ProviderError::HeaderNotFound(number.into()))?;
+        self.commit_of(hash)
+    }
+}
+
 impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     type Primitives = N::Primitives;
 
     fn latest(&self) -> ProviderResult<StateProviderBox> {
-        self.inner.latest()
+        self.with_accounts(self.inner.latest()?, self.store.head())
     }
 
     fn state_with_block_appended(
@@ -484,41 +531,62 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
         parent_hash: BlockHash,
         block: ExecutedBlock<N::Primitives>,
     ) -> ProviderResult<StateProviderBox> {
-        self.inner.state_with_block_appended(parent_hash, block)
+        // The appended block is not committed, so the store's newest account
+        // state is still head. Its own writes reach the caller through the
+        // `ExecutedBlock` reth layers on top.
+        let inner = self.inner.state_with_block_appended(parent_hash, block)?;
+        self.with_accounts(inner, self.store.head())
     }
 
     fn state_by_block_number_or_tag(
         &self,
         number_or_tag: BlockNumberOrTag,
     ) -> ProviderResult<StateProviderBox> {
-        self.inner.state_by_block_number_or_tag(number_or_tag)
+        let inner = self.inner.state_by_block_number_or_tag(number_or_tag)?;
+        let commit = match number_or_tag {
+            BlockNumberOrTag::Number(number) => self.commit_of_number(number)?,
+            // Every other tag resolves to a block the node considers current.
+            // Arkiv commits only blocks it will not reorg, so latest, safe and
+            // finalized are all the store's head.
+            _ => self.store.head(),
+        };
+        self.with_accounts(inner, commit)
     }
 
     fn history_by_block_number(
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<StateProviderBox> {
-        self.inner.history_by_block_number(block_number)
+        let inner = self.inner.history_by_block_number(block_number)?;
+        self.with_accounts(inner, self.commit_of_number(block_number)?)
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
-        self.inner.history_by_block_hash(block_hash)
+        let inner = self.inner.history_by_block_hash(block_hash)?;
+        self.with_accounts(inner, self.commit_of(block_hash)?)
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
-        self.inner.state_by_block_hash(hash)
+        let inner = self.inner.state_by_block_hash(hash)?;
+        self.with_accounts(inner, self.commit_of(hash)?)
     }
 
     fn pending(&self) -> ProviderResult<StateProviderBox> {
-        self.inner.pending()
+        self.with_accounts(self.inner.pending()?, self.store.head())
     }
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
-        self.inner.pending_state_by_hash(block_hash)
+        let Some(inner) = self.inner.pending_state_by_hash(block_hash)? else {
+            return Ok(None);
+        };
+        self.with_accounts(inner, self.store.head()).map(Some)
     }
 
     fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
-        self.inner.maybe_pending()
+        let Some(inner) = self.inner.maybe_pending()? else {
+            return Ok(None);
+        };
+        self.with_accounts(inner, self.store.head()).map(Some)
     }
 }
 
@@ -712,6 +780,28 @@ impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for ArkivProviderBuilder {
     type Provider = ArkivProvider<N>;
 
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
+        // The one place that holds both the store and the chain spec, and it
+        // runs once before the chain moves. On a store that already has a
+        // commit this is a no-op, so a restart costs one `head()`.
+        let spec = factory.chain_spec();
+        let alloc = spec.genesis().alloc.iter().map(|(address, account)| {
+            arkiv_reth_statemanager::GenesisAccount {
+                address: *address,
+                balance: account.balance,
+                nonce: account.nonce.unwrap_or_default(),
+            }
+        });
+        if let Some(commit) = seed_genesis(&self.store, spec.genesis_hash().0, alloc)
+            .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}"))?
+        {
+            tracing::info!(
+                target: "arkiv-reth",
+                commit = commit.0,
+                accounts = spec.genesis().alloc.len(),
+                "genesis allocation written to the Arkiv store",
+            );
+        }
+
         Ok(ArkivProvider::new(
             BlockchainProvider::new(factory)?,
             self.store,
