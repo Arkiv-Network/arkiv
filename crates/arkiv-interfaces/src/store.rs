@@ -77,8 +77,8 @@ impl CommitId {
 }
 
 /// A handle to one open branch. Store-assigned, monotonic per instance run,
-/// **never reused**: consumed by `merge` / `discard` / `commit`, and any later
-/// use is [`StoreError::HandleInvalid`].
+/// **never reused**: consumed by `discard` / `commit`, or invalidated when
+/// another branch commits, and any later use is [`StoreError::HandleInvalid`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchId(pub u64);
 
@@ -366,7 +366,7 @@ impl Cell {
 pub type CellName = String;
 
 /// The one naming rule the spec pins today: `#` is reserved for store-internal
-/// meta entries (`#version`) and is rejected in any caller-supplied cell map.
+/// meta entries (`#key`) and is rejected in any caller-supplied cell map.
 ///
 /// The full grammar — character set, length cap, structural rules — is still
 /// open upstream. When it lands it belongs here and nowhere else.
@@ -480,7 +480,12 @@ pub enum SortDirection {
 }
 
 /// One sort key. Absent, and as the tie-break under a sort, results are in
-/// ascending [`RecordKey`] order.
+/// creation order, oldest first. A record deleted and created again counts
+/// from its new creation.
+///
+/// A record without the cell ranks below every value, and `direction` applies
+/// to that as to anything else: first ascending, last descending. It never
+/// applies to the tie-break, which is oldest first either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sort {
     pub cell: CellName,
@@ -568,10 +573,10 @@ pub enum StoreError {
     OutOfBudget {
         spent: CostUnits,
     },
-    /// A consumed or unknown [`BranchId`].
+    /// A consumed, invalidated or unknown [`BranchId`].
     HandleInvalid,
     /// An optimistic-concurrency guard failed, or `commit`'s origin is no
-    /// longer head, or `merge`'s parent moved.
+    /// longer head.
     ///
     /// In blockchain mode the OCC cases are unreachable — a single proposer
     /// executing serially never supplies a guard. The `commit` case is the
@@ -629,7 +634,8 @@ pub trait Store: core::fmt::Debug {
     /// to head and must lie within the retention window.
     ///
     /// Any number may be open concurrently over the same origin — which is what
-    /// lets a host validate competing payloads at one height.
+    /// lets a host validate competing payloads at one height. Once one of them
+    /// commits, the rest are invalid: see [`commit`](Self::commit).
     ///
     /// **Arkiv always passes `None`.** The spec permits a branch over any
     /// retained commit, but the lineage never forks and there is no rewind, so
@@ -671,8 +677,14 @@ pub trait Store: core::fmt::Debug {
 
     /// Promote a branch to the canonical head: implies a final
     /// [`checkpoint`](Self::checkpoint), and a [`seal`](Self::seal) if none was
-    /// taken. The origin must still be head, else [`StoreError::Conflict`].
-    /// Assigns `head + 1` atomically and consumes the handle.
+    /// taken. Assigns `head + 1` atomically and consumes the handle.
+    ///
+    /// Every other open branch was opened over the old head, so a commit
+    /// invalidates them all. The first call to touch one is refused and
+    /// releases it — [`StoreError::Conflict`] if that call is `commit`,
+    /// [`StoreError::HandleInvalid`] otherwise — and any later call is
+    /// `HandleInvalid`. A refused commit consumes the branch too, so there is
+    /// nothing to clean up after it.
     ///
     /// **There is no rewind.** A commit cannot be undone, so a host commits
     /// only blocks it will not reorg.
@@ -684,8 +696,8 @@ pub trait Store: core::fmt::Debug {
 
     /// Insert a new record. Collision is [`StoreError::AlreadyExists`].
     ///
-    /// Besides `cells`, the store writes the record's `#version` meta entry at
-    /// `1` — its presence *is* record existence.
+    /// `cells` may be empty: a record exists from `create` until
+    /// [`delete`](Self::delete), whatever cells it holds.
     fn create(
         &self,
         branch: BranchId,
@@ -703,8 +715,9 @@ pub trait Store: core::fmt::Debug {
         budget: Option<Budget>,
     ) -> Result<Metered<Option<Record>>, StoreError>;
 
-    /// Partial mutation. Names absent from `changes` are untouched; the last
-    /// cell of a record may not be removed. Returns the new record version.
+    /// Partial mutation. Names absent from `changes` are untouched. Removing
+    /// every cell leaves the record empty, not absent — removing the record is
+    /// [`delete`](Self::delete)'s job. Returns the new record version.
     fn patch(
         &self,
         branch: BranchId,
@@ -1136,7 +1149,8 @@ impl Filter {
 
 impl Record {
     /// This record's value for a sort key, in [`order_encoding`] form.
-    /// `None` when the record has no such cell, which sorts it last.
+    /// `None` when the record has no such cell, which ranks it below every
+    /// value: see [`Sort`].
     pub fn sort_key(&self, cell: &str) -> Option<Vec<u8>> {
         self.cell(cell)
             .map(|cell| order_encoding(&cell.value, cell.type_id))
