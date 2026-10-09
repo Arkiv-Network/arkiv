@@ -27,6 +27,7 @@ import os
 import shutil
 import signal
 import socket
+import shlex
 import subprocess
 import sys
 import time
@@ -293,6 +294,7 @@ def main():
                         "eth,net,web3",
                         "--http.port",
                         str(rpc_port),
+                        *shlex.split(os.environ.get("ARKIV_DEMO_NODE_ARGS", "")),
                     ],
                     env={
                         **os.environ,

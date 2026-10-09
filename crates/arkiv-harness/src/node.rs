@@ -166,6 +166,12 @@ impl Node {
             "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
+        // An escape hatch for diagnosing a node under test: extra flags without
+        // editing the test that spawns it. Used for raising the log filter when
+        // a run's behaviour, not its assertions, is the thing in question.
+        if let Ok(extra) = std::env::var("ARKIV_HARNESS_NODE_ARGS") {
+            cmd.args(extra.split_whitespace());
+        }
 
         // Both streams go to one file, freshly truncated, so its tail is the
         // current run's output.

@@ -479,6 +479,39 @@ impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
     }
 }
 
+/// Which execution a seal belongs to.
+///
+/// Height alone does not identify one. reth builds a block and validates it,
+/// and `BasicPayloadJob::resolve_kind` races a second build against an
+/// unfinished one, so several executions at one height can be in flight at
+/// once — on different threads. Their *contents* are what tell them apart.
+///
+/// A transaction is named by `(signer, nonce)`, not by hash: an `Evm` is handed
+/// a `TxEnv`, which carries both of those but not the hash of the envelope they
+/// came from. It is no weaker an identity, since a block cannot hold two
+/// transactions with the same signer and nonce.
+///
+/// No parent hash. `BlockEnv` does not carry one, and it would add nothing:
+/// a branch is always opened over head, and Arkiv never reorgs, so one height
+/// has one parent.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExecutionKey {
+    /// The block being executed.
+    pub height: u64,
+    /// `(signer, nonce)` of each transaction executed, in order.
+    pub transactions: Vec<(UserAddress, u64)>,
+}
+
+impl ExecutionKey {
+    /// The key for a block at `height` that executed `transactions`.
+    pub const fn new(height: u64, transactions: Vec<(UserAddress, u64)>) -> Self {
+        Self {
+            height,
+            transactions,
+        }
+    }
+}
+
 /// The sealed candidates for each block height.
 ///
 /// reth executes a block to build it and again to validate it, and may build
@@ -486,9 +519,15 @@ impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
 /// computed, nothing written — and parks it here. When a block becomes
 /// canonical its seal commits and the rest are discarded, which is exactly the
 /// spec's "whichever is adopted commits and the rest leave no trace".
+///
+/// Seals are also indexed by [`ExecutionKey`], so the payload builder can ask
+/// for the root of *its own* execution rather than the newest one at its
+/// height. That index is what makes the built header's state root answerable
+/// while two builds race.
 #[derive(Debug, Default)]
 pub struct BlockSeals {
     pending: Mutex<BTreeMap<u64, Vec<(BranchId, SealedCommit)>>>,
+    by_execution: Mutex<BTreeMap<ExecutionKey, SealedCommit>>,
 }
 
 impl BlockSeals {
@@ -496,21 +535,54 @@ impl BlockSeals {
         Self::default()
     }
 
-    /// Seal `branch` as a candidate for `height`.
+    /// Seal `branch` as a candidate for the execution `key` describes.
     pub fn seal(
         &self,
         store: &HostStore,
-        height: u64,
+        key: ExecutionKey,
         branch: BranchId,
     ) -> Result<SealedCommit, ViewError> {
         let sealed = store.seal(branch)?;
         self.pending
             .lock()
             .expect("the seal registry's lock is never poisoned")
-            .entry(height)
+            .entry(key.height)
             .or_default()
             .push((branch, sealed));
+        // Last writer wins. Two executions sharing a key ran the same
+        // transactions over the same height, so a deterministic store gives
+        // them the same root and the overwrite is a no-op in everything that
+        // matters. If it ever is not, the roots disagreed and the chain would
+        // have halted anyway -- see `root_of`.
+        self.by_execution
+            .lock()
+            .expect("the seal registry's lock is never poisoned")
+            .insert(key, sealed);
         Ok(sealed)
+    }
+
+    /// The state root sealed for `key`, if that execution has sealed.
+    ///
+    /// `None` means no execution with these contents has sealed at this height.
+    /// Callers treat that as "compute the root the usual way" rather than as a
+    /// failure: a build that never reached `Evm::finish` leaves no seal, and
+    /// `eth_call`-shaped executions never seal at all.
+    pub fn root_of(&self, key: &ExecutionKey) -> Option<[u8; 32]> {
+        self.by_execution
+            .lock()
+            .expect("the seal registry's lock is never poisoned")
+            .get(key)
+            .map(|sealed| sealed.state_root)
+    }
+
+    /// Forget the execution index at or below `height`, once a block there is
+    /// canonical and no further build can target it.
+    fn forget_executions_through(&self, height: u64) {
+        let mut index = self
+            .by_execution
+            .lock()
+            .expect("the seal registry's lock is never poisoned");
+        index.retain(|key, _| key.height > height);
     }
 
     /// A block at `height` became canonical: commit its candidate and drop
@@ -561,6 +633,7 @@ impl BlockSeals {
             // state.
             let _ = store.discard(branch);
         }
+        self.forget_executions_through(height);
         match winner {
             // Tagged with the block hash, which is how a historical read finds
             // the commit for a past block.

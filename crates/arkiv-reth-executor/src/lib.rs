@@ -122,7 +122,9 @@ use arkiv_interfaces::statemanager::{
     RangeIndexStore, ReadMode, StateView,
 };
 use arkiv_interfaces::store::BranchId;
-use arkiv_reth_statemanager::{BlockSeals, HostStore, host_manager, open_block_branch};
+use arkiv_reth_statemanager::{
+    BlockSeals, ExecutionKey, HostStore, host_manager, open_block_branch,
+};
 use std::sync::Arc;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
@@ -345,6 +347,13 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
     /// is abandoned rather than sealed.
     charged: core::cell::Cell<bool>,
+    /// `(signer, nonce)` of each charged transaction, in order — the half of
+    /// [`ExecutionKey`] only the EVM sees.
+    ///
+    /// Recorded because height does not identify an execution: two builds at
+    /// one height race on separate threads, and the payload builder has to be
+    /// told the root of *its* execution, not of whichever sealed last.
+    executed: core::cell::RefCell<Vec<(UserAddress, u64)>>,
 }
 
 impl<DB, I> Evm for ArkivEvm<DB, I>
@@ -397,6 +406,12 @@ where
         let chain_id = self.inner.chain_id();
         if fees.charge {
             self.charged.set(true);
+            // Only charged transactions, and in arrival order: this is the list
+            // reth will hand back as the block's transactions, so the two have
+            // to agree exactly or the built header's root goes unanswered.
+            self.executed
+                .borrow_mut()
+                .push((tx.caller.into_array(), tx.nonce));
         }
         let store = self.store.clone();
         let branch = self.branch;
@@ -449,7 +464,8 @@ where
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         let height = self.inner.block().number.saturating_to::<u64>();
         if self.charged.get() {
-            if let Err(error) = self.seals.seal(&self.store, height, self.branch) {
+            let key = ExecutionKey::new(height, self.executed.borrow().clone());
+            if let Err(error) = self.seals.seal(&self.store, key, self.branch) {
                 tracing::error!(target: "arkiv::executor", ?error, height, "failed to seal the block's Arkiv state");
             }
         } else {
@@ -1161,6 +1177,7 @@ impl EvmFactory for ArkivEvmFactory {
             store: self.store.clone(),
             seals: self.seals.clone(),
             charged: core::cell::Cell::new(false),
+            executed: core::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1171,7 +1188,10 @@ impl EvmFactory for ArkivEvmFactory {
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let base = self.create_evm(db, input);
-        let (branch, charged) = (base.branch, base.charged.clone());
+        // The base EVM never executes anything; it is taken apart for its
+        // branch. Its empty `executed` list moves across with the branch, so
+        // the two stay the one record of what ran on it.
+        let (branch, charged, executed) = (base.branch, base.charged.clone(), base.executed);
         let inner = base.inner.into_inner().with_inspector(inspector);
         ArkivEvm {
             inner: EthEvm::new(inner, true),
@@ -1179,6 +1199,7 @@ impl EvmFactory for ArkivEvmFactory {
             seals: self.seals.clone(),
             branch,
             charged,
+            executed,
         }
     }
 }
