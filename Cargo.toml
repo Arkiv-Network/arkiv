@@ -62,6 +62,8 @@ reth-static-file-types = { git = "ssh://git@github.com/Arkiv-Network/reth", bran
 reth-storage-errors = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-chainspec = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-trie = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+# Re-exports revm, for the `BundleState` that `HashedPostStateProvider` names.
+reth-revm = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-storage-overlay = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 arkiv-reth-golemdbprovider = { path = "crates/arkiv-reth-golemdbprovider" }
 reth-basic-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }

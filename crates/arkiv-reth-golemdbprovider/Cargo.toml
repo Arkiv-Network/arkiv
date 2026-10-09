@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 # The provider being wrapped, and the types its trait signatures name.
+arkiv-interfaces.workspace = true
 arkiv-reth-statemanager.workspace = true
 reth-provider.workspace = true
 reth-storage-api.workspace = true
@@ -21,6 +22,7 @@ reth-prune-types.workspace = true
 reth-stages-types.workspace = true
 reth-static-file-types.workspace = true
 reth-trie.workspace = true
+reth-revm.workspace = true
 reth-storage-overlay.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
@@ -29,3 +31,4 @@ alloy-rpc-types-engine.workspace = true
 rocksdb.workspace = true
 reth-node-builder.workspace = true
 eyre.workspace = true
+tracing.workspace = true

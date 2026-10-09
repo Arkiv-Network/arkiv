@@ -74,7 +74,6 @@ impl<'a, DB: Database> WriteOverlay<'a, DB> {
             }
         }
     }
-
 }
 
 impl<DB: Database> BalanceAccess for WriteOverlay<'_, DB> {
