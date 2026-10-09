@@ -515,6 +515,10 @@ impl Inner {
             .map(|index| CommitId(index as u64)))
     }
 
+    fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError> {
+        Ok(self.commit_snapshot(commit)?.tag)
+    }
+
     fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {
         Ok(self.commit_snapshot(commit)?.changes.clone())
     }
@@ -758,6 +762,13 @@ impl StoreExt for MemStore {
             .lock()
             .expect("the reference store's lock is never poisoned")
             .commit_by_tag(tag)
+    }
+
+    fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .tag_of(commit)
     }
 
     fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {

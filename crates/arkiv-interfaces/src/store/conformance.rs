@@ -94,6 +94,8 @@ pub fn run_all_ext<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     changes_account_for_the_whole_difference(store_generator);
     failed_commit_writes_no_changeset(store_generator);
     commits_are_resolvable_by_their_committag(store_generator);
+    a_commits_tag_is_readable_from_the_commit(store_generator);
+    an_untagged_commit_has_no_tag(store_generator);
     digest_same_on_branch_committal(store_generator);
     changeset_report_all_crud_ops(store_generator);
     apply_batch_matches_individual_writes(store_generator);
@@ -1639,6 +1641,44 @@ fn commits_are_resolvable_by_their_committag<S: StoreExt>(store_generator: &dyn 
 
     assert_eq!(store.commit_by_tag(tag).unwrap(), Some(committed));
     assert_eq!(store.commit_by_tag([0x00; 32]).unwrap(), None);
+}
+
+/// The tag reads back from the commit, not just the commit from the tag.
+///
+/// reth needs both directions: `commit_by_tag` answers `state_by_block_hash`,
+/// and this answers `block_hash(number)`, which every provider must implement.
+fn a_commits_tag_is_readable_from_the_commit<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
+
+    let tag = [0xCD; 32];
+    let committed = store.commit_tagged(branch, tag).unwrap();
+
+    assert_eq!(store.tag_of(committed).unwrap(), Some(tag));
+    // And the two directions agree.
+    assert_eq!(store.commit_by_tag(tag).unwrap(), Some(committed));
+}
+
+/// A commit made without a tag has none — absent, not a zero tag. Reporting
+/// `[0u8; 32]` would be a block hash that no block has.
+fn an_untagged_commit_has_no_tag<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", u64_attribute(1))],
+    );
+
+    let committed = store.commit(branch).unwrap();
+    assert_eq!(store.tag_of(committed).unwrap(), None);
 }
 
 /// A commit's digest is the digest its branch carried at commit time, still

@@ -774,6 +774,15 @@ pub trait StoreExt: Store {
     /// **\[ext R1\]** Resolve a tag back to its commit, if still retained.
     fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError>;
 
+    /// **\[ext R1\]** The tag a commit was committed under, if it had one and
+    /// is still retained.
+    ///
+    /// The inverse of [`commit_by_tag`](Self::commit_by_tag). reth asks the
+    /// other way round too — `block_hash(number)` is a `BlockHashReader`
+    /// method every provider must answer — and a host-side map would be one
+    /// more thing to keep consistent with retention trimming.
+    fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError>;
+
     /// **\[ext R2\]** What one commit changed, as `(key, before, after)`.
     ///
     /// Three consumers: reth's `ChangeSetReader` / `StorageChangeSetReader`,
@@ -927,6 +936,10 @@ impl<T: StoreExt + ?Sized> StoreExt for alloc::sync::Arc<T> {
 
     fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError> {
         (**self).commit_by_tag(tag)
+    }
+
+    fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError> {
+        (**self).tag_of(commit)
     }
 
     fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {

@@ -947,6 +947,21 @@ impl Backend {
         Ok(found.map(CommitId))
     }
 
+    pub(crate) async fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError> {
+        if commit.0 > self.head().await? {
+            return Err(StoreError::NotFound);
+        }
+        let raw: Option<Vec<u8>> = self
+            .client
+            .get(self.namespace.commit_tag(commit.0))
+            .await
+            .map_err(internal)?;
+        // An untagged commit is absent, not malformed; only a present value of
+        // the wrong width is a fault.
+        raw.map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| StoreError::Internal))
+            .transpose()
+    }
+
     pub(crate) async fn changes(&self, commit: CommitId) -> Result<Vec<RecordChange>, StoreError> {
         if commit.0 > self.head().await? {
             return Err(StoreError::NotFound);
