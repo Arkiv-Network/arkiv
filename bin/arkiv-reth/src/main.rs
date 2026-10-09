@@ -131,7 +131,7 @@ fn main() {
                 });
             let launcher = builder
                 .engine_api_launcher()
-                .with_provider_builder(ArkivProviderBuilder);
+                .with_provider_builder(ArkivProviderBuilder::new(store.clone()));
             let handle = builder
                 .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
