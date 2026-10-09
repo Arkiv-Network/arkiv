@@ -31,6 +31,10 @@ use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
 use crate::limits;
 use crate::literal;
 
+/// Names reserved for possible future language features, so they cannot be
+/// used as attribute names.
+const RESERVED_NAMES: [&str; 1] = ["set"];
+
 /// Parse a query string into a [`Query`] AST. See the [module docs](self).
 pub fn parse(input: &str) -> Result<Query, ParseError> {
     if input.len() > limits::MAX_QUERY_BYTES {
@@ -434,6 +438,15 @@ fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
         return Err(ParseError::syntax(
             position,
             "attribute names are limited to 32 bytes",
+        ));
+    }
+    if RESERVED_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(ParseError::syntax(
+            position,
+            alloc::format!("{name} is reserved and cannot be an attribute name"),
         ));
     }
     if let Some(tag) = TypeTag::from_name(name) {
@@ -928,6 +941,10 @@ mod tests {
         // Keywords lex as keywords, so they never reach an attribute position.
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("set = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("Set = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("SET = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("seT = true"), ParseErrorKind::MalformedInputError);
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");
