@@ -13,10 +13,23 @@
 /// A **user's** 20-byte address — an entity's owner or creator, or a
 /// transaction's caller: someone who holds a key and signs.
 ///
-/// It just so happens to be equivalent to Ethereum's account addressing space
+/// **Twenty bytes, deliberately.** Arkiv's own model would happily make this the
+/// full 32 an [`EntityAddress`] uses, and the store keys on 32 either way — but
+/// every address that actually reaches this type comes from an Ethereum
+/// transaction or from the SDK, both of which speak alloy's 20-byte `Address`. A
+/// wider type would be 12 bytes of zeros at every real call site, plus a widening
+/// and a narrowing at every boundary, each a place the two spaces can drift.
+///
+/// So it stays equivalent to Ethereum's account addressing space
 /// ([`EthAddress`]), which is what lets an Ethereum-style host use it verbatim —
 /// but it is an Arkiv type, not a borrowed one. See
 /// [`ETH_ADDRESS_LEN`](crate::constants::ethereum::ETH_ADDRESS_LEN).
+///
+/// The width is load-bearing beyond convenience: a 20-byte address left-padded by
+/// [`RecordKey::from_address`](crate::store::RecordKey::from_address) has twelve
+/// leading zero bytes, and that is what keeps account records out of the entity
+/// key space. At 32 bytes the two spaces overlap and keys need domain-separated
+/// hashing instead — reversibility and a hash per lookup, bought for nothing.
 pub type UserAddress = [u8; 20];
 
 /// A 20-byte **Ethereum** account address — deliberately Eth-prefixed, because

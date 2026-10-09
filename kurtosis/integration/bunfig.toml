@@ -1,0 +1,3 @@
+[test]
+# Every test waits for at least one 2 s slot; a funding transfer can take a few.
+timeout = 90000

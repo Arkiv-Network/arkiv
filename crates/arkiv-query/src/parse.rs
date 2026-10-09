@@ -31,6 +31,10 @@ use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
 use crate::limits;
 use crate::literal;
 
+/// Names reserved for possible future language features, so they cannot be
+/// used as attribute names.
+const RESERVED_NAMES: [&str; 1] = ["set"];
+
 /// Parse a query string into a [`Query`] AST. See the [module docs](self).
 pub fn parse(input: &str) -> Result<Query, ParseError> {
     if input.len() > limits::MAX_QUERY_BYTES {
@@ -290,7 +294,6 @@ impl Parser {
             }
         };
         check_value_type(key, &value, position)?;
-        let value = normalize_builtin_value(key, value);
         Ok((value, position))
     }
 }
@@ -375,32 +378,13 @@ fn bare_str_value(
 ///
 /// For the block heights this is `u64`, which is what the spec's tag table says
 /// and what a query must spell. It is deliberately not the same thing as how
-/// the value is keyed in the index — see [`normalize_builtin_value`].
+/// the value is keyed in the store.
 fn builtin_type(field: BuiltIn) -> AttributeType {
     match field {
         BuiltIn::Owner | BuiltIn::Creator => AttributeType::EthereumAddress,
         BuiltIn::Key => AttributeType::EntityKey,
         BuiltIn::ExpiresAt | BuiltIn::CreatedAt => AttributeType::U64,
         BuiltIn::ContentType => AttributeType::Str,
-    }
-}
-
-/// Re-encode a system value from its surface type to the one the index is keyed
-/// on.
-///
-/// The block heights are `u64` to a client but are recorded as right-aligned
-/// `u256` words (`annotation::entity_annotations`), so a `u64(…)` literal has to
-/// become the same word the writer stored or it would hash to a different
-/// bucket and match nothing. This is the one place the surface and the index
-/// disagree, and it is confined here on purpose — `arkiv-engine.md` §2 allows
-/// internal representations to diverge from the wire.
-fn normalize_builtin_value(key: &AnnotKey, value: AnnotVal) -> AnnotVal {
-    match (key, &value) {
-        (
-            AnnotKey::BuiltIn(BuiltIn::ExpiresAt | BuiltIn::CreatedAt),
-            AttributeValue::U64(height),
-        ) => AttributeValue::u256_from_u64(*height),
-        _ => value,
     }
 }
 
@@ -454,6 +438,15 @@ fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
         return Err(ParseError::syntax(
             position,
             "attribute names are limited to 32 bytes",
+        ));
+    }
+    if RESERVED_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(ParseError::syntax(
+            position,
+            alloc::format!("{name} is reserved and cannot be an attribute name"),
         ));
     }
     if let Some(tag) = TypeTag::from_name(name) {
@@ -762,9 +755,9 @@ mod tests {
             parse("$expiresAt < u64(1200000)").unwrap(),
             Query::Lt {
                 key: built_in(BuiltIn::ExpiresAt),
-                // Surface u64, but stored — and therefore queried — as the
-                // right-aligned word the writer indexed.
-                value: AttributeValue::u256_from_u64(1_200_000),
+                // A block height is a u64 on the surface and a U64 cell in
+                // the store, so the literal travels unchanged.
+                value: AttributeValue::U64(1_200_000),
             }
         );
         assert!(matches!(
@@ -948,6 +941,10 @@ mod tests {
         // Keywords lex as keywords, so they never reach an attribute position.
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("set = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("Set = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("SET = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(kind_of("seT = true"), ParseErrorKind::MalformedInputError);
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");

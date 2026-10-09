@@ -13,9 +13,10 @@ use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
+use arkiv_interfaces::store::Store;
 use arkiv_reth_executor::ARKIV_ADDRESS;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
-use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
+use arkiv_reth_rpc::store_reads;
+use arkiv_reth_statemanager::{BlockSeals, ExecutionKey, HostStore};
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
@@ -36,7 +37,10 @@ use reth_ethereum::{
     },
     provider::CanonStateSubscriptions,
 };
-use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
+use reth_ethereum_payload_builder::{
+    EthereumBuilderConfig, PayloadStateRootRequest, PayloadStateRootResolver,
+    default_ethereum_payload,
+};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
 use reth_storage_api::{BlockReader, ReceiptProvider, StateProviderFactory};
@@ -47,8 +51,58 @@ use tracing::{debug, info, warn};
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ArkivPayloadServiceBuilder;
+/// Answers a built block's state root from the Arkiv seal that produced it.
+///
+/// GolemDB computes its own commitment at seal, so the root is a product of
+/// execution rather than a walk of an account trie — which is why reth asks for
+/// it through a resolver, after execution has ended. See
+/// `BlockBuilder::finish_with`.
+///
+/// The request names the execution by its transactions, not by its height, and
+/// the lookup is keyed the same way. Height alone would be ambiguous: reth
+/// races a second build against an unfinished one at the same height
+/// (`BasicPayloadJob::resolve_kind`), so two seals can be in flight and
+/// "whichever sealed last" is the wrong answer for one of them.
+///
+/// `None` falls back to reth's own state root. That happens when no seal
+/// matches — a build that never reached `Evm::finish`, or an empty block, which
+/// charges nothing and so seals nothing.
+fn arkiv_state_root_resolver(seals: Arc<BlockSeals>) -> PayloadStateRootResolver {
+    Arc::new(move |request: &PayloadStateRootRequest<'_>| {
+        let key = ExecutionKey::new(
+            request.number,
+            request
+                .transactions
+                .iter()
+                .map(|(signer, nonce)| (signer.into_array(), *nonce))
+                .collect(),
+        );
+        let root = seals.root_of(&key).map(B256::from);
+        if root.is_none() {
+            debug!(
+                target: "arkiv::payload",
+                number = request.number,
+                transactions = request.transactions.len(),
+                "no Arkiv seal for this execution; reth will compute the state root",
+            );
+        }
+        root
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ArkivPayloadServiceBuilder {
+    store: HostStore,
+    seals: Arc<BlockSeals>,
+}
+
+impl ArkivPayloadServiceBuilder {
+    /// The payload service over the store Arkiv's state lives in, adopting a
+    /// sealed candidate as each block becomes canonical.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
+    }
+}
 
 impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for ArkivPayloadServiceBuilder
 where
@@ -81,7 +135,8 @@ where
             chain_id: ctx.chain_spec().chain().id(),
             pruning_map: pruning_map.clone(),
             config: EthereumBuilderConfig::new()
-                .with_extra_data(ctx.payload_builder_config().extra_data()),
+                .with_extra_data(ctx.payload_builder_config().extra_data())
+                .with_state_root_resolver(arkiv_state_root_resolver(self.seals.clone())),
         };
         let conf = ctx.config().builder.clone();
         let generator = BasicPayloadJobGenerator::with_builder(
@@ -96,15 +151,34 @@ where
         spawn_catch_up(
             ctx.task_executor(),
             ctx.provider().clone(),
+            self.store.clone(),
             pruning_map.clone(),
         );
         let provider = ctx.provider().clone();
+        let store = self.store.clone();
+        let seals = self.seals.clone();
         let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
             move |notification| {
                 let provider = provider.clone();
+                let store = store.clone();
+                let seals = seals.clone();
                 let pruning_map = pruning_map.clone();
                 async move {
-                    if let Err(error) = catch_up(provider, pruning_map).await {
+                    // The block is canonical, so its Arkiv state is no longer
+                    // speculative: promote the seal to a commit. This is the
+                    // only place anything is written.
+                    let tip = notification.tip();
+                    let height = tip.number;
+                    match seals.adopt(&store, height, tip.hash().0) {
+                        Ok(Some(commit)) => {
+                            debug!(target: "arkiv-reth", height, commit = commit.0, "adopted the block's Arkiv state")
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(target: "arkiv-reth", ?error, height, "failed to adopt the block's Arkiv state")
+                        }
+                    }
+                    if let Err(error) = catch_up(provider, store, pruning_map).await {
                         warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
                     }
                     notification
@@ -124,6 +198,7 @@ where
 fn spawn_catch_up<P>(
     executor: &reth_ethereum::tasks::TaskExecutor,
     provider: P,
+    store: HostStore,
     pruning_map: ChainPruningMap,
 ) where
     P: StateProviderFactory
@@ -135,13 +210,17 @@ fn spawn_catch_up<P>(
         + 'static,
 {
     executor.spawn_task(async move {
-        if let Err(error) = catch_up(provider, pruning_map).await {
+        if let Err(error) = catch_up(provider, store, pruning_map).await {
             warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
         }
     });
 }
 
-async fn catch_up<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
+async fn catch_up<P>(
+    provider: P,
+    store: HostStore,
+    pruning_map: ChainPruningMap,
+) -> eyre::Result<()>
 where
     P: StateProviderFactory
         + BlockReader<Block = reth_ethereum::Block>
@@ -151,6 +230,8 @@ where
         + Sync
         + 'static,
 {
+    // No genesis walk: genesis holds no entities now that there is no seeding,
+    // so the map learns everything it needs from the logs replayed below.
     let _guard = pruning_map.update_guard().await;
     loop {
         let watermark = pruning_map.watermark().await?;
@@ -162,17 +243,21 @@ where
         }
         let height = watermark + 1;
         let block_provider = provider.clone();
-        let (entries, removed) =
-            tokio::task::spawn_blocking(move || pruning_updates_at(&block_provider, height))
-                .await
-                .map_err(|error| {
-                    eyre::eyre!("join pruning replay for block {height}: {error}")
-                })??;
+        let block_store = store.clone();
+        let (entries, removed) = tokio::task::spawn_blocking(move || {
+            pruning_updates_at(&block_provider, &block_store, height)
+        })
+        .await
+        .map_err(|error| eyre::eyre!("join pruning replay for block {height}: {error}"))??;
         pruning_map.apply_next(height, &entries, &removed).await?;
     }
 }
 
-fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
+fn pruning_updates_at<P>(
+    provider: &P,
+    store: &HostStore,
+    height: u64,
+) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
 where
     P: StateProviderFactory
         + BlockReader<Block = reth_ethereum::Block>
@@ -201,16 +286,12 @@ where
         }
     }
 
-    let state = provider
-        .history_by_block_number(height)
-        .map_err(|error| eyre::eyre!("read state for block {height}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
+    let at = store.head();
     let mut entries = Vec::with_capacity(touched.len());
     let mut removed = Vec::new();
     for key in touched {
-        match entities
-            .get(key.0)
-            .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error:?}"))?
+        match store_reads::entity(&**store, at, key.0)
+            .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error}"))?
         {
             Some(entity) => entries.push(PruningEntry {
                 key,

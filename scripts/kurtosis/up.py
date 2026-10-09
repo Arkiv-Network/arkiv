@@ -11,6 +11,7 @@ binary the build lane produced; leaving it unset keeps the from-source build.
 Usage: scripts/kurtosis/up.py [enclave]
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CACHE, BUILDER = ROOT / ".docker/caches", "arkiv-harness"
+ARGS_FILE = ROOT / "kurtosis/arkiv-chain.yaml"
 enclave = sys.argv[1] if len(sys.argv) > 1 else "arkiv-harness"
 prebuilt = os.environ.get("ARKIV_RETH_BINARY")
 
@@ -69,11 +71,19 @@ def package_prebuilt(tag, binary):
     binary = Path(binary).resolve()
     if not binary.is_file():
         sys.exit(f"ARKIV_RETH_BINARY does not point at a file: {binary}")
+    # The base image must carry a glibc at least as new as the build host's;
+    # ARKIV_PREBUILT_BASE_IMAGE overrides the Dockerfile's default for hosts
+    # newer than the CI runner.
+    base_args = []
+    base_image = os.environ.get("ARKIV_PREBUILT_BASE_IMAGE")
+    if base_image:
+        base_args = ["--build-arg", f"BASE_IMAGE={base_image}"]
     with tempfile.TemporaryDirectory() as context:
         shutil.copy2(binary, Path(context) / "arkiv-reth")
         run(
             "docker", "build", "-t", tag,
             "-f", str(ROOT / "docker/arkiv-reth-prebuilt.Dockerfile"),
+            *base_args,
             context,
         )  # fmt: skip
 
@@ -114,13 +124,14 @@ else:
     log("==> build images")
     buildx("arkiv-reth:dev", "docker/arkiv-reth.Dockerfile")
 
+args_file = ARGS_FILE
 # Start the two-node network only after the image is available to Kurtosis.
 remove_stopped_enclave(enclave)
 log(f"==> Arkiv chain (ethereum-package) -> enclave {enclave}")
 run(
     "kurtosis", "run", "--enclave", enclave,
     "github.com/ethpandaops/ethereum-package",
-    "--args-file", "./kurtosis/arkiv-chain.yaml",
+    "--args-file", str(args_file.relative_to(ROOT)),
 )  # fmt: skip
 
 log("==> check sequencer/follower health")

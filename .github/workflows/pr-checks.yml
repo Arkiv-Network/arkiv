@@ -69,9 +69,18 @@ jobs:
       PACKAGE: ghcr.io/arkiv-network/arkiv-${{ matrix.task == 'lint' && 'clippy' || 'build' }}-cache:${{ inputs.tag || inputs.profile || 'dev-fast' }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
-        with:
-          components: rustfmt, clippy
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry is
       # needed by anything that compiles the workspace — clippy included.
@@ -108,14 +117,6 @@ jobs:
           else
             echo "::warning::no build cache at $PACKAGE - compiling cold"
             echo "cache=miss" >> "$GITHUB_OUTPUT"
-          fi
-          # Only full-test-cache ships one. Restoring it skips both the
-          # crates.io fetch and the unpack into registry/src.
-          if [ -f cargo-home.tar.zst ]; then
-            tar --zstd --no-same-owner -xpf cargo-home.tar.zst -C "${CARGO_HOME:-$HOME/.cargo}" registry git
-            echo "cargo_home=yes" >> "$GITHUB_OUTPUT"
-          else
-            echo "cargo_home=no" >> "$GITHUB_OUTPUT"
           fi
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
@@ -169,5 +170,5 @@ jobs:
               echo "clippy lints: ${{ steps.clippy.outputs.lints }}"
             fi
             echo
-            echo "cache \`${PACKAGE##*:}\` ${{ steps.restore.outputs.cache }}, profile \`$PROFILE\`, cargo home restored: ${{ steps.restore.outputs.cargo_home }}"
+            echo "cache \`${PACKAGE##*:}\` ${{ steps.restore.outputs.cache }}, profile \`$PROFILE\`"
           } >> "$GITHUB_STEP_SUMMARY"

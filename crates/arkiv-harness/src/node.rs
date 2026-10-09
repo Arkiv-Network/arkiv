@@ -35,6 +35,7 @@ pub struct NodeBuilder {
     dev: bool,
     block_time: String,
     http_api: String,
+    chain: Option<PathBuf>,
     extra_args: Vec<String>,
 }
 
@@ -47,8 +48,16 @@ impl NodeBuilder {
             dev: true,
             block_time: "250ms".to_string(),
             http_api: "eth,net,web3,txpool".to_string(),
+            chain: None,
             extra_args: Vec::new(),
         }
+    }
+
+    /// Run on the genesis file at `path` (`--chain`) instead of the built-in
+    /// dev chain. Dev mode still auto-seals on it.
+    pub fn chain(mut self, path: impl Into<PathBuf>) -> Self {
+        self.chain = Some(path.into());
+        self
     }
 
     /// Toggle `--dev` (auto-sealing sequencer). Off = a follower that only
@@ -133,6 +142,9 @@ impl Node {
             cmd.arg("--dev")
                 .args(["--dev.block-time", &self.config.block_time]);
         }
+        if let Some(chain) = &self.config.chain {
+            cmd.arg("--chain").arg(chain);
+        }
         cmd.args([
             "--http",
             "--http.addr",
@@ -154,6 +166,12 @@ impl Node {
             "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
+        // An escape hatch for diagnosing a node under test: extra flags without
+        // editing the test that spawns it. Used for raising the log filter when
+        // a run's behaviour, not its assertions, is the thing in question.
+        if let Ok(extra) = std::env::var("ARKIV_HARNESS_NODE_ARGS") {
+            cmd.args(extra.split_whitespace());
+        }
 
         // Both streams go to one file, freshly truncated, so its tail is the
         // current run's output.
