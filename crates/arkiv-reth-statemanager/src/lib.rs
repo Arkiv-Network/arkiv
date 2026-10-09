@@ -24,6 +24,8 @@ pub mod provider;
 
 pub use accounts::{BalanceAccess, NonceAccess};
 pub use genesis::{GenesisAccount, seed_genesis};
-pub use host::{BlockSeals, HostError, HostStateView, HostStore, host_manager, open_block_branch};
+pub use host::{
+    BlockSeals, ExecutionKey, HostError, HostStateView, HostStore, host_manager, open_block_branch,
+};
 pub use overlay::WriteOverlay;
 pub use provider::{AccountReadError, GolemAccounts, StoredAccount};

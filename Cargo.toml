@@ -64,6 +64,11 @@ reth-chainspec = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "ra
 reth-trie = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 # Re-exports revm, for the `BundleState` that `HashedPostStateProvider` names.
 reth-revm = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+# The engine-tree state-root seam: the header carries GolemDB's root, not an MPT root.
+reth-engine-tree = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-evm = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-node-api = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
+reth-ethereum-primitives = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 reth-storage-overlay = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }
 arkiv-reth-golemdbprovider = { path = "crates/arkiv-reth-golemdbprovider" }
 reth-basic-payload-builder = { git = "ssh://git@github.com/Arkiv-Network/reth", branch = "raz-glm/feat/pluggable-engine-provider" }

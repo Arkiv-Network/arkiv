@@ -176,3 +176,62 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+    use arkiv_interfaces::primitives::UserBalance;
+    use arkiv_interfaces::statemanager::{AccountBalancesStore, ReadMode};
+    use arkiv_interfaces::store::reference::MemStore;
+    use std::sync::Arc;
+
+    /// The header is going to carry `SealedCommit.state_root`, so moving a
+    /// balance has to move that root. If it does not, every block advertises
+    /// the same root and the field says nothing about the state behind it.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+    fn a_balance_change_moves_the_sealed_state_root() {
+        let store: HostStore = Arc::new(MemStore::new());
+        seed_genesis(
+            &store,
+            [9; 32],
+            vec![GenesisAccount {
+                address: Address::repeat_byte(0xaa),
+                balance: U256::from(1_000),
+                nonce: 0,
+            }],
+        )
+        .expect("seed")
+        .expect("fresh");
+
+        // A block that writes nothing.
+        let idle = store.begin(Some(store.head())).expect("begin");
+        let idle_root = store.seal(idle).expect("seal").state_root;
+        store.discard(idle).expect("discard");
+
+        // A block that moves a balance.
+        let spent = store.begin(Some(store.head())).expect("begin");
+        let mut view = arkiv_golemdb_state::GolemStateView::new(
+            store.clone(),
+            spent,
+            store.head(),
+            arkiv_interfaces::statemanager::BlockRef::new(1, [9; 32]),
+            arkiv_interfaces::statemanager::SessionId([1; 16]),
+        );
+        view.fetch_sub_balance([0xaa; 20], UserBalance::from_u64(1))
+            .expect("debit");
+        assert_eq!(
+            view.get_balance([0xaa; 20], ReadMode::ViewWithOverlay)
+                .expect("read"),
+            UserBalance::from_u64(999),
+            "the write landed",
+        );
+        drop(view);
+        let spent_root = store.seal(spent).expect("seal").state_root;
+
+        assert_ne!(
+            idle_root, spent_root,
+            "a moved balance has to move the sealed state root",
+        );
+    }
+}

@@ -16,7 +16,7 @@ use arkiv_bindings::{
 use arkiv_interfaces::store::Store;
 use arkiv_reth_executor::ARKIV_ADDRESS;
 use arkiv_reth_rpc::store_reads;
-use arkiv_reth_statemanager::{BlockSeals, HostStore};
+use arkiv_reth_statemanager::{BlockSeals, ExecutionKey, HostStore};
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
@@ -37,7 +37,10 @@ use reth_ethereum::{
     },
     provider::CanonStateSubscriptions,
 };
-use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
+use reth_ethereum_payload_builder::{
+    EthereumBuilderConfig, PayloadStateRootRequest, PayloadStateRootResolver,
+    default_ethereum_payload,
+};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
 use reth_storage_api::{BlockReader, ReceiptProvider, StateProviderFactory};
@@ -47,6 +50,45 @@ use tracing::{debug, info, warn};
 
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
+
+/// Answers a built block's state root from the Arkiv seal that produced it.
+///
+/// GolemDB computes its own commitment at seal, so the root is a product of
+/// execution rather than a walk of an account trie — which is why reth asks for
+/// it through a resolver, after execution has ended. See
+/// `BlockBuilder::finish_with`.
+///
+/// The request names the execution by its transactions, not by its height, and
+/// the lookup is keyed the same way. Height alone would be ambiguous: reth
+/// races a second build against an unfinished one at the same height
+/// (`BasicPayloadJob::resolve_kind`), so two seals can be in flight and
+/// "whichever sealed last" is the wrong answer for one of them.
+///
+/// `None` falls back to reth's own state root. That happens when no seal
+/// matches — a build that never reached `Evm::finish`, or an empty block, which
+/// charges nothing and so seals nothing.
+fn arkiv_state_root_resolver(seals: Arc<BlockSeals>) -> PayloadStateRootResolver {
+    Arc::new(move |request: &PayloadStateRootRequest<'_>| {
+        let key = ExecutionKey::new(
+            request.number,
+            request
+                .transactions
+                .iter()
+                .map(|(signer, nonce)| (signer.into_array(), *nonce))
+                .collect(),
+        );
+        let root = seals.root_of(&key).map(B256::from);
+        if root.is_none() {
+            debug!(
+                target: "arkiv::payload",
+                number = request.number,
+                transactions = request.transactions.len(),
+                "no Arkiv seal for this execution; reth will compute the state root",
+            );
+        }
+        root
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ArkivPayloadServiceBuilder {
@@ -93,7 +135,8 @@ where
             chain_id: ctx.chain_spec().chain().id(),
             pruning_map: pruning_map.clone(),
             config: EthereumBuilderConfig::new()
-                .with_extra_data(ctx.payload_builder_config().extra_data()),
+                .with_extra_data(ctx.payload_builder_config().extra_data())
+                .with_state_root_resolver(arkiv_state_root_resolver(self.seals.clone())),
         };
         let conf = ctx.config().builder.clone();
         let generator = BasicPayloadJobGenerator::with_builder(

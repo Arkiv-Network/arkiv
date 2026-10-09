@@ -19,8 +19,10 @@
 //! [`BlockchainProvider`]: reth_provider::providers::BlockchainProvider
 
 pub mod state;
+pub mod state_root;
 
 pub use state::ArkivStateProvider;
+pub use state_root::ArkivStateRootStrategy;
 
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
