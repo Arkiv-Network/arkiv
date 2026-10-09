@@ -33,12 +33,16 @@ use super::{
     StoreError, StoreExt, WriteOp, WriteOutcome, validate_cell_name,
 };
 
-/// One record's stored form: its cells, plus the `#version` meta entry the
-/// spec keeps alongside them. Presence of this struct *is* record existence.
+/// One record's stored form. Presence of this struct *is* record existence,
+/// so a record with no cells still exists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct RecordData {
     version: RecordVersion,
     cells: BTreeMap<CellName, Cell>,
+    /// Where `create` put this record in the store's creation order — the
+    /// default query order, and the tie-break under a sort. A record deleted
+    /// and created again gets a new place, so it is the newest.
+    created: u64,
 }
 
 impl RecordData {
@@ -93,6 +97,9 @@ struct BranchState {
     frames: Vec<BTreeMap<RecordKey, RecordData>>,
     /// Set by `seal`. A sealed branch reads but refuses writes.
     sealed: Option<SealedCommit>,
+    /// Set when another branch commits: this one was opened over the old head
+    /// and is invalid. See [`Inner::admit`].
+    stale: bool,
 }
 
 /// An in-memory [`Store`]. See the crate docs for what it is and is not.
@@ -118,6 +125,9 @@ struct Inner {
     branches: BTreeMap<u64, BranchState>,
     /// Monotonic, never rewound — handles are never reused.
     next_branch: u64,
+    /// Monotonic, never rewound: the next [`RecordData::created`]. Shared by
+    /// every branch, which still gives each lineage its own creation order.
+    next_record: u64,
 }
 
 impl Default for MemStore {
@@ -145,6 +155,28 @@ impl Inner {
             }],
             branches: BTreeMap::new(),
             next_branch: 0,
+            next_record: 0,
+        }
+    }
+
+    /// Let a call through to an open branch, unless a commit has made it
+    /// stale. The first call to touch a stale branch releases it and is
+    /// refused with `stale_error` — [`StoreError::Conflict`] for `commit`,
+    /// [`StoreError::HandleInvalid`] for anything else — so any later call
+    /// finds the handle unknown.
+    fn admit(&mut self, branch: BranchId, stale_error: StoreError) -> Result<(), StoreError> {
+        if self.branch_state(branch)?.stale {
+            self.branches.remove(&branch.0);
+            return Err(stale_error);
+        }
+        Ok(())
+    }
+
+    /// [`admit`](Self::admit) a read, if it reads through a branch.
+    fn admit_target(&mut self, target: ReadTarget) -> Result<(), StoreError> {
+        match target {
+            ReadTarget::Branch(branch) => self.admit(branch, StoreError::HandleInvalid),
+            ReadTarget::Commit(_) => Ok(()),
         }
     }
 
@@ -185,6 +217,7 @@ impl Inner {
     /// Every write call goes through here, which is what keeps "+1 per call"
     /// true in exactly one place.
     fn begin_write(&mut self, branch: BranchId) -> Result<&mut BranchState, StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         let state = self.branch_state_mut(branch)?;
         // A sealed branch is frozen: it reads, it does not write.
         if state.sealed.is_some() {
@@ -245,12 +278,14 @@ impl Inner {
                 frames: alloc::vec![state.clone()],
                 state,
                 sealed: None,
+                stale: false,
             },
         );
         Ok(branch)
     }
 
     fn checkpoint(&mut self, branch: BranchId) -> Result<(), StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         let state = self.branch_state(branch)?;
         if state.sealed.is_some() {
             return Err(StoreError::HandleInvalid);
@@ -261,6 +296,7 @@ impl Inner {
     }
 
     fn rollback(&mut self, branch: BranchId) -> Result<(), StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         let state = self.branch_state_mut(branch)?;
         if state.sealed.is_some() {
             return Err(StoreError::HandleInvalid);
@@ -272,6 +308,7 @@ impl Inner {
     }
 
     fn seal(&mut self, branch: BranchId) -> Result<SealedCommit, StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         if let Some(sealed) = self.branch_state(branch)?.sealed {
             // Idempotent: sealing twice is the same freeze, so a host that
             // seals defensively and then commits does not pay twice.
@@ -288,6 +325,7 @@ impl Inner {
     }
 
     fn discard(&mut self, branch: BranchId) -> Result<(), StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         if self.branches.remove(&branch.0).is_none() {
             return Err(StoreError::HandleInvalid);
         }
@@ -307,6 +345,9 @@ impl Inner {
     }
 
     fn commit(&mut self, root: BranchId) -> Result<CommitId, StoreError> {
+        // The no-fork guarantee: a branch whose origin has been overtaken
+        // cannot commit. A host should treat this as fatal, not retry it.
+        self.admit(root, StoreError::Conflict)?;
         // "Implies a final checkpoint, and a seal if none was taken."
         if self.branch_state(root)?.sealed.is_none() {
             self.checkpoint(root)?;
@@ -316,9 +357,10 @@ impl Inner {
         let Origin::Commit(origin) = root_state.origin else {
             return Err(StoreError::HandleInvalid);
         };
-        // The no-fork guarantee: a branch whose origin has been overtaken
-        // cannot commit. A host should treat this as fatal, not retry it.
+        // Opened over an older commit with `begin(Some(..))`, so it never
+        // stood a chance. Consumed, like any refused commit.
         if origin != self.head() {
+            self.branches.remove(&root.0);
             return Err(StoreError::Conflict);
         }
 
@@ -330,6 +372,11 @@ impl Inner {
             .map_or_else(|| content_digest(&root_state.state), |s| s.state_root);
 
         self.branches.remove(&root.0);
+        // Every other branch was opened over the old head, and is not carried
+        // over to the new one.
+        for other in self.branches.values_mut() {
+            other.stale = true;
+        }
         self.commits.push(Snapshot {
             state: root_state.state,
             hash,
@@ -339,7 +386,8 @@ impl Inner {
         Ok(self.head())
     }
 
-    fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError> {
+    fn branch_info(&mut self, branch: BranchId) -> Result<BranchInfo, StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         let state = self.branch_state(branch)?;
         Ok(BranchInfo {
             origin: state.origin,
@@ -355,14 +403,16 @@ impl Inner {
         cells: Vec<(CellName, Cell)>,
         _budget: Option<Budget>,
     ) -> Result<Metered<RecordKey>, StoreError> {
-        if cells.is_empty() {
-            return Err(StoreError::InvalidArgument);
-        }
+        // The handle before the cells, as in GolemDB: a stale branch is
+        // refused and released whatever the call carries.
+        self.admit(branch, StoreError::HandleInvalid)?;
         for (name, cell) in &cells {
             validate_cell_name(name)?;
             cell.validate()?;
         }
 
+        let created = self.next_record;
+        self.next_record += 1;
         let state = self.begin_write(branch)?;
         if state.state.contains_key(&key) {
             return Err(StoreError::AlreadyExists);
@@ -372,18 +422,20 @@ impl Inner {
             RecordData {
                 version: RecordVersion(1),
                 cells: cells.into_iter().collect(),
+                created,
             },
         );
         Ok(with_free_receipt(key))
     }
 
     fn get(
-        &self,
+        &mut self,
         target: ReadTarget,
         key: RecordKey,
         projection: Option<&[CellName]>,
         _budget: Option<Budget>,
     ) -> Result<Metered<Option<Record>>, StoreError> {
+        self.admit_target(target)?;
         let found = self
             .state_for_target(target)?
             .get(&key)
@@ -399,6 +451,8 @@ impl Inner {
         changes: Vec<(CellName, CellChange)>,
         _budget: Option<Budget>,
     ) -> Result<Metered<RecordVersion>, StoreError> {
+        // The handle before the changes: see `create`.
+        self.admit(branch, StoreError::HandleInvalid)?;
         for (name, change) in &changes {
             validate_cell_name(name)?;
             if let CellChange::Set(cell) = change {
@@ -412,24 +466,18 @@ impl Inner {
             return Err(StoreError::Conflict);
         }
 
-        // Staged against a copy first: "may not remove the last cell" must
-        // leave the record untouched when it trips, not half-patched.
-        let mut staged = record.cells.clone();
+        // Removing every cell leaves the record empty, not absent: removing
+        // the record is `delete`'s job.
         for (name, change) in changes {
             match change {
                 CellChange::Set(cell) => {
-                    staged.insert(name, cell);
+                    record.cells.insert(name, cell);
                 }
                 CellChange::Remove => {
-                    staged.remove(&name);
+                    record.cells.remove(&name);
                 }
             }
         }
-        if staged.is_empty() {
-            return Err(StoreError::InvalidArgument);
-        }
-
-        record.cells = staged;
         record.version = RecordVersion(record.version.0 + 1);
         Ok(with_free_receipt(record.version))
     }
@@ -495,7 +543,8 @@ impl Inner {
         ))
     }
 
-    fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+    fn branch_hash(&mut self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        self.admit(branch, StoreError::HandleInvalid)?;
         Ok(content_digest(&self.branch_state(branch)?.state))
     }
 }
@@ -532,6 +581,7 @@ impl Inner {
         // All-or-nothing: keep the pre-batch branch, and put it back untouched
         // if any op fails. Batching must be a transport optimization, never a
         // semantic one.
+        self.admit(branch, StoreError::HandleInvalid)?;
         let saved = self.branch_state(branch)?.clone();
         let mut outcomes = Vec::with_capacity(ops.len());
 
@@ -580,12 +630,13 @@ impl Inner {
     }
 
     fn get_many(
-        &self,
+        &mut self,
         target: ReadTarget,
         keys: &[RecordKey],
         projection: Option<&[CellName]>,
         _budget: Option<Budget>,
     ) -> Result<Metered<Vec<Option<Record>>>, StoreError> {
+        self.admit_target(target)?;
         let state = self.state_for_target(target)?;
         let found = keys
             .iter()
@@ -822,14 +873,14 @@ impl StoreExt for MemStore {
 // query evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluate a filter and return the matching keys, ascending.
+/// Evaluate a filter and return the matching keys, in creation order.
 ///
 /// The matching itself is [`Filter::matches`] — shared with every other
 /// implementation, because filter semantics are spec and must not be able to
 /// diverge between backends. All this adds is the scan and the ordering:
-/// ascending key order falls out of the ordered map, and is both the default
-/// result order and the tie-break under a sort. A record matching several
-/// groups is visited once, so it appears once.
+/// creation order, which is both the default result order and the tie-break
+/// under a sort. A record matching several groups is visited once, so it
+/// appears once.
 fn evaluate_filter(
     state: &BTreeMap<RecordKey, RecordData>,
     filter: &Filter,
@@ -840,29 +891,28 @@ fn evaluate_filter(
             matched.push(*key);
         }
     }
+    matched.sort_by_key(|key| state[key].created);
     Ok(matched)
 }
 
 /// Sort matched keys by one cell, in the requested direction.
 ///
-/// Records lacking the sort cell sort last, and ascending key order is the
-/// tie-break — so the ordering is total and two implementations agreeing on
-/// the match set also agree on the page.
+/// A record lacking the sort cell ranks below every value, so it comes first
+/// ascending and last descending. Creation order, oldest first, is the
+/// tie-break in both directions — so the ordering is total and two
+/// implementations agreeing on the match set also agree on the page.
 fn sort_keys_by_cell(state: &BTreeMap<RecordKey, RecordData>, keys: &mut [RecordKey], sort: &Sort) {
     let sort_value = |key: &RecordKey| state[key].to_record(*key, None).sort_key(&sort.cell);
 
     keys.sort_by(|left, right| {
-        let ordering = match (sort_value(left), sort_value(right)) {
-            (Some(left_value), Some(right_value)) => left_value.cmp(&right_value),
-            (Some(_), None) => core::cmp::Ordering::Less,
-            (None, Some(_)) => core::cmp::Ordering::Greater,
-            (None, None) => core::cmp::Ordering::Equal,
-        };
-        let ordering = ordering.then_with(|| left.cmp(right));
-        match sort.direction {
+        // `None < Some(_)`: a missing cell ranks below every value.
+        let ordering = sort_value(left).cmp(&sort_value(right));
+        // Direction reverses the cell comparison only, never the tie-break.
+        let ordering = match sort.direction {
             SortDirection::Ascending => ordering,
             SortDirection::Descending => ordering.reverse(),
-        }
+        };
+        ordering.then_with(|| state[left].created.cmp(&state[right].created))
     });
 }
 
@@ -911,17 +961,6 @@ fn record_changes_between(
     changes
 }
 
-/// A deterministic digest over logical record content.
-///
-/// **Not a commitment.** FNV-1a over the canonical encoding, run with four
-/// seeds to fill 32 bytes. It detects divergence between implementations,
-/// which is what the conformance suite needs, and nothing more: no collision
-/// resistance, no proofs, no incremental maintenance. See the crate docs.
-///
-/// Excludes `#version`, as [`Store::branch_digest`] requires — the input is
-/// built from cells alone, so a write leaving content unchanged leaves the
-/// digest unchanged. Lengths are framed so that neighbouring names and values
-/// cannot be confused for one another.
 /// The index root: a digest over the **attribute** cells only.
 ///
 /// Separate from [`content_digest`] on purpose — it is what a query answer is
@@ -945,6 +984,16 @@ fn index_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
     fold(&encoded)
 }
 
+/// A deterministic digest over logical record content.
+///
+/// **Not a commitment.** FNV-1a over the canonical encoding, run with four
+/// seeds to fill 32 bytes. It detects divergence between implementations,
+/// which is what the conformance suite needs, and nothing more: no collision
+/// resistance, no proofs, no incremental maintenance. See the crate docs.
+///
+/// Built from cells alone, so a write leaving content unchanged leaves the
+/// digest unchanged. Lengths are framed so that neighbouring names and values
+/// cannot be confused for one another.
 fn content_digest(state: &BTreeMap<RecordKey, RecordData>) -> [u8; 32] {
     let mut encoded = Vec::new();
     for (key, record) in state {

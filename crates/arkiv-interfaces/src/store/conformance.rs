@@ -53,35 +53,31 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     commit_guard_rejects_second_branch_committal(store_generator);
     committed_branchid_becomes_invalid(store_generator);
     concurrent_branches_have_independent_views(store_generator);
-    patch_bumps_record_version(store_generator);
-    patch_version_guard_rejects_patch_on_state_view(store_generator);
-    recordversion_zero_version_guard_always_fails(store_generator);
-    patch_may_not_remove_last_cell(store_generator); // I do not understand this
+    patch_may_remove_the_last_cell(store_generator);
+    create_with_no_cells_makes_an_empty_record(store_generator);
     delete_removes_record(store_generator);
     reserved_cell_name_rejected(store_generator);
     field_only_type_cannot_be_attribute(store_generator); // I do not understand this
     invalid_type_id_rejected(store_generator);
-    branch_hash_doesnt_include_record_version(store_generator);
-    branch_hash_tracks_content(store_generator);
+    sealed_roots_track_content(store_generator);
     query_sees_committed_state(store_generator);
     query_dnf_unions_and_dedups(store_generator);
-    query_defaults_to_key_order(store_generator);
-    query_range_on_eq_only_type_is_invalid(store_generator);
+    query_defaults_to_creation_order(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
     genesis_is_readable_at_its_commit(store_generator);
     genesis_is_all_or_nothing(store_generator);
     block_lifecycle_in_frames(store_generator);
-    branch_reads_its_origin_not_the_head(store_generator);
+    a_commit_invalidates_the_other_branches(store_generator);
     projection_limits_returned_cells(store_generator);
     query_and_group_intersects_predicates(store_generator);
     query_negated_predicate_excludes_matches(store_generator);
     query_pages_with_offset_and_limit(store_generator);
     query_reports_total_matched_beyond_the_page(store_generator);
     query_sorts_ascending_and_descending(store_generator);
-    query_sort_puts_records_without_the_cell_last(store_generator);
+    query_sort_ranks_missing_cells_lowest_and_ties_oldest_first(store_generator);
     failed_commit_changes_nothing(store_generator);
-    failed_commit_leaves_the_branch_usable(store_generator);
+    a_refused_commit_consumes_the_branch(store_generator);
     commit_applies_every_record_or_none(store_generator);
 }
 
@@ -108,7 +104,8 @@ pub fn run_all_ext<S: StoreExt>(store_generator: &dyn Fn() -> S) {
 // ---------------------------------------------------------------------------
 
 /// A distinct record key per `ordinal`, ordered so that `record_key(1)` sorts
-/// before `record_key(2)` — which the default result-order assertion relies on.
+/// before `record_key(2)` — which lets the result-order assertions tell key
+/// order from creation order.
 fn record_key(ordinal: u8) -> RecordKey {
     let mut bytes = [0u8; 32];
     bytes[31] = ordinal;
@@ -167,16 +164,18 @@ fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
     }])])
 }
 
-/// The digest of committed state, using only [`Store`].
+/// The roots an empty branch over head seals to, using only [`Store`].
 ///
-/// A fresh branch over head has staged nothing, so its digest *is* the
-/// committed one — which is how the atomicity assertions observe the digest
-/// without needing [`StoreExt::commit_hash`].
-fn committed_digest<S: Store>(store: &mut S) -> [u8; 32] {
+/// The branch stages nothing, so its roots are a function of committed state
+/// alone — which is how the atomicity assertions observe committed state
+/// without needing [`StoreExt::commit_hash`]. They are not the head commit's
+/// own roots: a seal may add bookkeeping of its own (GolemDB records the
+/// previous commit's roots), and the probe is never committed.
+fn committed_roots<S: Store>(store: &S) -> ([u8; 32], [u8; 32]) {
     let probe = store.begin(None).expect("open a probe branch");
-    let digest = store.branch_hash(probe).expect("read its digest");
+    let sealed = store.seal(probe).expect("seal it");
     store.discard(probe).expect("and drop it again");
-    digest
+    (sealed.state_root, sealed.index_root)
 }
 
 /// The single-cell change list most patch assertions use.
@@ -193,7 +192,7 @@ fn new_store_starts_at_commit_zero<S: Store>(store_generator: &dyn Fn() -> S) {
     assert_eq!(store_generator().head(), CommitId::GENESIS);
 }
 
-/// A created record reads back with its key, its cells, and version 1.
+/// A created record reads back with its key and its cells.
 fn read_write_on_branch_without_commit_works<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
@@ -207,7 +206,6 @@ fn read_write_on_branch_without_commit_works<S: Store>(store_generator: &dyn Fn(
     let found = read_record(&store, ReadTarget::Branch(branch), record_key(1))
         .expect("the record just created is present");
     assert_eq!(found.key, record_key(1));
-    assert_eq!(found.version, RecordVersion(1), "a new record starts at 1");
     assert_eq!(found.cell("n"), Some(&u64_attribute(7)));
 }
 
@@ -500,8 +498,12 @@ fn two_branches_over_one_head_seal_independently<S: Store>(store_generator: &dyn
     assert_eq!(store.head(), head, "neither seal moved head");
 
     store.commit(a).expect("one is adopted");
-    store.discard(b).expect("the other leaves no trace");
     assert_eq!(store.head().0, head.0 + 1);
+    assert_eq!(
+        store.discard(b).unwrap_err(),
+        StoreError::HandleInvalid,
+        "the commit invalidated the other, so there is nothing left to discard"
+    );
 }
 
 /// "Implies a final checkpoint, and a seal if none was taken."
@@ -523,18 +525,18 @@ fn commit_seals_if_the_host_did_not<S: Store>(store_generator: &dyn Fn() -> S) {
     assert!(read_record(&store, ReadTarget::Commit(commit), record_key(1)).is_some());
 }
 
-/// A root branch whose origin is no longer head cannot commit. This is the
-/// no-fork guarantee: a second block at one height is refused, and a host
-/// should treat that as fatal rather than retry it.
+/// A branch whose origin is no longer head cannot commit. This is the no-fork
+/// guarantee: a second block at one height is refused, and a host should
+/// treat that as fatal rather than retry it.
 fn commit_guard_rejects_second_branch_committal<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let first = store.begin(None).unwrap();
     let stale = store.begin(None).unwrap();
 
     create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
+    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
     store.commit(first).unwrap();
 
-    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
     assert_eq!(
         store.commit(stale).unwrap_err(),
         StoreError::Conflict,
@@ -589,8 +591,9 @@ fn concurrent_branches_have_independent_views<S: Store>(store_generator: &dyn Fn
 // CRUD
 // ---------------------------------------------------------------------------
 
-/// Any mutation bumps the whole record's version by one.
-fn patch_bumps_record_version<S: Store>(store_generator: &dyn Fn() -> S) {
+/// Patching away a record's last cell leaves the record empty, not absent —
+/// removing the record is `delete`'s job.
+fn patch_may_remove_the_last_cell<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     create_record(
@@ -600,108 +603,32 @@ fn patch_bumps_record_version<S: Store>(store_generator: &dyn Fn() -> S) {
         &[("n", u64_attribute(1))],
     );
 
-    let version = store
+    store
         .patch(
             branch,
             record_key(1),
             None,
-            set_cell("n", u64_attribute(2)),
+            vec![("n".to_string(), CellChange::Remove)],
             None,
         )
-        .unwrap()
-        .into_value();
-    assert_eq!(version, RecordVersion(2));
+        .expect("the last cell may be removed");
+
+    let found = read_record(&store, ReadTarget::Branch(branch), record_key(1))
+        .expect("the record is still present");
+    assert!(found.cells.is_empty(), "with no cells left");
 }
 
-/// The optimistic-concurrency guard rejects a writer working from a stale read
-/// and admits one whose version still matches.
-fn patch_version_guard_rejects_patch_on_state_view<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A record may be created with no cells at all. It exists from `create` until
+/// `delete`, whatever cells it holds, so an empty one reads back present.
+fn create_with_no_cells_makes_an_empty_record<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
-    create_record(
-        &mut store,
-        branch,
-        record_key(1),
-        &[("n", u64_attribute(1))],
-    );
+    create_record(&mut store, branch, record_key(1), &[]);
 
-    assert_eq!(
-        store
-            .patch(
-                branch,
-                record_key(1),
-                Some(RecordVersion(2)),
-                set_cell("n", u64_attribute(9)),
-                None
-            )
-            .unwrap_err(),
-        StoreError::Conflict
-    );
-    assert!(
-        store
-            .patch(
-                branch,
-                record_key(1),
-                Some(RecordVersion(1)),
-                set_cell("n", u64_attribute(9)),
-                None
-            )
-            .is_ok(),
-        "the matching guard passes"
-    );
-}
-
-/// An explicit guard of `0` always fails: versions start at 1, so it is
-/// fail-closed rather than a don't-care sentinel.
-fn recordversion_zero_version_guard_always_fails<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
-    let branch = store.begin(None).unwrap();
-    create_record(
-        &mut store,
-        branch,
-        record_key(1),
-        &[("n", u64_attribute(1))],
-    );
-
-    assert_eq!(
-        store
-            .patch(
-                branch,
-                record_key(1),
-                Some(RecordVersion(0)),
-                set_cell("n", u64_attribute(2)),
-                None
-            )
-            .unwrap_err(),
-        StoreError::Conflict,
-        "0 is a guard that always fails, not a don't-care sentinel"
-    );
-}
-
-/// Emptying a record by patch is refused — a record with no cells would be
-/// indistinguishable from an absent one. Deleting is `delete`'s job.
-fn patch_may_not_remove_last_cell<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
-    let branch = store.begin(None).unwrap();
-    create_record(
-        &mut store,
-        branch,
-        record_key(1),
-        &[("n", u64_attribute(1))],
-    );
-
-    assert_eq!(
-        store
-            .patch(
-                branch,
-                record_key(1),
-                None,
-                vec![("n".to_string(), CellChange::Remove)],
-                None
-            )
-            .unwrap_err(),
-        StoreError::InvalidArgument
-    );
+    let found = read_record(&store, ReadTarget::Branch(branch), record_key(1))
+        .expect("an empty record is present");
+    assert_eq!(found.key, record_key(1));
+    assert!(found.cells.is_empty(), "with no cells");
 }
 
 /// Deleting removes the record; deleting again is `NotFound`, not a silent
@@ -735,7 +662,7 @@ fn reserved_cell_name_rejected<S: Store>(store_generator: &dyn Fn() -> S) {
             .create(
                 branch,
                 record_key(1),
-                cell_map(&[("#version", u64_attribute(1))]),
+                cell_map(&[("#key", u64_attribute(1))]),
                 None
             )
             .unwrap_err(),
@@ -785,68 +712,45 @@ fn invalid_type_id_rejected<S: Store>(store_generator: &dyn Fn() -> S) {
 // commitment
 // ---------------------------------------------------------------------------
 
-/// Record versions are coordination metadata, excluded from the digest: a
-/// write that leaves content unchanged must not move it.
-fn branch_hash_doesnt_include_record_version<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
+/// Seal a fresh branch over head holding one record with `cells`, or nothing
+/// at all for `None`, and drop it again.
+fn seal_one_record<S: Store>(store: &mut S, cells: Option<&[(&str, Cell)]>) -> SealedCommit {
     let branch = store.begin(None).unwrap();
-    create_record(
-        &mut store,
-        branch,
-        record_key(1),
-        &[("n", u64_attribute(1))],
-    );
-    let before = store.branch_hash(branch).unwrap();
-
-    store
-        .patch(
-            branch,
-            record_key(1),
-            None,
-            set_cell("n", u64_attribute(1)),
-            None,
-        )
-        .unwrap();
-
-    assert_eq!(
-        store.branch_hash(branch).unwrap(),
-        before,
-        "versions are coordination metadata, excluded from the commitment"
-    );
+    if let Some(cells) = cells {
+        create_record(store, branch, record_key(1), cells);
+    }
+    let sealed = store.seal(branch).unwrap();
+    store.discard(branch).unwrap();
+    sealed
 }
 
-/// The digest is a pure function of content, not of history: it moves when
-/// content moves, and returns when content returns.
-fn branch_hash_tracks_content<S: Store>(store_generator: &dyn Fn() -> S) {
+/// The roots a branch seals to follow its content: the same writes over one
+/// head seal to the same roots, and different content to different ones.
+///
+/// Each content state gets its own branch, because a sealed branch takes no
+/// more writes; all are over the same head, so only their writes differ.
+///
+/// Roots are **not** a function of content alone, so this does not assert
+/// that undoing a write restores them. In GolemDB a record that was created
+/// and then deleted still leaves the roots different from never creating it.
+fn sealed_roots_track_content<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
-    let branch = store.begin(None).unwrap();
-    let empty = store.branch_hash(branch).unwrap();
+    let empty = seal_one_record(&mut store, None);
+    let one = seal_one_record(&mut store, Some(&[("n", u64_attribute(1))]));
 
-    create_record(
-        &mut store,
-        branch,
-        record_key(1),
-        &[("n", u64_attribute(1))],
-    );
-    let one_record = store.branch_hash(branch).unwrap();
-    assert_ne!(one_record, empty);
-
-    store
-        .patch(
-            branch,
-            record_key(1),
-            None,
-            set_cell("n", u64_attribute(2)),
-            None,
-        )
-        .unwrap();
-    assert_ne!(store.branch_hash(branch).unwrap(), one_record);
-
-    store.delete(branch, record_key(1), None, None).unwrap();
     assert_eq!(
-        store.branch_hash(branch).unwrap(),
-        empty,
-        "returning to the same content returns to the same digest"
+        seal_one_record(&mut store, Some(&[("n", u64_attribute(1))])),
+        one,
+        "the same writes over the same head seal to the same roots"
+    );
+    assert_ne!(
+        one.state_root, empty.state_root,
+        "a new record moves the state root"
+    );
+    assert_ne!(
+        seal_one_record(&mut store, Some(&[("n", u64_attribute(2))])).state_root,
+        one.state_root,
+        "and so does a different value"
     );
 }
 
@@ -952,9 +856,10 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
-/// With no sort, results come back in ascending key order regardless of the
-/// order they were written in.
-fn query_defaults_to_key_order<S: Store>(store_generator: &dyn Fn() -> S) {
+/// With no sort, results come back in the order the records were created in,
+/// not in key order. A record deleted and created again counts from its new
+/// creation, so it comes back last.
+fn query_defaults_to_creation_order<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     for ordinal in [3u8, 1, 2] {
@@ -965,50 +870,29 @@ fn query_defaults_to_key_order<S: Store>(store_generator: &dyn Fn() -> S) {
             &[("kind", str_attribute("a"))],
         );
     }
-    let committed = store.commit(branch).unwrap();
+    let first = store.commit(branch).unwrap();
 
-    let query = Query {
-        filter: equals_filter("kind", TypeId::STR, b"a".to_vec()),
-        page: Page {
-            offset: 0,
-            limit: 10,
-        },
-        ..Query::default()
-    };
+    let query = paged_query(equals_filter("kind", TypeId::STR, b"a".to_vec()), 0, 10);
+    assert_eq!(
+        matched_keys(&store, first, &query),
+        vec![record_key(3), record_key(1), record_key(2)],
+        "creation order, not key order"
+    );
 
-    let found = store
-        .query(Some(committed), &query, None)
-        .unwrap()
-        .into_value();
-    let keys: Vec<RecordKey> = found.records.iter().map(|record| record.key).collect();
-    assert_eq!(keys, vec![record_key(1), record_key(2), record_key(3)]);
-}
-
-/// A range predicate against an equality-only type is refused, rather than
-/// silently answered from an index that cannot support it.
-fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -> S) {
-    let mut store = store_generator();
     let branch = store.begin(None).unwrap();
+    store.delete(branch, record_key(3), None, None).unwrap();
     create_record(
         &mut store,
         branch,
-        record_key(1),
-        &[("h", Cell::attribute(TypeId::BYTES32, vec![0u8; 32]))],
+        record_key(3),
+        &[("kind", str_attribute("a"))],
     );
-    let committed = store.commit(branch).unwrap();
-
-    let filter = Filter(vec![AndGroup(vec![Predicate {
-        cell: "h".to_string(),
-        op: CompareOp::Gt,
-        type_id: TypeId::BYTES32,
-        value: vec![0u8; 32],
-        negated: false,
-    }])]);
+    let second = store.commit(branch).unwrap();
 
     assert_eq!(
-        store.count(Some(committed), &filter, None).unwrap_err(),
-        StoreError::InvalidQuery,
-        "bytes32 indexes equality only"
+        matched_keys(&store, second, &query),
+        vec![record_key(1), record_key(2), record_key(3)],
+        "a record created again is the newest"
     );
 }
 
@@ -1083,7 +967,7 @@ fn genesis_is_all_or_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
             (record_key(1), cell_map(&[("balance", u64_attribute(100))])),
             // `#` is reserved, so this entry is refused — after the first was
             // already staged.
-            (record_key(2), cell_map(&[("#version", u64_attribute(1))])),
+            (record_key(2), cell_map(&[("#key", u64_attribute(1))])),
         ],
     );
 
@@ -1157,41 +1041,37 @@ fn block_lifecycle_in_frames<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
-/// A branch reads the commit it was opened on, not whatever head has since
-/// become — which is what makes a branch a stable base for simulation while
-/// the chain advances underneath it.
-fn branch_reads_its_origin_not_the_head<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A commit invalidates every other open branch: they were opened over the old
+/// head, and are not carried over to the new one.
+///
+/// The first call to touch such a branch is refused and releases it —
+/// [`StoreError::Conflict`] if that call is `commit` (see
+/// [`commit_guard_rejects_second_branch_committal`]), and
+/// [`StoreError::HandleInvalid`] otherwise. Any later call is `HandleInvalid`.
+fn a_commit_invalidates_the_other_branches<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
-
-    let first = store.begin(None).unwrap();
-    create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
-    let origin = store.commit(first).unwrap();
-
-    // Opened on `origin`, and held open while the chain moves on.
     let held = store.begin(None).unwrap();
+    create_record(&mut store, held, record_key(1), &[("n", u64_attribute(1))]);
 
-    let second = store.begin(None).unwrap();
-    create_record(
-        &mut store,
-        second,
-        record_key(2),
-        &[("n", u64_attribute(2))],
-    );
-    let newer = store.commit(second).unwrap();
-    assert_ne!(newer, origin, "head advanced past the held branch's origin");
+    let other = store.begin(None).unwrap();
+    store.commit(other).unwrap();
 
-    assert!(
-        read_record(&store, ReadTarget::Branch(held), record_key(1)).is_some(),
-        "the held branch still sees its origin's state"
+    assert_eq!(
+        store
+            .get(ReadTarget::Branch(held), record_key(1), None, None)
+            .unwrap_err(),
+        StoreError::HandleInvalid,
+        "a branch over the old head no longer reads"
     );
-    assert!(
-        read_record(&store, ReadTarget::Branch(held), record_key(2)).is_none(),
-        "and does not see a commit made after it was opened"
+    assert_eq!(
+        store.commit(held).unwrap_err(),
+        StoreError::HandleInvalid,
+        "and that refusal released it, so even `commit` is no longer a conflict"
     );
 }
 
-/// A projection returns only the named cells. The record's key and version are
-/// always present — they identify it, they are not content.
+/// A projection returns only the named cells. The record's key is always
+/// present — it identifies the record, it is not content.
 fn projection_limits_returned_cells<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
@@ -1380,23 +1260,27 @@ fn query_sorts_ascending_and_descending<S: Store>(store_generator: &dyn Fn() -> 
     );
 }
 
-/// A record lacking the sort cell sorts last, and ties break on key order — so
-/// the ordering is total and two implementations agreeing on the match set also
-/// agree on the page.
-fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A record lacking the sort cell ranks below every value, so it comes first
+/// ascending and last descending. Ties break on creation order, oldest first,
+/// in both directions — so the ordering is total and two implementations
+/// agreeing on the match set also agree on the page.
+fn query_sort_ranks_missing_cells_lowest_and_ties_oldest_first<S: Store>(
+    store_generator: &dyn Fn() -> S,
+) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
-    // Two records share a sort value, and one has no sort cell at all.
+    // Two records share a sort value, created against key order so the
+    // tie-break shows; and one has no sort cell at all.
     create_record(
         &mut store,
         branch,
-        record_key(1),
+        record_key(2),
         &[("n", u64_attribute(1))],
     );
     create_record(
         &mut store,
         branch,
-        record_key(2),
+        record_key(1),
         &[("n", u64_attribute(1))],
     );
     create_record(
@@ -1407,18 +1291,23 @@ fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn
     );
     let at = store.commit(branch).unwrap();
 
-    let query = Query {
+    let sorted = |direction| Query {
         sort: Some(Sort {
             cell: "n".to_string(),
-            direction: SortDirection::Ascending,
+            direction,
         }),
         ..paged_query(Filter::default(), 0, 10)
     };
 
     assert_eq!(
-        matched_keys(&store, at, &query),
-        vec![record_key(1), record_key(2), record_key(3)],
-        "tie broken by key, and the record without the cell last"
+        matched_keys(&store, at, &sorted(SortDirection::Ascending)),
+        vec![record_key(3), record_key(2), record_key(1)],
+        "ascending: the record without the cell first, then the tie oldest first"
+    );
+    assert_eq!(
+        matched_keys(&store, at, &sorted(SortDirection::Descending)),
+        vec![record_key(2), record_key(1), record_key(3)],
+        "descending: the tie still oldest first, and the record without the cell last"
     );
 }
 
@@ -1435,7 +1324,8 @@ fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn
 // has to be established by reading its implementation, not by running this.
 
 /// A commit that is refused changes nothing observable: head stays put, the
-/// branch's records do not appear, and the digest does not move.
+/// branch's records do not appear, and committed state seals to the same
+/// roots.
 ///
 /// The error alone is not enough to assert. A store that advanced head and
 /// *then* noticed the conflict would return the same error and have already
@@ -1443,14 +1333,14 @@ fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn
 fn failed_commit_changes_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
 
+    // Two branches over one head, each with a write staged; the first wins.
     let first = store.begin(None).unwrap();
     create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
     let stale = store.begin(None).unwrap();
+    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
     let committed = store.commit(first).unwrap();
 
-    let digest_before = committed_digest(&mut store);
-
-    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
+    let roots_before = committed_roots(&store);
     assert_eq!(store.commit(stale).unwrap_err(), StoreError::Conflict);
 
     assert_eq!(store.head(), committed, "head did not move");
@@ -1459,18 +1349,16 @@ fn failed_commit_changes_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
         "the refused branch's records did not land"
     );
     assert_eq!(
-        committed_digest(&mut store),
-        digest_before,
-        "and the committed digest is unchanged"
+        committed_roots(&store),
+        roots_before,
+        "and committed state seals to the same roots"
     );
 }
 
-/// A refused commit does **not** consume the branch.
-///
-/// `commit` consumes on success, so a caller that cannot distinguish the two
-/// has no way to clean up after a conflict — the branch would be unreachable
-/// and its staged writes stranded. Discarding it must still work.
-fn failed_commit_leaves_the_branch_usable<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A refused commit consumes the branch, as a successful one does, so the
+/// caller has nothing to clean up: any later call on it is
+/// [`StoreError::HandleInvalid`].
+fn a_refused_commit_consumes_the_branch<S: Store>(store_generator: &dyn Fn() -> S) {
     let store = store_generator();
 
     let first = store.begin(None).unwrap();
@@ -1478,20 +1366,23 @@ fn failed_commit_leaves_the_branch_usable<S: Store>(store_generator: &dyn Fn() -
     store.commit(first).unwrap();
 
     assert_eq!(store.commit(stale).unwrap_err(), StoreError::Conflict);
-    assert!(
-        store.branch_info(stale).is_ok(),
-        "a refused commit leaves the handle valid"
+    assert_eq!(
+        store.commit(stale).unwrap_err(),
+        StoreError::HandleInvalid,
+        "the refused commit consumed the handle, so a retry is not even a conflict"
     );
-    store
-        .discard(stale)
-        .expect("so the caller can still clean it up");
+    assert_eq!(
+        store.discard(stale).unwrap_err(),
+        StoreError::HandleInvalid,
+        "so there is nothing left to discard"
+    );
 }
 
-/// Every record of a committed branch lands, and the commit's digest is exactly
-/// the one the branch reported before committing.
+/// Every record of a committed branch lands.
 ///
-/// A commit that applied some records and not others would satisfy neither: the
-/// missing records would be absent, and the digest would not match.
+/// That the commit also keeps the roots its branch sealed to is not asserted
+/// here: [`Store`] has no way to read a commit's roots back. It is
+/// [`digest_same_on_branch_committal`]'s, through [`StoreExt::commit_hash`].
 fn commit_applies_every_record_or_none<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
@@ -1505,7 +1396,6 @@ fn commit_applies_every_record_or_none<S: Store>(store_generator: &dyn Fn() -> S
             &[("n", u64_attribute(u64::from(ordinal)))],
         );
     }
-    let expected_digest = store.branch_hash(branch).unwrap();
     let committed = store.commit(branch).unwrap();
 
     for ordinal in ordinals {
@@ -1513,11 +1403,6 @@ fn commit_applies_every_record_or_none<S: Store>(store_generator: &dyn Fn() -> S
             .unwrap_or_else(|| panic!("record {ordinal} landed"));
         assert_eq!(found.cell("n"), Some(&u64_attribute(u64::from(ordinal))));
     }
-    assert_eq!(
-        committed_digest(&mut store),
-        expected_digest,
-        "the commit's digest is the one its branch reported"
-    );
 }
 
 /// A commit's changeset accounts for the **whole** difference between it and
@@ -1608,9 +1493,9 @@ fn failed_commit_writes_no_changeset<S: StoreExt>(store_generator: &dyn Fn() -> 
     let first = store.begin(None).unwrap();
     create_record(&mut store, first, record_key(1), &[("n", u64_attribute(1))]);
     let stale = store.begin(None).unwrap();
+    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
     let committed = store.commit(first).unwrap();
 
-    create_record(&mut store, stale, record_key(2), &[("n", u64_attribute(2))]);
     assert_eq!(store.commit(stale).unwrap_err(), StoreError::Conflict);
 
     // The id the refused commit would have claimed must not resolve at all.
