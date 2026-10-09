@@ -32,9 +32,15 @@ use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
 use arkiv_reth_chainspec::ArkivChainSpecParser;
 use arkiv_reth_executor::ArkivEvmFactory;
+use arkiv_reth_golemdbprovider::{ArkivProvider, ArkivProviderBuilder};
 use arkiv_reth_statemanager::{BlockSeals, HostStore};
 use clap::Parser;
 use node::ArkivNode;
+use reth::builder::{DebugNodeLauncher, Node, NodeTypesWithDBAdapter};
+use reth_db::DatabaseEnv;
+
+/// The node types the provider is generic over, with the database bound in.
+type ArkivNodeTypes = NodeTypesWithDBAdapter<ArkivNode, DatabaseEnv>;
 use reth::{beacon_consensus::EthBeaconConsensus, cli::Cli};
 use reth_node_ethereum::EthEvmConfig;
 use std::sync::Arc;
@@ -104,9 +110,17 @@ fn main() {
         async move |builder, _| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
             let rpc_store = store.clone();
-            let handle = builder
-                // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
-                .node(ArkivNode::new(store.clone(), seals.clone()))
+            // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
+            let node = ArkivNode::new(store.clone(), seals.clone());
+            // Spelt out rather than `.node(node)`: that convenience pins the
+            // provider to reth's `BlockchainProvider`, and the whole point here
+            // is to run on ours. `with_types_and_provider` names the provider
+            // and `with_provider_builder` says how to build it; the two have to
+            // agree or the launcher will not typecheck.
+            let builder = builder
+                .with_types_and_provider::<ArkivNode, ArkivProvider<ArkivNodeTypes>>()
+                .with_components(node.components_builder())
+                .with_add_ons(node.add_ons())
                 // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
                 .extend_rpc_modules(move |ctx| {
                     let module =
@@ -114,8 +128,12 @@ fn main() {
                     ctx.modules.merge_configured(module)?;
                     info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                     Ok(())
-                })
-                .launch_with_debug_capabilities()
+                });
+            let launcher = builder
+                .engine_api_launcher()
+                .with_provider_builder(ArkivProviderBuilder);
+            let handle = builder
+                .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
             handle.wait_for_node_exit().await
         },

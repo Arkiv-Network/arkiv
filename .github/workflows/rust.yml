@@ -23,6 +23,18 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       - run: cargo fmt --all --check
 
   build:
@@ -35,6 +47,18 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -52,6 +76,18 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
@@ -84,6 +120,18 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       - uses: Swatinem/rust-cache@v2
       # Only these crates and their dependencies, so the job does not pay for
       # the reth build the other jobs already cover.
@@ -98,6 +146,18 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       # cargo-udeps needs a nightly rustc to run its analysis, independent of
       # the workspace's pinned 1.97 stable toolchain.
       - uses: dtolnay/rust-toolchain@nightly
@@ -148,6 +208,18 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:

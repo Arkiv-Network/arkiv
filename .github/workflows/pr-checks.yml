@@ -69,6 +69,18 @@ jobs:
       PACKAGE: ghcr.io/arkiv-network/arkiv-${{ matrix.task == 'lint' && 'clippy' || 'build' }}-cache:${{ inputs.tag || inputs.profile || 'dev-fast' }}
     steps:
       - uses: actions/checkout@v7
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
       # arkiv-bindings' build.rs shells out to `forge build`, so Foundry is
       # needed by anything that compiles the workspace — clippy included.
