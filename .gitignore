@@ -14,4 +14,8 @@ jwt.hex
 /.docker/caches/*
 !/.docker/caches/.gitkeep
 
+# Claude Code: personal overrides and runtime state (settings.json is shared)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
 .DS_Store

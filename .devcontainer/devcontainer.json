@@ -1,0 +1,48 @@
+{
+  // Optional. Nothing in the repo depends on it; native setups keep working.
+  "name": "arkiv",
+  "build": {
+    "dockerfile": "Dockerfile",
+    // The repo root, so the Dockerfile can read rust-toolchain.toml.
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+
+  // Build output and the cargo caches live on named volumes, not on the
+  // bind-mounted workspace: file I/O through the macOS bind mount is what makes
+  // container builds slow. The volumes survive container rebuilds.
+  "mounts": [
+    "source=arkiv-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=arkiv-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=arkiv-cargo-git,target=/usr/local/cargo/git,type=volume",
+    // Claude Code's login, settings and history, so a rebuild keeps them.
+    "source=arkiv-claude-config,target=/home/vscode/.claude,type=volume"
+  ],
+  "containerEnv": {
+    // Keep ~/.claude.json inside the volume too, not loose in the home directory.
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+    // On aarch64 (Apple Silicon hosts) rustc links with GNU ld, which runs out
+    // of memory when cargo test links many reth-sized test binaries at once.
+    // lld needs a fraction of the memory and is faster. x86_64 already uses
+    // rust-lld by default, so this is scoped to the aarch64 target. It takes
+    // precedence over any [build] rustflags in .cargo/config.toml.
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=lld"
+  },
+  // New volumes are created root-owned; hand them to the container user.
+  "postCreateCommand": "for dir in target /usr/local/cargo/registry /usr/local/cargo/git /home/vscode/.claude; do if [ \"$(stat -c %U \"$dir\")\" != vscode ]; then sudo chown -R vscode:vscode \"$dir\" || exit 1; fi; done && cargo --version",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        // rust-analyzer builds into target/rust-analyzer, so it never holds the
+        // build lock while you run cargo test in the terminal.
+        "rust-analyzer.cargo.targetDir": true
+      }
+    }
+  }
+}
