@@ -366,7 +366,7 @@ fn default_content_type() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchAttribute {
-    /// `Ident32` name (lowercase ASCII, validated client-side).
+    /// `Ident32` name (ASCII letters, digits, `.`, `-`, `_`; starts with a letter).
     name: String,
     #[serde(flatten)]
     value: BatchAttributeValue,

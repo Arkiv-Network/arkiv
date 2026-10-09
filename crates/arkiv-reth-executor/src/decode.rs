@@ -270,7 +270,7 @@ fn check_triple_list(attrs: &[AbiAttribute]) -> Result<(), DecodeError> {
     }
     for a in attrs {
         let name = attr_name(a);
-        // System names (`$…`) are protocol-defined and exempt from the `a-z`
+        // System names (`$…`) are protocol-defined and exempt from the `A-Z a-z`
         // leading-byte rule for user attributes — `$` is the byte that
         // separates the two namespaces. Which of them a client may write is
         // the allow-list's call, checked first so the error names the real
@@ -849,12 +849,56 @@ mod tests {
         ));
     }
 
-    /// Attribute names must be valid `Ident32`s — an uppercase byte (as an SDK
-    /// sends for `"testInvalidKey"`) reports its exact position and value.
+    #[test]
+    fn create_and_patch_preserve_attribute_name_case() {
+        let names = ["LEVEL", "Level", "level", "projectId"];
+        let attrs: Vec<_> = names
+            .iter()
+            .map(|name| attr(name, &AttributeValue::Bool(true)))
+            .collect();
+        let cd = calldata(vec![
+            create_in(1, attrs.clone()),
+            Operation::patch(B256::repeat_byte(1), attrs),
+            Operation::patch(
+                B256::repeat_byte(1),
+                names
+                    .iter()
+                    .map(|name| AbiAttribute::tombstone(ident(name)))
+                    .collect(),
+            ),
+        ]);
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityCreationNonce::ZERO).unwrap();
+        let expected: Vec<_> = names.iter().map(|name| name.as_bytes()).collect();
+        let Op::Create { attributes, .. } = &ops[0] else {
+            panic!("expected create")
+        };
+        assert_eq!(
+            attributes
+                .iter()
+                .map(|a| a.key.as_slice())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for (op, value) in [(&ops[1], Some(AttributeValue::Bool(true))), (&ops[2], None)] {
+            let Op::Patch { mutations, .. } = op else {
+                panic!("expected patch")
+            };
+            assert_eq!(
+                mutations
+                    .iter()
+                    .map(|a| a.key.as_slice())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(mutations.iter().all(|a| a.value == value));
+        }
+    }
+
+    /// Report the position and value of an invalid name byte.
     #[test]
     fn rejects_invalid_attribute_name() {
         let mut name = [0u8; 32];
-        name[..14].copy_from_slice(b"testInvalidKey");
+        name[..14].copy_from_slice(b"test/attribute");
         let bad = AbiAttribute {
             name: FixedBytes::from(name),
             typeId: AttributeType::Str.id(),
@@ -863,10 +907,10 @@ mod tests {
         let cd = calldata(vec![Operation::patch(B256::repeat_byte(1), vec![bad])]);
         assert!(matches!(
             decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityCreationNonce::new(0)),
-            // "testInvalidKey": the first bad byte is 'I' (0x49) at position 4.
+            // The slash (0x2f) is at position 4.
             Err(DecodeError::AttributeNameInvalidByte {
                 position: 4,
-                value: 0x49,
+                value: 0x2f,
             })
         ));
     }
