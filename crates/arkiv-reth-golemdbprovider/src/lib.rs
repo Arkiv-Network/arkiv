@@ -38,8 +38,10 @@ use reth_chainspec::{ChainInfo, EthChainSpec};
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
 use reth_execution_types::{ExecutionOutcome, RecoveredBlockAndExecutionOutput};
 use reth_node_builder::EngineProviderBuilder;
-use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
-use reth_primitives_traits::{RecoveredBlock, SealedHeader, SealedOrRecoveredBlock, StorageEntry};
+use reth_node_types::{BlockTy, BodyTy, HeaderTy, ReceiptTy, TxTy};
+use reth_primitives_traits::{
+    BlockBody as _, RecoveredBlock, SealedHeader, SealedOrRecoveredBlock, StorageEntry,
+};
 use reth_provider::ProviderFactory;
 use reth_provider::providers::{
     BlockchainProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider,
@@ -347,27 +349,16 @@ impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
         self.inner.find_sealed_or_recovered_block(hash, source)
     }
 
-    /// Still reth's.
+    /// Header from the `blocks` segment, body built from the `transactions`
+    /// one — see [`Self::assembled_block`] for how, and for what is checked.
     ///
-    /// # Why a block cannot be assembled here yet
-    ///
-    /// The tier has everything a block needs: the header and, now, its
-    /// transactions. What is missing is a way to *build* one generically.
-    /// `Block::new(header, body)` exists, but `Block::Body` has no
-    /// constructor — reth's `BlockBody` trait converts a body into an
-    /// Ethereum body and never the other way — so there is no generic path
-    /// from transactions to `Self::Block`.
-    ///
-    /// Pinning the block type here instead would force the same pin onto
-    /// every impl `BlockReader` is a supertrait of, which is most of this
-    /// file. The alternative is a small addition to the fork's `BlockBody`,
-    /// which is its own change and is what the fork exists for.
-    ///
-    /// Everything a caller needs to assemble a block itself is already
-    /// served from the tier: `header`, `transactions_by_block` and
-    /// `receipts_by_block`.
+    /// Falls back to reth for any block the tier cannot produce, including one
+    /// whose assembled body does not match its stored header.
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
-        self.inner.block(id)
+        match self.assembled_block(id)? {
+            Some(block) => Ok(Some(block)),
+            None => self.inner.block(id),
+        }
     }
 
     fn pending_block(&self) -> ProviderResult<Option<Arc<RecoveredBlock<Self::Block>>>> {
@@ -715,6 +706,71 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
                     "golemdb segment_get(blocks): {e:?}"
                 )))
             })
+    }
+
+    /// A whole block assembled from the tier, or `None` if it cannot be.
+    ///
+    /// # Building a body without pinning the block type
+    ///
+    /// `Block::new(header, body)` needs a `Block::Body`, and reth's
+    /// `BlockBody` trait has no constructor — it converts a body *into* an
+    /// Ethereum body and never the other way. But it does require RLP
+    /// `Encodable` and `Decodable`, so the body can be built concretely and
+    /// then round-tripped into the node's own type. RLP is the consensus wire
+    /// format for a body, so this is the same path a body takes arriving from
+    /// a peer; it costs one encode and one decode per block read.
+    ///
+    /// # The parts of a body the tier does not store
+    ///
+    /// A body is its transactions, its ommers and its withdrawals. Only the
+    /// transactions are stored: Arkiv is post-merge so there are no ommers,
+    /// and it has no staking so there are no withdrawals.
+    ///
+    /// That is an assumption, so it is checked rather than trusted — the
+    /// assembled body is accepted only if it hashes to the `ommers_hash`,
+    /// `transactions_root` and `withdrawals_root` the stored header already
+    /// commits to. A block that fails is served from reth instead, so a wrong
+    /// assumption costs a fallback rather than a wrong block.
+    fn assembled_block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<BlockTy<N>>> {
+        let Some(block_hash) = self.block_hash_of(id)? else {
+            return Ok(None);
+        };
+        let (Some(header), Some(transactions)) = (
+            self.stored_header(block_hash)?,
+            self.transactions_by_block(block_hash.into())?,
+        ) else {
+            return Ok(None);
+        };
+
+        // Withdrawals follow the header: a header with no withdrawals root
+        // predates them, one with a root has a list, which Arkiv keeps empty.
+        let withdrawals = header
+            .withdrawals_root()
+            .map(|_| alloy_eips::eip4895::Withdrawals::default());
+        let body = alloy_consensus::BlockBody::<TxTy<N>, HeaderTy<N>> {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals,
+        };
+
+        if body.calculate_ommers_root() != header.ommers_hash()
+            || body.calculate_tx_root() != header.transactions_root()
+            || body.calculate_withdrawals_root() != header.withdrawals_root()
+        {
+            // The stored header does not agree that this is its body, so the
+            // empty-ommers/empty-withdrawals assumption does not hold here.
+            return Ok(None);
+        }
+
+        let body: BodyTy<N> = alloy_rlp::Decodable::decode(
+            &mut alloy_rlp::encode(&body).as_slice(),
+        )
+        .map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!(
+                "assembled block body does not round-trip through RLP: {e}"
+            )))
+        })?;
+        Ok(Some(reth_primitives_traits::Block::new(header, body)))
     }
 
     /// The transaction hashes a block contains, in order, from its `blocks`
