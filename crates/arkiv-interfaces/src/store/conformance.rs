@@ -103,6 +103,30 @@ pub fn run_all_ext<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     retention_window_always_covers_HEAD(store_generator);
 }
 
+/// Run every segment assertion against stores built by `new_store`.
+///
+/// Separate again, and for a different reason from [`run_all_ext`]: segment
+/// storage *is* specified upstream, but it is unimplemented there today and
+/// the trait methods default to [`StoreError::NotImplemented`]. A store that
+/// has not built the tier yet is still a conforming store; one that has is
+/// held to all of this.
+pub fn run_all_segments<S: Store>(store_generator: &dyn Fn() -> S) {
+    appending_before_seal_is_refused(store_generator);
+    an_appended_row_is_invisible_until_commit(store_generator);
+    a_committed_row_reads_back_by_ordinal(store_generator);
+    a_committed_row_reads_back_by_key(store_generator);
+    ordinals_are_dense_and_in_append_order(store_generator);
+    a_duplicate_key_is_refused_and_overwrites_nothing(store_generator);
+    a_discarded_branchs_rows_never_appear(store_generator);
+    range_of_reports_what_one_commit_appended(store_generator);
+    rows_of_returns_that_commits_rows_in_order(store_generator);
+    an_untouched_segment_is_empty_not_an_error(store_generator);
+    segments_are_independent_of_each_other(store_generator);
+    a_row_needs_no_key(store_generator);
+    a_batch_append_matches_one_at_a_time(store_generator);
+    a_batch_with_a_duplicate_name_is_refused(store_generator);
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1847,4 +1871,384 @@ fn retention_window_always_covers_HEAD<S: StoreExt>(store_generator: &dyn Fn() -
     let (oldest, newest) = store.retention();
     assert_eq!(newest, committed);
     assert!(oldest <= newest);
+}
+
+// ---------------------------------------------------------------------------
+// Segments: the append-only tier
+// ---------------------------------------------------------------------------
+
+/// A single-column row carrying `bytes`.
+fn row(bytes: &[u8]) -> SegmentRow {
+    vec![bytes.to_vec()]
+}
+
+/// A distinct segment key per `ordinal`.
+fn segment_key(ordinal: u8) -> SegmentKey {
+    let mut key = [0u8; 32];
+    key[31] = ordinal;
+    SegmentKey(key)
+}
+
+/// A branch sealed and ready to take appends.
+fn sealed_branch<S: Store>(store: &S) -> BranchId {
+    let branch = store.begin(None).unwrap();
+    store.seal(branch).unwrap();
+    branch
+}
+
+/// Appends are legal only after `seal`. This is what keeps the tier outside
+/// the state root: by the time a row can be written, the roots are fixed.
+fn appending_before_seal_is_refused<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = store.begin(None).unwrap();
+
+    assert_eq!(
+        store.segment_append(branch, "blocks", None, row(b"header")),
+        Err(StoreError::NotSealed),
+    );
+}
+
+/// A staged row is not readable until the branch commits.
+fn an_appended_row_is_invisible_until_commit<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    let key = segment_key(1);
+    store
+        .segment_append(branch, "blocks", Some(key), row(b"header"))
+        .unwrap();
+
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Ordinal(0)),
+        Ok(None),
+        "an uncommitted row is not addressable by ordinal",
+    );
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Key(key)),
+        Ok(None),
+        "nor by key -- the row and its name become visible together, at commit",
+    );
+}
+
+/// After commit, the ordinal returned by `append` addresses the row.
+fn a_committed_row_reads_back_by_ordinal<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    let ordinal = store
+        .segment_append(branch, "blocks", None, row(b"header"))
+        .unwrap();
+    store.commit(branch).unwrap();
+
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Ordinal(ordinal)),
+        Ok(Some(row(b"header"))),
+    );
+}
+
+/// After commit, a row's key addresses it. This is the property that lets
+/// Arkiv keep no index: a transaction hash *is* its row's name.
+fn a_committed_row_reads_back_by_key<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    let key = segment_key(7);
+    store
+        .segment_append(branch, "transactions", Some(key), row(b"tx"))
+        .unwrap();
+    store.commit(branch).unwrap();
+
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Key(key)),
+        Ok(Some(row(b"tx"))),
+    );
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Key(segment_key(8))),
+        Ok(None),
+        "an unbound key is absent, not an error",
+    );
+}
+
+/// Ordinals start at zero, increase by one, and follow append order.
+fn ordinals_are_dense_and_in_append_order<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    let first = store
+        .segment_append(branch, "blocks", None, row(b"one"))
+        .unwrap();
+    let second = store
+        .segment_append(branch, "blocks", None, row(b"two"))
+        .unwrap();
+    let third = store
+        .segment_append(branch, "blocks", None, row(b"three"))
+        .unwrap();
+    store.commit(branch).unwrap();
+
+    assert_eq!((first, second, third), (0, 1, 2));
+    for (ordinal, expected) in [(0, b"one".as_slice()), (1, b"two"), (2, b"three")] {
+        assert_eq!(
+            store.segment_get("blocks", SegmentAddress::Ordinal(ordinal)),
+            Ok(Some(row(expected))),
+            "ordinal {ordinal} should hold the row appended in that position",
+        );
+    }
+}
+
+/// A duplicate key is refused, and the row already bound to it is untouched.
+fn a_duplicate_key_is_refused_and_overwrites_nothing<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let key = segment_key(1);
+
+    let first = sealed_branch(&store);
+    store
+        .segment_append(first, "transactions", Some(key), row(b"original"))
+        .unwrap();
+    store.commit(first).unwrap();
+
+    let second = sealed_branch(&store);
+    assert_eq!(
+        store.segment_append(second, "transactions", Some(key), row(b"replacement")),
+        Err(StoreError::AlreadyExists),
+    );
+    // Also within one branch, before anything has committed.
+    let third = sealed_branch(&store);
+    store
+        .segment_append(third, "transactions", Some(segment_key(2)), row(b"a"))
+        .unwrap();
+    assert_eq!(
+        store.segment_append(third, "transactions", Some(segment_key(2)), row(b"b")),
+        Err(StoreError::AlreadyExists),
+    );
+
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Key(key)),
+        Ok(Some(row(b"original"))),
+        "the bound row survived the refused append",
+    );
+}
+
+/// Rows staged on a branch that never commits are gone with it, and the key
+/// they claimed is free again.
+fn a_discarded_branchs_rows_never_appear<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let key = segment_key(1);
+
+    let abandoned = sealed_branch(&store);
+    store
+        .segment_append(abandoned, "blocks", Some(key), row(b"orphan"))
+        .unwrap();
+    store.discard(abandoned).unwrap();
+
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Ordinal(0)),
+        Ok(None),
+    );
+
+    let kept = sealed_branch(&store);
+    store
+        .segment_append(kept, "blocks", Some(key), row(b"real"))
+        .unwrap();
+    store.commit(kept).unwrap();
+
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Key(key)),
+        Ok(Some(row(b"real"))),
+        "the discarded branch left its key unbound",
+    );
+}
+
+/// `range_of` reports the ordinals one commit appended, which is what groups
+/// rows by the block that wrote them.
+fn range_of_reports_what_one_commit_appended<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+
+    let first = sealed_branch(&store);
+    store
+        .segment_append(first, "receipts", None, row(b"r0"))
+        .unwrap();
+    store
+        .segment_append(first, "receipts", None, row(b"r1"))
+        .unwrap();
+    let one = store.commit(first).unwrap();
+
+    let second = sealed_branch(&store);
+    store
+        .segment_append(second, "receipts", None, row(b"r2"))
+        .unwrap();
+    let two = store.commit(second).unwrap();
+
+    assert_eq!(store.segment_range_of("receipts", one), Ok(0..2));
+    assert_eq!(store.segment_range_of("receipts", two), Ok(2..3));
+}
+
+/// `rows_of` is the rows of `range_of`, in append order.
+fn rows_of_returns_that_commits_rows_in_order<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+
+    let first = sealed_branch(&store);
+    store
+        .segment_append(first, "receipts", None, row(b"skipped"))
+        .unwrap();
+    store.commit(first).unwrap();
+
+    let second = sealed_branch(&store);
+    store
+        .segment_append(second, "receipts", None, row(b"wanted-0"))
+        .unwrap();
+    store
+        .segment_append(second, "receipts", None, row(b"wanted-1"))
+        .unwrap();
+    let wanted = store.commit(second).unwrap();
+
+    assert_eq!(
+        store.segment_rows_of("receipts", wanted),
+        Ok(vec![row(b"wanted-0"), row(b"wanted-1")]),
+        "only that commit's rows, and in the order they were appended",
+    );
+}
+
+/// A commit that appended nothing, and a segment nobody has written, are
+/// empty rather than errors.
+fn an_untouched_segment_is_empty_not_an_error<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = store.begin(None).unwrap();
+    let quiet = store.commit(branch).unwrap();
+
+    assert_eq!(store.segment_range_of("blocks", quiet), Ok(0..0));
+    assert_eq!(store.segment_rows_of("blocks", quiet), Ok(vec![]));
+    assert_eq!(
+        store.segment_get("never-written", SegmentAddress::Ordinal(0)),
+        Ok(None),
+    );
+}
+
+/// Segments do not share an ordinal space or a key space.
+fn segments_are_independent_of_each_other<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    let key = segment_key(1);
+
+    let in_blocks = store
+        .segment_append(branch, "blocks", Some(key), row(b"a block"))
+        .unwrap();
+    // The same key in another segment is not a duplicate.
+    let in_receipts = store
+        .segment_append(branch, "receipts", Some(key), row(b"a receipt"))
+        .unwrap();
+    store.commit(branch).unwrap();
+
+    assert_eq!(
+        (in_blocks, in_receipts),
+        (0, 0),
+        "each segment counts from zero",
+    );
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Key(key)),
+        Ok(Some(row(b"a block"))),
+    );
+    assert_eq!(
+        store.segment_get("receipts", SegmentAddress::Key(key)),
+        Ok(Some(row(b"a receipt"))),
+    );
+}
+
+/// A key is optional: a row with no name is still appended and addressable by
+/// ordinal. Receipts need this -- they are reached through their block.
+fn a_row_needs_no_key<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    store
+        .segment_append(branch, "receipts", None, row(b"unnamed"))
+        .unwrap();
+    store
+        .segment_append(branch, "receipts", None, row(b"also unnamed"))
+        .unwrap();
+    let committed = store.commit(branch).unwrap();
+
+    assert_eq!(store.segment_range_of("receipts", committed), Ok(0..2));
+    assert_eq!(
+        store.segment_get("receipts", SegmentAddress::Ordinal(1)),
+        Ok(Some(row(b"also unnamed"))),
+    );
+}
+
+/// Appending a batch is indistinguishable from appending its rows one by one:
+/// same ordinals, same order, same names bound.
+fn a_batch_append_matches_one_at_a_time<S: Store>(store_generator: &dyn Fn() -> S) {
+    let batched = store_generator();
+    let branch = sealed_branch(&batched);
+    let ordinals = batched
+        .segment_append_many(
+            branch,
+            &[
+                ("blocks", Some(segment_key(1)), row(b"one")),
+                ("receipts", None, row(b"r")),
+                ("blocks", Some(segment_key(2)), row(b"two")),
+            ],
+        )
+        .unwrap();
+    let batched_commit = batched.commit(branch).unwrap();
+
+    // The same three rows, appended individually against a fresh store.
+    let singly = store_generator();
+    let branch = sealed_branch(&singly);
+    let mut expected = vec![];
+    for (segment, key, body) in [
+        ("blocks", Some(segment_key(1)), row(b"one")),
+        ("receipts", None, row(b"r")),
+        ("blocks", Some(segment_key(2)), row(b"two")),
+    ] {
+        expected.push(singly.segment_append(branch, segment, key, body).unwrap());
+    }
+    let singly_commit = singly.commit(branch).unwrap();
+
+    assert_eq!(ordinals, expected, "the ordinals a batch hands back");
+    assert_eq!(
+        ordinals,
+        vec![0, 0, 1],
+        "each segment counts separately, in append order",
+    );
+    for segment in ["blocks", "receipts"] {
+        assert_eq!(
+            batched.segment_rows_of(segment, batched_commit),
+            singly.segment_rows_of(segment, singly_commit),
+            "{segment} holds the same rows either way",
+        );
+    }
+    assert_eq!(
+        batched.segment_get("blocks", SegmentAddress::Key(segment_key(2))),
+        Ok(Some(row(b"two"))),
+        "and the names are bound",
+    );
+}
+
+/// A batch carrying a name twice is refused, and discarding the branch is what
+/// removes whatever it had staged.
+///
+/// The batch is not atomic on purpose — see `segment_append_many`. What must
+/// hold is that a refused batch cannot reach a reader, and discarding is the
+/// remedy a caller already has for a block it cannot complete.
+fn a_batch_with_a_duplicate_name_is_refused<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+
+    let refused = store.segment_append_many(
+        branch,
+        &[
+            ("blocks", Some(segment_key(1)), row(b"first")),
+            ("blocks", Some(segment_key(1)), row(b"again")),
+        ],
+    );
+    assert_eq!(refused, Err(StoreError::AlreadyExists));
+
+    store.discard(branch).unwrap();
+    let quiet = store.begin(None).unwrap();
+    let committed = store.commit(quiet).unwrap();
+    assert_eq!(
+        store.segment_rows_of("blocks", committed),
+        Ok(vec![]),
+        "the discarded branch took the refused batch with it",
+    );
+    assert_eq!(
+        store.segment_get("blocks", SegmentAddress::Key(segment_key(1))),
+        Ok(None),
+        "and the name it claimed is free again",
+    );
 }
