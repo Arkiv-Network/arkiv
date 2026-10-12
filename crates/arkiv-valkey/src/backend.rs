@@ -13,14 +13,21 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use core::ops::Range;
+
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Cell, CellChange, CellKind, CellName, CommitId, Origin,
-    ReadTarget, RecordChange, RecordKey, RecordVersion, SealedCommit, StoreError,
-    validate_cell_name,
+    ReadTarget, RecordChange, RecordKey, RecordVersion, SealedCommit, SegmentAddress, SegmentKey,
+    SegmentOrdinal, SegmentRow, StoreError, validate_cell_name,
 };
 use fred::prelude::*;
 
 use crate::codec::{self, Stored};
+
+/// One row inside a batch: where it sat in the caller's input, its optional
+/// name, and the row itself. The position is what lets ordinals come back in
+/// the caller's order while the work is grouped by segment.
+type StagedRow<'a> = (usize, Option<SegmentKey>, &'a SegmentRow);
 
 /// Roots live in a Redis hash, so they travel as hex.
 fn hex_of(bytes: &[u8; 32]) -> String {
@@ -50,7 +57,7 @@ fn bytes_of(text: &str) -> Result<[u8; 32], StoreError> {
     }
     Ok(out)
 }
-use crate::keys::{self, Namespace, VERSION_FIELD};
+use crate::keys::{self, Namespace, VERSION_FIELD, validate_segment_name};
 
 /// A cloneable handle to one namespaced store on one server.
 #[derive(Debug, Clone)]
@@ -528,20 +535,382 @@ impl Backend {
     }
 
     async fn drop_branch(&self, branch: BranchId) -> Result<(), StoreError> {
-        let _: u64 = self
+        // Staged segment rows go with the branch. On the commit path they have
+        // already been flushed; on the discard path they are what makes a
+        // losing candidate's rows -- and the keys it claimed -- disappear.
+        let staged: Vec<String> = self
             .client
-            .del(vec![
-                self.namespace.branch_diff(branch.0),
-                self.namespace.branch_meta(branch.0),
-            ])
+            .smembers(self.namespace.branch_segments(branch.0))
             .await
             .map_err(internal)?;
+        let mut doomed = vec![
+            self.namespace.branch_diff(branch.0),
+            self.namespace.branch_meta(branch.0),
+            self.namespace.branch_segments(branch.0),
+        ];
+        for segment in &staged {
+            doomed.push(self.namespace.branch_segment(branch.0, segment));
+            doomed.push(self.namespace.branch_segment_names(branch.0, segment));
+        }
+        let _: u64 = self.client.del(doomed).await.map_err(internal)?;
         let _: u64 = self
             .client
             .srem(self.namespace.branches(), branch.0.to_string())
             .await
             .map_err(internal)?;
         Ok(())
+    }
+
+    // -- segments: the append-only tier ------------------------------------
+
+    pub(crate) async fn segment_append(
+        &self,
+        branch: BranchId,
+        segment: &str,
+        key: Option<SegmentKey>,
+        row: SegmentRow,
+    ) -> Result<SegmentOrdinal, StoreError> {
+        validate_segment_name(segment)?;
+        // `sealed_roots` reports an unknown handle, so this covers both the
+        // stale-handle case and the not-yet-sealed one.
+        if self.sealed_roots(branch).await?.is_none() {
+            return Err(StoreError::NotSealed);
+        }
+        if let Some(key) = key {
+            self.claim_segment_key(branch, segment, key).await?;
+        }
+
+        // The ordinal this row would take: what is committed, plus what this
+        // branch has already staged ahead of it.
+        let committed = self.segment_len(segment).await?;
+        let staged: u64 = self
+            .client
+            .llen(self.namespace.branch_segment(branch.0, segment))
+            .await
+            .map_err(internal)?;
+
+        let _: u64 = self
+            .client
+            .rpush(
+                self.namespace.branch_segment(branch.0, segment),
+                vec![codec::encode_staged_row(key, &row)],
+            )
+            .await
+            .map_err(internal)?;
+        let _: u64 = self
+            .client
+            .sadd(
+                self.namespace.branch_segments(branch.0),
+                segment.to_string(),
+            )
+            .await
+            .map_err(internal)?;
+        Ok(committed + staged)
+    }
+
+    /// Append many rows with a constant number of round trips per segment,
+    /// rather than per row.
+    ///
+    /// This is the call that matters: a block is one row per transaction plus
+    /// one per receipt, and doing those one at a time is hundreds of round
+    /// trips while the chain waits for the commit. `RPUSH` and `SADD` both
+    /// take many arguments, so each segment costs a fixed handful of commands
+    /// however many rows it receives.
+    ///
+    /// Ordinals come back in the caller's order, which is why the grouping
+    /// keeps each row's position in the input.
+    pub(crate) async fn segment_append_many(
+        &self,
+        branch: BranchId,
+        writes: &[(&str, Option<SegmentKey>, SegmentRow)],
+    ) -> Result<Vec<SegmentOrdinal>, StoreError> {
+        for (segment, _, _) in writes {
+            validate_segment_name(segment)?;
+        }
+        if self.sealed_roots(branch).await?.is_none() {
+            return Err(StoreError::NotSealed);
+        }
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Grouped by segment, each row keeping where it sat in the input.
+        let mut grouped: BTreeMap<&str, Vec<StagedRow<'_>>> = BTreeMap::new();
+        for (position, (segment, key, row)) in writes.iter().enumerate() {
+            grouped
+                .entry(segment)
+                .or_default()
+                .push((position, *key, row));
+        }
+
+        // One result slot per input row, filled in as each segment is appended.
+        let mut ordinals: Vec<SegmentOrdinal> = vec![0; writes.len()];
+        for (segment, rows) in grouped {
+            let names: Vec<String> = rows
+                .iter()
+                .filter_map(|(_, key, _)| key.map(|key| keys::hex(&key.0)))
+                .collect();
+            if !names.is_empty() {
+                // One HMGET for every name in this segment, rather than one
+                // HEXISTS each.
+                let bound: Vec<Option<String>> = self
+                    .client
+                    .hmget(self.namespace.segment_keys(segment), names.clone())
+                    .await
+                    .map_err(internal)?;
+                if bound.iter().any(Option::is_some) {
+                    return Err(StoreError::AlreadyExists);
+                }
+                // SADD reports how many were new, so a name this branch has
+                // already claimed -- including a duplicate inside this very
+                // batch -- shows up as a short count.
+                let added: u64 = self
+                    .client
+                    .sadd(
+                        self.namespace.branch_segment_names(branch.0, segment),
+                        names.clone(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                if added != names.len() as u64 {
+                    return Err(StoreError::AlreadyExists);
+                }
+            }
+
+            let committed = self.segment_len(segment).await?;
+            let staged_key = self.namespace.branch_segment(branch.0, segment);
+            let staged: u64 = self.client.llen(&staged_key).await.map_err(internal)?;
+            let first = committed + staged;
+
+            let encoded: Vec<Vec<u8>> = rows
+                .iter()
+                .map(|(_, key, row)| codec::encode_staged_row(*key, row))
+                .collect();
+            let _: u64 = self
+                .client
+                .rpush(&staged_key, encoded)
+                .await
+                .map_err(internal)?;
+            let _: u64 = self
+                .client
+                .sadd(
+                    self.namespace.branch_segments(branch.0),
+                    segment.to_string(),
+                )
+                .await
+                .map_err(internal)?;
+
+            for (offset, (position, _, _)) in rows.iter().enumerate() {
+                ordinals[*position] = first + offset as u64;
+            }
+        }
+        Ok(ordinals)
+    }
+
+    /// How many rows a segment holds, which is also the next ordinal.
+    async fn segment_len(&self, segment: &str) -> Result<u64, StoreError> {
+        self.client
+            .llen(self.namespace.segment_rows(segment))
+            .await
+            .map_err(internal)
+    }
+
+    /// Claim `key` for this branch, or report that it is already taken.
+    ///
+    /// Two round trips and no scanning, whatever the block's size: `HEXISTS`
+    /// against the committed names, then `SADD` against this branch's staged
+    /// ones, which returns 0 when the name was already claimed. Both are O(1),
+    /// which matters because this runs once per transaction in a block.
+    ///
+    /// Another branch's staged name is deliberately not a conflict: it may
+    /// never commit, and only one branch can.
+    async fn claim_segment_key(
+        &self,
+        branch: BranchId,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<(), StoreError> {
+        let committed: bool = self
+            .client
+            .hexists(self.namespace.segment_keys(segment), keys::hex(&key.0))
+            .await
+            .map_err(internal)?;
+        if committed {
+            return Err(StoreError::AlreadyExists);
+        }
+        let added: u64 = self
+            .client
+            .sadd(
+                self.namespace.branch_segment_names(branch.0, segment),
+                keys::hex(&key.0),
+            )
+            .await
+            .map_err(internal)?;
+        if added == 0 {
+            return Err(StoreError::AlreadyExists);
+        }
+        Ok(())
+    }
+
+    /// A branch's staged rows for one segment, in append order.
+    async fn staged_rows(
+        &self,
+        branch: BranchId,
+        segment: &str,
+    ) -> Result<Vec<(Option<SegmentKey>, SegmentRow)>, StoreError> {
+        let encoded: Vec<Vec<u8>> = self
+            .client
+            .lrange(self.namespace.branch_segment(branch.0, segment), 0, -1)
+            .await
+            .map_err(internal)?;
+        encoded
+            .iter()
+            .map(|bytes| codec::decode_staged_row(bytes).map_err(|_| StoreError::Internal))
+            .collect()
+    }
+
+    /// Move a committing branch's staged rows into the committed segments, and
+    /// record the ordinal range each segment grew by.
+    ///
+    /// Called from `commit` before the head advances, and before the branch is
+    /// dropped — a discarded branch's staged keys are removed by
+    /// [`drop_branch`](Self::drop_branch) instead, so its rows never land.
+    async fn flush_segments(&self, branch: BranchId, commit: CommitId) -> Result<(), StoreError> {
+        let segments: Vec<String> = self
+            .client
+            .smembers(self.namespace.branch_segments(branch.0))
+            .await
+            .map_err(internal)?;
+
+        for segment in segments {
+            let staged = self.staged_rows(branch, &segment).await?;
+            if staged.is_empty() {
+                continue;
+            }
+            let start = self.segment_len(&segment).await?;
+
+            let rows: Vec<Vec<u8>> = staged
+                .iter()
+                .map(|(_, row)| codec::encode_row(row))
+                .collect();
+            let end: u64 = self
+                .client
+                .rpush(self.namespace.segment_rows(&segment), rows)
+                .await
+                .map_err(internal)?;
+
+            // Key bindings become visible with the rows, never before.
+            let bindings: Vec<(String, String)> = staged
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, (key, _))| {
+                    key.map(|key| (keys::hex(&key.0), (start + offset as u64).to_string()))
+                })
+                .collect();
+            if !bindings.is_empty() {
+                let _: u64 = self
+                    .client
+                    .hset(self.namespace.segment_keys(&segment), bindings)
+                    .await
+                    .map_err(internal)?;
+            }
+
+            let _: u64 = self
+                .client
+                .hset(
+                    self.namespace.commit_segments(commit.0),
+                    vec![(segment.clone(), format!("{start}:{end}"))],
+                )
+                .await
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn segment_get(
+        &self,
+        segment: &str,
+        address: SegmentAddress,
+    ) -> Result<Option<SegmentRow>, StoreError> {
+        validate_segment_name(segment)?;
+        let ordinal = match address {
+            SegmentAddress::Ordinal(ordinal) => ordinal,
+            SegmentAddress::Key(key) => {
+                let bound: Option<String> = self
+                    .client
+                    .hget(self.namespace.segment_keys(segment), keys::hex(&key.0))
+                    .await
+                    .map_err(internal)?;
+                match bound {
+                    Some(ordinal) => ordinal.parse().map_err(|_| StoreError::Internal)?,
+                    None => return Ok(None),
+                }
+            }
+        };
+        // LINDEX is signed, and a negative index addresses from the end — which
+        // would turn an out-of-range ordinal into somebody else's row.
+        let Ok(index) = i64::try_from(ordinal) else {
+            return Ok(None);
+        };
+        let encoded: Option<Vec<u8>> = self
+            .client
+            .lindex(self.namespace.segment_rows(segment), index)
+            .await
+            .map_err(internal)?;
+        encoded
+            .map(|bytes| codec::decode_row(&bytes).map_err(|_| StoreError::Internal))
+            .transpose()
+    }
+
+    pub(crate) async fn segment_range_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Range<SegmentOrdinal>, StoreError> {
+        validate_segment_name(segment)?;
+        // Validated like any other commit-targeted read, so an ask beyond head
+        // is an error rather than an empty range.
+        if commit.0 > self.head().await? {
+            return Err(StoreError::NotFound);
+        }
+        let raw: Option<String> = self
+            .client
+            .hget(self.namespace.commit_segments(commit.0), segment)
+            .await
+            .map_err(internal)?;
+        let Some(raw) = raw else {
+            return Ok(0..0);
+        };
+        let (start, end) = raw.split_once(':').ok_or(StoreError::Internal)?;
+        Ok(start.parse().map_err(|_| StoreError::Internal)?
+            ..end.parse().map_err(|_| StoreError::Internal)?)
+    }
+
+    pub(crate) async fn segment_rows_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Vec<SegmentRow>, StoreError> {
+        let range = self.segment_range_of(segment, commit).await?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (Ok(start), Ok(last)) = (
+            i64::try_from(range.start),
+            i64::try_from(range.end.saturating_sub(1)),
+        ) else {
+            return Err(StoreError::Internal);
+        };
+        // LRANGE is inclusive at both ends.
+        let encoded: Vec<Vec<u8>> = self
+            .client
+            .lrange(self.namespace.segment_rows(segment), start, last)
+            .await
+            .map_err(internal)?;
+        encoded
+            .iter()
+            .map(|bytes| codec::decode_row(bytes).map_err(|_| StoreError::Internal))
+            .collect()
     }
 
     // -- writes ------------------------------------------------------------
@@ -785,6 +1154,11 @@ impl Backend {
                 .await
                 .map_err(internal)?;
         }
+        // Before the head moves, so a reader that can see the commit can see
+        // its rows. The reverse order would expose a commit whose segments are
+        // still arriving.
+        self.flush_segments(root, commit).await?;
+
         let _: Option<()> = self
             .client
             .set(

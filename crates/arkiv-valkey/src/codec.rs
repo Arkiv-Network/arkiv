@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 
-use arkiv_interfaces::store::{Cell, CellName, Record, RecordKey, RecordVersion};
+use arkiv_interfaces::store::{
+    Cell, CellName, Record, RecordKey, RecordVersion, SegmentKey, SegmentRow,
+};
 
 /// Marks an absent record: a branch tombstone, or the empty side of a change.
 const ABSENT: u8 = 0x00;
@@ -118,6 +120,64 @@ pub(crate) fn decode_change(
     let before = decode_record_at(&mut cursor)?;
     let after = decode_record_at(&mut cursor)?;
     Ok((key, before, after))
+}
+
+/// Encode one segment row: the column count, then each column length-framed.
+///
+/// Columns are opaque to the store, so this frames them and looks no further.
+pub(crate) fn encode_row(row: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::from((row.len() as u32).to_be_bytes());
+    for column in row {
+        out.extend_from_slice(&(column.len() as u32).to_be_bytes());
+        out.extend_from_slice(column);
+    }
+    out
+}
+
+/// The inverse of [`encode_row`].
+pub(crate) fn decode_row(bytes: &[u8]) -> Result<SegmentRow, &'static str> {
+    let mut cursor = Cursor::new(bytes);
+    decode_row_at(&mut cursor)
+}
+
+fn decode_row_at(cursor: &mut Cursor<'_>) -> Result<SegmentRow, &'static str> {
+    let columns = u32::from_be_bytes(cursor.array::<4>()?);
+    let mut row = Vec::with_capacity(columns as usize);
+    for _ in 0..columns {
+        let len = u32::from_be_bytes(cursor.array::<4>()?) as usize;
+        row.push(cursor.slice(len)?.to_vec());
+    }
+    Ok(row)
+}
+
+/// Encode a row staged on a branch: its optional key, then the row itself.
+///
+/// The key rides with the row because the two become visible together, at
+/// commit — there is no point at which one is staged and the other is not.
+pub(crate) fn encode_staged_row(key: Option<SegmentKey>, row: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = match key {
+        Some(key) => {
+            let mut out = vec![PRESENT];
+            out.extend_from_slice(&key.0);
+            out
+        }
+        None => vec![ABSENT],
+    };
+    out.extend_from_slice(&encode_row(row));
+    out
+}
+
+/// The inverse of [`encode_staged_row`].
+pub(crate) fn decode_staged_row(
+    bytes: &[u8],
+) -> Result<(Option<SegmentKey>, SegmentRow), &'static str> {
+    let mut cursor = Cursor::new(bytes);
+    let key = match cursor.byte()? {
+        ABSENT => None,
+        PRESENT => Some(SegmentKey(cursor.array::<32>()?)),
+        _ => return Err("staged row marker is neither present nor absent"),
+    };
+    Ok((key, decode_row_at(&mut cursor)?))
 }
 
 /// A record's contribution to the state digest.

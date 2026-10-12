@@ -20,11 +20,25 @@
 //! {ns}:nextbranch           the branch-id counter, never rewound
 //! ```
 //!
+//! The append-only tier, which lives outside the state digest entirely:
+//!
+//! ```text
+//! {ns}:seg:{seg}:rows            LIST of encoded rows; the index *is* the ordinal
+//! {ns}:seg:{seg}:keys            HASH hex segment key -> ordinal
+//! {ns}:branch:{id}:segs          SET of segment names this branch has staged
+//! {ns}:branch:{id}:seg:{seg}     LIST of encoded staged rows, in append order
+//! {ns}:commit:{id}:segs          HASH segment name -> "{start}:{end}"
+//! ```
+//!
+//! A Valkey LIST gives the ordinal space for free: rows are only ever appended,
+//! never removed or reordered, so a row's index in the list is its ordinal and
+//! `LLEN` is the next one.
+//!
 //! Record keys are hex rather than raw bytes because they appear inside key
 //! names and hash fields, where a binary-safe but human-illegible encoding
 //! buys nothing.
 
-use arkiv_interfaces::store::RecordKey;
+use arkiv_interfaces::store::{RecordKey, StoreError};
 
 /// The hash field holding a record's version, inside `{ns}:rec:{key}`.
 ///
@@ -97,6 +111,59 @@ impl Namespace {
 
     pub(crate) fn next_branch(&self) -> String {
         format!("{}:nextbranch", self.0)
+    }
+
+    pub(crate) fn segment_rows(&self, segment: &str) -> String {
+        format!("{}:seg:{segment}:rows", self.0)
+    }
+
+    pub(crate) fn segment_keys(&self, segment: &str) -> String {
+        format!("{}:seg:{segment}:keys", self.0)
+    }
+
+    /// The set of segments a branch has staged rows for, so a commit knows
+    /// which lists to drain without scanning the keyspace.
+    pub(crate) fn branch_segments(&self, branch: u64) -> String {
+        format!("{}:branch:{branch}:segs", self.0)
+    }
+
+    pub(crate) fn branch_segment(&self, branch: u64, segment: &str) -> String {
+        format!("{}:branch:{branch}:seg:{segment}", self.0)
+    }
+
+    /// The names a branch has staged in one segment.
+    ///
+    /// A set rather than a scan of the staged rows: `SADD` both claims a name
+    /// and reports whether it was already there, in one round trip. Checking
+    /// by reading the staged rows instead made each append cost the whole
+    /// block so far, which is quadratic and showed up as a node that could
+    /// not keep up.
+    pub(crate) fn branch_segment_names(&self, branch: u64, segment: &str) -> String {
+        format!("{}:branch:{branch}:seg:{segment}:names", self.0)
+    }
+
+    /// What each segment grew by at one commit.
+    pub(crate) fn commit_segments(&self, commit: u64) -> String {
+        format!("{}:commit:{commit}:segs", self.0)
+    }
+}
+
+/// Segment names appear inside key names, so they are restricted rather than
+/// escaped: lowercase letters, digits, `_` and `-`, and never empty.
+///
+/// Arkiv's are fixed strings (`blocks`, `transactions`, `receipts`), so this
+/// only ever fires on a caller mistake — but a name carrying `:` would silently
+/// address another store structure, which is worth refusing outright.
+pub(crate) fn validate_segment_name(segment: &str) -> Result<(), StoreError> {
+    let legal = !segment.is_empty()
+        && segment.len() <= 64
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        });
+    if legal {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidArgument)
     }
 }
 

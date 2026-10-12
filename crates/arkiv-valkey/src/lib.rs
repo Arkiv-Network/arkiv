@@ -43,9 +43,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange, RecordKey,
-    RecordVersion, ScheduleVersion, SealedCommit, Sort, SortDirection, Store, StoreError, StoreExt,
-    WriteOp, WriteOutcome,
+    RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey, SegmentOrdinal,
+    SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp, WriteOutcome,
 };
+use core::ops::Range;
 use fred::prelude::*;
 
 use crate::backend::Backend;
@@ -343,6 +344,64 @@ impl Store for ValkeyStore {
 
     fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         self.call(move |backend| async move { backend.branch_hash(branch).await })
+    }
+
+    fn segment_append(
+        &self,
+        branch: BranchId,
+        segment: &str,
+        key: Option<SegmentKey>,
+        row: SegmentRow,
+    ) -> Result<SegmentOrdinal, StoreError> {
+        let segment = segment.to_owned();
+        self.call(
+            move |backend| async move { backend.segment_append(branch, &segment, key, row).await },
+        )
+    }
+
+    fn segment_append_many(
+        &self,
+        branch: BranchId,
+        writes: &[(&str, Option<SegmentKey>, SegmentRow)],
+    ) -> Result<Vec<SegmentOrdinal>, StoreError> {
+        let writes: Vec<(String, Option<SegmentKey>, SegmentRow)> = writes
+            .iter()
+            .map(|(segment, key, row)| ((*segment).to_owned(), *key, row.clone()))
+            .collect();
+        self.call(move |backend| async move {
+            let borrowed: Vec<(&str, Option<SegmentKey>, SegmentRow)> = writes
+                .iter()
+                .map(|(segment, key, row)| (segment.as_str(), *key, row.clone()))
+                .collect();
+            backend.segment_append_many(branch, &borrowed).await
+        })
+    }
+
+    fn segment_get(
+        &self,
+        segment: &str,
+        address: SegmentAddress,
+    ) -> Result<Option<SegmentRow>, StoreError> {
+        let segment = segment.to_owned();
+        self.call(move |backend| async move { backend.segment_get(&segment, address).await })
+    }
+
+    fn segment_range_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Range<SegmentOrdinal>, StoreError> {
+        let segment = segment.to_owned();
+        self.call(move |backend| async move { backend.segment_range_of(&segment, commit).await })
+    }
+
+    fn segment_rows_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Vec<SegmentRow>, StoreError> {
+        let segment = segment.to_owned();
+        self.call(move |backend| async move { backend.segment_rows_of(&segment, commit).await })
     }
 }
 
