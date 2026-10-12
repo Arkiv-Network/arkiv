@@ -1590,3 +1590,62 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
         "the beneficiary receives the tip; the base fee is burned",
     );
 }
+
+/// A transaction, its receipt and its block all agree when read back over RPC.
+///
+/// A regression test for the transaction and receipt read surface rather than
+/// a proof that the append-only tier serves it — see the note on
+/// `TransactionsProvider` in `arkiv-reth-golemdbprovider`: reth answers these
+/// queries without consulting the provider, so nothing here reaches the tier
+/// yet. It still pins the behaviour these methods have to preserve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transaction_its_receipt_and_its_block_agree() {
+    let (_node, client, _caller) = spawn_dev(DEV_KEY_0).await;
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+
+    let sent = registry
+        .execute(vec![create_op(
+            1000,
+            Bytes::from_static(b"tier read"),
+            vec![],
+        )])
+        .send()
+        .await
+        .expect("send");
+    let tx_hash = *sent.tx_hash();
+    let receipt = sent.get_receipt().await.expect("receipt");
+    assert!(receipt.status(), "the transaction must have succeeded");
+    let block_number = receipt.block_number.expect("a mined receipt has a block");
+
+    let provider = client.provider();
+
+    let fetched = provider
+        .get_transaction_by_hash(tx_hash)
+        .await
+        .expect("get_transaction_by_hash")
+        .expect("the transaction is retrievable by its hash");
+    assert_eq!(fetched.block_number, Some(block_number));
+    assert_eq!(
+        fetched.block_hash, receipt.block_hash,
+        "the transaction and its receipt name the same block",
+    );
+
+    let fetched_receipt = provider
+        .get_transaction_receipt(tx_hash)
+        .await
+        .expect("get_transaction_receipt")
+        .expect("the receipt is retrievable by the transaction hash");
+    assert_eq!(fetched_receipt.transaction_hash, tx_hash);
+    assert_eq!(fetched_receipt.block_number, Some(block_number));
+
+    let block = provider
+        .get_block_by_number(block_number.into())
+        .full()
+        .await
+        .expect("get_block_by_number")
+        .expect("the block exists");
+    assert!(
+        block.transactions.hashes().any(|hash| hash == tx_hash),
+        "and the block lists it",
+    );
+}
