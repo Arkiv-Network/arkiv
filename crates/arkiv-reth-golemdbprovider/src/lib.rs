@@ -28,8 +28,8 @@ use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, TxHash, TxNumber};
 use alloy_rpc_types_engine::ForkchoiceState;
-use arkiv_interfaces::store::{CommitId, Store};
-use arkiv_reth_statemanager::{GolemAccounts, HostStore, seed_genesis};
+use arkiv_interfaces::store::{CommitId, SegmentAddress, SegmentKey, SegmentRow, Store};
+use arkiv_reth_statemanager::{GolemAccounts, HostStore, seed_genesis, segments};
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
     ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
@@ -167,42 +167,115 @@ impl<N: ProviderNodeTypes> RocksDBProviderFactory for ArkivProvider<N> {
 impl<N: ProviderNodeTypes> HeaderProvider for ArkivProvider<N> {
     type Header = HeaderTy<N>;
 
+    /// From the `blocks` segment, falling back to reth for a block the store
+    /// does not have.
+    ///
+    /// The fallback is what makes this safe to land on a running chain: every
+    /// block written before this node started appending them is only in reth's
+    /// database, and refusing those would break `eth_getBlockByHash` for the
+    /// whole history. It goes away with reth's copy, in step 6.
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
-        self.inner.header(block_hash)
+        match self.stored_header(block_hash)? {
+            Some(header) => Ok(Some(header)),
+            None => self.inner.header(block_hash),
+        }
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
-        self.inner.header_by_number(num)
+        let Some(hash) = self.inner.block_hash(num)? else {
+            return self.inner.header_by_number(num);
+        };
+        self.header(hash)
     }
 
     fn headers_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Self::Header>> {
-        self.inner.headers_range(range)
+        // Whatever exists in the range, not an error on the first gap: this is
+        // a range query, and reth's own implementations answer with the rows
+        // they find.
+        let mut headers = Vec::new();
+        for number in heights(range, self.best_block_number()?) {
+            if let Some(header) = self.header_by_number(number)? {
+                headers.push(header);
+            }
+        }
+        Ok(headers)
     }
 
     fn sealed_header(
         &self,
         number: BlockNumber,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        self.inner.sealed_header(number)
+        // Falls back whenever the store cannot answer, including when reth has
+        // no canonical hash for the height yet -- a block being built is in
+        // reth's in-memory chain but not in its hash index, and answering
+        // `None` there stops the payload builder.
+        //
+        // Sealed with reth's own hash rather than re-hashing the header: a
+        // disagreement between the two is a bug that must surface in reth's
+        // own root check, not be papered over here.
+        let Some(hash) = self.inner.block_hash(number)? else {
+            return self.inner.sealed_header(number);
+        };
+        match self.stored_header(hash)? {
+            Some(header) => Ok(Some(SealedHeader::new(header, hash))),
+            None => self.inner.sealed_header(number),
+        }
     }
 
     fn sealed_headers_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
-        self.inner.sealed_headers_range(range)
+        let mut headers = Vec::new();
+        for number in heights(range, self.best_block_number()?) {
+            if let Some(header) = self.sealed_header(number)? {
+                headers.push(header);
+            }
+        }
+        Ok(headers)
     }
 
     fn sealed_headers_while(
         &self,
         range: impl RangeBounds<BlockNumber>,
-        predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
+        mut predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
-        self.inner.sealed_headers_while(range, predicate)
+        // Stops at the first height with no header and at the first the
+        // predicate rejects, which is what reth's implementations do.
+        let mut headers = Vec::new();
+        for number in heights(range, self.best_block_number()?) {
+            let Some(header) = self.sealed_header(number)? else {
+                break;
+            };
+            if !predicate(&header) {
+                break;
+            }
+            headers.push(header);
+        }
+        Ok(headers)
     }
+}
+
+/// The heights a `RangeBounds<BlockNumber>` names, with an unbounded end
+/// meaning "up to the tip".
+fn heights(
+    range: impl RangeBounds<BlockNumber>,
+    tip: BlockNumber,
+) -> impl Iterator<Item = BlockNumber> {
+    let start = match range.start_bound() {
+        core::ops::Bound::Included(first) => *first,
+        core::ops::Bound::Excluded(before) => before.saturating_add(1),
+        core::ops::Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        core::ops::Bound::Included(last) => *last,
+        core::ops::Bound::Excluded(after) => after.saturating_sub(1),
+        core::ops::Bound::Unbounded => tip,
+    };
+    start..=end
 }
 
 impl<N: ProviderNodeTypes> BlockHashReader for ArkivProvider<N> {
@@ -518,6 +591,47 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
             .block_hash(number)?
             .ok_or(ProviderError::HeaderNotFound(number.into()))?;
         self.commit_of(hash)
+    }
+
+    /// The stored block a hash names, from the `blocks` segment.
+    ///
+    /// A direct read: the row's name *is* the block hash, so there is no index
+    /// to consult and no commit to resolve first. `None` means the store has
+    /// no such block, which includes every block written before this node
+    /// started appending them.
+    fn stored_block_row(&self, hash: BlockHash) -> ProviderResult<Option<SegmentRow>> {
+        self.store
+            .segment_get(segments::BLOCKS, SegmentAddress::Key(SegmentKey(hash.0)))
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_get(blocks): {e:?}"
+                )))
+            })
+    }
+
+    /// The header a hash names, decoded as this node's own header type.
+    ///
+    /// Decoded generically rather than as a concrete `alloy_consensus::Header`:
+    /// pinning the type here would force the same pin onto every impl that
+    /// `HeaderProvider` is a supertrait of, which is most of this file. The
+    /// row is consensus RLP, so any header type that round-trips through RLP
+    /// reads it.
+    fn stored_header(&self, hash: BlockHash) -> ProviderResult<Option<HeaderTy<N>>> {
+        let Some(row) = self.stored_block_row(hash)? else {
+            return Ok(None);
+        };
+        let [header, _] = row.as_slice() else {
+            return Err(ProviderError::other(std::io::Error::other(
+                "a blocks row has two columns",
+            )));
+        };
+        alloy_rlp::Decodable::decode(&mut header.as_slice())
+            .map(Some)
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "blocks row header is not RLP: {e}"
+                )))
+            })
     }
 }
 
