@@ -1688,7 +1688,10 @@ dependencies = [
 name = "arkiv-reth-statemanager"
 version = "0.5.1"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
+ "alloy-rlp",
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",

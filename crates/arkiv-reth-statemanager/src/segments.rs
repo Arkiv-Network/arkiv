@@ -8,7 +8,7 @@
 //! | Segment | Row | Named by |
 //! | --- | --- | --- |
 //! | [`BLOCKS`] | the header, plus its body's transaction hashes | the block hash |
-//! | [`TRANSACTIONS`] | the transaction, plus its recovered sender | the transaction hash |
+//! | [`TRANSACTIONS`] | the transaction, its recovered sender, and its block's hash | the transaction hash |
 //! | [`RECEIPTS`] | the receipt | its transaction's hash |
 //!
 //! # Why the names matter
@@ -23,9 +23,9 @@
 //!
 //! # Encodings
 //!
-//! Consensus encodings, not bespoke ones: RLP for the header, EIP-2718 for
-//! transactions and receipts. They are canonical, they are what the hashes are
-//! taken over, and they are already the format every other Ethereum tool
+//! Consensus encodings, not bespoke ones: RLP for the header and the receipt,
+//! EIP-2718 for the transaction. They are canonical, they are what the hashes
+//! are taken over, and they are already the format every other Ethereum tool
 //! expects — so a row stays readable without this crate.
 //!
 //! The one piece of non-consensus data is a transaction's **sender**. It is
@@ -33,7 +33,7 @@
 //! senders in bulk (`senders_by_tx_range`), so it is stored beside the
 //! transaction rather than recomputed per read.
 
-use alloy_consensus::{Header, ReceiptWithBloom, TxReceipt};
+use alloy_consensus::Header;
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256};
 use alloy_rlp::Decodable;
@@ -73,6 +73,14 @@ pub struct StoredBlock {
 pub struct StoredTransaction {
     pub transaction: TransactionSigned,
     pub sender: Address,
+    /// The block that included it.
+    ///
+    /// Carried on the row because the only other way to answer "which block
+    /// was this transaction in" is an index from transaction to block, and
+    /// avoiding exactly that index is why rows are named by hash at all. 32
+    /// bytes per transaction buys `transaction_by_hash_with_meta`, which every
+    /// `eth_getTransactionByHash` needs.
+    pub block_hash: B256,
 }
 
 /// The rows one block contributes, in the order they must be appended.
@@ -112,7 +120,7 @@ pub fn rows_for_block(
         writes.push(SegmentWrite {
             segment: TRANSACTIONS,
             key: Some(SegmentKey(hash.0)),
-            row: encode_transaction(transaction, *sender),
+            row: encode_transaction(transaction, *sender, block_hash),
         });
     }
     for (receipt, hash) in receipts.iter().zip(&hashes) {
@@ -175,15 +183,30 @@ fn encode_block(header: &Header, transactions: &[B256]) -> SegmentRow {
     vec![alloy_rlp::encode(header), hashes]
 }
 
-/// Column 0 is the EIP-2718 transaction; column 1 is its 20-byte sender.
-fn encode_transaction(transaction: &TransactionSigned, sender: Address) -> SegmentRow {
-    vec![transaction.encoded_2718(), sender.to_vec()]
+/// Column 0 is the EIP-2718 transaction, column 1 its 20-byte sender, column 2
+/// the 32-byte hash of the block that included it.
+fn encode_transaction(
+    transaction: &TransactionSigned,
+    sender: Address,
+    block_hash: B256,
+) -> SegmentRow {
+    vec![
+        transaction.encoded_2718(),
+        sender.to_vec(),
+        block_hash.to_vec(),
+    ]
 }
 
-/// Column 0 is the EIP-2718 receipt, with its bloom — which is what the
-/// encoding commits to and what `receipts_by_block` must return.
+/// Column 0 is the receipt as plain RLP.
+///
+/// Not the EIP-2718 form, deliberately. reth's receipt trait requires RLP
+/// `Encodable` and `Decodable` but *not* 2718 decoding, so a 2718 row could be
+/// written and then not read back without pinning the receipt type — and
+/// pinning it would spread through every provider impl that touches receipts.
+/// Plain RLP is symmetric, generic, and round-trips the receipt's fields
+/// exactly. The bloom is left out because it is derived from the logs.
 fn encode_receipt(receipt: &Receipt) -> SegmentRow {
-    vec![receipt.with_bloom_ref().encoded_2718()]
+    vec![alloy_rlp::encode(receipt)]
 }
 
 /// A row that does not decode. Only reachable if a row was written by a
@@ -218,14 +241,17 @@ pub fn decode_block(row: &SegmentRow) -> Result<StoredBlock, MalformedRow> {
 }
 
 pub fn decode_transaction(row: &SegmentRow) -> Result<StoredTransaction, MalformedRow> {
-    let [transaction, sender] = row.as_slice() else {
-        return Err(MalformedRow("a transactions row has two columns"));
+    let [transaction, sender, block_hash] = row.as_slice() else {
+        return Err(MalformedRow("a transactions row has three columns"));
     };
     Ok(StoredTransaction {
         transaction: TransactionSigned::decode_2718(&mut transaction.as_slice())
             .map_err(|_| MalformedRow("transaction is not valid EIP-2718"))?,
         sender: Address::try_from(sender.as_slice())
             .map_err(|_| MalformedRow("sender is not 20 bytes"))?,
+        block_hash: <[u8; 32]>::try_from(block_hash.as_slice())
+            .map(B256::from)
+            .map_err(|_| MalformedRow("block hash is not 32 bytes"))?,
     })
 }
 
@@ -233,17 +259,30 @@ pub fn decode_receipt(row: &SegmentRow) -> Result<Receipt, MalformedRow> {
     let [receipt] = row.as_slice() else {
         return Err(MalformedRow("a receipts row has one column"));
     };
-    Ok(
-        ReceiptWithBloom::<Receipt>::decode_2718(&mut receipt.as_slice())
-            .map_err(|_| MalformedRow("receipt is not valid EIP-2718"))?
-            .receipt,
-    )
+    Receipt::decode(&mut receipt.as_slice()).map_err(|_| MalformedRow("receipt is not RLP"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_consensus::TxType;
+
+    /// A signed transaction, built by signing a minimal legacy transaction.
+    fn a_transaction() -> TransactionSigned {
+        use alloy_consensus::{SignableTransaction, TxLegacy};
+        use alloy_primitives::{Signature, U256};
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::repeat_byte(9)),
+            value: U256::ZERO,
+            input: Default::default(),
+        };
+        let signature = Signature::new(U256::from(1), U256::from(1), false);
+        TransactionSigned::from(tx.into_signed(signature))
+    }
 
     fn a_receipt() -> Receipt {
         Receipt {
@@ -276,9 +315,27 @@ mod tests {
     }
 
     #[test]
+    fn a_transaction_row_carries_its_block() {
+        // The block hash is what makes `transaction_by_hash_with_meta`
+        // answerable without an index from transaction to block.
+        let row = encode_transaction(
+            &a_transaction(),
+            Address::repeat_byte(3),
+            B256::repeat_byte(7),
+        );
+        let decoded = decode_transaction(&row).expect("decode");
+        assert_eq!(decoded.sender, Address::repeat_byte(3));
+        assert_eq!(decoded.block_hash, B256::repeat_byte(7));
+        assert_eq!(decoded.transaction, a_transaction());
+    }
+
+    #[test]
     fn a_receipt_row_round_trips() {
         let receipt = a_receipt();
-        assert_eq!(decode_receipt(&encode_receipt(&receipt)).expect("decode"), receipt);
+        assert_eq!(
+            decode_receipt(&encode_receipt(&receipt)).expect("decode"),
+            receipt
+        );
     }
 
     #[test]
@@ -287,7 +344,7 @@ mod tests {
         assert!(decode_block(&vec![vec![0xff], vec![]]).is_err());
         assert!(decode_receipt(&vec![vec![0xff; 4]]).is_err());
         // A hash column that is not a whole number of hashes.
-        let header = alloy_rlp::encode(&Header::default());
+        let header = alloy_rlp::encode(Header::default());
         assert!(decode_block(&vec![header, vec![0u8; 33]]).is_err());
     }
 

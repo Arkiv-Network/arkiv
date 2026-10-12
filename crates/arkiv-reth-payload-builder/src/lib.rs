@@ -16,7 +16,9 @@ use arkiv_bindings::{
 use arkiv_interfaces::store::Store;
 use arkiv_reth_executor::ARKIV_ADDRESS;
 use arkiv_reth_rpc::store_reads;
-use arkiv_reth_statemanager::{BlockSeals, ExecutionKey, HostStore};
+use arkiv_reth_statemanager::{
+    BlockSeals, ExecutionKey, HostStore, SegmentWrite, segments::rows_for_block,
+};
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
@@ -169,13 +171,42 @@ where
                     // only place anything is written.
                     let tip = notification.tip();
                     let height = tip.number;
-                    match seals.adopt(&store, height, tip.hash().0) {
-                        Ok(Some(commit)) => {
+                    // The block's own rows go into the append-only tier in the
+                    // same commit as its state. Built before `adopt` because a
+                    // block we cannot encode is one we must not commit state
+                    // for either -- the two would disagree permanently.
+                    let writes = match rows_for_canonical_tip(&notification) {
+                        Ok(writes) => writes,
+                        Err(error) => {
+                            warn!(target: "arkiv-reth", %error, height, "failed to encode the block's rows; its Arkiv state is not adopted");
+                            return notification;
+                        }
+                    };
+                    // On a blocking thread, not this one. Adoption is now a
+                    // write per transaction and receipt rather than a couple
+                    // of calls, and the store's seam is synchronous -- against
+                    // Valkey that is thousands of round trips. Blocking this
+                    // worker for them stalls the payload builder sharing the
+                    // runtime, which costs transactions per block rather than
+                    // correctness, and so does not show up in any in-process
+                    // test. `catch_up` below already does the same thing.
+                    let adopting_store = store.clone();
+                    let adopting_seals = seals.clone();
+                    let block_hash = tip.hash().0;
+                    let adopted = tokio::task::spawn_blocking(move || {
+                        adopting_seals.adopt(&adopting_store, height, block_hash, &writes)
+                    })
+                    .await;
+                    match adopted {
+                        Ok(Ok(Some(commit))) => {
                             debug!(target: "arkiv-reth", height, commit = commit.0, "adopted the block's Arkiv state")
                         }
-                        Ok(None) => {}
-                        Err(error) => {
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => {
                             warn!(target: "arkiv-reth", ?error, height, "failed to adopt the block's Arkiv state")
+                        }
+                        Err(error) => {
+                            warn!(target: "arkiv-reth", %error, height, "the task adopting the block's Arkiv state did not finish")
                         }
                     }
                     if let Err(error) = catch_up(provider, store, pruning_map).await {
@@ -193,6 +224,38 @@ where
         );
         Ok(handle)
     }
+}
+
+/// The rows the canonical tip contributes to the append-only tier.
+///
+/// # Only the tip
+///
+/// A notification can commit several blocks at once, and this writes rows for
+/// the last of them. That matches `BlockSeals::adopt`, which commits the tip's
+/// seal and discards the rest, so rows and state stay consistent with each
+/// other — a block with no rows also has no committed state.
+///
+/// It is still a gap: on a multi-block notification the intermediate blocks
+/// reach neither tier. Nothing breaks today because reth keeps its own copy of
+/// every block, but that copy is what step 6 switches off, so this has to be
+/// closed before then.
+fn rows_for_canonical_tip(
+    notification: &reth_ethereum::provider::CanonStateNotification,
+) -> eyre::Result<Vec<SegmentWrite>> {
+    let chain = notification.committed();
+    let block = chain.tip();
+    let hash = block.hash();
+    let receipts = chain
+        .receipts_by_block_hash(hash)
+        .ok_or_else(|| eyre::eyre!("block {hash} is canonical but has no receipts"))?;
+    let receipts: Vec<reth_ethereum::Receipt> = receipts.into_iter().cloned().collect();
+    Ok(rows_for_block(
+        block.header(),
+        &block.body().transactions,
+        block.senders(),
+        &receipts,
+        hash,
+    )?)
 }
 
 fn spawn_catch_up<P>(
