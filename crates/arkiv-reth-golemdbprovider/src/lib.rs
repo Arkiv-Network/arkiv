@@ -499,15 +499,31 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// empty state: it means the block is outside the retention window or was
     /// never adopted, and answering "every account is absent" would be a
     /// confident lie about a block we simply cannot see.
+    ///
+    /// # Only the head commit can be read
+    ///
+    /// A commit that resolves to anything other than the store's head is
+    /// refused. GolemDB serves reads at its current head only — reading at a
+    /// past commit is not supported and is not planned (#145) — so a provider
+    /// built on an older commit would silently answer from head while claiming
+    /// to speak for an earlier block. That is the one failure mode worth
+    /// refusing loudly: a wrong balance is indistinguishable from a right one.
+    ///
+    /// This is what makes a live Arkiv node a non-archive node. State history
+    /// still exists in the store and is reachable by rewinding a *copy*, which
+    /// is a one-way operation and so cannot be done by a node serving traffic.
     fn commit_of(&self, hash: BlockHash) -> ProviderResult<CommitId> {
-        self.store
+        let commit = self
+            .store
             .commit_by_tag(hash.0)
             .map_err(|e| {
                 ProviderError::other(std::io::Error::other(format!(
                     "golemdb commit_by_tag: {e:?}"
                 )))
             })?
-            .ok_or(ProviderError::StateForHashNotFound(hash))
+            .ok_or(ProviderError::StateForHashNotFound(hash))?;
+        head_only(commit, self.store.head())?;
+        Ok(commit)
     }
 
     /// The commit a block number names: reth's hash for that number, then the
@@ -518,6 +534,48 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
             .block_hash(number)?
             .ok_or(ProviderError::HeaderNotFound(number.into()))?;
         self.commit_of(hash)
+    }
+}
+
+/// Refuse a commit that is not the store's head — see [`ArkivProvider::commit_of`].
+///
+/// A free function rather than a method so it can be tested without standing up
+/// a whole `BlockchainProvider`; it needs nothing but the two numbers.
+fn head_only(commit: CommitId, head: CommitId) -> ProviderResult<()> {
+    if commit == head {
+        return Ok(());
+    }
+    Err(ProviderError::other(std::io::Error::other(format!(
+        "arkiv serves state at the chain head only: asked for commit {}, head is {}. GolemDB \
+         cannot read at a past commit, so a live node has no historical state view (see #145).",
+        commit.0, head.0
+    ))))
+}
+
+#[cfg(test)]
+mod head_only_tests {
+    use super::head_only;
+    use arkiv_interfaces::store::CommitId;
+
+    #[test]
+    fn the_head_commit_is_served() {
+        assert!(head_only(CommitId(7), CommitId(7)).is_ok());
+    }
+
+    #[test]
+    fn an_older_commit_is_refused_rather_than_answered_from_head() {
+        // The whole point: without this the provider would read at head and
+        // present the answer as block 6's state.
+        let err = head_only(CommitId(6), CommitId(7)).unwrap_err();
+        assert!(
+            err.to_string().contains("chain head only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_future_commit_is_refused_too() {
+        assert!(head_only(CommitId(8), CommitId(7)).is_err());
     }
 }
 

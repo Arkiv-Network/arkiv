@@ -5,7 +5,7 @@
 //! else — primitives, storage, engine types, pool, network, consensus, RPC add-ons
 //! — is reth's stock Ethereum set, reused through `EthereumNode::components()`.
 
-use alloy_rpc_types_engine::ExecutionData;
+use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes};
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_golemdbprovider::ArkivStateRootStrategy;
@@ -17,8 +17,13 @@ use reth::{
 };
 use reth_engine_tree::tree::state_root_strategy::StateRootStrategy;
 use reth_engine_tree::tree::{BasicEngineValidator, TreeConfig};
-use reth_ethereum::{Block, EthPrimitives, engine::local::LocalPayloadAttributesBuilder};
-use reth_node_api::AddOnsContext;
+use reth_ethereum::{
+    Block, EthPrimitives, engine::local::LocalPayloadAttributesBuilder, primitives::SealedBlock,
+};
+use reth_node_api::{
+    AddOnsContext, EngineApiMessageVersion, EngineApiValidator, EngineObjectValidationError,
+    InvalidPayloadAttributesError, NewPayloadError, PayloadOrAttributes, PayloadValidator,
+};
 use reth_node_builder::ConfigureEngineEvm;
 use reth_node_builder::rpc::{
     BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineValidatorBuilder,
@@ -72,8 +77,8 @@ where
     type AddOns = EthereumAddOns<
         NodeAdapter<N>,
         EthereumEthApiBuilder,
-        EthereumEngineValidatorBuilder,
-        BasicEngineApiBuilder<EthereumEngineValidatorBuilder>,
+        ArkivPayloadValidatorBuilder,
+        BasicEngineApiBuilder<ArkivPayloadValidatorBuilder>,
         ArkivEngineValidatorBuilder,
     >;
 
@@ -91,11 +96,12 @@ where
 
     /// Spelt out rather than `EthereumAddOns::default()`: the default pins the
     /// engine validator builder, and Arkiv's is what installs the state-root
-    /// strategy that puts GolemDB's root in the header.
+    /// strategy that puts GolemDB's root in the header and the payload
+    /// validator that refuses withdrawals.
     fn add_ons(&self) -> Self::AddOns {
         EthereumAddOns::new(RpcAddOns::new(
             EthereumEthApiBuilder::default(),
-            EthereumEngineValidatorBuilder::default(),
+            ArkivPayloadValidatorBuilder,
             BasicEngineApiBuilder::default(),
             ArkivEngineValidatorBuilder::new(self.seals.clone()),
             Default::default(),
@@ -133,14 +139,14 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArkivNode {
 /// supplies and a structural bound does not.
 #[derive(Clone)]
 pub struct ArkivEngineValidatorBuilder {
-    inner: BasicEngineValidatorBuilder<EthereumEngineValidatorBuilder>,
+    inner: BasicEngineValidatorBuilder<ArkivPayloadValidatorBuilder>,
     seals: Arc<BlockSeals>,
 }
 
 impl ArkivEngineValidatorBuilder {
     pub fn new(seals: Arc<BlockSeals>) -> Self {
         Self {
-            inner: BasicEngineValidatorBuilder::default(),
+            inner: BasicEngineValidatorBuilder::new(ArkivPayloadValidatorBuilder),
             seals,
         }
     }
@@ -160,7 +166,7 @@ where
     type EngineValidator = BasicEngineValidator<
         N::Provider,
         N::Evm,
-        <EthereumEngineValidatorBuilder as PayloadValidatorBuilder<N>>::Validator,
+        <ArkivPayloadValidatorBuilder as PayloadValidatorBuilder<N>>::Validator,
     >;
 
     async fn build_tree_validator(
@@ -176,5 +182,166 @@ where
         let strategy: Arc<dyn StateRootStrategy<EthPrimitives, N::Provider, N::Evm>> =
             Arc::new(ArkivStateRootStrategy::new(self.seals));
         Ok(validator.with_state_root_strategy(strategy))
+    }
+}
+
+/// Refuses blocks and build requests that carry consensus-layer withdrawals.
+///
+/// A withdrawal credits an account outside the EVM: reth's block executor
+/// applies it straight to its own `State`, after transaction execution and
+/// without passing through Arkiv's EVM. Arkiv's balances live in GolemDB and
+/// are written only by that EVM, so since accounts moved there (#154) a
+/// withdrawal would credit reth's copy and leave the real balance untouched —
+/// the two would disagree, silently, forever.
+///
+/// Arkiv has no staking, so no honest withdrawal can arrive. Refusing is
+/// therefore free, and it is the decision recorded as #145's third open
+/// question. The alternative — routing withdrawals into the store — is real
+/// work for a feature the chain does not have.
+///
+/// Both directions are covered:
+///
+/// * **Inbound**, a payload from the consensus layer, in
+///   [`convert_payload_to_block`](PayloadValidator::convert_payload_to_block).
+///   Every path to a block runs through it, including
+///   `ensure_well_formed_payload`, whose default calls it.
+/// * **Outbound**, payload attributes asking us to *build* such a block, in
+///   [`validate_payload_attributes_against_header`](PayloadValidator::validate_payload_attributes_against_header).
+///   Without this the node would build a block it then rejects itself.
+#[derive(Debug, Clone)]
+pub struct ArkivPayloadValidator<V> {
+    inner: V,
+}
+
+impl<V> ArkivPayloadValidator<V> {
+    pub const fn new(inner: V) -> Self {
+        Self { inner }
+    }
+}
+
+impl<V, Types> PayloadValidator<Types> for ArkivPayloadValidator<V>
+where
+    Types: PayloadTypes<ExecutionData = ExecutionData, PayloadAttributes = EthPayloadAttributes>,
+    V: PayloadValidator<Types, Block = Block>,
+{
+    type Block = Block;
+
+    fn convert_payload_to_block(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+        let block = self.inner.convert_payload_to_block(payload)?;
+        if let Some(count) =
+            withdrawal_count(block.body().withdrawals.as_deref().map(Vec::as_slice))
+        {
+            return Err(NewPayloadError::other(ArkivWithdrawalsUnsupported(count)));
+        }
+        Ok(block)
+    }
+
+    fn validate_payload_attributes_against_header(
+        &self,
+        attr: &Types::PayloadAttributes,
+        header: &<Self::Block as reth_ethereum::primitives::Block>::Header,
+    ) -> Result<(), InvalidPayloadAttributesError> {
+        if let Some(count) = withdrawal_count(attr.withdrawals.as_deref()) {
+            return Err(InvalidPayloadAttributesError::InvalidParams(Box::new(
+                ArkivWithdrawalsUnsupported(count),
+            )));
+        }
+        self.inner
+            .validate_payload_attributes_against_header(attr, header)
+    }
+}
+
+impl<V, Types> EngineApiValidator<Types> for ArkivPayloadValidator<V>
+where
+    Types: PayloadTypes<ExecutionData = ExecutionData, PayloadAttributes = EthPayloadAttributes>,
+    V: EngineApiValidator<Types> + PayloadValidator<Types, Block = Block>,
+{
+    fn validate_version_specific_fields(
+        &self,
+        version: EngineApiMessageVersion,
+        payload_or_attrs: PayloadOrAttributes<'_, Types::ExecutionData, EthPayloadAttributes>,
+    ) -> Result<(), EngineObjectValidationError> {
+        self.inner
+            .validate_version_specific_fields(version, payload_or_attrs)
+    }
+
+    fn ensure_well_formed_attributes(
+        &self,
+        version: EngineApiMessageVersion,
+        attributes: &EthPayloadAttributes,
+    ) -> Result<(), EngineObjectValidationError> {
+        self.inner
+            .ensure_well_formed_attributes(version, attributes)
+    }
+}
+
+/// `Some(n)` when a withdrawal list is present and non-empty. An empty list is
+/// what every post-Shanghai block on a chain without staking carries, so it is
+/// not an error; `None` is the pre-Shanghai shape.
+fn withdrawal_count<T>(withdrawals: Option<&[T]>) -> Option<usize> {
+    withdrawals.map(<[T]>::len).filter(|count| *count > 0)
+}
+
+/// The refusal itself, so the reason reaches the consensus layer's logs rather
+/// than just a rejected hash.
+#[derive(Debug)]
+struct ArkivWithdrawalsUnsupported(usize);
+
+impl std::fmt::Display for ArkivWithdrawalsUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "arkiv does not support consensus-layer withdrawals, and this payload carries {}. \
+             Arkiv balances live in GolemDB and are written only through its executor, which a \
+             withdrawal bypasses (see #145).",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ArkivWithdrawalsUnsupported {}
+
+/// Builds [`ArkivPayloadValidator`] over reth's Ethereum payload validator.
+#[derive(Debug, Clone, Default)]
+pub struct ArkivPayloadValidatorBuilder;
+
+impl<N> PayloadValidatorBuilder<N> for ArkivPayloadValidatorBuilder
+where
+    N: FullNodeComponents<Types = ArkivNode>,
+    EthereumEngineValidatorBuilder: PayloadValidatorBuilder<N>,
+    <EthereumEngineValidatorBuilder as PayloadValidatorBuilder<N>>::Validator:
+        PayloadValidator<<ArkivNode as NodeTypes>::Payload, Block = Block>,
+{
+    type Validator = ArkivPayloadValidator<
+        <EthereumEngineValidatorBuilder as PayloadValidatorBuilder<N>>::Validator,
+    >;
+
+    async fn build(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::Validator> {
+        Ok(ArkivPayloadValidator::new(
+            EthereumEngineValidatorBuilder::default().build(ctx).await?,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::withdrawal_count;
+
+    #[test]
+    fn absent_and_empty_withdrawal_lists_are_not_refused() {
+        // Pre-Shanghai blocks have no list; post-Shanghai blocks on a chain
+        // without staking carry an empty one. Refusing either would halt the
+        // chain on every block.
+        assert_eq!(withdrawal_count::<()>(None), None);
+        assert_eq!(withdrawal_count::<()>(Some(&[])), None);
+    }
+
+    #[test]
+    fn any_withdrawal_at_all_is_refused() {
+        assert_eq!(withdrawal_count(Some(&[()])), Some(1));
+        assert_eq!(withdrawal_count(Some(&[(), ()])), Some(2));
     }
 }
