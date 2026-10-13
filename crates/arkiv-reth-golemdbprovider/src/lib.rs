@@ -24,11 +24,13 @@ pub mod state_root;
 pub use state::ArkivStateProvider;
 pub use state_root::ArkivStateRootStrategy;
 
-use alloy_consensus::{BlockHeader as _, transaction::TransactionMeta};
+use alloy_consensus::{BlockHeader as _, Sealable as _, transaction::TransactionMeta};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, TxHash, TxNumber};
 use alloy_rpc_types_engine::ForkchoiceState;
-use arkiv_interfaces::store::{CommitId, SegmentAddress, SegmentKey, SegmentRow, Store};
+use arkiv_interfaces::store::{
+    CommitId, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
+};
 use arkiv_reth_statemanager::{GolemAccounts, HostStore, seed_genesis, segments};
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
@@ -64,7 +66,7 @@ use reth_storage_api::{
 };
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::ops::{RangeBounds, RangeInclusive};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// The node's provider. Forwards everything to reth's for now; see the module
@@ -73,12 +75,21 @@ use std::time::Instant;
 pub struct ArkivProvider<N: ProviderNodeTypes> {
     inner: BlockchainProvider<N>,
     store: HostStore,
+    /// The block number of the `blocks` segment's first row, once read.
+    /// Shared across clones because the provider is cloned per request and
+    /// the answer is a property of the store — see
+    /// [`blocks_base`](Self::blocks_base).
+    blocks_base: Arc<OnceLock<BlockNumber>>,
 }
 
 impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// Wrap reth's provider, over the store the answers will come from.
-    pub const fn new(inner: BlockchainProvider<N>, store: HostStore) -> Self {
-        Self { inner, store }
+    pub fn new(inner: BlockchainProvider<N>, store: HostStore) -> Self {
+        Self {
+            inner,
+            store,
+            blocks_base: Arc::new(OnceLock::new()),
+        }
     }
 
     /// The provider being delegated to. Shrinks as trait groups move across.
@@ -104,6 +115,7 @@ impl<N: ProviderNodeTypes> Clone for ArkivProvider<N> {
         Self {
             inner: self.inner.clone(),
             store: self.store.clone(),
+            blocks_base: self.blocks_base.clone(),
         }
     }
 }
@@ -184,7 +196,7 @@ impl<N: ProviderNodeTypes> HeaderProvider for ArkivProvider<N> {
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
-        let Some(hash) = self.inner.block_hash(num)? else {
+        let Some(hash) = self.block_hash(num)? else {
             return self.inner.header_by_number(num);
         };
         self.header(hash)
@@ -218,7 +230,7 @@ impl<N: ProviderNodeTypes> HeaderProvider for ArkivProvider<N> {
         // Sealed with reth's own hash rather than re-hashing the header: a
         // disagreement between the two is a bug that must surface in reth's
         // own root check, not be papered over here.
-        let Some(hash) = self.inner.block_hash(number)? else {
+        let Some(hash) = self.block_hash(number)? else {
             return self.inner.sealed_header(number);
         };
         match self.stored_header(hash)? {
@@ -281,8 +293,21 @@ fn heights(
 }
 
 impl<N: ProviderNodeTypes> BlockHashReader for ArkivProvider<N> {
+    /// From the `blocks` segment by ordinal, falling back to reth.
+    ///
+    /// This is the keystone of the height side of the tier: `header_by_number`,
+    /// `sealed_header`, `block_hash_of` and `commit_of_number` all ask it for
+    /// the hash they then look a block up by, so they follow it across without
+    /// changing.
+    ///
+    /// The fallback covers both ends — blocks older than the segment's first
+    /// row, which exist only in reth's database, and a height above its last,
+    /// which is a block reth is still building.
     fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
-        self.inner.block_hash(number)
+        match self.stored_at_height(number)? {
+            Some((hash, _)) => Ok(Some(hash)),
+            None => self.inner.block_hash(number),
+        }
     }
 
     fn canonical_hashes_range(
@@ -290,10 +315,28 @@ impl<N: ProviderNodeTypes> BlockHashReader for ArkivProvider<N> {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.inner.canonical_hashes_range(start, end)
+        // Per height through `block_hash`, so each one takes the tier or the
+        // fallback on its own merits. Whatever exists in the range rather than
+        // an error on the first gap, which is what reth's own answer is.
+        let mut hashes = Vec::new();
+        for number in start..end {
+            if let Some(hash) = self.block_hash(number)? {
+                hashes.push(hash);
+            }
+        }
+        Ok(hashes)
     }
 }
 
+/// The tier answers where a block *is*; reth answers where the chain *is*.
+///
+/// `block_number` is storage — a hash either names a stored row or it does
+/// not. The four heights below are live chain state: reth's canonical tip
+/// moves with blocks still in memory, ahead of anything committed, and the
+/// engine and the payload builder read them constantly while building on top.
+/// Answering them from the tier would report a node permanently a block or
+/// two behind itself, which is the same over-reach that routing number-ids
+/// through the tier caused in #166.
 impl<N: ProviderNodeTypes> BlockNumReader for ArkivProvider<N> {
     fn chain_info(&self) -> ProviderResult<ChainInfo> {
         self.inner.chain_info()
@@ -311,8 +354,14 @@ impl<N: ProviderNodeTypes> BlockNumReader for ArkivProvider<N> {
         self.inner.earliest_block_number()
     }
 
+    /// From the named `blocks` row — the hash is the row's name, so this is a
+    /// point read and needs no index. Falls back to reth for a block written
+    /// before this node started appending them.
     fn block_number(&self, hash: B256) -> ProviderResult<Option<BlockNumber>> {
-        self.inner.block_number(hash)
+        match self.stored_header(hash)? {
+            Some(header) => Ok(Some(header.number())),
+            None => self.inner.block_number(hash),
+        }
     }
 }
 
@@ -775,7 +824,6 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// tag. Never `commit = number + anything` — see [`state`](crate::state).
     fn commit_of_number(&self, number: BlockNumber) -> ProviderResult<CommitId> {
         let hash = self
-            .inner
             .block_hash(number)?
             .ok_or(ProviderError::HeaderNotFound(number.into()))?;
         self.commit_of(hash)
@@ -915,7 +963,7 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     fn block_hash_of(&self, id: BlockHashOrNumber) -> ProviderResult<Option<BlockHash>> {
         match id {
             BlockHashOrNumber::Hash(hash) => Ok(Some(hash)),
-            BlockHashOrNumber::Number(number) => self.inner.block_hash(number),
+            BlockHashOrNumber::Number(number) => self.block_hash(number),
         }
     }
 
@@ -1002,18 +1050,90 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
         let Some(row) = self.stored_block_row(hash)? else {
             return Ok(None);
         };
+        Self::header_of_row(&row).map(Some)
+    }
+
+    /// The header column of a `blocks` row, decoded.
+    fn header_of_row(row: &SegmentRow) -> ProviderResult<HeaderTy<N>> {
         let [header, _] = row.as_slice() else {
             return Err(ProviderError::other(std::io::Error::other(
                 "a blocks row has two columns",
             )));
         };
-        alloy_rlp::Decodable::decode(&mut header.as_slice())
-            .map(Some)
+        alloy_rlp::Decodable::decode(&mut header.as_slice()).map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!(
+                "blocks row header is not RLP: {e}"
+            )))
+        })
+    }
+
+    /// The `blocks` row at `ordinal`, or `None` past the end of the segment.
+    fn block_row_at(&self, ordinal: SegmentOrdinal) -> ProviderResult<Option<SegmentRow>> {
+        self.store
+            .segment_get(segments::BLOCKS, SegmentAddress::Ordinal(ordinal))
             .map_err(|e| {
                 ProviderError::other(std::io::Error::other(format!(
-                    "blocks row header is not RLP: {e}"
+                    "golemdb segment_get(blocks, #{ordinal}): {e:?}"
                 )))
             })
+    }
+
+    /// The block number of the `blocks` segment's first row.
+    ///
+    /// One row is appended per committed block and ordinals are dense, so a
+    /// height is `ordinal + base` and an ordinal is `height - base`. The base
+    /// is not necessarily genesis or one: a node that began appending partway
+    /// through a chain has its own first block sitting at ordinal 0, and every
+    /// block before it exists only in reth's database.
+    ///
+    /// Read once and kept, because ordinal 0 cannot change — a row provably
+    /// cannot move, which is why appends require a sealed branch. An empty
+    /// segment answers `None` and is not cached, so the first block to arrive
+    /// sets the base.
+    fn blocks_base(&self) -> ProviderResult<Option<BlockNumber>> {
+        if let Some(base) = self.blocks_base.get() {
+            return Ok(Some(*base));
+        }
+        let Some(row) = self.block_row_at(0)? else {
+            return Ok(None);
+        };
+        let base = Self::header_of_row(&row)?.number();
+        let _ = self.blocks_base.set(base);
+        Ok(Some(base))
+    }
+
+    /// The hash and header of the block at `number`, from the `blocks`
+    /// segment, or `None` if the segment does not reach that height.
+    ///
+    /// The dense-ordinal assumption is checked rather than trusted: a row that
+    /// turns out not to be the height asked for means the mapping is wrong,
+    /// and the caller falls back to reth instead of being handed the wrong
+    /// block. A gap cannot arise today — every adopted block appends exactly
+    /// one row — but this is the one place that would silently serve the
+    /// neighbouring block if one ever did.
+    fn stored_at_height(
+        &self,
+        number: BlockNumber,
+    ) -> ProviderResult<Option<(BlockHash, HeaderTy<N>)>> {
+        let Some(base) = self.blocks_base()? else {
+            return Ok(None);
+        };
+        let Some(ordinal) = number.checked_sub(base) else {
+            return Ok(None);
+        };
+        let Some(row) = self.block_row_at(ordinal)? else {
+            return Ok(None);
+        };
+        let header = Self::header_of_row(&row)?;
+        if header.number() != number {
+            return Ok(None);
+        }
+        // The hash is not stored beside the header — it names the row, and a
+        // name cannot be read back off one. Re-deriving it is not a second
+        // opinion: keccak of the header RLP *is* the block hash, and a
+        // disagreement would mean the row could not be found by hash at all,
+        // which the store's own conformance covers.
+        Ok(Some((header.hash_slow(), header)))
     }
 }
 

@@ -1700,4 +1700,27 @@ async fn a_transaction_and_receipt_are_read_from_the_tier() {
         .expect("the receipt is found by the transaction hash after a restart");
     assert_eq!(fetched_receipt.transaction_hash, tx_hash);
     assert_eq!(fetched_receipt.block_number, Some(block_number));
+
+    // The height side of the same rows: a block number resolves to its hash
+    // through the segment's ordinals, and the hash back to its number through
+    // the row's name. Both answers have to survive the restart and agree with
+    // what the receipt reported before it.
+    let by_number = provider
+        .get_block_by_number(block_number.into())
+        .await
+        .expect("get_block_by_number")
+        .expect("the block is found by its number after a restart");
+    assert_eq!(
+        by_number.header.hash, block_hash,
+        "the height resolves to the hash the receipt reported",
+    );
+    let by_hash = provider
+        .get_block_by_hash(block_hash)
+        .await
+        .expect("get_block_by_hash")
+        .expect("the block is found by its hash after a restart");
+    assert_eq!(
+        by_hash.header.number, block_number,
+        "and the hash resolves back to the height",
+    );
 }
