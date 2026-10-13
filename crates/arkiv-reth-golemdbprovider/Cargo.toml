@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 # The provider being wrapped, and the types its trait signatures name.
 arkiv-interfaces.workspace = true
+# Block headers come out of the append-only tier as consensus RLP.
+alloy-rlp.workspace = true
 arkiv-reth-statemanager.workspace = true
 reth-provider.workspace = true
 reth-storage-api.workspace = true
