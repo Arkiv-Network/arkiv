@@ -98,13 +98,14 @@ jobs:
       - run: cargo nextest run --workspace --locked
 
   # The suites that need a real server are #[ignore] by default and run here
-  # against a service container: arkiv-valkey's store conformance, and
-  # arkiv-golemdb-state's view over it. A fake backend would only prove our
-  # model of Valkey is self-consistent, which MemStore already does without a
-  # network.
+  # against a service container: arkiv-valkey's store conformance,
+  # arkiv-golemdb-state's view over it, and arkiv-reth's restart tests, which
+  # need a store that outlives the node process. A fake backend would only
+  # prove our model of Valkey is self-consistent, which MemStore already does
+  # without a network.
   valkey:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       VALKEY_URL: redis://127.0.0.1:6379
@@ -133,9 +134,12 @@ jobs:
             url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
             "ssh://git@github.com/Arkiv-Network/reth"
       - uses: Swatinem/rust-cache@v2
-      # Only these crates and their dependencies, so the job does not pay for
-      # the reth build the other jobs already cover.
       - run: cargo test -p arkiv-valkey -p arkiv-golemdb-state --locked -- --ignored
+      # Separate because this one does pay for the reth build: these tests drive
+      # the real `arkiv-reth` binary across a restart, and a store that outlives
+      # the process is the whole point of them, so this is the only job that can
+      # run them.
+      - run: cargo test -p arkiv-reth --locked -- --ignored
 
   udeps:
     runs-on: ubuntu-latest

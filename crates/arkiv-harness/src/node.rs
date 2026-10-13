@@ -5,13 +5,17 @@
 //! reused for the node's whole life. [`Node::kill`] stops the process while
 //! **keeping** the datadir, and [`Node::restart`] relaunches on the same ports and
 //! datadir, so a test can prove crash recovery (state resumes after a restart).
+//!
+//! The datadir is only reth's half. Arkiv's own state lives in the store, which
+//! by default is in-process and so goes with the process — a test that wants to
+//! watch state survive a restart needs [`NodeBuilder::valkey_store`].
 
 use std::fs::File;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_provider::Provider;
 
@@ -26,6 +30,10 @@ const LOG_TAIL_LINES: usize = 150;
 /// How often [`Node::wait_ready`] checks the process and its RPC.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long [`Node::terminate`] lets a node finish its own shutdown before
+/// resorting to SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
 /// How to launch an `arkiv-reth`. Ports and the datadir are allocated
 /// automatically at [`spawn`](NodeBuilder::spawn); everything else has a
 /// dev-friendly default you can override.
@@ -37,6 +45,10 @@ pub struct NodeBuilder {
     http_api: String,
     chain: Option<PathBuf>,
     extra_args: Vec<String>,
+    env: Vec<(String, String)>,
+    /// The Valkey server and namespace holding this node's Arkiv state, when it
+    /// is not the default in-process store. Erased when the [`Node`] drops.
+    store: Option<(String, String)>,
 }
 
 impl NodeBuilder {
@@ -50,6 +62,8 @@ impl NodeBuilder {
             http_api: "eth,net,web3,txpool".to_string(),
             chain: None,
             extra_args: Vec::new(),
+            env: Vec::new(),
+            store: None,
         }
     }
 
@@ -83,6 +97,44 @@ impl NodeBuilder {
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.extra_args.push(arg.into());
         self
+    }
+
+    /// Set one environment variable on the node process, for both the first
+    /// launch and every [`restart`](Node::restart).
+    ///
+    /// This is how a test chooses the node's backing store: `ARKIV_STORE_URL`
+    /// and `ARKIV_STORE_NAMESPACE` are read by the binary at startup, and
+    /// setting them per node rather than on the test process keeps nodes
+    /// running side by side out of each other's state.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Put the node's Arkiv state on the Valkey server at `url`, in a namespace
+    /// of this node's own, erased when the [`Node`] drops.
+    ///
+    /// The default in-process store is gone the moment the process is, so a
+    /// test that kills and restarts a node can only observe state surviving if
+    /// the store outlives the process. That is what this is for.
+    ///
+    /// The namespace carries the `arkiv-test:` prefix the store's own
+    /// conformance tests use, so a leaked one is recognisable as test debris.
+    pub fn valkey_store(mut self, url: impl Into<String>) -> Self {
+        // Wall-clock nanos plus the process id: unique per node on one machine,
+        // and it needs no dependency. Same scheme as `ValkeyStore::ephemeral`,
+        // which this cannot use directly — that store erases its namespace when
+        // *it* drops, and the node here is a separate process that has to find
+        // its state again after a restart.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after the unix epoch")
+            .as_nanos();
+        let namespace = format!("arkiv-test:node:{}:{nanos}", std::process::id());
+        let url = url.into();
+        self.store = Some((url.clone(), namespace.clone()));
+        self.env("ARKIV_STORE_URL", url)
+            .env("ARKIV_STORE_NAMESPACE", namespace)
     }
 
     /// Launch the node.
@@ -166,6 +218,7 @@ impl Node {
             "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
+        cmd.envs(self.config.env.iter().map(|(k, v)| (k, v)));
         // An escape hatch for diagnosing a node under test: extra flags without
         // editing the test that spawns it. Used for raising the log filter when
         // a run's behaviour, not its assertions, is the thing in question.
@@ -265,13 +318,41 @@ impl Node {
         }
     }
 
-    /// Stop the process but **keep** the datadir — the chain persists for a
-    /// [`restart`](Node::restart). Idempotent.
+    /// Stop the process abruptly (SIGKILL) but **keep** the datadir — the chain
+    /// persists for a [`restart`](Node::restart). Idempotent.
+    ///
+    /// This is a crash, not a shutdown: the node gets no chance to flush, so
+    /// reth's own database can be left mid-write. For the restart an operator
+    /// would perform, use [`terminate`](Node::terminate) — the two are not
+    /// interchangeable, and a node can survive one and not the other.
     pub fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// Stop the process the way an operator would — SIGTERM, so reth runs its
+    /// shutdown — and **keep** the datadir for a [`restart`](Node::restart).
+    ///
+    /// Falls back to [`kill`](Node::kill) if the node has not exited within
+    /// [`SHUTDOWN_GRACE`], so a node that hangs cannot hang the test.
+    pub fn terminate(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // `std::process::Child` can only SIGKILL, and reaching for a signal
+        // crate to send one other signal is not worth it.
+        let _ = Command::new("kill").arg(child.id().to_string()).status();
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(READY_POLL_INTERVAL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Relaunch on the same ports and datadir. Must [`kill`](Node::kill) first.
@@ -297,5 +378,20 @@ impl Drop for Node {
         self.kill();
         let _ = std::fs::remove_dir_all(&self.datadir);
         let _ = std::fs::remove_file(&self.log_path);
+        // The store outlives the process on purpose, so nothing else will clean
+        // it up. Best-effort: a server that has already gone away leaves keys
+        // behind under the recognisable `arkiv-test:` prefix.
+        //
+        // On its own thread because a `ValkeyStore` carries a tokio runtime, and
+        // tests drop their node from inside one — where building and dropping a
+        // second runtime panics.
+        if let Some((url, namespace)) = self.config.store.clone() {
+            let _ = std::thread::spawn(move || {
+                if let Ok(store) = arkiv_valkey::ValkeyStore::connect(&url, &namespace) {
+                    let _ = store.drop_namespace();
+                }
+            })
+            .join();
+        }
     }
 }

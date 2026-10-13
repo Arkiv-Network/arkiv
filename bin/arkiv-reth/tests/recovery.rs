@@ -20,6 +20,22 @@ use arkiv_harness::{
 
 const READY: Duration = Duration::from_secs(90);
 
+/// Blocks to let pass before a kill, to clear reth's
+/// `DEFAULT_PERSISTENCE_THRESHOLD` of 50 — under which reth has written nothing
+/// to its own database and a restart has nothing to resume from.
+const PERSISTED: u64 = 60;
+
+/// Where the Valkey server is, or a clear explanation of why we cannot proceed.
+///
+/// Panics rather than silently passing: a green restart test that never had a
+/// store able to survive the restart is worse than no test.
+fn valkey_url() -> String {
+    std::env::var("VALKEY_URL").expect(
+        "this test needs a store that outlives the node process: set VALKEY_URL \
+         (for example redis://127.0.0.1:6379)",
+    )
+}
+
 /// A create carrying `payload` under `text/plain`, with a purely relative
 /// lifetime — `$contentType` / `$payload` ride in the attribute list now.
 fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
@@ -83,9 +99,39 @@ async fn wait_for_physical_purge(
     }
 }
 
+/// Entity state and the query index survive a shutdown and restart, and the
+/// chain goes on producing blocks afterwards.
+///
+/// Two things this needs that the rest of the file does not:
+///
+/// * **A store that outlives the process.** Arkiv's state is not in the
+///   datadir; by default it is in-process, so after a restart there is simply
+///   nothing to find and the question the test asks is unanswerable. Hence
+///   Valkey, which is also what a real deployment runs.
+/// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50. Below
+///   it reth has written nothing to its own database, and a restart therefore
+///   never reaches the startup checks or the catch-up this is here to cover —
+///   both of the faults it guards against (the trie stages rejecting a header
+///   that carries GolemDB's root, and a tag becoming readable before the head
+///   covered it) are invisible under 50 blocks.
+///
+/// This is the graceful restart — SIGTERM, the one an operator performs. The
+/// abrupt one is a separate story: see
+/// [`a_crash_past_the_persistence_threshold_cannot_restart`].
+///
+/// Ignored by default because it needs a server, like the store's own
+/// conformance tests:
+///
+/// ```sh
+/// VALKEY_URL=redis://127.0.0.1:6379 \
+///   cargo nextest run -p arkiv-reth --run-ignored only -- restart
+/// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn state_and_index_survive_kill_and_restart() {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+async fn state_and_index_survive_shutdown_and_restart() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .valkey_store(valkey_url())
+        .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
@@ -112,17 +158,17 @@ async fn state_and_index_survive_kill_and_restart() {
     ));
     let created = hex_quantity(&client.get_entity(key0).await["createdAt"]);
 
-    // Let the chain advance well past the create block so it is persisted below the
-    // in-memory tip (the safe head that survives an abrupt kill).
+    // Past reth's persistence threshold, so the create block is on disk and the
+    // restart below exercises the startup path rather than simply losing it.
     client
-        .wait_for_block(created + 20, Duration::from_secs(30))
+        .wait_for_block(created + PERSISTED, Duration::from_secs(60))
         .await;
     let count_before = client.entity_count(None, None).await;
     let entity_before = client.get_entity(key0).await;
     assert_eq!(count_before, 2);
 
-    // Crash: stop the process (datadir kept), then restart on the same ports/datadir.
-    node.kill();
+    // Shut down (datadir kept), then restart on the same ports/datadir.
+    node.terminate();
     // A brief pause so the OS releases the listening ports before the rebind.
     tokio::time::sleep(Duration::from_secs(1)).await;
     node.restart();
@@ -150,9 +196,12 @@ async fn state_and_index_survive_kill_and_restart() {
     );
 
     // The chain keeps producing blocks and accepts new writes after recovery.
+    // Ten of them rather than one or two: a restarted node that cannot read its
+    // own state back fails while *building* a payload, not at startup, so the
+    // evidence that it recovered is sustained block production.
     let tip = client.block_number().await;
     client
-        .wait_for_block(tip + 2, Duration::from_secs(30))
+        .wait_for_block(tip + 10, Duration::from_secs(60))
         .await;
     client
         .execute(vec![create_op(1000, Bytes::from_static(b"gamma"), vec![])])
@@ -162,6 +211,44 @@ async fn state_and_index_survive_kill_and_restart() {
         3,
         "new writes work after recovery"
     );
+}
+
+/// A node SIGKILLed past the persistence threshold cannot start again.
+///
+/// This asserts the *fault*, not the fix — it is the repro, written as a
+/// passing test so the limitation is recorded where it will be noticed rather
+/// than in a comment, and so whoever fixes it is told by a failure here.
+///
+/// An abrupt kill can leave reth's database mid-write, and on the next start
+/// reth recovers by unwinding its state trie. That recovery is the one place
+/// `Node::disabled_stages` does not reach: reth re-enables `MerkleUnwind`
+/// unconditionally for it (`launch/common.rs`, "Partial trie recovery is not
+/// complete until Merkle has unwound"). The stage then recomputes an MPT root
+/// and compares it with the header, which carries GolemDB's root instead — so
+/// it can never agree, and the node exits with `mismatched block state root`.
+///
+/// A graceful SIGTERM leaves no partial trie to recover, which is why
+/// [`state_and_index_survive_shutdown_and_restart`] passes and this does not.
+/// Making it pass means reth not maintaining a trie for us at all, which is
+/// the step 6 work on crash recovery, not a fix that belongs here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+#[should_panic(expected = "node exited during startup")]
+async fn a_crash_past_the_persistence_threshold_cannot_restart() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .valkey_store(valkey_url())
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    client
+        .wait_for_block(PERSISTED, Duration::from_secs(60))
+        .await;
+
+    node.kill();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node.restart();
+    node.wait_ready(&client, READY).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
