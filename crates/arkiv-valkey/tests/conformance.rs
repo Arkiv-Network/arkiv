@@ -45,6 +45,52 @@ fn store_ext_conformance() {
     conformance::run_all_ext(&new_store);
 }
 
+#[test]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+fn segment_conformance() {
+    conformance::run_all_segments(&new_store);
+}
+
+/// Appended rows outlive the connection too, addressable by both ordinal and
+/// key — the half of the segment contract `MemStore` cannot demonstrate.
+#[test]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+fn segment_rows_survive_reconnection() {
+    use arkiv_interfaces::store::{SegmentAddress, SegmentKey, Store};
+
+    let namespace = format!("arkiv-test:segments:{}", std::process::id());
+    let key = SegmentKey([9u8; 32]);
+    let row = vec![b"a header".to_vec()];
+
+    let committed = {
+        let store = ValkeyStore::connect(&url(), &namespace).expect("connect");
+        let branch = store.begin(None).expect("begin");
+        store.seal(branch).expect("seal");
+        store
+            .segment_append(branch, "blocks", Some(key), row.clone())
+            .expect("append");
+        store.commit(branch).expect("commit")
+    };
+
+    let reopened = ValkeyStore::connect(&url(), &namespace).expect("reconnect");
+    assert_eq!(
+        reopened.segment_get("blocks", SegmentAddress::Key(key)),
+        Ok(Some(row.clone())),
+        "the row is still reachable by its key",
+    );
+    assert_eq!(
+        reopened.segment_get("blocks", SegmentAddress::Ordinal(0)),
+        Ok(Some(row)),
+        "and by its ordinal",
+    );
+    assert_eq!(
+        reopened.segment_range_of("blocks", committed),
+        Ok(0..1),
+        "and the commit still knows what it appended",
+    );
+    reopened.drop_namespace().expect("clean up");
+}
+
 /// Committed state outlives the connection that wrote it, and reconnecting to
 /// the same namespace resumes from it — the property that separates this from
 /// an in-memory store.
