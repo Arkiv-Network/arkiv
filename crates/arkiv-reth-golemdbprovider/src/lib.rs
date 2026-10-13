@@ -333,12 +333,30 @@ impl<N: ProviderNodeTypes> BlockIdReader for ArkivProvider<N> {
 impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
     type Block = BlockTy<N>;
 
+    /// The tier answers for a block the caller insists is canonical; anything
+    /// that may want a pending block goes to reth first.
+    ///
+    /// A pending block is not committed, so it is not in the tier at all. For
+    /// `BlockSource::Any` reth documents Pending before Database, and asking
+    /// the tier first would answer with a canonical block where reth would
+    /// have returned the pending one — so for `Any` the tier is only the
+    /// fallback.
     fn find_block_by_hash(
         &self,
         hash: B256,
         source: BlockSource,
     ) -> ProviderResult<Option<Self::Block>> {
-        self.inner.find_block_by_hash(hash, source)
+        if matches!(source, BlockSource::Canonical) {
+            if let Some(block) = self.assembled_block(hash.into())? {
+                return Ok(Some(block));
+            }
+            return self.inner.find_block_by_hash(hash, source);
+        }
+        match self.inner.find_block_by_hash(hash, source)? {
+            Some(block) => Ok(Some(block)),
+            None if source.is_canonical() => self.assembled_block(hash.into()),
+            None => Ok(None),
+        }
     }
 
     fn find_sealed_or_recovered_block(
@@ -346,7 +364,22 @@ impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
         hash: B256,
         source: BlockSource,
     ) -> ProviderResult<Option<SealedOrRecoveredBlock<Self::Block>>> {
-        self.inner.find_sealed_or_recovered_block(hash, source)
+        let from_tier = |provider: &Self| -> ProviderResult<_> {
+            Ok(provider
+                .recovered_from_tier(hash.into())?
+                .map(|block| SealedOrRecoveredBlock::Recovered(Arc::new(block))))
+        };
+        if matches!(source, BlockSource::Canonical) {
+            if let Some(block) = from_tier(self)? {
+                return Ok(Some(block));
+            }
+            return self.inner.find_sealed_or_recovered_block(hash, source);
+        }
+        match self.inner.find_sealed_or_recovered_block(hash, source)? {
+            Some(block) => Ok(Some(block)),
+            None if source.is_canonical() => from_tier(self),
+            None => Ok(None),
+        }
     }
 
     /// Header from the `blocks` segment, body built from the `transactions`
@@ -371,12 +404,21 @@ impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
         self.inner.pending_block_and_receipts()
     }
 
+    /// From the tier, with senders taken from the transaction rows rather
+    /// than recovered from signatures.
+    ///
+    /// `transaction_kind` is ignored. It chooses whether reth recovers
+    /// transaction hashes eagerly, which is a cost its own storage pays; here
+    /// the hashes are the row names and are already known either way.
     fn recovered_block(
         &self,
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.inner.recovered_block(id, transaction_kind)
+        match self.recovered_from_tier(id)? {
+            Some(block) => Ok(Some(block)),
+            None => self.inner.recovered_block(id, transaction_kind),
+        }
     }
 
     fn sealed_block_with_senders(
@@ -384,25 +426,45 @@ impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.inner.sealed_block_with_senders(id, transaction_kind)
+        match self.recovered_from_tier(id)? {
+            Some(block) => Ok(Some(block)),
+            None => self.inner.sealed_block_with_senders(id, transaction_kind),
+        }
     }
 
+    /// Whatever the range holds, like every other range here: a gap ends the
+    /// walk rather than failing it.
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
-        self.inner.block_range(range)
+        let mut blocks = Vec::new();
+        for number in range {
+            let Some(block) = self.block(number.into())? else {
+                break;
+            };
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     fn block_with_senders_range(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
-        self.inner.block_with_senders_range(range)
+        self.recovered_block_range(range)
     }
 
     fn recovered_block_range(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
-        self.inner.recovered_block_range(range)
+        let mut blocks = Vec::new();
+        for number in range {
+            let Some(block) = self.recovered_block(number.into(), TransactionVariant::default())?
+            else {
+                break;
+            };
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
@@ -595,7 +657,18 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ArkivProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> ReceiptProviderIdExt for ArkivProvider<N> {
+    /// Resolved to a block and then read from the tier.
+    ///
+    /// Only a hash or a plain number resolves here. The tags — `latest`,
+    /// `safe`, `finalized`, `pending`, `earliest` — are forkchoice state
+    /// rather than block data, and reth is what tracks them, so those stay
+    /// with it.
     fn receipts_by_block_id(&self, block: BlockId) -> ProviderResult<Option<Vec<Self::Receipt>>> {
+        if let Some(id) = resolve_block_id(block)
+            && let Some(receipts) = self.receipts_by_block(id)?
+        {
+            return Ok(Some(receipts));
+        }
         self.inner.receipts_by_block_id(block)
     }
 }
@@ -771,6 +844,35 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
             )))
         })?;
         Ok(Some(reth_primitives_traits::Block::new(header, body)))
+    }
+
+    /// A whole block plus the senders of its transactions, both from the tier.
+    ///
+    /// The senders ride on the transaction rows, so recovering a block costs
+    /// no signature recovery — which is the reason they are stored at all.
+    fn recovered_from_tier(
+        &self,
+        id: BlockHashOrNumber,
+    ) -> ProviderResult<Option<RecoveredBlock<BlockTy<N>>>> {
+        let Some(block_hash) = self.block_hash_of(id)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.assembled_block(block_hash.into())? else {
+            return Ok(None);
+        };
+        let Some(hashes) = self.block_transaction_hashes(block_hash)? else {
+            return Ok(None);
+        };
+        let mut senders = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let (_, sender, _) = self.stored_transaction(hash)?.ok_or_else(|| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "block {block_hash} names transaction {hash}, which is not stored"
+                )))
+            })?;
+            senders.push(sender);
+        }
+        Ok(Some(RecoveredBlock::new(block, senders, block_hash)))
     }
 
     /// The transaction hashes a block contains, in order, from its `blocks`
@@ -1093,8 +1195,22 @@ impl<N: ProviderNodeTypes> BlockReaderIdExt for ArkivProvider<N>
 where
     Self: ReceiptProviderIdExt,
 {
+    // Convenience wrappers over the lookups above. Left delegating they would
+    // quietly bypass the tier -- `header_by_id(Hash)` would read reth's header
+    // even though the hash names a row we hold -- so the **hash** case is
+    // routed through this provider.
+    //
+    // Only the hash case. A number or a tag goes to reth untouched: these
+    // wrappers also resolve `pending`, and reth's answer for a height can be a
+    // block it is still building, which is not committed and so is not in the
+    // tier. Routing those here turned a pending block into a missing one and
+    // stalled the chain.
+
     fn block_by_id(&self, id: BlockId) -> ProviderResult<Option<Self::Block>> {
-        self.inner.block_by_id(id)
+        match id {
+            BlockId::Hash(hash) => self.block(hash.block_hash.into()),
+            BlockId::Number(_) => self.inner.block_by_id(id),
+        }
     }
 
     fn header_by_number_or_tag(
@@ -1115,11 +1231,33 @@ where
         &self,
         id: BlockId,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        self.inner.sealed_header_by_id(id)
+        match id {
+            // Sealed with the hash it was asked for, which is the hash the row
+            // is named by.
+            BlockId::Hash(hash) => Ok(self
+                .header(hash.block_hash)?
+                .map(|header| SealedHeader::new(header, hash.block_hash))),
+            BlockId::Number(_) => self.inner.sealed_header_by_id(id),
+        }
     }
 
     fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Self::Header>> {
-        self.inner.header_by_id(id)
+        match id {
+            BlockId::Hash(hash) => self.header(hash.block_hash),
+            BlockId::Number(_) => self.inner.header_by_id(id),
+        }
+    }
+}
+
+/// A [`BlockId`] as a hash or a height, or `None` for a tag that only the
+/// canonical-chain tracker can resolve.
+const fn resolve_block_id(id: BlockId) -> Option<BlockHashOrNumber> {
+    match id {
+        BlockId::Hash(hash) => Some(BlockHashOrNumber::Hash(hash.block_hash)),
+        BlockId::Number(BlockNumberOrTag::Number(number)) => {
+            Some(BlockHashOrNumber::Number(number))
+        }
+        BlockId::Number(_) => None,
     }
 }
 
