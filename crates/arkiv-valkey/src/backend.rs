@@ -1344,9 +1344,6 @@ impl Backend {
         if commit.0 > self.head().await? {
             return Ok(None);
         }
-        if commit.0 > self.head().await? {
-            return Err(StoreError::NotFound);
-        }
         let raw: Option<Vec<u8>> = self
             .client
             .get(self.namespace.commit_tag(commit.0))

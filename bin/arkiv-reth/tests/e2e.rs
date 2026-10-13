@@ -1607,35 +1607,24 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
 ///   Below it reth has written nothing to its own database, so a restart
 ///   loses the block entirely and there is nothing to read either way.
 ///
-/// # This test does not pass yet
-///
-/// It fails in the restart, before it reaches any of its assertions, and the
-/// reason is not the tier: reth's staged sync re-verifies the MPT state root
-/// on startup and compares it against the header, which since #157 carries
-/// GolemDB's root instead. The node refuses to start with `mismatched block
-/// state root`. So a node cannot currently restart once it has persisted
-/// blocks, which is also the only situation in which these reads are reached.
-///
-/// It is committed as the repro for that, and as the test that will prove the
-/// tier serves these reads once the restart works.
-///
 /// Ignored by default because it needs a server, like the store's own
 /// conformance tests:
 ///
 /// ```sh
-/// ARKIV_STORE_URL=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=tierread \
-///   cargo nextest run -p arkiv-reth -- --ignored tier
+/// VALKEY_URL=redis://127.0.0.1:6379 \
+///   cargo nextest run -p arkiv-reth --run-ignored only -- tier
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set ARKIV_STORE_URL and run with --ignored"]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
 async fn a_transaction_and_receipt_are_read_from_the_tier() {
-    std::env::var("ARKIV_STORE_URL").expect(
+    let url = std::env::var("VALKEY_URL").expect(
         "this test needs the node on a store that survives a restart: \
-         set ARKIV_STORE_URL (for example redis://127.0.0.1:6379)",
+         set VALKEY_URL (for example redis://127.0.0.1:6379)",
     );
 
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .block_time("50ms")
+        .valkey_store(url)
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let client = connect(&node.http_url(), signer);
@@ -1679,7 +1668,11 @@ async fn a_transaction_and_receipt_are_read_from_the_tier() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    node.kill();
+    // A shutdown, not a crash: an abrupt kill past the persistence threshold
+    // leaves a partial state trie that a node with no trie cannot recover, and
+    // the node would never come back up to answer the reads below. See
+    // `recovery::a_crash_past_the_persistence_threshold_cannot_restart`.
+    node.terminate();
     node.restart();
     node.wait_ready(&client, READY).await;
     let provider = client.provider();
