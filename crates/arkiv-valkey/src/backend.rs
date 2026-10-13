@@ -1309,6 +1309,18 @@ impl Backend {
         fixed_32(raw)
     }
 
+    /// Resolve a tag, but never to a commit the head does not yet cover.
+    ///
+    /// A commit writes its data first and advances the head last, so that a
+    /// crash cannot leave the head pointing at records that were never
+    /// written. That ordering means the tag is briefly readable while the head
+    /// is still behind it, and a caller that resolved the tag in that window
+    /// would then be refused by every commit-targeted read -- which surfaced
+    /// as `NotFound` from a perfectly healthy store, and stopped a node from
+    /// building blocks.
+    ///
+    /// So visibility is decided here rather than by write ordering: a commit
+    /// exists, for readers, once the head says it does.
     pub(crate) async fn commit_by_tag(
         &self,
         tag: [u8; 32],
@@ -1318,10 +1330,20 @@ impl Backend {
             .get(self.namespace.tag_index(tag))
             .await
             .map_err(internal)?;
-        Ok(found.map(CommitId))
+        let Some(commit) = found else { return Ok(None) };
+        if commit > self.head().await? {
+            return Ok(None);
+        }
+        Ok(Some(CommitId(commit)))
     }
 
+    /// The tag a commit carries, or `None` for a commit the head does not yet
+    /// cover — the same visibility rule as
+    /// [`commit_by_tag`](Self::commit_by_tag).
     pub(crate) async fn tag_of(&self, commit: CommitId) -> Result<Option<[u8; 32]>, StoreError> {
+        if commit.0 > self.head().await? {
+            return Ok(None);
+        }
         if commit.0 > self.head().await? {
             return Err(StoreError::NotFound);
         }
