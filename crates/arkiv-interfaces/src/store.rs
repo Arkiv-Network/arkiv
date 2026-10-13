@@ -546,6 +546,34 @@ pub struct BranchInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Segments: the append-only tier
+// ---------------------------------------------------------------------------
+
+/// A row's position in its segment. Dense per segment, assigned on append.
+///
+/// Provisional until the branch commits: a discarded branch's ordinals are
+/// never handed out again, but nothing else can claim them in the meantime
+/// either, because the lineage never forks (see [`StoreError::Conflict`]).
+pub type SegmentOrdinal = u64;
+/// One row: an opaque byte array per column. The store never looks inside.
+pub type SegmentRow = Vec<Vec<u8>>;
+
+/// A row's optional name, unique within its segment.
+///
+/// This is what makes the append-only tier usable without an index of our own:
+/// a transaction hash *is* its row's name, so `transaction_by_hash` is a direct
+/// read rather than a lookup through a table Arkiv would have to maintain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SegmentKey(pub [u8; 32]);
+
+/// How to address a row: by position, or by name if it was given one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentAddress {
+    Ordinal(SegmentOrdinal),
+    Key(SegmentKey),
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -556,6 +584,17 @@ pub struct BranchInfo {
 pub enum StoreError {
     NotFound,
     AlreadyExists,
+    /// A segment append on a branch that has not been sealed.
+    ///
+    /// Appends are only allowed after [`Store::seal`], which is what keeps the
+    /// append-only tier structurally outside the state root: by the time a row
+    /// can be written, the roots are already computed and cannot move.
+    NotSealed,
+    /// The implementation does not provide this operation.
+    ///
+    /// Segment storage is specified upstream but unimplemented there today, so
+    /// a store may honestly answer "not me" rather than pretend.
+    NotImplemented,
     /// The `key` argument disagreed with the branch lineage's key-assignment
     /// mode.
     KeyModeMismatch,
@@ -753,6 +792,110 @@ pub trait Store: core::fmt::Debug {
     /// root — that is [`SealedCommit::state_root`], which only a
     /// [`seal`](Self::seal) produces.
     fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError>;
+
+    // -- segments: the append-only tier ------------------------------------
+
+    /// Append a row to `segment` on a **sealed** branch.
+    ///
+    /// Returns the row's [`SegmentOrdinal`], provisional until the branch
+    /// commits. The row and its key become visible together, at commit.
+    ///
+    /// # Why this tier exists
+    ///
+    /// Blocks, transactions and receipts are written once, read by name, and
+    /// never updated. Keeping them as records would hash every one of them
+    /// into the state root for no benefit — the block hash already commits to
+    /// them. This tier is deliberately outside the root, which is why appends
+    /// are only legal *after* [`seal`](Self::seal): the roots are fixed by
+    /// then, so a row provably cannot move one.
+    ///
+    /// `key`, if given, must be unique within the segment; a duplicate is
+    /// [`StoreError::AlreadyExists`] and never overwrites a row.
+    ///
+    /// Default: [`StoreError::NotImplemented`].
+    fn segment_append(
+        &self,
+        _branch: BranchId,
+        _segment: &str,
+        _key: Option<SegmentKey>,
+        _row: SegmentRow,
+    ) -> Result<SegmentOrdinal, StoreError> {
+        Err(StoreError::NotImplemented)
+    }
+
+    /// Append many rows under one call, in the order given.
+    ///
+    /// Returns their ordinals, in that same order.
+    ///
+    /// # A refusal may leave earlier rows staged
+    ///
+    /// This is deliberately *not* atomic. Staged rows only become visible at
+    /// commit, so a caller that cannot finish its batch must not commit — and
+    /// discarding the branch removes every staged row with it. That is already
+    /// what a caller does with a block it cannot complete, so demanding
+    /// atomicity here would buy nothing and cost every implementation a
+    /// rollback path.
+    ///
+    /// An implementation is free to be atomic anyway; nothing may rely on it.
+    ///
+    /// # Why this is not just a convenience
+    ///
+    /// A block is one row per transaction and one per receipt, so hundreds of
+    /// appends arrive together. Per-row calls are tolerable in-process and
+    /// fatal across a process boundary, which is the same reason
+    /// [`StoreExt::apply`] exists — a node whose adoption takes hundreds of
+    /// round trips falls behind the chain it is adopting.
+    ///
+    /// The default is one [`segment_append`](Self::segment_append) each, which
+    /// is correct and is all an in-process store needs. An out-of-process
+    /// store should override it.
+    fn segment_append_many(
+        &self,
+        branch: BranchId,
+        writes: &[(&str, Option<SegmentKey>, SegmentRow)],
+    ) -> Result<Vec<SegmentOrdinal>, StoreError> {
+        writes
+            .iter()
+            .map(|(segment, key, row)| self.segment_append(branch, segment, *key, row.clone()))
+            .collect()
+    }
+
+    /// Read a committed row by position or by name. `None` if no such row.
+    ///
+    /// Default: [`StoreError::NotImplemented`].
+    fn segment_get(
+        &self,
+        _segment: &str,
+        _address: SegmentAddress,
+    ) -> Result<Option<SegmentRow>, StoreError> {
+        Err(StoreError::NotImplemented)
+    }
+
+    /// The half-open ordinal range `commit` appended to `segment`.
+    ///
+    /// Empty when that commit appended nothing. This is what groups rows by
+    /// the block that wrote them — "the receipts of block N" needs no index.
+    ///
+    /// Default: [`StoreError::NotImplemented`].
+    fn segment_range_of(
+        &self,
+        _segment: &str,
+        _commit: CommitId,
+    ) -> Result<core::ops::Range<SegmentOrdinal>, StoreError> {
+        Err(StoreError::NotImplemented)
+    }
+
+    /// That commit's rows, in append order. The rows of
+    /// [`segment_range_of`](Self::segment_range_of), fetched.
+    ///
+    /// Default: [`StoreError::NotImplemented`].
+    fn segment_rows_of(
+        &self,
+        _segment: &str,
+        _commit: CommitId,
+    ) -> Result<Vec<SegmentRow>, StoreError> {
+        Err(StoreError::NotImplemented)
+    }
 }
 
 /// Host-facing additions this seam needs and `golem-db-api.md` does not yet
@@ -926,6 +1069,51 @@ impl<T: Store + ?Sized> Store for alloc::sync::Arc<T> {
 
     fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
         (**self).branch_hash(branch)
+    }
+
+    // Forwarded explicitly, like everything else here: these four have
+    // defaults, so an `Arc` that did not forward would answer
+    // `NotImplemented` for a store that implements them.
+    fn segment_append(
+        &self,
+        branch: BranchId,
+        segment: &str,
+        key: Option<SegmentKey>,
+        row: SegmentRow,
+    ) -> Result<SegmentOrdinal, StoreError> {
+        (**self).segment_append(branch, segment, key, row)
+    }
+
+    fn segment_append_many(
+        &self,
+        branch: BranchId,
+        writes: &[(&str, Option<SegmentKey>, SegmentRow)],
+    ) -> Result<Vec<SegmentOrdinal>, StoreError> {
+        (**self).segment_append_many(branch, writes)
+    }
+
+    fn segment_get(
+        &self,
+        segment: &str,
+        address: SegmentAddress,
+    ) -> Result<Option<SegmentRow>, StoreError> {
+        (**self).segment_get(segment, address)
+    }
+
+    fn segment_range_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<core::ops::Range<SegmentOrdinal>, StoreError> {
+        (**self).segment_range_of(segment, commit)
+    }
+
+    fn segment_rows_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Vec<SegmentRow>, StoreError> {
+        (**self).segment_rows_of(segment, commit)
     }
 }
 

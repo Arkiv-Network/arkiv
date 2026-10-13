@@ -29,9 +29,12 @@ use std::sync::Mutex;
 use super::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Origin, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange,
-    RecordKey, RecordVersion, ScheduleVersion, SealedCommit, Sort, SortDirection, Store,
-    StoreError, StoreExt, WriteOp, WriteOutcome, validate_cell_name,
+    RecordKey, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey,
+    SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp,
+    WriteOutcome, validate_cell_name,
 };
+use alloc::string::{String, ToString};
+use core::ops::Range;
 
 /// One record's stored form: its cells, plus the `#version` meta entry the
 /// spec keeps alongside them. Presence of this struct *is* record existence.
@@ -72,6 +75,18 @@ struct Snapshot {
     /// hash.
     tag: Option<[u8; 32]>,
     changes: Vec<RecordChange>,
+    /// What this commit appended to each segment, as a half-open ordinal
+    /// range. Absent means it appended nothing to that segment.
+    segments: BTreeMap<String, Range<SegmentOrdinal>>,
+}
+
+/// One append-only segment: the rows, plus the names bound to them.
+#[derive(Debug, Clone, Default)]
+struct SegmentData {
+    /// Indexed by [`SegmentOrdinal`], so ordinals are positions and the
+    /// sequence is dense.
+    rows: Vec<SegmentRow>,
+    by_key: BTreeMap<SegmentKey, SegmentOrdinal>,
 }
 
 /// One open branch.
@@ -93,6 +108,10 @@ struct BranchState {
     frames: Vec<BTreeMap<RecordKey, RecordData>>,
     /// Set by `seal`. A sealed branch reads but refuses writes.
     sealed: Option<SealedCommit>,
+    /// Rows appended on this branch, per segment, in append order, waiting for
+    /// the commit that makes them visible. A discarded branch takes them with
+    /// it — which is why nothing here touches [`Inner::segments`] until then.
+    staged_segments: BTreeMap<String, Vec<(Option<SegmentKey>, SegmentRow)>>,
 }
 
 /// An in-memory [`Store`]. See the crate docs for what it is and is not.
@@ -118,6 +137,8 @@ struct Inner {
     branches: BTreeMap<u64, BranchState>,
     /// Monotonic, never rewound — handles are never reused.
     next_branch: u64,
+    /// Committed segment rows, by segment name. Created on first append.
+    segments: BTreeMap<String, SegmentData>,
 }
 
 impl Default for MemStore {
@@ -142,9 +163,11 @@ impl Inner {
                 state: genesis,
                 tag: None,
                 changes: Vec::new(),
+                segments: BTreeMap::new(),
             }],
             branches: BTreeMap::new(),
             next_branch: 0,
+            segments: BTreeMap::new(),
         }
     }
 
@@ -245,6 +268,7 @@ impl Inner {
                 frames: alloc::vec![state.clone()],
                 state,
                 sealed: None,
+                staged_segments: BTreeMap::new(),
             },
         );
         Ok(branch)
@@ -330,13 +354,154 @@ impl Inner {
             .map_or_else(|| content_digest(&root_state.state), |s| s.state_root);
 
         self.branches.remove(&root.0);
+        // Staged rows land now, and only now: the ordinals handed out by
+        // `segment_append` become real here, and the key bindings with them.
+        let segments = self.flush_segments(root_state.staged_segments);
         self.commits.push(Snapshot {
             state: root_state.state,
             hash,
             tag: None,
             changes,
+            segments,
         });
         Ok(self.head())
+    }
+
+    /// Move a committing branch's staged rows into the committed segments,
+    /// returning the ordinal range each segment grew by.
+    fn flush_segments(
+        &mut self,
+        staged: BTreeMap<String, Vec<(Option<SegmentKey>, SegmentRow)>>,
+    ) -> BTreeMap<String, Range<SegmentOrdinal>> {
+        let mut ranges = BTreeMap::new();
+        for (name, rows) in staged {
+            let segment = self.segments.entry(name.clone()).or_default();
+            let start = segment.rows.len() as SegmentOrdinal;
+            for (key, row) in rows {
+                let ordinal = segment.rows.len() as SegmentOrdinal;
+                segment.rows.push(row);
+                if let Some(key) = key {
+                    segment.by_key.insert(key, ordinal);
+                }
+            }
+            let end = segment.rows.len() as SegmentOrdinal;
+            ranges.insert(name, start..end);
+        }
+        ranges
+    }
+
+    fn segment_append(
+        &mut self,
+        branch: BranchId,
+        segment: &str,
+        key: Option<SegmentKey>,
+        row: SegmentRow,
+    ) -> Result<SegmentOrdinal, StoreError> {
+        // Sealed only: the roots are fixed by now, so an appended row provably
+        // cannot move one. This is the whole reason the tier is cheap.
+        if self.branch_state(branch)?.sealed.is_none() {
+            return Err(StoreError::NotSealed);
+        }
+        if let Some(key) = key
+            && self.key_taken(branch, segment, key)?
+        {
+            return Err(StoreError::AlreadyExists);
+        }
+
+        // The ordinal a commit would give this row: what is committed already,
+        // plus what this branch has staged ahead of it. Exact rather than
+        // provisional in practice, because a branch whose origin was overtaken
+        // cannot commit at all (`StoreError::Conflict`).
+        let committed = self
+            .segments
+            .get(segment)
+            .map_or(0, |data| data.rows.len() as SegmentOrdinal);
+        let staged = self
+            .branch_state(branch)?
+            .staged_segments
+            .get(segment)
+            .map_or(0, |rows| rows.len() as SegmentOrdinal);
+
+        self.branch_state_mut(branch)?
+            .staged_segments
+            .entry(segment.to_string())
+            .or_default()
+            .push((key, row));
+        Ok(committed + staged)
+    }
+
+    /// Whether `key` is already bound in `segment`, committed or staged on this
+    /// branch. Another branch's staged key is not a conflict: it may never
+    /// commit, and only one branch can.
+    fn key_taken(
+        &self,
+        branch: BranchId,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<bool, StoreError> {
+        if self
+            .segments
+            .get(segment)
+            .is_some_and(|data| data.by_key.contains_key(&key))
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .branch_state(branch)?
+            .staged_segments
+            .get(segment)
+            .is_some_and(|rows| rows.iter().any(|(staged, _)| *staged == Some(key))))
+    }
+
+    fn segment_get(
+        &self,
+        segment: &str,
+        address: SegmentAddress,
+    ) -> Result<Option<SegmentRow>, StoreError> {
+        let Some(data) = self.segments.get(segment) else {
+            return Ok(None);
+        };
+        let ordinal = match address {
+            SegmentAddress::Ordinal(ordinal) => ordinal,
+            SegmentAddress::Key(key) => match data.by_key.get(&key) {
+                Some(ordinal) => *ordinal,
+                None => return Ok(None),
+            },
+        };
+        Ok(usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| data.rows.get(ordinal))
+            .cloned())
+    }
+
+    fn segment_range_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Range<SegmentOrdinal>, StoreError> {
+        // Validates the commit the same way every other commit-targeted read
+        // does, so an out-of-retention ask is an error and not an empty range.
+        let snapshot = self.commit_snapshot(commit)?;
+        Ok(snapshot.segments.get(segment).cloned().unwrap_or(0..0))
+    }
+
+    fn segment_rows_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Vec<SegmentRow>, StoreError> {
+        let range = self.segment_range_of(segment, commit)?;
+        let Some(data) = self.segments.get(segment) else {
+            return Ok(Vec::new());
+        };
+        Ok(range
+            .filter_map(|ordinal| {
+                usize::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| data.rows.get(ordinal))
+                    .cloned()
+            })
+            .collect())
     }
 
     fn branch_info(&self, branch: BranchId) -> Result<BranchInfo, StoreError> {
@@ -747,6 +912,52 @@ impl Store for MemStore {
             .expect("the reference store's lock is never poisoned")
             .branch_hash(branch)
     }
+
+    fn segment_append(
+        &self,
+        branch: BranchId,
+        segment: &str,
+        key: Option<SegmentKey>,
+        row: SegmentRow,
+    ) -> Result<SegmentOrdinal, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .segment_append(branch, segment, key, row)
+    }
+
+    fn segment_get(
+        &self,
+        segment: &str,
+        address: SegmentAddress,
+    ) -> Result<Option<SegmentRow>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .segment_get(segment, address)
+    }
+
+    fn segment_range_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Range<SegmentOrdinal>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .segment_range_of(segment, commit)
+    }
+
+    fn segment_rows_of(
+        &self,
+        segment: &str,
+        commit: CommitId,
+    ) -> Result<Vec<SegmentRow>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .segment_rows_of(segment, commit)
+    }
 }
 
 impl StoreExt for MemStore {
@@ -996,6 +1207,11 @@ mod tests {
     #[test]
     fn store_ext_conformance() {
         crate::store::conformance::run_all_ext(&MemStore::new);
+    }
+
+    #[test]
+    fn segment_conformance() {
+        crate::store::conformance::run_all_segments(&MemStore::new);
     }
 
     /// A 20-byte address survives the trip into the 32-byte key space, and an
