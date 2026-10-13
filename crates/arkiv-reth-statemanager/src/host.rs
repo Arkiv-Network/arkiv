@@ -41,6 +41,7 @@ use crate::WriteOverlay;
 use std::sync::Arc;
 
 use crate::accounts::{BalanceAccess, NonceAccess};
+use crate::segments::SegmentWrite;
 
 /// The erased store handle the host carries. `StoreExt` is object-safe, a trait
 /// object implements its supertrait `Store`, and `Arc<T: Store>` is a `Store` —
@@ -599,11 +600,23 @@ impl BlockSeals {
     /// ponytail: last-at-height, which is ordering and not identity. Naming
     /// the right seal outright needs the header to carry the Arkiv state root,
     /// which is what installing a `StateRootStrategy` buys.
+    /// # The block's own rows
+    ///
+    /// `writes` are the header, transactions and receipts of the block going
+    /// canonical, appended to the winning branch before it commits. That is
+    /// the only point at which they can be: appends need a **sealed** branch,
+    /// and they must land in the same commit as the state they describe, or a
+    /// reader could see a block whose state has not arrived.
+    ///
+    /// Appending to the loser branches would be wasted work, so only the
+    /// winner's rows are written. Nothing is written at all if no candidate
+    /// sealed at this height.
     pub fn adopt(
         &self,
         store: &HostStore,
         height: u64,
         block_hash: [u8; 32],
+        writes: &[SegmentWrite],
     ) -> Result<Option<CommitId>, ViewError> {
         let stale: BTreeMap<u64, Vec<(BranchId, SealedCommit)>> = {
             let mut pending = self
@@ -635,9 +648,27 @@ impl BlockSeals {
         }
         self.forget_executions_through(height);
         match winner {
-            // Tagged with the block hash, which is how a historical read finds
-            // the commit for a past block.
-            Some((branch, _)) => Ok(Some(store.commit_tagged(branch, block_hash)?)),
+            Some((branch, _)) => {
+                // One call, not one per row. A block is a row per transaction
+                // and a row per receipt, and against an out-of-process store
+                // doing those individually takes long enough that the chain
+                // moves on without us -- the payload builder asks for this
+                // block's commit before it exists and cannot build on it.
+                let batch: Vec<_> = writes
+                    .iter()
+                    .map(|write| (write.segment, write.key, write.row.clone()))
+                    .collect();
+                if let Err(error) = store.segment_append_many(branch, &batch) {
+                    // The branch must not survive a half-written block: its
+                    // staged rows would otherwise sit there until something
+                    // else committed it. Discarding takes them with it.
+                    let _ = store.discard(branch);
+                    return Err(error.into());
+                }
+                // Tagged with the block hash, which is how a historical read
+                // finds the commit for a past block.
+                Ok(Some(store.commit_tagged(branch, block_hash)?))
+            }
             None => Ok(None),
         }
     }
@@ -788,5 +819,140 @@ mod tests {
         EntityStore::commit_store(&mut view).expect("entities");
 
         assert_ne!(view.golem().digest().expect("digest"), [0u8; 32]);
+    }
+
+    // ── the append-only tier, written at adoption ──────────────────────────
+
+    /// A store with genesis committed, and the seal registry over it.
+    fn adoptable() -> (HostStore, BlockSeals) {
+        let store: HostStore = Arc::new(MemStore::new());
+        store
+            .commit_tagged(store.begin(None).expect("begin"), [0u8; 32])
+            .expect("tag genesis");
+        (store, BlockSeals::default())
+    }
+
+    fn a_row(segment: &'static str, name: u8, body: &[u8]) -> SegmentWrite {
+        SegmentWrite {
+            segment,
+            key: Some(arkiv_interfaces::store::SegmentKey([name; 32])),
+            row: alloc_row(body),
+        }
+    }
+
+    fn alloc_row(body: &[u8]) -> arkiv_interfaces::store::SegmentRow {
+        vec![body.to_vec()]
+    }
+
+    /// The adopted block's rows land in the same commit as its state, and are
+    /// addressable by the names they were given.
+    #[test]
+    fn an_adopted_blocks_rows_land_with_its_state() {
+        use arkiv_interfaces::store::SegmentAddress;
+
+        let (store, seals) = adoptable();
+        let branch = store.begin(Some(store.head())).expect("begin");
+        seals
+            .seal(&store, ExecutionKey::new(1, vec![]), branch)
+            .expect("seal");
+
+        let writes = vec![
+            a_row(crate::segments::BLOCKS, 0xb1, b"header"),
+            a_row(crate::segments::TRANSACTIONS, 0x7a, b"tx"),
+            a_row(crate::segments::RECEIPTS, 0x7a, b"receipt"),
+        ];
+        let commit = seals
+            .adopt(&store, 1, [0xb1; 32], &writes)
+            .expect("adopt")
+            .expect("a candidate was sealed at this height");
+
+        assert_eq!(
+            store
+                .segment_get(
+                    crate::segments::BLOCKS,
+                    SegmentAddress::Key(arkiv_interfaces::store::SegmentKey([0xb1; 32]))
+                )
+                .expect("read"),
+            Some(alloc_row(b"header")),
+            "the header is reachable by the block hash",
+        );
+        assert_eq!(
+            store
+                .segment_range_of(crate::segments::RECEIPTS, commit)
+                .expect("range"),
+            0..1,
+            "and the commit knows which receipts it appended",
+        );
+    }
+
+    /// A height with no sealed candidate writes nothing at all — rows must not
+    /// outlive the state they describe.
+    #[test]
+    fn rows_are_not_written_when_no_candidate_sealed() {
+        let (store, seals) = adoptable();
+        let before = store.head();
+
+        let adopted = seals
+            .adopt(
+                &store,
+                1,
+                [0xb1; 32],
+                &[a_row(crate::segments::BLOCKS, 0xb1, b"header")],
+            )
+            .expect("adopt");
+
+        assert_eq!(adopted, None);
+        assert_eq!(store.head(), before, "nothing was committed");
+        assert_eq!(
+            store
+                .segment_get(
+                    crate::segments::BLOCKS,
+                    arkiv_interfaces::store::SegmentAddress::Ordinal(0)
+                )
+                .expect("read"),
+            None,
+            "and nothing was appended",
+        );
+    }
+
+    /// A losing candidate's rows go with it. Only the winner's are written, so
+    /// a discarded branch cannot leave a block behind.
+    #[test]
+    fn only_the_winning_candidates_rows_are_written() {
+        use arkiv_interfaces::store::SegmentAddress;
+
+        let (store, seals) = adoptable();
+        for _ in 0..2 {
+            let branch = store.begin(Some(store.head())).expect("begin");
+            seals
+                .seal(&store, ExecutionKey::new(1, vec![]), branch)
+                .expect("seal");
+        }
+
+        let commit = seals
+            .adopt(
+                &store,
+                1,
+                [0xb1; 32],
+                &[a_row(crate::segments::BLOCKS, 0xb1, b"header")],
+            )
+            .expect("adopt")
+            .expect("adopted");
+
+        assert_eq!(
+            store
+                .segment_rows_of(crate::segments::BLOCKS, commit)
+                .expect("rows")
+                .len(),
+            1,
+            "one header, not one per candidate",
+        );
+        assert_eq!(
+            store
+                .segment_get(crate::segments::BLOCKS, SegmentAddress::Ordinal(1))
+                .expect("read"),
+            None,
+            "the loser appended nothing",
+        );
     }
 }

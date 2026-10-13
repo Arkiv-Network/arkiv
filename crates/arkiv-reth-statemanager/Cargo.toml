@@ -20,6 +20,11 @@ arkiv-golemdb-state.workspace = true
 arkiv-reth-uncommitted-store.workspace = true
 
 alloy-primitives.workspace = true
+# The append-only tier stores consensus encodings: RLP headers, EIP-2718
+# transactions and receipts.
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
 # WriteOverlay reads through revm's Database and stages an EvmState diff.
 reth-ethereum = { workspace = true, features = ["evm"] }
 eyre.workspace = true

@@ -21,6 +21,7 @@ pub mod genesis;
 pub mod host;
 pub mod overlay;
 pub mod provider;
+pub mod segments;
 
 pub use accounts::{BalanceAccess, NonceAccess};
 pub use genesis::{GenesisAccount, seed_genesis};
@@ -29,3 +30,4 @@ pub use host::{
 };
 pub use overlay::WriteOverlay;
 pub use provider::{AccountReadError, GolemAccounts, StoredAccount};
+pub use segments::{BLOCKS, RECEIPTS, SegmentWrite, TRANSACTIONS};
