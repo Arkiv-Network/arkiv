@@ -1590,3 +1590,121 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
         "the beneficiary receives the tip; the base fee is burned",
     );
 }
+
+/// A transaction and its receipt read back by hash from the append-only tier,
+/// with every other source of the answer removed.
+///
+/// Getting a read to actually reach the tier takes three things, and leaving
+/// out any one of them makes the test prove nothing:
+///
+/// * **A restart.** `eth_getTransactionByHash` consults reth's in-memory RPC
+///   cache first and only calls the provider on a miss, so a freshly mined
+///   transaction is always a cache hit.
+/// * **A store that outlives the process.** The default in-process store does
+///   not, so after a restart the tier would be empty and the provider would
+///   fall back to reth. Hence Valkey.
+/// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50.
+///   Below it reth has written nothing to its own database, so a restart
+///   loses the block entirely and there is nothing to read either way.
+///
+/// # This test does not pass yet
+///
+/// It fails in the restart, before it reaches any of its assertions, and the
+/// reason is not the tier: reth's staged sync re-verifies the MPT state root
+/// on startup and compares it against the header, which since #157 carries
+/// GolemDB's root instead. The node refuses to start with `mismatched block
+/// state root`. So a node cannot currently restart once it has persisted
+/// blocks, which is also the only situation in which these reads are reached.
+///
+/// It is committed as the repro for that, and as the test that will prove the
+/// tier serves these reads once the restart works.
+///
+/// Ignored by default because it needs a server, like the store's own
+/// conformance tests:
+///
+/// ```sh
+/// ARKIV_STORE_URL=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=tierread \
+///   cargo nextest run -p arkiv-reth -- --ignored tier
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a valkey server; set ARKIV_STORE_URL and run with --ignored"]
+async fn a_transaction_and_receipt_are_read_from_the_tier() {
+    std::env::var("ARKIV_STORE_URL").expect(
+        "this test needs the node on a store that survives a restart: \
+         set ARKIV_STORE_URL (for example redis://127.0.0.1:6379)",
+    );
+
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .block_time("50ms")
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+    let sent = registry
+        .execute(vec![create_op(
+            1000,
+            Bytes::from_static(b"tier read"),
+            vec![],
+        )])
+        .send()
+        .await
+        .expect("send");
+    let tx_hash = *sent.tx_hash();
+    let receipt = sent.get_receipt().await.expect("receipt");
+    assert!(receipt.status(), "the transaction must have succeeded");
+    let block_number = receipt.block_number.expect("a mined receipt has a block");
+    let block_hash = receipt
+        .block_hash
+        .expect("a mined receipt has a block hash");
+
+    // Past the persistence threshold, so reth has the block on disk and the
+    // restart below does not simply lose it.
+    let target = block_number + 60;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let tip = client
+            .provider()
+            .get_block_number()
+            .await
+            .expect("block number");
+        if tip >= target {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chain reached only {tip} of {target}; it is not producing blocks",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    node.kill();
+    node.restart();
+    node.wait_ready(&client, READY).await;
+    let provider = client.provider();
+
+    let fetched = provider
+        .get_transaction_by_hash(tx_hash)
+        .await
+        .expect("get_transaction_by_hash")
+        .expect("the transaction is found by its hash after a restart");
+    assert_eq!(
+        fetched.block_number,
+        Some(block_number),
+        "the stored row reports the block it was in",
+    );
+    assert_eq!(
+        fetched.block_hash,
+        Some(block_hash),
+        "and the block hash the receipt reported",
+    );
+
+    let fetched_receipt = provider
+        .get_transaction_receipt(tx_hash)
+        .await
+        .expect("get_transaction_receipt")
+        .expect("the receipt is found by the transaction hash after a restart");
+    assert_eq!(fetched_receipt.transaction_hash, tx_hash);
+    assert_eq!(fetched_receipt.block_number, Some(block_number));
+}

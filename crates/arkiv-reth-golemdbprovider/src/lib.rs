@@ -24,7 +24,7 @@ pub mod state_root;
 pub use state::ArkivStateProvider;
 pub use state_root::ArkivStateRootStrategy;
 
-use alloy_consensus::transaction::TransactionMeta;
+use alloy_consensus::{BlockHeader as _, transaction::TransactionMeta};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, TxHash, TxNumber};
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -38,8 +38,10 @@ use reth_chainspec::{ChainInfo, EthChainSpec};
 use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIndices};
 use reth_execution_types::{ExecutionOutcome, RecoveredBlockAndExecutionOutput};
 use reth_node_builder::EngineProviderBuilder;
-use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
-use reth_primitives_traits::{RecoveredBlock, SealedHeader, SealedOrRecoveredBlock, StorageEntry};
+use reth_node_types::{BlockTy, BodyTy, HeaderTy, ReceiptTy, TxTy};
+use reth_primitives_traits::{
+    BlockBody as _, RecoveredBlock, SealedHeader, SealedOrRecoveredBlock, StorageEntry,
+};
 use reth_provider::ProviderFactory;
 use reth_provider::providers::{
     BlockchainProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider,
@@ -347,8 +349,16 @@ impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
         self.inner.find_sealed_or_recovered_block(hash, source)
     }
 
+    /// Header from the `blocks` segment, body built from the `transactions`
+    /// one — see [`Self::assembled_block`] for how, and for what is checked.
+    ///
+    /// Falls back to reth for any block the tier cannot produce, including one
+    /// whose assembled body does not match its stored header.
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
-        self.inner.block(id)
+        match self.assembled_block(id)? {
+            Some(block) => Ok(Some(block)),
+            None => self.inner.block(id),
+        }
     }
 
     fn pending_block(&self) -> ProviderResult<Option<Arc<RecoveredBlock<Self::Block>>>> {
@@ -418,29 +428,91 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ArkivProvider<N> {
         self.inner.transaction_by_id_unhashed(id)
     }
 
+    /// From the `transactions` segment, where the row's name is the hash.
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
-        self.inner.transaction_by_hash(hash)
+        match self.stored_transaction(hash)? {
+            Some((transaction, _, _)) => Ok(Some(transaction)),
+            None => self.inner.transaction_by_hash(hash),
+        }
     }
 
+    /// The transaction plus where it sat: its block, its index in that block,
+    /// and the fee fields a receipt is read against.
+    ///
+    /// The block comes from the row itself rather than an index — that is what
+    /// the block-hash column is for — and the index from the position of this
+    /// hash in the block's own list.
     fn transaction_by_hash_with_meta(
         &self,
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
-        self.inner.transaction_by_hash_with_meta(tx_hash)
+        let Some((transaction, _, block_hash)) = self.stored_transaction(tx_hash)? else {
+            return self.inner.transaction_by_hash_with_meta(tx_hash);
+        };
+        let (Some(header), Some(hashes)) = (
+            self.stored_header(block_hash)?,
+            self.block_transaction_hashes(block_hash)?,
+        ) else {
+            // The transaction is stored but its block is not. Rather than
+            // invent a position, let reth answer.
+            return self.inner.transaction_by_hash_with_meta(tx_hash);
+        };
+        let Some(index) = hashes.iter().position(|hash| *hash == tx_hash) else {
+            return Err(ProviderError::other(std::io::Error::other(format!(
+                "transaction {tx_hash} names block {block_hash} but is not in it"
+            ))));
+        };
+        Ok(Some((
+            transaction,
+            TransactionMeta {
+                tx_hash,
+                index: index as u64,
+                block_hash,
+                block_number: header.number(),
+                base_fee: header.base_fee_per_gas(),
+                excess_blob_gas: header.excess_blob_gas(),
+                timestamp: header.timestamp(),
+            },
+        )))
     }
 
+    /// A block's transactions, read by the names its `blocks` row carries.
     fn transactions_by_block(
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        self.inner.transactions_by_block(id)
+        let Some(block_hash) = self.block_hash_of(id)? else {
+            return self.inner.transactions_by_block(id);
+        };
+        let Some(hashes) = self.block_transaction_hashes(block_hash)? else {
+            return self.inner.transactions_by_block(id);
+        };
+        let mut transactions = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            // A block that names a transaction the store does not have is a
+            // half-written block, which adoption is supposed to make
+            // impossible. Loud rather than a short list.
+            let (transaction, _, _) = self.stored_transaction(hash)?.ok_or_else(|| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "block {block_hash} names transaction {hash}, which is not stored"
+                )))
+            })?;
+            transactions.push(transaction);
+        }
+        Ok(Some(transactions))
     }
 
     fn transactions_by_block_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Vec<Self::Transaction>>> {
-        self.inner.transactions_by_block_range(range)
+        let mut blocks = Vec::new();
+        for number in heights(range, self.best_block_number()?) {
+            if let Some(transactions) = self.transactions_by_block(number.into())? {
+                blocks.push(transactions);
+            }
+        }
+        Ok(blocks)
     }
 
     fn transactions_by_tx_range(
@@ -469,15 +541,36 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ArkivProvider<N> {
         self.inner.receipt(id)
     }
 
+    /// From the `receipts` segment, where a receipt's row is named by its
+    /// transaction's hash.
     fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
-        self.inner.receipt_by_hash(hash)
+        match self.stored_receipt(hash)? {
+            Some(receipt) => Ok(Some(receipt)),
+            None => self.inner.receipt_by_hash(hash),
+        }
     }
 
+    /// A block's receipts, in transaction order, read by the same names.
     fn receipts_by_block(
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        self.inner.receipts_by_block(block)
+        let Some(block_hash) = self.block_hash_of(block)? else {
+            return self.inner.receipts_by_block(block);
+        };
+        let Some(hashes) = self.block_transaction_hashes(block_hash)? else {
+            return self.inner.receipts_by_block(block);
+        };
+        let mut receipts = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let receipt = self.stored_receipt(hash)?.ok_or_else(|| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "block {block_hash} names transaction {hash}, whose receipt is not stored"
+                )))
+            })?;
+            receipts.push(receipt);
+        }
+        Ok(Some(receipts))
     }
 
     fn receipts_by_tx_range(
@@ -491,7 +584,13 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ArkivProvider<N> {
         &self,
         block_range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<Vec<Self::Receipt>>> {
-        self.inner.receipts_by_block_range(block_range)
+        let mut blocks = Vec::new();
+        for number in block_range {
+            if let Some(receipts) = self.receipts_by_block(number.into())? {
+                blocks.push(receipts);
+            }
+        }
+        Ok(blocks)
     }
 }
 
@@ -605,6 +704,171 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
             .map_err(|e| {
                 ProviderError::other(std::io::Error::other(format!(
                     "golemdb segment_get(blocks): {e:?}"
+                )))
+            })
+    }
+
+    /// A whole block assembled from the tier, or `None` if it cannot be.
+    ///
+    /// # Building a body without pinning the block type
+    ///
+    /// `Block::new(header, body)` needs a `Block::Body`, and reth's
+    /// `BlockBody` trait has no constructor — it converts a body *into* an
+    /// Ethereum body and never the other way. But it does require RLP
+    /// `Encodable` and `Decodable`, so the body can be built concretely and
+    /// then round-tripped into the node's own type. RLP is the consensus wire
+    /// format for a body, so this is the same path a body takes arriving from
+    /// a peer; it costs one encode and one decode per block read.
+    ///
+    /// # The parts of a body the tier does not store
+    ///
+    /// A body is its transactions, its ommers and its withdrawals. Only the
+    /// transactions are stored: Arkiv is post-merge so there are no ommers,
+    /// and it has no staking so there are no withdrawals.
+    ///
+    /// That is an assumption, so it is checked rather than trusted — the
+    /// assembled body is accepted only if it hashes to the `ommers_hash`,
+    /// `transactions_root` and `withdrawals_root` the stored header already
+    /// commits to. A block that fails is served from reth instead, so a wrong
+    /// assumption costs a fallback rather than a wrong block.
+    fn assembled_block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<BlockTy<N>>> {
+        let Some(block_hash) = self.block_hash_of(id)? else {
+            return Ok(None);
+        };
+        let (Some(header), Some(transactions)) = (
+            self.stored_header(block_hash)?,
+            self.transactions_by_block(block_hash.into())?,
+        ) else {
+            return Ok(None);
+        };
+
+        // Withdrawals follow the header: a header with no withdrawals root
+        // predates them, one with a root has a list, which Arkiv keeps empty.
+        let withdrawals = header
+            .withdrawals_root()
+            .map(|_| alloy_eips::eip4895::Withdrawals::default());
+        let body = alloy_consensus::BlockBody::<TxTy<N>, HeaderTy<N>> {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals,
+        };
+
+        if body.calculate_ommers_root() != header.ommers_hash()
+            || body.calculate_tx_root() != header.transactions_root()
+            || body.calculate_withdrawals_root() != header.withdrawals_root()
+        {
+            // The stored header does not agree that this is its body, so the
+            // empty-ommers/empty-withdrawals assumption does not hold here.
+            return Ok(None);
+        }
+
+        let body: BodyTy<N> = alloy_rlp::Decodable::decode(
+            &mut alloy_rlp::encode(&body).as_slice(),
+        )
+        .map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!(
+                "assembled block body does not round-trip through RLP: {e}"
+            )))
+        })?;
+        Ok(Some(reth_primitives_traits::Block::new(header, body)))
+    }
+
+    /// The transaction hashes a block contains, in order, from its `blocks`
+    /// row. `None` if the store has no such block.
+    ///
+    /// These are what turn every block-addressed read into a set of point
+    /// reads by name: the *n*th hash names the *n*th transaction and the *n*th
+    /// receipt.
+    fn block_transaction_hashes(&self, hash: BlockHash) -> ProviderResult<Option<Vec<B256>>> {
+        let Some(row) = self.stored_block_row(hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            segments::decode_block(&row)
+                .map_err(|e| ProviderError::other(std::io::Error::other(e)))?
+                .transactions,
+        ))
+    }
+
+    /// Resolve a block id to the hash the segments are named by.
+    ///
+    /// A number goes through reth, which still owns the number-to-hash
+    /// mapping — see [`Self::stored_header`].
+    fn block_hash_of(&self, id: BlockHashOrNumber) -> ProviderResult<Option<BlockHash>> {
+        match id {
+            BlockHashOrNumber::Hash(hash) => Ok(Some(hash)),
+            BlockHashOrNumber::Number(number) => self.inner.block_hash(number),
+        }
+    }
+
+    /// One transaction by its hash, with its sender and its block.
+    ///
+    /// Decoded generically for the same reason headers are: pinning the
+    /// transaction type here would spread the pin across every impl that
+    /// `TransactionsProvider` is a supertrait of.
+    fn stored_transaction(
+        &self,
+        hash: TxHash,
+    ) -> ProviderResult<Option<(TxTy<N>, Address, BlockHash)>> {
+        let row = self
+            .store
+            .segment_get(
+                segments::TRANSACTIONS,
+                SegmentAddress::Key(SegmentKey(hash.0)),
+            )
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_get(transactions): {e:?}"
+                )))
+            })?;
+        let Some(row) = row else { return Ok(None) };
+        let [transaction, sender, block_hash] = row.as_slice() else {
+            return Err(ProviderError::other(std::io::Error::other(
+                "a transactions row has three columns",
+            )));
+        };
+        let transaction = alloy_eips::eip2718::Decodable2718::decode_2718(
+            &mut transaction.as_slice(),
+        )
+        .map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!(
+                "transactions row is not valid EIP-2718: {e}"
+            )))
+        })?;
+        let sender = Address::try_from(sender.as_slice()).map_err(|_| {
+            ProviderError::other(std::io::Error::other("sender column is not 20 bytes"))
+        })?;
+        let block_hash = <[u8; 32]>::try_from(block_hash.as_slice())
+            .map(BlockHash::from)
+            .map_err(|_| {
+                ProviderError::other(std::io::Error::other("block hash column is not 32 bytes"))
+            })?;
+        Ok(Some((transaction, sender, block_hash)))
+    }
+
+    /// One receipt by its transaction's hash, from the `receipts` segment.
+    fn stored_receipt(&self, hash: TxHash) -> ProviderResult<Option<ReceiptTy<N>>> {
+        let row = self
+            .store
+            .segment_get(segments::RECEIPTS, SegmentAddress::Key(SegmentKey(hash.0)))
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_get(receipts): {e:?}"
+                )))
+            })?;
+        let Some(row) = row else { return Ok(None) };
+        let [receipt] = row.as_slice() else {
+            return Err(ProviderError::other(std::io::Error::other(
+                "a receipts row has one column",
+            )));
+        };
+        // Decoded generically, like headers: plain RLP, which reth's receipt
+        // trait guarantees in both directions. EIP-2718 it does not.
+        alloy_rlp::Decodable::decode(&mut receipt.as_slice())
+            .map(Some)
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "receipts row is not RLP: {e}"
                 )))
             })
     }
