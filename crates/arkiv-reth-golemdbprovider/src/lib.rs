@@ -1366,6 +1366,26 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     }
 }
 
+/// Refuse a backwards-looking read, naming the method and the block asked for.
+fn no_history(method: &str, block: BlockNumber) -> ProviderError {
+    ProviderError::other(std::io::Error::other(format!(
+        "arkiv has no state history: {method} asked for block {block}. Changesets record what \
+         state held before a block, and GolemDB cannot read at a past commit, so a live node \
+         cannot answer (see #145). The past is reachable by rewinding a copy, which is one-way \
+         and therefore an archive node's job, not a serving node's."
+    )))
+}
+
+/// The same refusal for a range, which has no single block to name.
+fn no_history_range(method: &str, range: &impl RangeBounds<BlockNumber>) -> ProviderError {
+    let first = match range.start_bound() {
+        core::ops::Bound::Included(first) => *first,
+        core::ops::Bound::Excluded(before) => before.saturating_add(1),
+        core::ops::Bound::Unbounded => 0,
+    };
+    no_history(method, first)
+}
+
 /// Refuse a commit that is not the store's head — see [`ArkivProvider::commit_of`].
 ///
 /// A free function rather than a method so it can be tested without standing up
@@ -1566,53 +1586,73 @@ impl<N: ProviderNodeTypes> PersistedBlockSubscriptions for ArkivProvider<N> {
     }
 }
 
+/// Changesets are a history mechanism, and a live Arkiv node has no history.
+///
+/// A changeset records what an account or slot held *before* a block, so that
+/// state can be walked backwards. That is the one thing GolemDB does not
+/// offer: it serves its current head, reading at a past commit is not
+/// supported and not planned, and the only route to an earlier state is
+/// rewinding a copy, which is one-way and so impossible on a node serving
+/// traffic (#145).
+///
+/// reth's own changesets still exist today and would answer. They stop
+/// existing when its database goes, at the end of step 6, and a read that
+/// works until then and silently returns nothing afterwards is worse than one
+/// that refuses from the start. So these refuse now, loudly, for the same
+/// reason [`head_only`] refuses a past commit: this is the failure mode where
+/// a wrong answer is indistinguishable from a right one.
+///
+/// This is what makes a live node a non-archive node, which is a decision
+/// already taken in #145 — serve the present, and stand up an archive node
+/// from a rewound copy when a customer needs the past.
 impl<N: ProviderNodeTypes> StorageChangeSetReader for ArkivProvider<N> {
     fn storage_changeset(
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<Vec<(BlockNumberAddress, StorageEntry)>> {
-        self.inner.storage_changeset(block_number)
+        Err(no_history("storage_changeset", block_number))
     }
 
     fn get_storage_before_block(
         &self,
         block_number: BlockNumber,
-        address: Address,
-        storage_key: B256,
+        _address: Address,
+        _storage_key: B256,
     ) -> ProviderResult<Option<StorageEntry>> {
-        self.inner
-            .get_storage_before_block(block_number, address, storage_key)
+        Err(no_history("get_storage_before_block", block_number))
     }
 
     fn storage_changesets_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<(BlockNumberAddress, StorageEntry)>> {
-        self.inner.storage_changesets_range(range)
+        Err(no_history_range("storage_changesets_range", &range))
     }
 }
 
+/// See [`StorageChangeSetReader`]'s impl above — the same reasoning, for
+/// accounts rather than storage slots.
 impl<N: ProviderNodeTypes> ChangeSetReader for ArkivProvider<N> {
     fn account_block_changeset(
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<Vec<AccountBeforeTx>> {
-        self.inner.account_block_changeset(block_number)
+        Err(no_history("account_block_changeset", block_number))
     }
 
     fn get_account_before_block(
         &self,
         block_number: BlockNumber,
-        address: Address,
+        _address: Address,
     ) -> ProviderResult<Option<AccountBeforeTx>> {
-        self.inner.get_account_before_block(block_number, address)
+        Err(no_history("get_account_before_block", block_number))
     }
 
     fn account_changesets_range(
         &self,
         range: impl core::ops::RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
-        self.inner.account_changesets_range(range)
+        Err(no_history_range("account_changesets_range", &range))
     }
 }
 
