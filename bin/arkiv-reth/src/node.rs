@@ -82,6 +82,34 @@ where
         ArkivEngineValidatorBuilder,
     >;
 
+    /// Arkiv maintains no Merkle trie, so the stages that build and verify one
+    /// must not run.
+    ///
+    /// Since the header carries GolemDB's state root rather than an MPT root,
+    /// `MerkleExecute` recomputes a root from reth's own tables and compares
+    /// it against a number it can never equal. The staged pipeline runs on
+    /// startup, so a node that had persisted blocks would unwind, fail the
+    /// comparison and exit:
+    ///
+    /// ```text
+    /// mismatched block state root: got 0x2b98…, expected 0xda47…
+    /// ```
+    ///
+    /// Disabling them loses nothing Arkiv had. The root in the header is
+    /// GolemDB's, computed at seal, and reth's engine still checks the block
+    /// it executes against it — what goes is a second, contradictory check
+    /// against a trie this node does not keep.
+    ///
+    /// The hashing stages that feed them are left on: they only populate
+    /// tables, so they are wasted work rather than a wrong answer, and
+    /// removing them is a separate question from making the node start.
+    fn disabled_stages() -> &'static [reth_stages_types::StageId] {
+        &[
+            reth_stages_types::StageId::MerkleExecute,
+            reth_stages_types::StageId::MerkleUnwind,
+        ]
+    }
+
     fn components_builder(&self) -> Self::ComponentsBuilder {
         EthereumNode::components()
             .executor(ArkivExecutorBuilder::new(

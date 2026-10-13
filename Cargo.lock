@@ -1556,6 +1556,7 @@ dependencies = [
  "reth-node-api",
  "reth-node-builder",
  "reth-node-ethereum",
+ "reth-stages-types",
  "reth-storage-api",
  "reth-storage-overlay",
  "serde",
