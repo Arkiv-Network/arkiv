@@ -474,6 +474,17 @@ impl Inner {
             .cloned())
     }
 
+    fn segment_ordinal_of(
+        &self,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<Option<SegmentOrdinal>, StoreError> {
+        Ok(self
+            .segments
+            .get(segment)
+            .and_then(|data| data.by_key.get(&key).copied()))
+    }
+
     fn segment_range_of(
         &self,
         segment: &str,
@@ -935,6 +946,17 @@ impl Store for MemStore {
             .lock()
             .expect("the reference store's lock is never poisoned")
             .segment_get(segment, address)
+    }
+
+    fn segment_ordinal_of(
+        &self,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<Option<SegmentOrdinal>, StoreError> {
+        self.0
+            .lock()
+            .expect("the reference store's lock is never poisoned")
+            .segment_ordinal_of(segment, key)
     }
 
     fn segment_range_of(

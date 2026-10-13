@@ -1723,4 +1723,26 @@ async fn a_transaction_and_receipt_are_read_from_the_tier() {
         by_hash.header.number, block_number,
         "and the hash resolves back to the height",
     );
+
+    // `eth_getLogs` is what reaches the transaction *number* side of the tier:
+    // it finds a log by block and index and then asks the provider for the
+    // transaction by its number to report the hash. reth's other callers of
+    // that method are staged-sync stages, which read reth's own provider
+    // rather than this one, so this request is the only path to it.
+    let logs = provider
+        .get_logs(
+            &alloy_rpc_types::Filter::new()
+                .from_block(block_number)
+                .to_block(block_number),
+        )
+        .await
+        .expect("eth_getLogs");
+    assert!(
+        !logs.is_empty(),
+        "the create emitted an EntityOperation log, so the block has logs",
+    );
+    assert!(
+        logs.iter().all(|log| log.transaction_hash == Some(tx_hash)),
+        "every log in the block belongs to the create, by the hash the number resolved to",
+    );
 }

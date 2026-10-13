@@ -125,6 +125,7 @@ pub fn run_all_segments<S: Store>(store_generator: &dyn Fn() -> S) {
     a_row_needs_no_key(store_generator);
     a_batch_append_matches_one_at_a_time(store_generator);
     a_batch_with_a_duplicate_name_is_refused(store_generator);
+    a_name_resolves_to_the_ordinal_it_was_appended_at(store_generator);
 }
 
 // ---------------------------------------------------------------------------
@@ -2250,5 +2251,49 @@ fn a_batch_with_a_duplicate_name_is_refused<S: Store>(store_generator: &dyn Fn()
         store.segment_get("blocks", SegmentAddress::Key(segment_key(1))),
         Ok(None),
         "and the name it claimed is free again",
+    );
+}
+
+/// A name resolves to the ordinal its row was appended at, and the two
+/// addresses then reach the same row.
+///
+/// This is what lets a host keep a dense numbering of its own over named rows:
+/// reth identifies a transaction by a `TxNumber`, which is the ordinal, while
+/// the chain identifies it by hash, which is the name. If the two disagreed,
+/// a transaction looked up by number would be a different transaction.
+fn a_name_resolves_to_the_ordinal_it_was_appended_at<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = sealed_branch(&store);
+    let first = segment_key(1);
+    let second = segment_key(2);
+    let first_ordinal = store
+        .segment_append(branch, "transactions", Some(first), row(b"one"))
+        .unwrap();
+    // An unnamed row in between, so the ordinals cannot be read off the names.
+    store
+        .segment_append(branch, "transactions", None, row(b"unnamed"))
+        .unwrap();
+    let second_ordinal = store
+        .segment_append(branch, "transactions", Some(second), row(b"two"))
+        .unwrap();
+    store.commit(branch).unwrap();
+
+    assert_eq!(
+        store.segment_ordinal_of("transactions", first),
+        Ok(Some(first_ordinal)),
+    );
+    assert_eq!(
+        store.segment_ordinal_of("transactions", second),
+        Ok(Some(second_ordinal)),
+    );
+    assert_eq!(
+        store.segment_ordinal_of("transactions", segment_key(9)),
+        Ok(None),
+        "an unbound name is absent, not an error",
+    );
+    // The point of the two addresses: both reach the row.
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Ordinal(second_ordinal)),
+        store.segment_get("transactions", SegmentAddress::Key(second)),
     );
 }

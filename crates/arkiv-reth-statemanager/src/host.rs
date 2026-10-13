@@ -955,4 +955,111 @@ mod tests {
             "the loser appended nothing",
         );
     }
+
+    /// Across several blocks, the `transactions` and `receipts` ordinals stay
+    /// in step with each other and with the order the transactions were
+    /// mined — and a transaction's hash resolves to exactly its ordinal.
+    ///
+    /// This is the invariant the provider's transaction *numbering* rests on:
+    /// reth numbers every transaction in the chain from zero in block order,
+    /// so a row's ordinal is its `TxNumber`, and ordinal N in `receipts` is
+    /// the receipt of ordinal N in `transactions`. If those ever drifted, a
+    /// transaction looked up by number would be a different transaction and a
+    /// receipt would belong to the wrong one — neither detectable afterwards.
+    #[test]
+    fn transaction_and_receipt_ordinals_stay_in_step_across_blocks() {
+        use crate::segments::{RECEIPTS, TRANSACTIONS, rows_for_block};
+        use alloy_consensus::Header;
+        use alloy_consensus::TxType;
+        use alloy_primitives::{Address, B256, Signature, U256};
+        use arkiv_interfaces::store::{SegmentAddress, SegmentKey};
+        use reth_ethereum::{Receipt, TransactionSigned};
+
+        // Distinct transactions, so their hashes and therefore their row names
+        // differ -- a block of identical transactions would hide a mix-up.
+        fn transaction(nonce: u64) -> TransactionSigned {
+            use alloy_consensus::{SignableTransaction, TxLegacy};
+            let tx = TxLegacy {
+                chain_id: Some(1),
+                nonce,
+                gas_price: 1,
+                gas_limit: 21_000,
+                to: alloy_primitives::TxKind::Call(Address::repeat_byte(9)),
+                value: U256::ZERO,
+                input: Default::default(),
+            };
+            TransactionSigned::from(tx.into_signed(Signature::new(
+                U256::from(1),
+                U256::from(1),
+                false,
+            )))
+        }
+        fn receipt(gas: u64) -> Receipt {
+            Receipt {
+                tx_type: TxType::Legacy,
+                success: true,
+                cumulative_gas_used: gas,
+                logs: vec![],
+            }
+        }
+
+        let (store, seals) = adoptable();
+        // Two blocks of two, with an empty block between them: an empty block
+        // appends no transaction rows at all, so the numbering must carry
+        // straight across it rather than leaving a hole.
+        let blocks: [&[u64]; 3] = [&[0, 1], &[], &[2, 3]];
+        let mut mined: Vec<B256> = Vec::new();
+
+        for (index, nonces) in blocks.iter().enumerate() {
+            let height = index as u64 + 1;
+            let block_hash = B256::repeat_byte(height as u8);
+            let transactions: Vec<_> = nonces.iter().map(|n| transaction(*n)).collect();
+            let senders = vec![Address::repeat_byte(3); transactions.len()];
+            let receipts: Vec<_> = nonces.iter().map(|n| receipt(n + 1)).collect();
+            let header = Header {
+                number: height,
+                ..Default::default()
+            };
+            let writes = rows_for_block(&header, &transactions, &senders, &receipts, block_hash)
+                .expect("the block's parts agree");
+
+            let branch = store.begin(Some(store.head())).expect("begin");
+            seals
+                .seal(&store, ExecutionKey::new(height, vec![]), branch)
+                .expect("seal");
+            seals
+                .adopt(&store, height, block_hash.0, &writes)
+                .expect("adopt")
+                .expect("a candidate was sealed at this height");
+            mined.extend(transactions.iter().map(|tx| *tx.hash()));
+        }
+
+        assert_eq!(mined.len(), 4, "four transactions over the three blocks");
+        for (ordinal, hash) in mined.iter().enumerate() {
+            let ordinal = ordinal as u64;
+            assert_eq!(
+                store
+                    .segment_ordinal_of(TRANSACTIONS, SegmentKey(hash.0))
+                    .expect("ordinal"),
+                Some(ordinal),
+                "transaction {hash} is numbered by the order it was mined in",
+            );
+            assert_eq!(
+                store
+                    .segment_get(RECEIPTS, SegmentAddress::Ordinal(ordinal))
+                    .expect("receipt row"),
+                store
+                    .segment_get(RECEIPTS, SegmentAddress::Key(SegmentKey(hash.0)))
+                    .expect("receipt row"),
+                "the receipt at ordinal {ordinal} is the one named by that transaction",
+            );
+        }
+        assert_eq!(
+            store
+                .segment_get(TRANSACTIONS, SegmentAddress::Ordinal(4))
+                .expect("read"),
+            None,
+            "and the numbering stops at the last transaction mined",
+        );
+    }
 }

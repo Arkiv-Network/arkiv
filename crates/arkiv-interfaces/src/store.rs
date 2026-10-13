@@ -871,6 +871,23 @@ pub trait Store: core::fmt::Debug {
         Err(StoreError::NotImplemented)
     }
 
+    /// The ordinal of the row named `key`, or `None` if no row carries it.
+    ///
+    /// [`segment_get`](Self::segment_get) already resolves a name to an
+    /// ordinal and then throws it away. A host that addresses the same rows
+    /// both ways needs the number itself: reth identifies a transaction by a
+    /// dense `TxNumber`, which is exactly a row's ordinal, so answering
+    /// "which number is this hash?" is a name lookup and nothing more.
+    ///
+    /// Default: [`StoreError::NotImplemented`].
+    fn segment_ordinal_of(
+        &self,
+        _segment: &str,
+        _key: SegmentKey,
+    ) -> Result<Option<SegmentOrdinal>, StoreError> {
+        Err(StoreError::NotImplemented)
+    }
+
     /// The half-open ordinal range `commit` appended to `segment`.
     ///
     /// Empty when that commit appended nothing. This is what groups rows by
@@ -1098,6 +1115,14 @@ impl<T: Store + ?Sized> Store for alloc::sync::Arc<T> {
         address: SegmentAddress,
     ) -> Result<Option<SegmentRow>, StoreError> {
         (**self).segment_get(segment, address)
+    }
+
+    fn segment_ordinal_of(
+        &self,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<Option<SegmentOrdinal>, StoreError> {
+        (**self).segment_ordinal_of(segment, key)
     }
 
     fn segment_range_of(

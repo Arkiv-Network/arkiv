@@ -386,6 +386,15 @@ impl Store for ValkeyStore {
         self.call(move |backend| async move { backend.segment_get(&segment, address).await })
     }
 
+    fn segment_ordinal_of(
+        &self,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<Option<SegmentOrdinal>, StoreError> {
+        let segment = segment.to_owned();
+        self.call(move |backend| async move { backend.segment_ordinal_of(&segment, key).await })
+    }
+
     fn segment_range_of(
         &self,
         segment: &str,
