@@ -838,18 +838,67 @@ impl<N: ProviderNodeTypes> ReceiptProviderIdExt for ArkivProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ArkivProvider<N> {
+    /// Where a block's transactions sit in the numbering, which is exactly the
+    /// ordinal range its commit appended to `transactions`.
+    ///
+    /// `first_tx_num` and `tx_count` are the range's start and length, so this
+    /// needs no index and no walk — the commit already recorded it. An empty
+    /// block answers `end..end`, which is why
+    /// [`Store::segment_range_of`](arkiv_interfaces::store::Store::segment_range_of)
+    /// has to place an empty range rather than return `0..0`.
+    ///
+    /// The commit is resolved through the tag directly rather than through
+    /// `commit_of`, which refuses anything but the head: that guard is about
+    /// reading *state* at an old commit, which GolemDB cannot do. What a
+    /// commit appended to a segment is a recorded fact about the past and is
+    /// served for any retained commit.
     fn block_body_indices(
         &self,
         number: BlockNumber,
     ) -> ProviderResult<Option<StoredBlockBodyIndices>> {
-        self.inner.block_body_indices(number)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.block_body_indices(number);
+        }
+        let Some(hash) = self.block_hash(number)? else {
+            return self.inner.block_body_indices(number);
+        };
+        let found = self.store.commit_by_tag(hash.0).map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!(
+                "golemdb commit_by_tag: {e:?}"
+            )))
+        })?;
+        let Some(commit) = found else {
+            return self.inner.block_body_indices(number);
+        };
+        let range = self
+            .store
+            .segment_range_of(segments::TRANSACTIONS, commit)
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_range_of(transactions): {e:?}"
+                )))
+            })?;
+        Ok(Some(StoredBlockBodyIndices {
+            first_tx_num: range.start,
+            tx_count: range.end - range.start,
+        }))
     }
 
     fn block_body_indices_range(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
-        self.inner.block_body_indices_range(range)
+        let mut indices = Vec::new();
+        for number in range.clone() {
+            let Some(found) = self.block_body_indices(number)? else {
+                break;
+            };
+            indices.push(found);
+        }
+        if indices.is_empty() {
+            return self.inner.block_body_indices_range(range);
+        }
+        Ok(indices)
     }
 }
 

@@ -126,6 +126,7 @@ pub fn run_all_segments<S: Store>(store_generator: &dyn Fn() -> S) {
     a_batch_append_matches_one_at_a_time(store_generator);
     a_batch_with_a_duplicate_name_is_refused(store_generator);
     a_name_resolves_to_the_ordinal_it_was_appended_at(store_generator);
+    an_empty_range_still_says_where_the_commit_stood(store_generator);
 }
 
 // ---------------------------------------------------------------------------
@@ -2295,5 +2296,52 @@ fn a_name_resolves_to_the_ordinal_it_was_appended_at<S: Store>(store_generator: 
     assert_eq!(
         store.segment_get("transactions", SegmentAddress::Ordinal(second_ordinal)),
         store.segment_get("transactions", SegmentAddress::Key(second)),
+    );
+}
+
+/// A commit that appended nothing to an existing segment reports an empty
+/// range *at that segment's end*, not `0..0`.
+///
+/// The position is as load-bearing as the count. A host asking "where do this
+/// block's transactions start?" gets `first_tx_num` from the range's start,
+/// and a block with no transactions has to be distinguishable from one whose
+/// transactions genuinely start at ordinal zero. On a quiet chain the empty
+/// block is the common case, so `0..0` would be wrong far more often than
+/// right.
+fn an_empty_range_still_says_where_the_commit_stood<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+
+    // One commit puts two rows in `transactions`.
+    let branch = sealed_branch(&store);
+    store
+        .segment_append(branch, "transactions", None, row(b"one"))
+        .unwrap();
+    store
+        .segment_append(branch, "transactions", None, row(b"two"))
+        .unwrap();
+    let first = store.commit(branch).unwrap();
+    assert_eq!(store.segment_range_of("transactions", first), Ok(0..2));
+
+    // The next touches only `blocks`, leaving `transactions` alone.
+    let branch = sealed_branch(&store);
+    store
+        .segment_append(branch, "blocks", None, row(b"header"))
+        .unwrap();
+    let second = store.commit(branch).unwrap();
+
+    assert_eq!(
+        store.segment_range_of("transactions", second),
+        Ok(2..2),
+        "the empty range sits at the end the segment had reached, not at zero",
+    );
+    assert_eq!(
+        store.segment_range_of("blocks", second),
+        Ok(0..1),
+        "and the segment it did append to is unaffected",
+    );
+    assert_eq!(
+        store.segment_range_of("receipts", second),
+        Ok(0..0),
+        "a segment the store has never seen has no length to report",
     );
 }

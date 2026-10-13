@@ -890,8 +890,18 @@ pub trait Store: core::fmt::Debug {
 
     /// The half-open ordinal range `commit` appended to `segment`.
     ///
-    /// Empty when that commit appended nothing. This is what groups rows by
-    /// the block that wrote them — "the receipts of block N" needs no index.
+    /// This is what groups rows by the block that wrote them — "the receipts
+    /// of block N" needs no index.
+    ///
+    /// # An empty range still says where
+    ///
+    /// A commit that appended nothing to a segment the store already has
+    /// answers `end..end`, where `end` is the segment's length at that commit
+    /// — not `0..0`. The position matters as much as the count: a block with
+    /// no transactions has to be distinguishable from one whose transactions
+    /// start at ordinal zero, and on a quiet chain the empty block is the
+    /// common case. A segment the store has never seen is still `0..0`,
+    /// because it has no length to report.
     ///
     /// Default: [`StoreError::NotImplemented`].
     fn segment_range_of(
