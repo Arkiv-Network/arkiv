@@ -862,6 +862,24 @@ impl Backend {
             .transpose()
     }
 
+    /// The ordinal bound to a row name — the `keys` hash this already consults
+    /// to serve a read by name, asked directly.
+    pub(crate) async fn segment_ordinal_of(
+        &self,
+        segment: &str,
+        key: SegmentKey,
+    ) -> Result<Option<SegmentOrdinal>, StoreError> {
+        validate_segment_name(segment)?;
+        let bound: Option<String> = self
+            .client
+            .hget(self.namespace.segment_keys(segment), keys::hex(&key.0))
+            .await
+            .map_err(internal)?;
+        bound
+            .map(|ordinal| ordinal.parse().map_err(|_| StoreError::Internal))
+            .transpose()
+    }
+
     pub(crate) async fn segment_range_of(
         &self,
         segment: &str,

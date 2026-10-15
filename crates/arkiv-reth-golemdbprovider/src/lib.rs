@@ -273,6 +273,27 @@ impl<N: ProviderNodeTypes> HeaderProvider for ArkivProvider<N> {
     }
 }
 
+/// The first and last transaction number a range names, with `None` for an
+/// unbounded end.
+///
+/// Unlike [`heights`], an unbounded end is not resolved to a tip: there is no
+/// cheap "last transaction number" to resolve it to, and none is needed — a
+/// caller walking the segment stops at the first ordinal with no row, which is
+/// the end of the segment by definition.
+fn tx_bounds(range: &impl RangeBounds<TxNumber>) -> (TxNumber, Option<TxNumber>) {
+    let start = match range.start_bound() {
+        core::ops::Bound::Included(first) => *first,
+        core::ops::Bound::Excluded(before) => before.saturating_add(1),
+        core::ops::Bound::Unbounded => 0,
+    };
+    let last = match range.end_bound() {
+        core::ops::Bound::Included(last) => Some(*last),
+        core::ops::Bound::Excluded(after) => Some(after.saturating_sub(1)),
+        core::ops::Bound::Unbounded => None,
+    };
+    (start, last)
+}
+
 /// The heights a `RangeBounds<BlockNumber>` names, with an unbounded end
 /// meaning "up to the tip".
 fn heights(
@@ -524,19 +545,47 @@ impl<N: ProviderNodeTypes> BlockReader for ArkivProvider<N> {
 impl<N: ProviderNodeTypes> TransactionsProvider for ArkivProvider<N> {
     type Transaction = TxTy<N>;
 
+    /// The ordinal the row named by this hash sits at — a name lookup, which
+    /// is all a transaction number is here.
     fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
-        self.inner.transaction_id(tx_hash)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.transaction_id(tx_hash);
+        }
+        match self
+            .store
+            .segment_ordinal_of(segments::TRANSACTIONS, SegmentKey(tx_hash.0))
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_ordinal_of(transactions): {e:?}"
+                )))
+            })? {
+            Some(ordinal) => Ok(Some(ordinal)),
+            None => self.inner.transaction_id(tx_hash),
+        }
     }
 
+    /// By ordinal, which is what the number is.
     fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
-        self.inner.transaction_by_id(id)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.transaction_by_id(id);
+        }
+        match self.transaction_row_at(id)? {
+            Some((transaction, _, _)) => Ok(Some(transaction)),
+            None => self.inner.transaction_by_id(id),
+        }
     }
 
+    /// The same read as [`Self::transaction_by_id`].
+    ///
+    /// reth separates the two so a caller can skip hashing the transaction.
+    /// Here there is nothing to skip: the row decodes to the node's own
+    /// transaction type either way, and whether that type caches its hash is
+    /// the type's business, not this provider's.
     fn transaction_by_id_unhashed(
         &self,
         id: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
-        self.inner.transaction_by_id_unhashed(id)
+        self.transaction_by_id(id)
     }
 
     /// From the `transactions` segment, where the row's name is the hash.
@@ -630,26 +679,76 @@ impl<N: ProviderNodeTypes> TransactionsProvider for ArkivProvider<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Transaction>> {
-        self.inner.transactions_by_tx_range(range)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.transactions_by_tx_range(range);
+        }
+        let (start, last) = tx_bounds(&range);
+        let mut transactions = Vec::new();
+        let mut id = start;
+        while last.is_none_or(|last| id <= last) {
+            let Some((transaction, _, _)) = self.transaction_row_at(id)? else {
+                break;
+            };
+            transactions.push(transaction);
+            id += 1;
+        }
+        if transactions.is_empty() {
+            // The tier does not reach this range; defer rather than report
+            // that it holds nothing.
+            return self.inner.transactions_by_tx_range(range);
+        }
+        Ok(transactions)
     }
 
     fn senders_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Address>> {
-        self.inner.senders_by_tx_range(range)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.senders_by_tx_range(range);
+        }
+        let (start, last) = tx_bounds(&range);
+        let mut senders = Vec::new();
+        let mut id = start;
+        while last.is_none_or(|last| id <= last) {
+            let Some((_, sender, _)) = self.transaction_row_at(id)? else {
+                break;
+            };
+            senders.push(sender);
+            id += 1;
+        }
+        if senders.is_empty() {
+            return self.inner.senders_by_tx_range(range);
+        }
+        Ok(senders)
     }
 
+    /// The sender rides on the transaction's own row, which is why it is
+    /// stored there — recovering it from the signature again would cost more
+    /// than the read.
     fn transaction_sender(&self, id: TxNumber) -> ProviderResult<Option<Address>> {
-        self.inner.transaction_sender(id)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.transaction_sender(id);
+        }
+        match self.transaction_row_at(id)? {
+            Some((_, sender, _)) => Ok(Some(sender)),
+            None => self.inner.transaction_sender(id),
+        }
     }
 }
 
 impl<N: ProviderNodeTypes> ReceiptProvider for ArkivProvider<N> {
     type Receipt = ReceiptTy<N>;
 
+    /// By ordinal: a receipt sits at the same ordinal as its transaction.
     fn receipt(&self, id: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
-        self.inner.receipt(id)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.receipt(id);
+        }
+        match self.receipt_row_at(id)? {
+            Some(receipt) => Ok(Some(receipt)),
+            None => self.inner.receipt(id),
+        }
     }
 
     /// From the `receipts` segment, where a receipt's row is named by its
@@ -688,7 +787,23 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ArkivProvider<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Receipt>> {
-        self.inner.receipts_by_tx_range(range)
+        if !self.ordinals_are_tx_numbers()? {
+            return self.inner.receipts_by_tx_range(range);
+        }
+        let (start, last) = tx_bounds(&range);
+        let mut receipts = Vec::new();
+        let mut id = start;
+        while last.is_none_or(|last| id <= last) {
+            let Some(receipt) = self.receipt_row_at(id)? else {
+                break;
+            };
+            receipts.push(receipt);
+            id += 1;
+        }
+        if receipts.is_empty() {
+            return self.inner.receipts_by_tx_range(range);
+        }
+        Ok(receipts)
     }
 
     fn receipts_by_block_range(
@@ -987,8 +1102,13 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
                     "golemdb segment_get(transactions): {e:?}"
                 )))
             })?;
-        let Some(row) = row else { return Ok(None) };
-        let [transaction, sender, block_hash] = row.as_slice() else {
+        row.as_deref().map(Self::decode_transaction_row).transpose()
+    }
+
+    /// The three columns of a `transactions` row: the transaction, its sender
+    /// and the block it was in.
+    fn decode_transaction_row(row: &[Vec<u8>]) -> ProviderResult<(TxTy<N>, Address, BlockHash)> {
+        let [transaction, sender, block_hash] = row else {
             return Err(ProviderError::other(std::io::Error::other(
                 "a transactions row has three columns",
             )));
@@ -1009,7 +1129,7 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
             .map_err(|_| {
                 ProviderError::other(std::io::Error::other("block hash column is not 32 bytes"))
             })?;
-        Ok(Some((transaction, sender, block_hash)))
+        Ok((transaction, sender, block_hash))
     }
 
     /// One receipt by its transaction's hash, from the `receipts` segment.
@@ -1022,21 +1142,23 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
                     "golemdb segment_get(receipts): {e:?}"
                 )))
             })?;
-        let Some(row) = row else { return Ok(None) };
-        let [receipt] = row.as_slice() else {
+        row.as_deref().map(Self::decode_receipt_row).transpose()
+    }
+
+    /// The single column of a `receipts` row.
+    fn decode_receipt_row(row: &[Vec<u8>]) -> ProviderResult<ReceiptTy<N>> {
+        let [receipt] = row else {
             return Err(ProviderError::other(std::io::Error::other(
                 "a receipts row has one column",
             )));
         };
         // Decoded generically, like headers: plain RLP, which reth's receipt
         // trait guarantees in both directions. EIP-2718 it does not.
-        alloy_rlp::Decodable::decode(&mut receipt.as_slice())
-            .map(Some)
-            .map_err(|e| {
-                ProviderError::other(std::io::Error::other(format!(
-                    "receipts row is not RLP: {e}"
-                )))
-            })
+        alloy_rlp::Decodable::decode(&mut receipt.as_slice()).map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!(
+                "receipts row is not RLP: {e}"
+            )))
+        })
     }
 
     /// The header a hash names, decoded as this node's own header type.
@@ -1102,6 +1224,64 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
         Ok(Some(base))
     }
 
+    /// Whether the tier's ordinals *are* reth's transaction numbers.
+    ///
+    /// reth numbers every transaction in the chain from zero, in block order,
+    /// and the `transactions` segment appends in exactly that order — one row
+    /// per transaction, enforced against the sender and receipt counts. So the
+    /// two numberings coincide, but only if the segment begins at the chain's
+    /// first block. A node that started appending partway through has ordinal
+    /// 0 sitting on some later transaction, and serving `transaction_by_id`
+    /// from it would hand back a *different* transaction under the same
+    /// number — the one failure mode here that cannot be noticed afterwards.
+    ///
+    /// So it is a precondition and it is checked. When it does not hold, every
+    /// ordinal-addressed read falls back to reth, which still holds the
+    /// numbering it assigned. Genesis carries no transactions, so the first
+    /// block to append is the one after it.
+    fn ordinals_are_tx_numbers(&self) -> ProviderResult<bool> {
+        let Some(base) = self.blocks_base()? else {
+            return Ok(false);
+        };
+        let genesis = self.chain_spec().genesis().number.unwrap_or_default();
+        Ok(base == genesis + 1)
+    }
+
+    /// A `transactions` row by ordinal, which is reth's `TxNumber` once
+    /// [`ordinals_are_tx_numbers`](Self::ordinals_are_tx_numbers) holds.
+    fn transaction_row_at(
+        &self,
+        id: TxNumber,
+    ) -> ProviderResult<Option<(TxTy<N>, Address, BlockHash)>> {
+        let row = self
+            .store
+            .segment_get(segments::TRANSACTIONS, SegmentAddress::Ordinal(id))
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_get(transactions, #{id}): {e:?}"
+                )))
+            })?;
+        row.as_deref().map(Self::decode_transaction_row).transpose()
+    }
+
+    /// A `receipts` row by ordinal.
+    ///
+    /// The same ordinal as the transaction it belongs to: `rows_for_block`
+    /// appends one receipt per transaction over the same hash list, so the two
+    /// segments carry identical ordinal sequences. That is what makes
+    /// `receipt(id)` a direct read rather than a lookup through the block.
+    fn receipt_row_at(&self, id: TxNumber) -> ProviderResult<Option<ReceiptTy<N>>> {
+        let row = self
+            .store
+            .segment_get(segments::RECEIPTS, SegmentAddress::Ordinal(id))
+            .map_err(|e| {
+                ProviderError::other(std::io::Error::other(format!(
+                    "golemdb segment_get(receipts, #{id}): {e:?}"
+                )))
+            })?;
+        row.as_deref().map(Self::decode_receipt_row).transpose()
+    }
+
     /// The hash and header of the block at `number`, from the `blocks`
     /// segment, or `None` if the segment does not reach that height.
     ///
@@ -1150,6 +1330,35 @@ fn head_only(commit: CommitId, head: CommitId) -> ProviderResult<()> {
          cannot read at a past commit, so a live node has no historical state view (see #145).",
         commit.0, head.0
     ))))
+}
+
+#[cfg(test)]
+mod tx_bounds_tests {
+    use super::tx_bounds;
+
+    #[test]
+    fn a_half_open_range_excludes_its_end() {
+        assert_eq!(tx_bounds(&(4u64..7)), (4, Some(6)));
+    }
+
+    #[test]
+    fn an_inclusive_range_keeps_its_end() {
+        assert_eq!(tx_bounds(&(4u64..=7)), (4, Some(7)));
+    }
+
+    #[test]
+    fn an_unbounded_end_is_not_resolved_to_a_number() {
+        // The caller stops at the first ordinal with no row instead, which is
+        // why this is `None` rather than a tip.
+        assert_eq!(tx_bounds(&(4u64..)), (4, None));
+        assert_eq!(tx_bounds(&(..)), (0, None));
+    }
+
+    #[test]
+    fn an_empty_range_is_expressed_as_a_last_below_the_start() {
+        // `4..4` names nothing, and the loop's `id <= last` sees that.
+        assert_eq!(tx_bounds(&(4u64..4)), (4, Some(3)));
+    }
 }
 
 #[cfg(test)]
