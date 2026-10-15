@@ -902,30 +902,49 @@ impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ArkivProvider<N> {
     }
 }
 
+/// Arkiv's chain is driven by the engine, so no stage ever runs against this
+/// provider and there is no checkpoint to report.
+///
+/// `None` here is an accurate answer rather than a missing one: a stage
+/// checkpoint says how far a staged-sync stage has progressed, and for a
+/// provider that no stage reads or writes, "never run" is the truth.
+///
+/// reth's own pipeline is unaffected. Backfill and the stages read reth's
+/// `DatabaseProvider` directly, never this one, and they keep their own
+/// checkpoints wherever that provider puts them — which is why these could be
+/// answered from reth's database until now and need not be once it is gone.
 impl<N: ProviderNodeTypes> StageCheckpointReader for ArkivProvider<N> {
-    fn get_stage_checkpoint(&self, id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
-        self.inner.get_stage_checkpoint(id)
+    fn get_stage_checkpoint(&self, _id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
+        Ok(None)
     }
 
-    fn get_stage_checkpoint_progress(&self, id: StageId) -> ProviderResult<Option<Vec<u8>>> {
-        self.inner.get_stage_checkpoint_progress(id)
+    fn get_stage_checkpoint_progress(&self, _id: StageId) -> ProviderResult<Option<Vec<u8>>> {
+        Ok(None)
     }
 
     fn get_all_checkpoints(&self) -> ProviderResult<Vec<(String, StageCheckpoint)>> {
-        self.inner.get_all_checkpoints()
+        Ok(Vec::new())
     }
 }
 
+/// Arkiv prunes on its own schedule, by entity lifetime, not by reth's
+/// segments.
+///
+/// A prune checkpoint records how far reth's pruner has run over one of *its*
+/// segments. Arkiv's pruning is driven by the expiry an entity was created
+/// with and is tracked in its own map (`arkiv-pruning.db`), so there is no
+/// reth segment whose progress this provider can report. Empty is the
+/// accurate answer, not a placeholder.
 impl<N: ProviderNodeTypes> PruneCheckpointReader for ArkivProvider<N> {
     fn get_prune_checkpoint(
         &self,
-        segment: PruneSegment,
+        _segment: PruneSegment,
     ) -> ProviderResult<Option<PruneCheckpoint>> {
-        self.inner.get_prune_checkpoint(segment)
+        Ok(None)
     }
 
     fn get_prune_checkpoints(&self) -> ProviderResult<Vec<(PruneSegment, PruneCheckpoint)>> {
-        self.inner.get_prune_checkpoints()
+        Ok(Vec::new())
     }
 }
 
@@ -1659,11 +1678,24 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ArkivProvider<N> {
 impl<N: ProviderNodeTypes> StateReader for ArkivProvider<N> {
     type Receipt = ReceiptTy<N>;
 
+    /// Refused: an execution outcome is a past block's state changes, and a
+    /// live node has no view of those.
+    ///
+    /// The receipts half of the outcome is in the tier, but the bundle state —
+    /// what every touched account and slot became — is not, for the same
+    /// reason changesets are not (#175): GolemDB serves its head, and the
+    /// changes a past block made are not recoverable from it.
+    ///
+    /// reth's one caller is the engine's `canonical_block_by_hash`, for a
+    /// block no longer in memory, and that path already cannot succeed: its
+    /// next step asks `state_by_block_hash` for the *parent*, which
+    /// [`head_only`] refuses. Refusing here makes it fail at the first
+    /// impossible step with a message that says why, rather than the second.
     fn get_state(
         &self,
         block: BlockNumber,
     ) -> ProviderResult<Option<ExecutionOutcome<Self::Receipt>>> {
-        self.inner.get_state(block)
+        Err(no_history("get_state", block))
     }
 }
 
