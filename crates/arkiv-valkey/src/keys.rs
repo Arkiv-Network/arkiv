@@ -146,6 +146,16 @@ impl Namespace {
     pub(crate) fn commit_segments(&self, commit: u64) -> String {
         format!("{}:commit:{commit}:segs", self.0)
     }
+
+    /// Every segment this store has ever appended to.
+    ///
+    /// A commit has to record an empty range *at the current end* for the
+    /// segments it did not touch, so that an empty range still says where —
+    /// and the only alternative way to enumerate them is a `KEYS` scan of the
+    /// whole keyspace.
+    pub(crate) fn segments(&self) -> String {
+        format!("{}:segs", self.0)
+    }
 }
 
 /// Segment names appear inside key names, so they are restricted rather than

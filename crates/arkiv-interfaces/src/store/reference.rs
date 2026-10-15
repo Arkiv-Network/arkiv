@@ -387,6 +387,14 @@ impl Inner {
             let end = segment.rows.len() as SegmentOrdinal;
             ranges.insert(name, start..end);
         }
+        // Every other segment gets an empty range *at its current end*, so an
+        // empty range still says where this commit stood in the segment. A
+        // block with no transactions has to be distinguishable from one whose
+        // transactions happen to start at zero -- see `segment_range_of`.
+        for (name, segment) in &self.segments {
+            let end = segment.rows.len() as SegmentOrdinal;
+            ranges.entry(name.clone()).or_insert(end..end);
+        }
         ranges
     }
 

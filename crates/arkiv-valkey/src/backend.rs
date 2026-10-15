@@ -823,6 +823,42 @@ impl Backend {
                 )
                 .await
                 .map_err(internal)?;
+            // This segment now exists for every future commit, which has to
+            // report where it stood even when it appended nothing to it.
+            let _: u64 = self
+                .client
+                .sadd(self.namespace.segments(), segment.clone())
+                .await
+                .map_err(internal)?;
+        }
+
+        // The segments this commit left alone: an empty range at the length
+        // they currently stand at, so the position survives. See
+        // `Store::segment_range_of`.
+        let known: Vec<String> = self
+            .client
+            .smembers(self.namespace.segments())
+            .await
+            .map_err(internal)?;
+        let mut untouched = Vec::new();
+        for segment in known {
+            let recorded: Option<String> = self
+                .client
+                .hget(self.namespace.commit_segments(commit.0), segment.clone())
+                .await
+                .map_err(internal)?;
+            if recorded.is_some() {
+                continue;
+            }
+            let end = self.segment_len(&segment).await?;
+            untouched.push((segment, format!("{end}:{end}")));
+        }
+        if !untouched.is_empty() {
+            let _: u64 = self
+                .client
+                .hset(self.namespace.commit_segments(commit.0), untouched)
+                .await
+                .map_err(internal)?;
         }
         Ok(())
     }
