@@ -61,8 +61,8 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BalStoreHandle, BlockBodyIndicesProvider, NodePrimitivesProvider, StateRangeProviderFactory,
-    StateRangeView, StorageChangeSetReader,
+    BalStoreHandle, BlockBodyIndicesProvider, NodePrimitivesProvider, StateProvider as _,
+    StateRangeProviderFactory, StateRangeView, StorageChangeSetReader,
 };
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::ops::{RangeBounds, RangeInclusive};
@@ -136,16 +136,42 @@ impl<N: ProviderNodeTypes> StateRangeProviderFactory for ArkivProvider<N> {
     }
 }
 
+/// Something asked for reth's own database, which this node does not write.
+///
+/// Not an error: `FullProvider` requires these, and reth's launch path and
+/// unexercised feature paths may legitimately hold one without reading
+/// anything that matters. But the database holds nothing past the genesis
+/// allocation, and it *answers* rather than faults -- a read of it comes back
+/// as a funded account that never moved, a stage checkpoint at zero, an empty
+/// trie. Those are the bugs this node has actually had (#178), and they do not
+/// announce themselves.
+///
+/// So: say so, loudly, every time. The two paths that used to come through
+/// here -- payload validation and prewarming -- now take the node's own state
+/// instead, so in a healthy run this is silent. If it starts firing, a path
+/// that was unexercised has woken up, and the span in the log names it.
+#[track_caller]
+fn reth_reads_its_own_database(method: &'static str) {
+    tracing::warn!(
+        target: "arkiv-reth",
+        method,
+        at = %std::panic::Location::caller(),
+        "reth's own database was asked for; it holds nothing this node wrote",
+    );
+}
+
 impl<N: ProviderNodeTypes> DatabaseProviderFactory for ArkivProvider<N> {
     type DB = N::DB;
     type Provider = <BlockchainProvider<N> as DatabaseProviderFactory>::Provider;
     type ProviderRW = <BlockchainProvider<N> as DatabaseProviderFactory>::ProviderRW;
 
     fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+        reth_reads_its_own_database("database_provider_ro");
         self.inner.database_provider_ro()
     }
 
     fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
+        reth_reads_its_own_database("database_provider_rw");
         self.inner.database_provider_rw()
     }
 }
@@ -1954,6 +1980,26 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         // covering the whole chain. Reporting the store's head, for both
         // frontiers, says what is actually true: everything up to the head is
         // durable, so there is nothing to replay.
+        // Where EVM execution reads its state. Without this the engine builds
+        // it from reth's database, which this node never writes: every
+        // account would read back as its genesis allocation, and silently --
+        // an unwritten database answers, it does not fault. See #178, which
+        // was this same hazard reached through a different path.
+        let evm_store = self.store.clone();
+        let evm_base: Arc<OnceLock<BlockNumber>> = Arc::default();
+        factory
+            .overlay_manager()
+            .set_evm_state(Arc::new(move |parent| {
+                let commit = commit_of_tag(&evm_store, parent)?;
+                let provider = ArkivStateProvider::new(
+                    evm_store.clone(),
+                    GolemAccounts::new(evm_store.clone(), commit),
+                    Arc::clone(&evm_base),
+                );
+                Ok(Box::new(provider.into_evm_state_provider()))
+            }))
+            .map_err(|_| eyre::eyre!("the overlay manager already has an EVM state source"))?;
+
         let frontier_store = self.store.clone();
         let genesis = BlockNumHash::new(
             spec.genesis().number.unwrap_or_default(),
@@ -1989,6 +2035,22 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         };
         Ok(ArkivProvider::new(inner, self.store))
     }
+}
+
+/// The commit a parent block names, for a view execution will read.
+///
+/// Falls back to the store's head when the tag is unknown. Adoption runs on
+/// the canonical-state notification, a moment behind reth canonicalising the
+/// block, so the parent of the block being built is briefly a hash no commit
+/// carries yet. The head is that parent's state: the store only ever holds
+/// blocks it will not reorg, so there is nothing newer to confuse it with.
+fn commit_of_tag(store: &HostStore, parent: B256) -> ProviderResult<CommitId> {
+    let found = store.commit_by_tag(parent.0).map_err(|e| {
+        ProviderError::other(std::io::Error::other(format!(
+            "golemdb commit_by_tag: {e:?}"
+        )))
+    })?;
+    Ok(found.unwrap_or_else(|| store.head()))
 }
 
 /// The sealed header of the block the store's head commit holds.
