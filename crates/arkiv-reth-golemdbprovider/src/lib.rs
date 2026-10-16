@@ -980,14 +980,11 @@ impl<N: ProviderNodeTypes> ChainSpecProvider for ArkivProvider<N> {
 impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// Wrap one of reth's state providers so its accounts come from the store
     /// at `commit`.
-    fn with_accounts(
-        &self,
-        inner: StateProviderBox,
-        commit: CommitId,
-    ) -> ProviderResult<StateProviderBox> {
+    fn with_accounts(&self, commit: CommitId) -> ProviderResult<StateProviderBox> {
         Ok(Box::new(ArkivStateProvider::new(
-            inner,
+            self.store.clone(),
             GolemAccounts::new(self.store.clone(), commit),
+            Arc::clone(&self.blocks_base),
         )))
     }
 
@@ -1005,7 +1002,7 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// that is not the head is already refused, so the only block this can be
     /// asked about is the one at the head, whose state *is* the latest state.
     fn state_at_commit(&self, commit: CommitId) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.inner.latest()?, commit)
+        self.with_accounts(commit)
     }
 
     /// The commit a block hash names, through the commit's host tag.
@@ -1564,7 +1561,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     type Primitives = N::Primitives;
 
     fn latest(&self) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.inner.latest()?, self.store.head())
+        self.with_accounts(self.store.head())
     }
 
     fn state_with_block_appended(
@@ -1573,17 +1570,16 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
         block: ExecutedBlock<N::Primitives>,
     ) -> ProviderResult<StateProviderBox> {
         // The appended block is not committed, so the store's newest account
-        // state is still head. Its own writes reach the caller through the
-        // `ExecutedBlock` reth layers on top.
-        let inner = self.inner.state_with_block_appended(parent_hash, block)?;
-        self.with_accounts(inner, self.store.head())
+        // state is still head -- and its own account writes were already
+        // shadowed by that, back when reth's view was layered underneath.
+        let _ = (parent_hash, block);
+        self.with_accounts(self.store.head())
     }
 
     fn state_by_block_number_or_tag(
         &self,
         number_or_tag: BlockNumberOrTag,
     ) -> ProviderResult<StateProviderBox> {
-        let inner = self.inner.state_by_block_number_or_tag(number_or_tag)?;
         let commit = match number_or_tag {
             BlockNumberOrTag::Number(number) => self.commit_of_number(number)?,
             // Every other tag resolves to a block the node considers current.
@@ -1591,7 +1587,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
             // finalized are all the store's head.
             _ => self.store.head(),
         };
-        self.with_accounts(inner, commit)
+        self.with_accounts(commit)
     }
 
     fn history_by_block_number(
@@ -1629,21 +1625,16 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     }
 
     fn pending(&self) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.inner.pending()?, self.store.head())
+        self.with_accounts(self.store.head())
     }
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
-        let Some(inner) = self.inner.pending_state_by_hash(block_hash)? else {
-            return Ok(None);
-        };
-        self.with_accounts(inner, self.store.head()).map(Some)
+        let _ = block_hash;
+        self.with_accounts(self.store.head()).map(Some)
     }
 
     fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
-        let Some(inner) = self.inner.maybe_pending()? else {
-            return Ok(None);
-        };
-        self.with_accounts(inner, self.store.head()).map(Some)
+        self.with_accounts(self.store.head()).map(Some)
     }
 }
 
