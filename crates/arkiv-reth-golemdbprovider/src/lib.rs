@@ -991,6 +991,23 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
         )))
     }
 
+    /// A state view at `commit`, which [`commit_of`](Self::commit_of) has
+    /// already established is the store's head.
+    ///
+    /// The inner view is reth's *latest*, not one addressed by block. Asking
+    /// reth by hash or number cannot work any more: with our own persistence
+    /// service the chain is never written to reth's database, and once a block
+    /// has been acknowledged as durable the engine drops it from memory too --
+    /// so `state_by_block_hash` finds it in neither place and reports
+    /// `StateForHashNotFound` for a block the store holds perfectly well.
+    ///
+    /// Latest is the right view rather than a substitute for one: a commit
+    /// that is not the head is already refused, so the only block this can be
+    /// asked about is the one at the head, whose state *is* the latest state.
+    fn state_at_commit(&self, commit: CommitId) -> ProviderResult<StateProviderBox> {
+        self.with_accounts(self.inner.latest()?, commit)
+    }
+
     /// The commit a block hash names, through the commit's host tag.
     ///
     /// A hash the store does not know is `StateForHashNotFound` rather than an
@@ -1019,7 +1036,7 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
                     "golemdb commit_by_tag: {e:?}"
                 )))
             })?
-            .ok_or(ProviderError::StateForHashNotFound(hash))?;
+            .ok_or_else(|| ProviderError::StateForHashNotFound(hash))?;
         head_only(commit, self.store.head())?;
         Ok(commit)
     }
@@ -1581,18 +1598,34 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<StateProviderBox> {
-        let inner = self.inner.history_by_block_number(block_number)?;
-        self.with_accounts(inner, self.commit_of_number(block_number)?)
+        self.state_at_commit(self.commit_of_number(block_number)?)
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
-        let inner = self.inner.history_by_block_hash(block_hash)?;
-        self.with_accounts(inner, self.commit_of(block_hash)?)
+        self.state_at_commit(self.commit_of(block_hash)?)
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
-        let inner = self.inner.state_by_block_hash(hash)?;
-        self.with_accounts(inner, self.commit_of(hash)?)
+        // Adoption runs on the canonical-state notification, on a blocking
+        // task, so reth canonicalises a block a moment before the store holds
+        // it. In that window reth's own head is a hash no commit is tagged
+        // with yet, and an `eth_call` at `latest` -- which reth resolves to
+        // that hash before it gets here -- would be refused for a chain that
+        // is perfectly healthy.
+        //
+        // The store's head is the answer `latest` is asking for, so that is
+        // what this serves. Only for reth's current head: any other unknown
+        // hash is still a block we genuinely cannot see, and answering from
+        // head would be a confident lie about a different block.
+        match self.commit_of(hash) {
+            Ok(commit) => self.state_at_commit(commit),
+            Err(error) => {
+                if self.inner.chain_info()?.best_hash == hash {
+                    return self.state_at_commit(self.store.head());
+                }
+                Err(error)
+            }
+        }
     }
 
     fn pending(&self) -> ProviderResult<StateProviderBox> {
@@ -1940,7 +1973,9 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
             .set_state_frontiers(Arc::new(move || {
                 let head = head_of::<HeaderTy<N>>(&frontier_store)
                     .map_err(|e| ProviderError::other(std::io::Error::other(e.to_string())))?
-                    .map_or(genesis, |header| BlockNumHash::new(header.number(), header.hash()));
+                    .map_or(genesis, |header| {
+                        BlockNumHash::new(header.number(), header.hash())
+                    });
                 Ok((head, head))
             }))
             .map_err(|_| eyre::eyre!("the overlay manager already has a frontier source"))?;

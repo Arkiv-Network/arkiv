@@ -118,8 +118,8 @@ use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::gas::CostModel;
 use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
-    AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore, EqualityIndexStore,
-    RangeIndexStore, ReadMode, StateView,
+    AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
+    EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
 };
 use arkiv_interfaces::store::BranchId;
 use arkiv_reth_statemanager::{
@@ -276,11 +276,17 @@ fn charge_sender<V: StateView, DBError>(
 ) -> Result<(), EVMError<DBError>> {
     let sender = sender.into_array();
     debit(view, fees, sender, value_out, "debit sender value")?;
-    view.fetch_increment_acc_nonce(sender)
-        .map_err(state_fault("bump sender nonce"))?;
     if !fees.charge {
+        // A question, not a transaction: reth turns fee charging off for
+        // `eth_call` and `eth_estimateGas`. revm bumps the nonce anyway, on a
+        // state it is about to throw away -- but this view writes through to
+        // the store's branch, and that branch is the block's. Bumping here
+        // would let an estimate advance the sender's nonce for real, and the
+        // pool would then reject the very transaction being estimated for.
         return Ok(());
     }
+    view.fetch_increment_acc_nonce(sender)
+        .map_err(state_fault("bump sender nonce"))?;
 
     let price = fees.effective_gas_price(tx);
     let gas_cost = U256::from(gas_used).saturating_mul(U256::from(price));
@@ -423,13 +429,11 @@ where
         if has_purge_selector && !is_protocol_purge {
             return Err(invalid_transaction("purgeExpired is protocol-only"));
         }
-        if !is_protocol_purge {
-            if nonce_check {
-                validate_nonce(db, &tx)?;
-            }
-            validate_fees(db, &tx, fees.base_fee, fee_checks)?;
-        }
-        arkiv_transact(store, branch, db, block_number, fees, tx)
+        let checks = (!is_protocol_purge).then_some(SenderChecks {
+            nonce: nonce_check,
+            fees: fee_checks,
+        });
+        arkiv_transact(store, branch, db, block_number, fees, checks, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -510,13 +514,60 @@ fn invalid_transaction<DBError>(message: impl Into<String>) -> EVMError<DBError>
 /// instead of aborting the block. Without it, a transaction still sitting in the pool
 /// when the dev miner's next interval fires — the pool is cleared asynchronously, on the
 /// canonical-state stream — is built into a second block and applied twice.
-fn validate_nonce<DB: Database>(db: &mut DB, tx: &TxEnv) -> Result<(), EVMError<DB::Error>> {
-    let state = db
-        .basic(tx.caller)
-        .map_err(EVMError::Database)?
-        .map(|acc| acc.nonce)
-        .unwrap_or_default();
+/// The sender's nonce and balance checks, read from the Arkiv view.
+///
+/// Not from reth's `db`: this node no longer writes reth's database -- its
+/// persistence service is ours and commits to the store instead -- so `db`
+/// answers with the genesis allocation for every account, forever. Execution
+/// has always read the store; only these two checks did not, and they agreed
+/// with it for as long as reth kept a second copy (#178).
+///
+/// Takes the view the caller already opened rather than opening its own. A
+/// second view is a second frame on the branch, and a frame is what a reverted
+/// call rolls back to -- so opening one turns a reverted call into a state
+/// change.
+fn check_sender<V, E, DBE>(
+    view: &V,
+    checks: Option<SenderChecks>,
+    fees: &FeeEnv,
+    tx: &TxEnv,
+) -> Result<(), EVMError<DBE>>
+where
+    V: AccountBalancesStore<Error = E> + AccountNoncesStore<Error = E>,
+    E: core::fmt::Debug,
+{
+    let Some(checks) = checks else { return Ok(()) };
+    let caller = tx.caller.into_array();
+    if checks.nonce {
+        let nonce = view
+            .get_acc_nonce(caller, ReadMode::ViewWithOverlay)
+            .map_err(state_fault("read the sender's nonce"))?;
+        validate_nonce(nonce.get(), tx)?;
+    }
+    let balance = view
+        .get_balance(caller, ReadMode::ViewWithOverlay)
+        .map_err(state_fault("read the sender's balance"))?;
+    validate_fees(
+        U256::from_be_bytes(balance.to_be_bytes()),
+        tx,
+        fees.base_fee,
+        checks.fees,
+    )
+}
 
+/// Which sender pre-checks a transaction gets, and on what terms.
+///
+/// `None` means a protocol purge, which is not a user transaction and is
+/// subject to neither.
+#[derive(Debug, Clone, Copy)]
+struct SenderChecks {
+    /// Whether the nonce must match.
+    nonce: bool,
+    /// Which fee checks apply, which the RPC path varies.
+    fees: FeeChecks,
+}
+
+fn validate_nonce<DBE>(state: u64, tx: &TxEnv) -> Result<(), EVMError<DBE>> {
     match tx.nonce.cmp(&state) {
         Ordering::Equal => Ok(()),
         Ordering::Less => Err(EVMError::Transaction(InvalidTransaction::NonceTooLow {
@@ -545,12 +596,12 @@ fn validate_nonce<DB: Database>(db: &mut DB, tx: &TxEnv) -> Result<(), EVMError<
 /// All three are typed [`InvalidTransaction`]s, for the reason [`validate_nonce`]
 /// spells out: the payload builder skips a transaction on those and aborts the
 /// block on anything else.
-fn validate_fees<DB: Database>(
-    db: &mut DB,
+fn validate_fees<DBE>(
+    balance: U256,
     tx: &TxEnv,
     base_fee: u64,
     checks: FeeChecks,
-) -> Result<(), EVMError<DB::Error>> {
+) -> Result<(), EVMError<DBE>> {
     let max_fee = tx.max_fee_per_gas();
     if checks.priority_fee && tx.max_priority_fee_per_gas().unwrap_or_default() > max_fee {
         return Err(EVMError::Transaction(
@@ -570,11 +621,6 @@ fn validate_fees<DB: Database>(
         } else {
             tx.value
         };
-        let balance = db
-            .basic(tx.caller)
-            .map_err(EVMError::Database)?
-            .map(|acc| acc.balance)
-            .unwrap_or_default();
         if balance < max_spend {
             return Err(EVMError::Transaction(
                 InvalidTransaction::LackOfFundForMaxFee {
@@ -603,6 +649,7 @@ fn arkiv_transact<DB: Database>(
     db: &mut DB,
     block_number: u64,
     fees: FeeEnv,
+    checks: Option<SenderChecks>,
     tx: TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     // Neuter: user programs never execute. The rejection must be a *typed*
@@ -637,7 +684,7 @@ fn arkiv_transact<DB: Database>(
         if selector == purgeExpiredCall::SELECTOR {
             return arkiv_purge_expired(store, branch, db, block_number, &tx);
         }
-        return arkiv_entity_transact(store, branch, db, block_number, &fees, &tx);
+        return arkiv_entity_transact(store, branch, db, block_number, &fees, checks, &tx);
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
@@ -653,6 +700,7 @@ fn arkiv_transact<DB: Database>(
     // transfer stages the same way every other state change does.
     let mut view = host_manager(store, branch, db, parent_ref(block_number))
         .map_err(state_fault("open view"))?;
+    check_sender(&view, checks, &fees, &tx)?;
     charge_sender(&mut view, &fees, tx.caller, value_out, gas_used, &tx)?;
     if to != tx.caller {
         view.fetch_add_balance(to.into_array(), as_balance(tx.value))
@@ -760,6 +808,7 @@ fn arkiv_entity_transact<DB: Database>(
     db: &mut DB,
     block_number: u64,
     fees: &FeeEnv,
+    checks: Option<SenderChecks>,
     tx: &TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
     // During eth_estimateGas the binary search probes gas limits below the
@@ -792,6 +841,7 @@ fn arkiv_entity_transact<DB: Database>(
     // the one commit at the end flushes exactly what should land.
     let mut view = host_manager(store, branch, db, parent_ref(block_number))
         .map_err(state_fault("open view"))?;
+    check_sender(&view, checks, fees, tx)?;
     let start_nonce = view
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;

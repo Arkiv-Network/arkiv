@@ -16,11 +16,11 @@
 //!
 //! [`EvmState`]: reth_ethereum::evm::revm::state::EvmState
 
-pub mod persistence;
 pub mod accounts;
 pub mod genesis;
 pub mod host;
 pub mod overlay;
+pub mod persistence;
 pub mod provider;
 pub mod segments;
 
