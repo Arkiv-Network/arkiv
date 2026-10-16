@@ -59,6 +59,14 @@ impl ArkivStateProvider {
     pub const fn new(inner: StateProviderBox, accounts: GolemAccounts<HostStore>) -> Self {
         Self { inner, accounts }
     }
+
+    /// The digest the store committed at the point these accounts read.
+    fn committed_root(&self) -> ProviderResult<B256> {
+        self.accounts
+            .commit_hash()
+            .map(B256::from)
+            .map_err(read_error)
+    }
 }
 
 /// An account read that failed is a provider error, not an empty account.
@@ -123,27 +131,43 @@ impl BlockHashReader for ArkivStateProvider {
     }
 }
 
+/// The state root, which on this node is GolemDB's commit digest.
+///
+/// # Only the empty-block case reaches here
+///
+/// A block that executed something carries its root out of execution: the
+/// digest the branch reached is sealed by `BlockSeals` and installed by the
+/// payload builder's state-root resolver, before the provider is consulted.
+/// What the resolver cannot answer is a block that sealed nothing — an empty
+/// one, which charges no gas — and it falls back to the provider for those.
+///
+/// An empty block changes no state, so the root is the one the store already
+/// committed: the digest at the head commit, which the accounts view is
+/// already pinned to.
+///
+/// The updates are empty because there is no trie to update. reth writes them
+/// to its own database, which this node does not keep.
 impl StateRootProvider for ArkivStateProvider {
-    fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
-        self.inner.state_root(hashed_state)
+    fn state_root(&self, _hashed_state: HashedPostState) -> ProviderResult<B256> {
+        self.committed_root()
     }
 
-    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
-        self.inner.state_root_from_nodes(input)
+    fn state_root_from_nodes(&self, _input: TrieInput) -> ProviderResult<B256> {
+        self.committed_root()
     }
 
     fn state_root_with_updates(
         &self,
-        hashed_state: HashedPostState,
+        _hashed_state: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        self.inner.state_root_with_updates(hashed_state)
+        Ok((self.committed_root()?, TrieUpdates::default()))
     }
 
     fn state_root_from_nodes_with_updates(
         &self,
-        input: TrieInput,
+        _input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        self.inner.state_root_from_nodes_with_updates(input)
+        Ok((self.committed_root()?, TrieUpdates::default()))
     }
 }
 
