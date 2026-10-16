@@ -34,7 +34,6 @@ use tracing::{debug, error};
 
 use crate::host::{BlockSeals, HostStore};
 
-
 /// Start the service and return the handle the engine sends through.
 ///
 /// The thread lives as long as the channel: when the engine drops its handle,

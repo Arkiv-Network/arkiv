@@ -1036,9 +1036,7 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
                     "golemdb commit_by_tag: {e:?}"
                 )))
             })?
-            .ok_or_else(|| {
-                ProviderError::StateForHashNotFound(hash)
-            })?;
+            .ok_or_else(|| ProviderError::StateForHashNotFound(hash))?;
         head_only(commit, self.store.head())?;
         Ok(commit)
     }
@@ -1975,7 +1973,9 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
             .set_state_frontiers(Arc::new(move || {
                 let head = head_of::<HeaderTy<N>>(&frontier_store)
                     .map_err(|e| ProviderError::other(std::io::Error::other(e.to_string())))?
-                    .map_or(genesis, |header| BlockNumHash::new(header.number(), header.hash()));
+                    .map_or(genesis, |header| {
+                        BlockNumHash::new(header.number(), header.hash())
+                    });
                 Ok((head, head))
             }))
             .map_err(|_| eyre::eyre!("the overlay manager already has a frontier source"))?;

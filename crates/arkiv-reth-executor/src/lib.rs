@@ -119,8 +119,7 @@ use arkiv_interfaces::gas::CostModel;
 use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
-    EqualityIndexStore,
-    RangeIndexStore, ReadMode, StateView,
+    EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
 };
 use arkiv_interfaces::store::BranchId;
 use arkiv_reth_statemanager::{
