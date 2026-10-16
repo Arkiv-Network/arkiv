@@ -22,7 +22,7 @@
 
 use alloy_primitives::{Address, B256, U256};
 use arkiv_golemdb_state::accounts::{CELL_BALANCE, CELL_NONCE, record_key};
-use arkiv_interfaces::store::{CommitId, ReadTarget, Record, Store, StoreError};
+use arkiv_interfaces::store::{CommitId, ReadTarget, Record, Store, StoreError, StoreExt};
 
 /// An Ethereum account as the store holds it.
 ///
@@ -75,7 +75,7 @@ pub struct GolemAccounts<S> {
     at: CommitId,
 }
 
-impl<S: Store> GolemAccounts<S> {
+impl<S: Store + StoreExt> GolemAccounts<S> {
     /// Read accounts as of `at`.
     pub const fn new(store: S, at: CommitId) -> Self {
         Self { store, at }
@@ -84,6 +84,14 @@ impl<S: Store> GolemAccounts<S> {
     /// The commit these reads are against.
     pub const fn at(&self) -> CommitId {
         self.at
+    }
+
+    /// The content digest the store committed at [`at`](Self::at).
+    ///
+    /// Arkiv's state root: the fingerprint a commit reached, which is what
+    /// goes in the block header in place of a Merkle root.
+    pub fn commit_hash(&self) -> Result<[u8; 32], AccountReadError> {
+        Ok(self.store.commit_hash(self.at)?)
     }
 
     fn record(&self, address: Address) -> Result<Option<Record>, AccountReadError> {
