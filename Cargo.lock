@@ -1616,6 +1616,7 @@ dependencies = [
  "reth-chainspec",
  "reth-db-api",
  "reth-engine-tree",
+ "reth-ethereum",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-execution-types",
@@ -1699,7 +1700,10 @@ dependencies = [
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
  "eyre",
+ "reth-engine-tree",
  "reth-ethereum",
+ "reth-provider",
+ "tracing",
 ]
 
 [[package]]

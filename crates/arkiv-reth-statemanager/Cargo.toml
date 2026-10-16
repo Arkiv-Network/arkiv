@@ -27,6 +27,10 @@ alloy-eips.workspace = true
 alloy-rlp.workspace = true
 # WriteOverlay reads through revm's Database and stages an EvmState diff.
 reth-ethereum = { workspace = true, features = ["evm"] }
+# The engine's persistence seam: Arkiv runs its own service in place of reth's.
+reth-engine-tree.workspace = true
+reth-provider.workspace = true
+tracing.workspace = true
 eyre.workspace = true
 
 [dev-dependencies]
