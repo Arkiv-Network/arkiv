@@ -360,15 +360,22 @@ impl<N: ProviderNodeTypes> BlockHashReader for ArkivProvider<N> {
 /// through the tier caused in #166.
 impl<N: ProviderNodeTypes> BlockNumReader for ArkivProvider<N> {
     fn chain_info(&self) -> ProviderResult<ChainInfo> {
-        self.inner.chain_info()
+        let inner = self.inner.chain_info()?;
+        match self.store_head_num_hash()? {
+            Some((number, hash)) if number > inner.best_number => Ok(ChainInfo {
+                best_number: number,
+                best_hash: hash,
+            }),
+            _ => Ok(inner),
+        }
     }
 
     fn best_block_number(&self) -> ProviderResult<BlockNumber> {
-        self.inner.best_block_number()
+        self.furthest_tip(self.inner.best_block_number()?)
     }
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
-        self.inner.last_block_number()
+        self.furthest_tip(self.inner.last_block_number()?)
     }
 
     fn earliest_block_number(&self) -> ProviderResult<BlockNumber> {
@@ -903,19 +910,33 @@ impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ArkivProvider<N> {
 }
 
 /// Arkiv's chain is driven by the engine, so no stage ever runs against this
-/// provider and there is no checkpoint to report.
+/// provider — with one exception that is not really a stage at all.
 ///
-/// `None` here is an accurate answer rather than a missing one: a stage
-/// checkpoint says how far a staged-sync stage has progressed, and for a
-/// provider that no stage reads or writes, "never run" is the truth.
+/// reth's `Finish` checkpoint is what the launcher reads to decide **where to
+/// resume from**. On the stock node that is a stage's progress, because the
+/// chain lives in the database the stages write. Here the chain lives in the
+/// Arkiv Store, so the honest answer to "where should the node resume?" is
+/// the block the store's head holds — not a stage's progress, which is why
+/// every other id is still `None`.
+///
+/// Without this the two halves keep separate records of where the node got
+/// to, and a crash leaves them disagreeing with no way back (#176). Answering
+/// from the store gives reth and the store one shared answer.
 ///
 /// reth's own pipeline is unaffected. Backfill and the stages read reth's
-/// `DatabaseProvider` directly, never this one, and they keep their own
-/// checkpoints wherever that provider puts them — which is why these could be
-/// answered from reth's database until now and need not be once it is gone.
+/// `DatabaseProvider` directly, never this one.
 impl<N: ProviderNodeTypes> StageCheckpointReader for ArkivProvider<N> {
-    fn get_stage_checkpoint(&self, _id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
-        Ok(None)
+    fn get_stage_checkpoint(&self, id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
+        if id != StageId::Finish {
+            return Ok(None);
+        }
+        // Before the store holds a block of its own -- a fresh node, or one
+        // whose head commit carries no block -- reth's own record is still the
+        // only answer there is.
+        match self.store_head_block()? {
+            Some(number) => Ok(Some(StageCheckpoint::new(number))),
+            None => self.inner.get_stage_checkpoint(id),
+        }
     }
 
     fn get_stage_checkpoint_progress(&self, _id: StageId) -> ProviderResult<Option<Vec<u8>>> {
@@ -1290,6 +1311,52 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
         let base = Self::header_of_row(&row)?.number();
         let _ = self.blocks_base.set(base);
         Ok(Some(base))
+    }
+
+    /// The block number the store's head commit holds, if it holds one.
+    ///
+    /// The head commit is tagged with its block hash, and that names the row
+    /// in the `blocks` segment, whose header carries the number. A commit with
+    /// no tag is not a block -- the genesis allocation is one -- and answers
+    /// `None`.
+    fn store_head_block(&self) -> ProviderResult<Option<BlockNumber>> {
+        Ok(self.store_head_num_hash()?.map(|(number, _)| number))
+    }
+
+    /// The block the store's head commit holds, with its hash.
+    fn store_head_num_hash(&self) -> ProviderResult<Option<(BlockNumber, BlockHash)>> {
+        let head = self.store.head();
+        let tag = self.store.tag_of(head).map_err(|e| {
+            ProviderError::other(std::io::Error::other(format!("golemdb tag_of: {e:?}")))
+        })?;
+        let Some(tag) = tag else {
+            return Ok(None);
+        };
+        let hash = BlockHash::from(tag);
+        Ok(self
+            .stored_header(hash)?
+            .map(|header| (header.number(), hash)))
+    }
+
+    /// Whichever half of the Arkiv Store has got further.
+    ///
+    /// While the node runs, reth is ahead: it holds blocks in memory that the
+    /// store has not committed yet, and reporting the store's number would
+    /// have the node believe it was behind itself (#166).
+    ///
+    /// After a crash the opposite holds. reth's database has only what it
+    /// managed to flush, while the store kept every block it committed, so
+    /// reth's number is a stale record rather than a live one — and resuming
+    /// from it strands the node on a block the store cannot serve (#176).
+    ///
+    /// Neither half is ever ahead of the real chain: the store commits only
+    /// adopted blocks, and reth's memory holds only blocks it built. So the
+    /// further of the two is the best answer available, and it is the right
+    /// one in both situations.
+    fn furthest_tip(&self, inner: BlockNumber) -> ProviderResult<BlockNumber> {
+        Ok(self
+            .store_head_block()?
+            .map_or(inner, |number| number.max(inner)))
     }
 
     /// Whether the tier's ordinals *are* reth's transaction numbers.
@@ -1793,17 +1860,41 @@ const fn _satisfies_full_provider<N: ProviderNodeTypes>() {
 #[derive(Debug, Clone)]
 pub struct ArkivProviderBuilder {
     store: HostStore,
+    seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
 }
 
 impl ArkivProviderBuilder {
-    /// Build providers over this store.
-    pub const fn new(store: HostStore) -> Self {
-        Self { store }
+    /// Build providers over this store, promoting seals from this registry.
+    pub const fn new(
+        store: HostStore,
+        seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
+    ) -> Self {
+        Self { store, seals }
     }
 }
 
-impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for ArkivProviderBuilder {
+/// Pinned to Ethereum primitives, which Arkiv's row encoding already is: a
+/// block's header, transactions and receipts are written as the Ethereum
+/// types, so a persistence service over anything else could not encode them.
+impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProviderBuilder<N>
+    for ArkivProviderBuilder
+{
     type Provider = ArkivProvider<N>;
+
+    /// Arkiv's own persistence service, in place of reth's.
+    ///
+    /// This is what keeps one record of where the chain is. reth's service
+    /// would write every block into its database as well, and the two records
+    /// then disagree after a crash -- see #176 and the service's own docs.
+    fn engine_persistence(
+        &self,
+    ) -> Option<reth_engine_tree::persistence::PersistenceHandle<reth_ethereum::EthPrimitives>>
+    {
+        Some(arkiv_reth_statemanager::persistence::spawn(
+            self.store.clone(),
+            self.seals.clone(),
+        ))
+    }
 
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
         // The one place that holds both the store and the chain spec, and it
@@ -1828,9 +1919,75 @@ impl<N: ProviderNodeTypes> EngineProviderBuilder<N> for ArkivProviderBuilder {
             );
         }
 
-        Ok(ArkivProvider::new(
-            BlockchainProvider::new(factory)?,
-            self.store,
-        ))
+        // Anchor the overlays on the store's head, not on reth's stage
+        // checkpoints.
+        //
+        // Every overlay decision -- which trie updates must be replayed, which
+        // changesets to read -- is taken against the durable frontiers, and
+        // reth reads those from its own `Finish` checkpoint. With its
+        // persistence service switched off nothing writes that checkpoint, so
+        // it answers genesis forever and the overlay asks for trie updates
+        // covering the whole chain. Reporting the store's head, for both
+        // frontiers, says what is actually true: everything up to the head is
+        // durable, so there is nothing to replay.
+        let frontier_store = self.store.clone();
+        let genesis = BlockNumHash::new(
+            spec.genesis().number.unwrap_or_default(),
+            spec.genesis_hash(),
+        );
+        factory
+            .overlay_manager()
+            .set_state_frontiers(Arc::new(move || {
+                let head = head_of::<HeaderTy<N>>(&frontier_store)
+                    .map_err(|e| ProviderError::other(std::io::Error::other(e.to_string())))?
+                    .map_or(genesis, |header| BlockNumHash::new(header.number(), header.hash()));
+                Ok((head, head))
+            }))
+            .map_err(|_| eyre::eyre!("the overlay manager already has a frontier source"))?;
+
+        // Seed reth's view of the chain from the Arkiv Store, not from its own
+        // database.
+        //
+        // `BlockchainProvider::new` would read reth's own `chain_info` and
+        // start the engine believing the chain ends wherever reth last managed
+        // to flush. After a crash that is behind the store, and the engine
+        // then rejects a forkchoice to the real head as unknown. Seeding it
+        // from the store's head is what makes the store authoritative for
+        // where the chain is -- which is the point of keeping one record.
+        //
+        // A store with no block yet (a fresh chain) has nothing to seed from,
+        // so reth's own answer stands; it is genesis in that case anyway.
+        let inner = match head_of(&self.store)? {
+            Some(latest) => BlockchainProvider::with_latest(factory, latest)?,
+            None => BlockchainProvider::new(factory)?,
+        };
+        Ok(ArkivProvider::new(inner, self.store))
     }
+}
+
+/// The sealed header of the block the store's head commit holds.
+///
+/// `None` when the head commit carries no block -- a fresh chain whose only
+/// commit is the genesis allocation.
+fn head_of<H>(store: &HostStore) -> eyre::Result<Option<SealedHeader<H>>>
+where
+    H: alloy_rlp::Decodable + reth_primitives_traits::BlockHeader,
+{
+    let head = store.head();
+    let Some(tag) = store
+        .tag_of(head)
+        .map_err(|e| eyre::eyre!("golemdb tag_of({}): {e:?}", head.0))?
+    else {
+        return Ok(None);
+    };
+    let row = store
+        .segment_get(segments::BLOCKS, SegmentAddress::Key(SegmentKey(tag)))
+        .map_err(|e| eyre::eyre!("golemdb segment_get(blocks): {e:?}"))?;
+    let Some(row) = row else { return Ok(None) };
+    let [header, _] = row.as_slice() else {
+        eyre::bail!("a blocks row has two columns");
+    };
+    let header: H = alloy_rlp::Decodable::decode(&mut header.as_slice())
+        .map_err(|e| eyre::eyre!("the head block row is not RLP: {e}"))?;
+    Ok(Some(SealedHeader::new(header, BlockHash::from(tag))))
 }
