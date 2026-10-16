@@ -1608,7 +1608,26 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
-        self.state_at_commit(self.commit_of(hash)?)
+        // Adoption runs on the canonical-state notification, on a blocking
+        // task, so reth canonicalises a block a moment before the store holds
+        // it. In that window reth's own head is a hash no commit is tagged
+        // with yet, and an `eth_call` at `latest` -- which reth resolves to
+        // that hash before it gets here -- would be refused for a chain that
+        // is perfectly healthy.
+        //
+        // The store's head is the answer `latest` is asking for, so that is
+        // what this serves. Only for reth's current head: any other unknown
+        // hash is still a block we genuinely cannot see, and answering from
+        // head would be a confident lie about a different block.
+        match self.commit_of(hash) {
+            Ok(commit) => self.state_at_commit(commit),
+            Err(error) => {
+                if self.inner.chain_info()?.best_hash == hash {
+                    return self.state_at_commit(self.store.head());
+                }
+                Err(error)
+            }
+        }
     }
 
     fn pending(&self) -> ProviderResult<StateProviderBox> {

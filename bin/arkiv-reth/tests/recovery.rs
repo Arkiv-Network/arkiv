@@ -21,8 +21,8 @@ use arkiv_harness::{
 const READY: Duration = Duration::from_secs(90);
 
 /// Blocks to let pass before a kill, to clear reth's
-/// `DEFAULT_PERSISTENCE_THRESHOLD` of 50 — under which reth has written nothing
-/// to its own database and a restart has nothing to resume from.
+/// `DEFAULT_PERSISTENCE_THRESHOLD` of 50 — the depth at which reth's own
+/// persistence would have run, had this node not replaced it with its own.
 const PERSISTED: u64 = 60;
 
 /// Where the Valkey server is, or a clear explanation of why we cannot proceed.
@@ -115,9 +115,7 @@ async fn wait_for_physical_purge(
 ///   that carries GolemDB's root, and a tag becoming readable before the head
 ///   covered it) are invisible under 50 blocks.
 ///
-/// This is the graceful restart — SIGTERM, the one an operator performs. The
-/// abrupt one is a separate story: see
-/// [`a_crash_past_the_persistence_threshold_cannot_restart`].
+/// This is the graceful restart — SIGTERM, the one an operator performs.
 ///
 /// Ignored by default because it needs a server, like the store's own
 /// conformance tests:
@@ -211,44 +209,6 @@ async fn state_and_index_survive_shutdown_and_restart() {
         3,
         "new writes work after recovery"
     );
-}
-
-/// A node SIGKILLed past the persistence threshold cannot start again.
-///
-/// This asserts the *fault*, not the fix — it is the repro, written as a
-/// passing test so the limitation is recorded where it will be noticed rather
-/// than in a comment, and so whoever fixes it is told by a failure here.
-///
-/// An abrupt kill can leave reth's database mid-write, and on the next start
-/// reth recovers by unwinding its state trie. That recovery is the one place
-/// `Node::disabled_stages` does not reach: reth re-enables `MerkleUnwind`
-/// unconditionally for it (`launch/common.rs`, "Partial trie recovery is not
-/// complete until Merkle has unwound"). The stage then recomputes an MPT root
-/// and compares it with the header, which carries GolemDB's root instead — so
-/// it can never agree, and the node exits with `mismatched block state root`.
-///
-/// A graceful SIGTERM leaves no partial trie to recover, which is why
-/// [`state_and_index_survive_shutdown_and_restart`] passes and this does not.
-/// Making it pass means reth not maintaining a trie for us at all, which is
-/// the step 6 work on crash recovery, not a fix that belongs here.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
-#[should_panic(expected = "node exited during startup")]
-async fn a_crash_past_the_persistence_threshold_cannot_restart() {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
-        .valkey_store(valkey_url())
-        .spawn();
-    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
-    let client = connect(&node.http_url(), signer);
-    node.wait_ready(&client, READY).await;
-    client
-        .wait_for_block(PERSISTED, Duration::from_secs(60))
-        .await;
-
-    node.kill();
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    node.restart();
-    node.wait_ready(&client, READY).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
