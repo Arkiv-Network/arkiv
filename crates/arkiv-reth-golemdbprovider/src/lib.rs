@@ -1059,9 +1059,49 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
                     "golemdb commit_by_tag: {e:?}"
                 )))
             })?
-            .ok_or_else(|| ProviderError::StateForHashNotFound(hash))?;
+            .map_or_else(|| self.unadopted(hash), Ok)?;
         head_only(commit, self.store.head())?;
         Ok(commit)
+    }
+
+    /// The commit to serve for a block the store has not tagged.
+    ///
+    /// Adoption runs on the canonical-state notification, on a blocking task,
+    /// so reth canonicalises a block a moment before the store commits it. In
+    /// that window a perfectly healthy chain has a canonical head no commit
+    /// carries, and an `eth_call` at `latest` -- which reth has already
+    /// resolved to that hash before it reaches us -- would be refused.
+    ///
+    /// The window is one block wide, deliberately. Adoption commits the tip
+    /// of each canonical notification, so at most the block reth has just
+    /// canonicalised is missing, and the store's head is that block's parent
+    /// state -- the newest durable state there is, since the store commits
+    /// only blocks it will not reorg.
+    ///
+    /// Beyond one block is not a lag, it is adoption having stopped, and the
+    /// store's head is then genuinely stale. Serving it would answer an
+    /// `eth_call` with state from an arbitrary distance back, which is the
+    /// one failure worth being loud about: a wrong balance reads exactly like
+    /// a right one. A block *behind* the store's head is refused for the same
+    /// reason -- that is history this node does not keep.
+    fn unadopted(&self, hash: BlockHash) -> ProviderResult<CommitId> {
+        let Some(number) = self.inner.block_number(hash)? else {
+            // Not a block reth knows either, so there is nothing to be behind.
+            return Err(ProviderError::StateForHashNotFound(hash));
+        };
+        let adopted = self.store_head_block()?;
+        let next = adopted.map_or(0, |block| block + 1);
+        if number <= next {
+            return Ok(self.store.head());
+        }
+        tracing::warn!(
+            target: "arkiv-reth",
+            %hash,
+            number,
+            adopted = ?adopted,
+            "the store is more than a block behind; adoption has stopped",
+        );
+        Err(ProviderError::StateForHashNotFound(hash))
     }
 
     /// The commit a block number names: reth's hash for that number, then the

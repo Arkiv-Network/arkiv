@@ -197,6 +197,7 @@ impl Node {
         if let Some(chain) = &self.config.chain {
             cmd.arg("--chain").arg(chain);
         }
+        let log_dir = self.datadir.join("logs");
         cmd.args([
             "--http",
             "--http.addr",
@@ -211,6 +212,13 @@ impl Node {
             &self.p2p_port.to_string(),
             "--datadir",
             self.datadir.to_str().expect("utf-8 datadir"),
+            // Inside this node's datadir, not reth's shared default. Every
+            // node otherwise writes to one `reth.log` and rotates it under
+            // the others' feet -- shared mutable state between tests that are
+            // supposed to be independent, and it does not go away by running
+            // them one at a time.
+            "--log.file.directory",
+            log_dir.to_str().expect("utf-8 log directory"),
             "--disable-discovery",
             // reth's IPC endpoint has a single fixed default path, so nodes
             // running side by side would collide on it. Callers reach the node
