@@ -11,8 +11,11 @@
 # Not debian:bookworm-slim, unlike the from-source image. The binary comes from
 # the GitHub runner (Ubuntu 24.04, glibc 2.39) and bookworm only has 2.36, so a
 # dynamically linked reth built there will not start on it. Matching the
-# builder's distribution keeps that contract simple.
-FROM ubuntu:24.04 AS runtime
+# builder's distribution keeps that contract simple. A binary built on a newer
+# host needs a newer base: pass `--build-arg BASE_IMAGE=ubuntu:26.04` (up.py
+# takes it from ARKIV_PREBUILT_BASE_IMAGE).
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE} AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

@@ -34,7 +34,7 @@ use crate::{content_type_attr, payload_attr};
 use arkiv_genesis::dev_signers;
 use clap::Args;
 use eyre::{Result, bail};
-use rand::{Rng, SeedableRng, seq::IndexedRandom};
+use rand::{RngExt, SeedableRng, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::sync::Arc;

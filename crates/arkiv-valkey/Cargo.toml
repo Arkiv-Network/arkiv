@@ -1,0 +1,22 @@
+[package]
+name = "arkiv-valkey"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A Valkey-backed `arkiv_interfaces::store::Store` — the interim backing store
+# until Golem DB exists, and the thing that exercises the out-of-process seam.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+fred = { version = "10.1", default-features = false, features = [
+    "i-keys",
+    "i-hashes",
+    "i-sets",
+    "i-lists",
+] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+arkiv-interfaces = { workspace = true, features = ["conformance"] }

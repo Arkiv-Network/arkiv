@@ -1,0 +1,19 @@
+{
+  "name": "arkiv-kurtosis-integration",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Black-box integration tests that drive the Kurtosis devnet through the Arkiv SDK",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@arkiv-network/sdk": "^0.7.0",
+    "viem": "^2.56.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}

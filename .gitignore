@@ -4,6 +4,8 @@
 
 # devnet runtime artifacts
 /data
+# seeded-genesis outputs of scripts/kurtosis/up.py
+/kurtosis/.seed/
 **/datadir
 jwt.hex
 .env
@@ -11,5 +13,9 @@ jwt.hex
 # docker build cache (kept on disk under the repo, not committed)
 /.docker/caches/*
 !/.docker/caches/.gitkeep
+
+# Claude Code: personal overrides and runtime state (settings.json is shared)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 .DS_Store

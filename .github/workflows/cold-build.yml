@@ -63,9 +63,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
-        with:
-          components: ${{ matrix.lane == 'clippy' && 'clippy' || '' }}
+      # Cargo fetches the private reth fork, and `actions/checkout`'s credential
+      # only applies to this checkout -- cargo fetches into ~/.cargo/git, a
+      # different repository, so it never sees it. The default GITHUB_TOKEN
+      # cannot read a second private repo in the org either. Rewrite the fork's
+      # SSH URL to an HTTPS one carrying a token that can.
+      - name: Authenticate cargo to the reth fork
+        env:
+          TOKEN: ${{ secrets.RETH_FORK_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${TOKEN}@github.com/Arkiv-Network/reth".insteadOf \
+            "ssh://git@github.com/Arkiv-Network/reth"
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile
       # installs. The clippy lane needs them too: check mode still compiles and
       # runs every build script, C and all.

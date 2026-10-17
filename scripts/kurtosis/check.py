@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the Arkiv Kurtosis network and its sequencer/follower RPCs.
+"""Check an Arkiv network and its sequencer/follower RPCs.
 
 Usage:
     scripts/kurtosis/check.py [--enclave NAME] [--sequencer-rpc URL]
@@ -8,6 +8,14 @@ Usage:
 The default published ports match the first two EL RPC endpoints in
 `kurtosis/arkiv-chain.yaml`: 32003 and 32010. The package allocates all EL
 ports for participant 1 before allocating participant 2's ports.
+
+Also works against a node that is not in a Kurtosis enclave — the single-node
+`docker/compose.yml` stack, or anything else serving an EL RPC:
+
+    scripts/kurtosis/check.py --no-enclave --sequencer-rpc http://127.0.0.1:8545
+
+With no `--follower-rpc` the cross-node agreement checks are skipped and only
+the sequencer is verified: RPC reachable, and blocks actually being produced.
 """
 
 import argparse
@@ -48,8 +56,20 @@ def log(message, color=None):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enclave", default=DEFAULT_ENCLAVE)
+    parser.add_argument(
+        "--no-enclave",
+        action="store_true",
+        help="skip the Kurtosis enclave check, for a node running outside one",
+    )
     parser.add_argument("--sequencer-rpc", default=DEFAULT_SEQUENCER_RPC)
-    parser.add_argument("--follower-rpc", default=DEFAULT_FOLLOWER_RPC)
+    parser.add_argument(
+        "--follower-rpc",
+        default=None,
+        help=(
+            "follower EL RPC; omit for a single-node network, which skips the "
+            f"cross-node agreement checks (Kurtosis default: {DEFAULT_FOLLOWER_RPC})"
+        ),
+    )
     parser.add_argument(
         "--wait",
         type=float,
@@ -170,6 +190,32 @@ def check_rpc(url, role):
     return chain_id, number
 
 
+def check_single_node(args):
+    """Verify one node: RPC reachable, and blocks actually being produced.
+
+    There is no second node to compare against, so this deliberately proves
+    less than `check_network` — it is the smoke test for the single-node
+    `docker/compose.yml` stack, not a substitute for the two-node check.
+    """
+    _, start = check_rpc(args.sequencer_rpc, "node")
+
+    deadline = time.monotonic() + args.wait
+    latest = start
+    while time.monotonic() < deadline and latest - start < args.samples:
+        time.sleep(POLL_INTERVAL)
+        latest = block_number(args.sequencer_rpc)
+
+    produced = latest - start
+    if produced < args.samples:
+        fail(f"only {produced}/{args.samples} blocks produced in {args.wait:g}s")
+    log(f"OK: node advanced {start} -> {latest}", "green")
+
+    # A block that cannot be fetched by height means the RPC is answering
+    # eth_blockNumber from something it cannot actually serve.
+    block(args.sequencer_rpc, latest)
+    log(f"OK: block {latest} is retrievable", "green")
+
+
 def check_network(args):
     # Capture both starting heights before polling. This lets us distinguish
     # a live-but-idle sequencer from a network that is producing blocks.
@@ -234,8 +280,19 @@ def main():
     global DIAGNOSTIC_ENCLAVE
     global USE_COLOR
     args = parse_args()
-    DIAGNOSTIC_ENCLAVE = args.enclave
     USE_COLOR = not args.no_color and sys.stdout.isatty() and os.environ.get("CI") != "true"
+
+    if args.no_enclave:
+        # Nothing to inspect on failure, and no enclave to check first.
+        check_single_node(args) if args.follower_rpc is None else check_network(args)
+        log("PASS: Arkiv node health check", "green")
+        return
+
+    DIAGNOSTIC_ENCLAVE = args.enclave
+    # In an enclave there are always two participants, so default the follower
+    # rather than silently dropping the agreement checks.
+    if args.follower_rpc is None:
+        args.follower_rpc = DEFAULT_FOLLOWER_RPC
     check_enclave(args.enclave)
     check_network(args)
     log("PASS: Arkiv Kurtosis network health check", "green")

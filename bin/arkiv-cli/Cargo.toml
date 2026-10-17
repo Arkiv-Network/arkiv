@@ -15,7 +15,6 @@ arkiv-interfaces.workspace = true
 # The node's own arkiv_* response types, rather than local restatements.
 arkiv-rpc-types.workspace = true
 arkiv-genesis.workspace = true
-
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 alloy-provider.workspace = true
@@ -27,8 +26,8 @@ alloy-rpc-types.workspace = true
 clap.workspace = true
 eyre.workspace = true
 tokio.workspace = true
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 tracing.workspace = true
 hex.workspace = true
 humantime = "2"

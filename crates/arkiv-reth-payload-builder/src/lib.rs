@@ -13,9 +13,12 @@ use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
+use arkiv_interfaces::store::Store;
 use arkiv_reth_executor::ARKIV_ADDRESS;
-use arkiv_reth_mpt_committed_store::{CodeBackend, RethEntityStore};
-use arkiv_reth_rpc::snapshot::SnapshotAccountCode;
+use arkiv_reth_rpc::store_reads;
+use arkiv_reth_statemanager::{
+    BlockSeals, ExecutionKey, HostStore, SegmentWrite, segments::rows_for_block,
+};
 use chain_pruning_map::{ChainPruningMap, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
@@ -36,7 +39,10 @@ use reth_ethereum::{
     },
     provider::CanonStateSubscriptions,
 };
-use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
+use reth_ethereum_payload_builder::{
+    EthereumBuilderConfig, PayloadStateRootRequest, PayloadStateRootResolver,
+    default_ethereum_payload,
+};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
 use reth_storage_api::{BlockReader, ReceiptProvider, StateProviderFactory};
@@ -47,8 +53,58 @@ use tracing::{debug, info, warn};
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ArkivPayloadServiceBuilder;
+/// Answers a built block's state root from the Arkiv seal that produced it.
+///
+/// GolemDB computes its own commitment at seal, so the root is a product of
+/// execution rather than a walk of an account trie — which is why reth asks for
+/// it through a resolver, after execution has ended. See
+/// `BlockBuilder::finish_with`.
+///
+/// The request names the execution by its transactions, not by its height, and
+/// the lookup is keyed the same way. Height alone would be ambiguous: reth
+/// races a second build against an unfinished one at the same height
+/// (`BasicPayloadJob::resolve_kind`), so two seals can be in flight and
+/// "whichever sealed last" is the wrong answer for one of them.
+///
+/// `None` falls back to reth's own state root. That happens when no seal
+/// matches — a build that never reached `Evm::finish`, or an empty block, which
+/// charges nothing and so seals nothing.
+fn arkiv_state_root_resolver(seals: Arc<BlockSeals>) -> PayloadStateRootResolver {
+    Arc::new(move |request: &PayloadStateRootRequest<'_>| {
+        let key = ExecutionKey::new(
+            request.number,
+            request
+                .transactions
+                .iter()
+                .map(|(signer, nonce)| (signer.into_array(), *nonce))
+                .collect(),
+        );
+        let root = seals.root_of(&key).map(B256::from);
+        if root.is_none() {
+            debug!(
+                target: "arkiv::payload",
+                number = request.number,
+                transactions = request.transactions.len(),
+                "no Arkiv seal for this execution; reth will compute the state root",
+            );
+        }
+        root
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ArkivPayloadServiceBuilder {
+    store: HostStore,
+    seals: Arc<BlockSeals>,
+}
+
+impl ArkivPayloadServiceBuilder {
+    /// The payload service over the store Arkiv's state lives in, adopting a
+    /// sealed candidate as each block becomes canonical.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
+    }
+}
 
 impl<Node, Pool, Evm> PayloadServiceBuilder<Node, Pool, Evm> for ArkivPayloadServiceBuilder
 where
@@ -81,7 +137,8 @@ where
             chain_id: ctx.chain_spec().chain().id(),
             pruning_map: pruning_map.clone(),
             config: EthereumBuilderConfig::new()
-                .with_extra_data(ctx.payload_builder_config().extra_data()),
+                .with_extra_data(ctx.payload_builder_config().extra_data())
+                .with_state_root_resolver(arkiv_state_root_resolver(self.seals.clone())),
         };
         let conf = ctx.config().builder.clone();
         let generator = BasicPayloadJobGenerator::with_builder(
@@ -96,15 +153,63 @@ where
         spawn_catch_up(
             ctx.task_executor(),
             ctx.provider().clone(),
+            self.store.clone(),
             pruning_map.clone(),
         );
         let provider = ctx.provider().clone();
+        let store = self.store.clone();
+        let seals = self.seals.clone();
         let notifications = Box::pin(ctx.provider().canonical_state_stream().then(
             move |notification| {
                 let provider = provider.clone();
+                let store = store.clone();
+                let seals = seals.clone();
                 let pruning_map = pruning_map.clone();
                 async move {
-                    if let Err(error) = catch_up(provider, pruning_map).await {
+                    // The block is canonical, so its Arkiv state is no longer
+                    // speculative: promote the seal to a commit. This is the
+                    // only place anything is written.
+                    let tip = notification.tip();
+                    let height = tip.number;
+                    // The block's own rows go into the append-only tier in the
+                    // same commit as its state. Built before `adopt` because a
+                    // block we cannot encode is one we must not commit state
+                    // for either -- the two would disagree permanently.
+                    let writes = match rows_for_canonical_tip(&notification) {
+                        Ok(writes) => writes,
+                        Err(error) => {
+                            warn!(target: "arkiv-reth", %error, height, "failed to encode the block's rows; its Arkiv state is not adopted");
+                            return notification;
+                        }
+                    };
+                    // On a blocking thread, not this one. Adoption is now a
+                    // write per transaction and receipt rather than a couple
+                    // of calls, and the store's seam is synchronous -- against
+                    // Valkey that is thousands of round trips. Blocking this
+                    // worker for them stalls the payload builder sharing the
+                    // runtime, which costs transactions per block rather than
+                    // correctness, and so does not show up in any in-process
+                    // test. `catch_up` below already does the same thing.
+                    let adopting_store = store.clone();
+                    let adopting_seals = seals.clone();
+                    let block_hash = tip.hash().0;
+                    let adopted = tokio::task::spawn_blocking(move || {
+                        adopting_seals.adopt(&adopting_store, height, block_hash, &writes)
+                    })
+                    .await;
+                    match adopted {
+                        Ok(Ok(Some(commit))) => {
+                            debug!(target: "arkiv-reth", height, commit = commit.0, "adopted the block's Arkiv state")
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => {
+                            warn!(target: "arkiv-reth", ?error, height, "failed to adopt the block's Arkiv state")
+                        }
+                        Err(error) => {
+                            warn!(target: "arkiv-reth", %error, height, "the task adopting the block's Arkiv state did not finish")
+                        }
+                    }
+                    if let Err(error) = catch_up(provider, store, pruning_map).await {
                         warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
                     }
                     notification
@@ -121,9 +226,42 @@ where
     }
 }
 
+/// The rows the canonical tip contributes to the append-only tier.
+///
+/// # Only the tip
+///
+/// A notification can commit several blocks at once, and this writes rows for
+/// the last of them. That matches `BlockSeals::adopt`, which commits the tip's
+/// seal and discards the rest, so rows and state stay consistent with each
+/// other — a block with no rows also has no committed state.
+///
+/// It is still a gap: on a multi-block notification the intermediate blocks
+/// reach neither tier. Nothing breaks today because reth keeps its own copy of
+/// every block, but that copy is what step 6 switches off, so this has to be
+/// closed before then.
+fn rows_for_canonical_tip(
+    notification: &reth_ethereum::provider::CanonStateNotification,
+) -> eyre::Result<Vec<SegmentWrite>> {
+    let chain = notification.committed();
+    let block = chain.tip();
+    let hash = block.hash();
+    let receipts = chain
+        .receipts_by_block_hash(hash)
+        .ok_or_else(|| eyre::eyre!("block {hash} is canonical but has no receipts"))?;
+    let receipts: Vec<reth_ethereum::Receipt> = receipts.into_iter().cloned().collect();
+    Ok(rows_for_block(
+        block.header(),
+        &block.body().transactions,
+        block.senders(),
+        &receipts,
+        hash,
+    )?)
+}
+
 fn spawn_catch_up<P>(
     executor: &reth_ethereum::tasks::TaskExecutor,
     provider: P,
+    store: HostStore,
     pruning_map: ChainPruningMap,
 ) where
     P: StateProviderFactory
@@ -135,13 +273,17 @@ fn spawn_catch_up<P>(
         + 'static,
 {
     executor.spawn_task(async move {
-        if let Err(error) = catch_up(provider, pruning_map).await {
+        if let Err(error) = catch_up(provider, store, pruning_map).await {
             warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
         }
     });
 }
 
-async fn catch_up<P>(provider: P, pruning_map: ChainPruningMap) -> eyre::Result<()>
+async fn catch_up<P>(
+    provider: P,
+    store: HostStore,
+    pruning_map: ChainPruningMap,
+) -> eyre::Result<()>
 where
     P: StateProviderFactory
         + BlockReader<Block = reth_ethereum::Block>
@@ -151,6 +293,8 @@ where
         + Sync
         + 'static,
 {
+    // No genesis walk: genesis holds no entities now that there is no seeding,
+    // so the map learns everything it needs from the logs replayed below.
     let _guard = pruning_map.update_guard().await;
     loop {
         let watermark = pruning_map.watermark().await?;
@@ -162,17 +306,21 @@ where
         }
         let height = watermark + 1;
         let block_provider = provider.clone();
-        let (entries, removed) =
-            tokio::task::spawn_blocking(move || pruning_updates_at(&block_provider, height))
-                .await
-                .map_err(|error| {
-                    eyre::eyre!("join pruning replay for block {height}: {error}")
-                })??;
+        let block_store = store.clone();
+        let (entries, removed) = tokio::task::spawn_blocking(move || {
+            pruning_updates_at(&block_provider, &block_store, height)
+        })
+        .await
+        .map_err(|error| eyre::eyre!("join pruning replay for block {height}: {error}"))??;
         pruning_map.apply_next(height, &entries, &removed).await?;
     }
 }
 
-fn pruning_updates_at<P>(provider: &P, height: u64) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
+fn pruning_updates_at<P>(
+    provider: &P,
+    store: &HostStore,
+    height: u64,
+) -> eyre::Result<(Vec<PruningEntry>, Vec<B256>)>
 where
     P: StateProviderFactory
         + BlockReader<Block = reth_ethereum::Block>
@@ -201,16 +349,12 @@ where
         }
     }
 
-    let state = provider
-        .history_by_block_number(height)
-        .map_err(|error| eyre::eyre!("read state for block {height}: {error:?}"))?;
-    let mut entities = RethEntityStore::new(CodeBackend::new(SnapshotAccountCode::new(state)));
+    let at = store.head();
     let mut entries = Vec::with_capacity(touched.len());
     let mut removed = Vec::new();
     for key in touched {
-        match entities
-            .get(key.0)
-            .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error:?}"))?
+        match store_reads::entity(&**store, at, key.0)
+            .map_err(|error| eyre::eyre!("read entity {key} at block {height}: {error}"))?
         {
             Some(entity) => entries.push(PruningEntry {
                 key,

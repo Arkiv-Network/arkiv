@@ -315,10 +315,9 @@ async fn typed_revert_errors_over_a_live_node() {
         "expected EmptyBatch revert data, got: {err}"
     );
 
-    // An invalid attribute name (uppercase bytes, as an SDK sends for
-    // "testInvalidKey") → Ident32InvalidByte(position, value).
+    // A slash in an attribute name causes Ident32InvalidByte.
     let mut name = [0u8; 32];
-    name[..14].copy_from_slice(b"testInvalidKey");
+    name[..14].copy_from_slice(b"test/attribute");
     let bad_attr = Attribute {
         name: alloy_primitives::FixedBytes::from(name),
         typeId: AttributeType::Str.id(),
@@ -1589,5 +1588,161 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
         tips,
         U256::from(gas_used * (effective - base_fee)),
         "the beneficiary receives the tip; the base fee is burned",
+    );
+}
+
+/// A transaction and its receipt read back by hash from the append-only tier,
+/// with every other source of the answer removed.
+///
+/// Getting a read to actually reach the tier takes three things, and leaving
+/// out any one of them makes the test prove nothing:
+///
+/// * **A restart.** `eth_getTransactionByHash` consults reth's in-memory RPC
+///   cache first and only calls the provider on a miss, so a freshly mined
+///   transaction is always a cache hit.
+/// * **A store that outlives the process.** The default in-process store does
+///   not, so after a restart the tier would be empty and the provider would
+///   fall back to reth. Hence Valkey.
+/// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50.
+///   Below it reth has written nothing to its own database, so a restart
+///   loses the block entirely and there is nothing to read either way.
+///
+/// Ignored by default because it needs a server, like the store's own
+/// conformance tests:
+///
+/// ```sh
+/// VALKEY_URL=redis://127.0.0.1:6379 \
+///   cargo nextest run -p arkiv-reth --run-ignored only -- tier
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+async fn a_transaction_and_receipt_are_read_from_the_tier() {
+    let url = std::env::var("VALKEY_URL").expect(
+        "this test needs the node on a store that survives a restart: \
+         set VALKEY_URL (for example redis://127.0.0.1:6379)",
+    );
+
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .block_time("50ms")
+        .valkey_store(url)
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+    let sent = registry
+        .execute(vec![create_op(
+            1000,
+            Bytes::from_static(b"tier read"),
+            vec![],
+        )])
+        .send()
+        .await
+        .expect("send");
+    let tx_hash = *sent.tx_hash();
+    let receipt = sent.get_receipt().await.expect("receipt");
+    assert!(receipt.status(), "the transaction must have succeeded");
+    let block_number = receipt.block_number.expect("a mined receipt has a block");
+    let block_hash = receipt
+        .block_hash
+        .expect("a mined receipt has a block hash");
+
+    // Past the persistence threshold, so reth has the block on disk and the
+    // restart below does not simply lose it.
+    let target = block_number + 60;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let tip = client
+            .provider()
+            .get_block_number()
+            .await
+            .expect("block number");
+        if tip >= target {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "chain reached only {tip} of {target}; it is not producing blocks",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A shutdown, not a crash: an abrupt kill past the persistence threshold
+    // leaves a partial state trie that a node with no trie cannot recover, and
+    // the node would never come back up to answer the reads below. See
+    // `recovery::a_crash_past_the_persistence_threshold_cannot_restart`.
+    node.terminate();
+    node.restart();
+    node.wait_ready(&client, READY).await;
+    let provider = client.provider();
+
+    let fetched = provider
+        .get_transaction_by_hash(tx_hash)
+        .await
+        .expect("get_transaction_by_hash")
+        .expect("the transaction is found by its hash after a restart");
+    assert_eq!(
+        fetched.block_number,
+        Some(block_number),
+        "the stored row reports the block it was in",
+    );
+    assert_eq!(
+        fetched.block_hash,
+        Some(block_hash),
+        "and the block hash the receipt reported",
+    );
+
+    let fetched_receipt = provider
+        .get_transaction_receipt(tx_hash)
+        .await
+        .expect("get_transaction_receipt")
+        .expect("the receipt is found by the transaction hash after a restart");
+    assert_eq!(fetched_receipt.transaction_hash, tx_hash);
+    assert_eq!(fetched_receipt.block_number, Some(block_number));
+
+    // The height side of the same rows: a block number resolves to its hash
+    // through the segment's ordinals, and the hash back to its number through
+    // the row's name. Both answers have to survive the restart and agree with
+    // what the receipt reported before it.
+    let by_number = provider
+        .get_block_by_number(block_number.into())
+        .await
+        .expect("get_block_by_number")
+        .expect("the block is found by its number after a restart");
+    assert_eq!(
+        by_number.header.hash, block_hash,
+        "the height resolves to the hash the receipt reported",
+    );
+    let by_hash = provider
+        .get_block_by_hash(block_hash)
+        .await
+        .expect("get_block_by_hash")
+        .expect("the block is found by its hash after a restart");
+    assert_eq!(
+        by_hash.header.number, block_number,
+        "and the hash resolves back to the height",
+    );
+
+    // `eth_getLogs` is what reaches the transaction *number* side of the tier:
+    // it finds a log by block and index and then asks the provider for the
+    // transaction by its number to report the hash. reth's other callers of
+    // that method are staged-sync stages, which read reth's own provider
+    // rather than this one, so this request is the only path to it.
+    let logs = provider
+        .get_logs(
+            &alloy_rpc_types::Filter::new()
+                .from_block(block_number)
+                .to_block(block_number),
+        )
+        .await
+        .expect("eth_getLogs");
+    assert!(
+        !logs.is_empty(),
+        "the create emitted an EntityOperation log, so the block has logs",
+    );
+    assert!(
+        logs.iter().all(|log| log.transaction_hash == Some(tx_hash)),
+        "every log in the block belongs to the create, by the hash the number resolved to",
     );
 }

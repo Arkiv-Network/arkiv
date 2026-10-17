@@ -67,6 +67,7 @@ mod error;
 mod lexer;
 pub mod limits;
 mod literal;
+pub mod lower;
 pub mod parse;
 
 pub use error::{ParseError, ParseErrorKind};

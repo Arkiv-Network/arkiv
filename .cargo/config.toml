@@ -1,0 +1,6 @@
+# Cargo's built-in (libgit2) fetcher does not reliably use an ssh-agent or the
+# system git credential helper, and the reth fork this workspace depends on is a
+# private repository. Shelling out to the real `git` binary makes cargo use
+# whatever credentials git already has.
+[net]
+git-fetch-with-cli = true
