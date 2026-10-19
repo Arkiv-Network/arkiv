@@ -18,6 +18,14 @@
 //! This is only safe while anchoring keeps reth's own MPT as the header state
 //! root. A store whose digest *becomes* the header root must be the real one.
 //!
+//! **Queries read a mirror, not the server.** Valkey keeps no index, so a
+//! query, a count and the index root are answered from an in-process mirror
+//! of the committed state (see [`cache`]), rebuilt from Valkey on first use
+//! and rolled forward through the undo logs when another handle commits. The
+//! mirror costs memory in proportion to the state; it is what lets a chain
+//! that starts from a prefilled genesis seal a block without reading every
+//! record back.
+//!
 //! **There is one durability domain too many.** Writes here are not
 //! transactional with the host's, and a crash mid-commit can leave the head
 //! advanced without its undo log. See [`backend`] for why, and the
@@ -35,6 +43,7 @@
 
 mod backend;
 mod bridge;
+mod cache;
 mod codec;
 mod keys;
 
@@ -42,9 +51,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
-    Filter, Metered, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange, RecordKey,
-    RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey, SegmentOrdinal,
-    SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp, WriteOutcome,
+    Filter, Metered, Page, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange,
+    RecordKey, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey,
+    SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp,
+    WriteOutcome, order_encoding,
 };
 use core::ops::Range;
 use fred::prelude::*;
@@ -289,34 +299,57 @@ impl Store for ValkeyStore {
         let at = at.unwrap_or_else(|| self.head());
         let query = query.clone();
         self.call(move |backend| async move {
-            let state = backend.state_at(at).await?;
+            backend
+                .scan_at(at, |view| {
+                    // Matching is `Filter::matches`, shared with every other
+                    // implementation, so filter semantics cannot diverge by
+                    // backend. It reads attributes only, which the mirror
+                    // keeps apart so a scan copies no payload.
+                    let Page { offset, limit } = query.page;
+                    let projection = query.projection.as_deref();
+                    if let Some(sort) = &query.sort {
+                        let mut hits = Vec::new();
+                        for (key, entry) in view {
+                            if query.filter.matches(&entry.attributes)? {
+                                hits.push((key, entry));
+                            }
+                        }
+                        sort_hits(&mut hits, sort);
+                        let total_matched = query.total_matched.then_some(hits.len() as u64);
+                        let records = hits
+                            .into_iter()
+                            .skip(offset as usize)
+                            .take(limit as usize)
+                            .map(|(key, entry)| entry.stored.to_record(key, projection))
+                            .collect();
+                        return Ok(QueryResult {
+                            records,
+                            total_matched,
+                        });
+                    }
 
-            // Matching is `Filter::matches`, shared with every other
-            // implementation, so filter semantics cannot diverge by backend.
-            let mut matched = Vec::new();
-            for (key, record) in &state {
-                let full = record.to_record(*key, None);
-                if query.filter.matches(&full)? {
-                    matched.push(full);
-                }
-            }
-
-            if let Some(sort) = &query.sort {
-                sort_records(&mut matched, sort);
-            }
-
-            let total_matched = query.total_matched.then_some(matched.len() as u64);
-            let records = matched
-                .into_iter()
-                .skip(query.page.offset as usize)
-                .take(query.page.limit as usize)
-                .map(|record| project(record, query.projection.as_deref()))
-                .collect();
-
-            Ok(QueryResult {
-                records,
-                total_matched,
-            })
+                    // Unsorted, the view's key order is the answer's order, so
+                    // a page can stop as soon as it is full.
+                    let mut matched = 0u64;
+                    let mut records = Vec::new();
+                    for (key, entry) in view {
+                        if !query.filter.matches(&entry.attributes)? {
+                            continue;
+                        }
+                        if matched >= offset && (records.len() as u64) < limit {
+                            records.push(entry.stored.to_record(key, projection));
+                        }
+                        matched += 1;
+                        if !query.total_matched && records.len() as u64 >= limit {
+                            break;
+                        }
+                    }
+                    Ok(QueryResult {
+                        records,
+                        total_matched: query.total_matched.then_some(matched),
+                    })
+                })
+                .await
         })
         .map(with_free_receipt)
     }
@@ -330,14 +363,17 @@ impl Store for ValkeyStore {
         let at = at.unwrap_or_else(|| self.head());
         let filter = filter.clone();
         self.call(move |backend| async move {
-            let state = backend.state_at(at).await?;
-            let mut matched = 0;
-            for (key, record) in &state {
-                if filter.matches(&record.to_record(*key, None))? {
-                    matched += 1;
-                }
-            }
-            Ok(matched)
+            backend
+                .scan_at(at, |view| {
+                    let mut matched = 0;
+                    for (_, entry) in view {
+                        if filter.matches(&entry.attributes)? {
+                            matched += 1;
+                        }
+                    }
+                    Ok(matched)
+                })
+                .await
         })
         .map(with_free_receipt)
     }
@@ -515,29 +551,27 @@ impl StoreExt for ValkeyStore {
     }
 }
 
-/// Drop the cells a projection excludes. Applied after matching, because a
-/// predicate may name a cell the caller did not ask to see.
-fn project(mut record: Record, projection: Option<&[CellName]>) -> Record {
-    if let Some(wanted) = projection {
-        record.cells.retain(|(name, _)| wanted.contains(name));
-    }
-    record
-}
-
 /// Sort matched records by one cell, in the requested direction.
 ///
 /// Records lacking the sort cell sort last, and ascending key order is the
-/// tie-break — so the ordering is total and two implementations agreeing on
+/// tie-break -- so the ordering is total and two implementations agreeing on
 /// the match set also agree on the page.
-fn sort_records(records: &mut [Record], sort: &Sort) {
-    records.sort_by(|left, right| {
-        let ordering = match (left.sort_key(&sort.cell), right.sort_key(&sort.cell)) {
+fn sort_hits(hits: &mut [(RecordKey, &cache::Entry)], sort: &Sort) {
+    let sort_key = |entry: &cache::Entry| {
+        entry
+            .stored
+            .cells
+            .get(&sort.cell)
+            .map(|cell| order_encoding(&cell.value, cell.type_id))
+    };
+    hits.sort_by(|(left_key, left), (right_key, right)| {
+        let ordering = match (sort_key(left), sort_key(right)) {
             (Some(left_value), Some(right_value)) => left_value.cmp(&right_value),
             (Some(_), None) => core::cmp::Ordering::Less,
             (None, Some(_)) => core::cmp::Ordering::Greater,
             (None, None) => core::cmp::Ordering::Equal,
         };
-        let ordering = ordering.then_with(|| left.key.cmp(&right.key));
+        let ordering = ordering.then_with(|| left_key.cmp(right_key));
         match sort.direction {
             SortDirection::Ascending => ordering,
             SortDirection::Descending => ordering.reverse(),

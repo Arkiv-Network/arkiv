@@ -12,6 +12,7 @@
 //! {ns}:rec:{key}            HASH cell name -> tag ‖ value, plus "#v" -> version
 //! {ns}:commit:{id}:undo     LIST of encoded changes that produced this commit
 //! {ns}:commit:{id}:hash     that commit's digest, 32 raw bytes
+//! {ns}:commit:{id}:index    that commit's index root, 32 raw bytes
 //! {ns}:commit:{id}:tag      that commit's host tag, 32 raw bytes, if tagged
 //! {ns}:tag:{tag}            reverse index: host tag -> commit id
 //! {ns}:branches             SET of live branch ids
@@ -82,6 +83,10 @@ impl Namespace {
 
     pub(crate) fn commit_hash(&self, commit: u64) -> String {
         format!("{}:commit:{commit}:hash", self.0)
+    }
+
+    pub(crate) fn commit_index(&self, commit: u64) -> String {
+        format!("{}:commit:{commit}:index", self.0)
     }
 
     pub(crate) fn commit_tag(&self, commit: u64) -> String {

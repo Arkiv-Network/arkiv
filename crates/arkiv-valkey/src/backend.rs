@@ -11,17 +11,20 @@
 //! names, and it is why this crate is an interim store rather than a
 //! production one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use core::ops::Range;
 
 use arkiv_interfaces::store::{
-    BranchId, BranchInfo, BranchVersion, Cell, CellChange, CellKind, CellName, CommitId, Origin,
-    ReadTarget, RecordChange, RecordKey, RecordVersion, SealedCommit, SegmentAddress, SegmentKey,
+    BranchId, BranchInfo, BranchVersion, Cell, CellChange, CellName, CommitId, Origin, ReadTarget,
+    RecordChange, RecordKey, RecordVersion, SealedCommit, SegmentAddress, SegmentKey,
     SegmentOrdinal, SegmentRow, StoreError, validate_cell_name,
 };
 use fred::prelude::*;
+use tokio::sync::{RwLock, RwLockReadGuard};
 
+use crate::cache::{self, Entry, HeadCache, View};
 use crate::codec::{self, Stored};
 
 /// One row inside a batch: where it sat in the caller's input, its optional
@@ -64,7 +67,25 @@ use crate::keys::{self, Namespace, VERSION_FIELD, validate_segment_name};
 pub(crate) struct Backend {
     client: Client,
     namespace: Namespace,
+    /// The committed state mirrored in memory, for queries and the index
+    /// root. Built on first use; see [`crate::cache`].
+    cache: Arc<RwLock<Option<HeadCache>>>,
+    /// Undo logs a historical read has decoded, by commit. A commit never
+    /// changes once written, so an entry never goes stale; the map is only
+    /// emptied when it grows past [`UNDO_MEMO_LIMIT`].
+    undo: Arc<Mutex<HashMap<u64, Arc<UndoLog>>>>,
 }
+
+/// One commit's changes by record: the record before it and after it.
+type UndoLog = BTreeMap<RecordKey, (Option<Stored>, Option<Stored>)>;
+
+/// How many decoded undo logs to keep before starting over.
+const UNDO_MEMO_LIMIT: usize = 65_536;
+
+/// Records per `SSCAN` / `HSCAN` page, and per pipelined batch of reads or
+/// writes. Large enough to amortize the round trip, small enough that one
+/// page of a prefilled genesis stays a few tens of megabytes.
+const PAGE: u32 = 512;
 
 /// Anything the server or an encoding can do wrong becomes
 /// [`StoreError::Internal`]: it is not a caller's mistake, and the trait's
@@ -74,8 +95,13 @@ fn internal<E>(_error: E) -> StoreError {
 }
 
 impl Backend {
-    pub(crate) const fn new(client: Client, namespace: Namespace) -> Self {
-        Self { client, namespace }
+    pub(crate) fn new(client: Client, namespace: Namespace) -> Self {
+        Self {
+            client,
+            namespace,
+            cache: Arc::default(),
+            undo: Arc::default(),
+        }
     }
 
     pub(crate) fn namespace(&self) -> &Namespace {
@@ -127,52 +153,258 @@ impl Backend {
         Ok(decode_record_hash(fields))
     }
 
-    /// Every committed record as of head.
-    async fn committed_state(&self) -> Result<BTreeMap<RecordKey, Stored>, StoreError> {
-        let hexes: Vec<String> = self
-            .client
-            .smembers(self.namespace.records())
-            .await
-            .map_err(internal)?;
-
-        let mut state = BTreeMap::new();
-        for text in hexes {
-            let Some(key) = keys::record_key_from_hex(&text) else {
-                return Err(StoreError::Internal);
-            };
-            if let Some(record) = self.committed_record(key).await? {
-                state.insert(key, record);
-            }
+    /// Several committed records as of head, in one pipelined round trip.
+    async fn committed_records(
+        &self,
+        keys: &[RecordKey],
+    ) -> Result<Vec<Option<Stored>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(state)
+        let pipeline = self.client.pipeline();
+        for key in keys {
+            let _: () = pipeline
+                .hgetall(self.namespace.record(*key))
+                .await
+                .map_err(internal)?;
+        }
+        pipeline
+            .try_all::<HashMap<String, Vec<u8>>>()
+            .await
+            .into_iter()
+            .map(|reply| reply.map(decode_record_hash).map_err(internal))
+            .collect()
     }
 
-    /// The state as of `commit`, replaying undo logs backwards when it is not
-    /// head.
+    /// One `SSCAN` page: the next cursor (`"0"` when done) and the members.
+    async fn sscan_page(
+        &self,
+        key: &str,
+        cursor: &str,
+    ) -> Result<(String, Vec<String>), StoreError> {
+        let reply: Value = self
+            .client
+            .custom(
+                fred::cmd!("SSCAN"),
+                vec![
+                    key.to_owned(),
+                    cursor.to_owned(),
+                    "COUNT".to_owned(),
+                    PAGE.to_string(),
+                ],
+            )
+            .await
+            .map_err(internal)?;
+        let (next, members) = scan_reply(reply)?;
+        let members = members
+            .into_iter()
+            .map(|member| member.as_string().ok_or(StoreError::Internal))
+            .collect::<Result<_, _>>()?;
+        Ok((next, members))
+    }
+
+    /// One `HSCAN` page of a branch diff, decoded: the next cursor (`"0"` when
+    /// done) and the staged records it held.
+    async fn diff_page(
+        &self,
+        key: &str,
+        cursor: &str,
+    ) -> Result<(String, Vec<(RecordKey, Option<Stored>)>), StoreError> {
+        let reply: Value = self
+            .client
+            .custom(
+                fred::cmd!("HSCAN"),
+                vec![
+                    key.to_owned(),
+                    cursor.to_owned(),
+                    "COUNT".to_owned(),
+                    PAGE.to_string(),
+                ],
+            )
+            .await
+            .map_err(internal)?;
+        let (next, flat) = scan_reply(reply)?;
+        let mut page = Vec::with_capacity(flat.len() / 2);
+        let mut fields = flat.into_iter();
+        while let (Some(field), Some(value)) = (fields.next(), fields.next()) {
+            let text = field.as_string().ok_or(StoreError::Internal)?;
+            let record_key = keys::record_key_from_hex(&text).ok_or(StoreError::Internal)?;
+            let encoded = value.as_bytes().ok_or(StoreError::Internal)?;
+            page.push((record_key, codec::decode_record(encoded).map_err(internal)?));
+        }
+        Ok((next, page))
+    }
+
+    /// Read the whole committed state into a fresh mirror.
     ///
-    /// Linear in the number of changes between `commit` and head. Acceptable
-    /// for an interim store with a short retention window; a real one answers
-    /// this from its own history rather than by replay.
-    pub(crate) async fn state_at(
+    /// Retried if a commit lands while it reads, so the mirror is always one
+    /// commit's state and never a blend of two.
+    async fn load_cache(&self) -> Result<HeadCache, StoreError> {
+        loop {
+            let head = self.head().await?;
+            let mut records = BTreeMap::new();
+            let mut cursor = "0".to_owned();
+            loop {
+                let (next, members) = self.sscan_page(&self.namespace.records(), &cursor).await?;
+                let page: Vec<RecordKey> = members
+                    .iter()
+                    .map(|text| keys::record_key_from_hex(text).ok_or(StoreError::Internal))
+                    .collect::<Result<_, _>>()?;
+                for (key, record) in page.iter().zip(self.committed_records(&page).await?) {
+                    if let Some(record) = record {
+                        records.insert(*key, record);
+                    }
+                }
+                if next == "0" {
+                    break;
+                }
+                cursor = next;
+            }
+            if self.head().await? == head {
+                return Ok(HeadCache::build(head, records));
+            }
+        }
+    }
+
+    /// A commit's undo log, decoded.
+    async fn decode_undo(&self, commit: u64) -> Result<UndoLog, StoreError> {
+        let raw: Vec<Vec<u8>> = self
+            .client
+            .lrange(self.namespace.commit_undo(commit), 0, -1)
+            .await
+            .map_err(internal)?;
+        let mut log = BTreeMap::new();
+        for encoded in raw {
+            let (key, before, after) = codec::decode_change(&encoded).map_err(internal)?;
+            log.insert(key, (before, after));
+        }
+        Ok(log)
+    }
+
+    /// [`decode_undo`](Self::decode_undo), remembered. Only historical reads
+    /// come through here, and they never need commit 1's log -- the one a
+    /// prefilled genesis makes huge -- because the state before commit 1 is
+    /// the empty state and is answered without it.
+    async fn undo_log(&self, commit: u64) -> Result<Arc<UndoLog>, StoreError> {
+        if let Some(log) = self.undo.lock().map_err(internal)?.get(&commit) {
+            return Ok(Arc::clone(log));
+        }
+        let log = Arc::new(self.decode_undo(commit).await?);
+        let mut memo = self.undo.lock().map_err(internal)?;
+        if memo.len() >= UNDO_MEMO_LIMIT {
+            memo.clear();
+        }
+        memo.insert(commit, Arc::clone(&log));
+        Ok(log)
+    }
+
+    /// The mirror, brought up to at least `commit`.
+    ///
+    /// A mirror behind head -- another handle committed, or this one has
+    /// never looked -- is rolled forward through the undo logs; a missing or
+    /// unusable one is read afresh.
+    async fn cache_covering(
+        &self,
+        commit: u64,
+    ) -> Result<RwLockReadGuard<'_, Option<HeadCache>>, StoreError> {
+        {
+            let guard = self.cache.read().await;
+            if guard.as_ref().is_some_and(|cache| cache.head >= commit) {
+                return Ok(guard);
+            }
+        }
+        {
+            let mut guard = self.cache.write().await;
+            let head = self.head().await?;
+            match guard.as_mut() {
+                Some(cache) if cache.head >= commit && cache.head <= head => {}
+                // Rolling forward from an empty mirror would replay commit 1,
+                // which on a prefilled chain is the whole genesis: a fresh
+                // read costs the same and keeps nothing twice.
+                Some(cache) if cache.head > 0 && cache.head <= head => {
+                    for id in (cache.head + 1)..=head {
+                        for (key, (_, after)) in self.decode_undo(id).await? {
+                            cache.apply(key, after);
+                        }
+                        cache.head = id;
+                    }
+                }
+                _ => *guard = Some(self.load_cache().await?),
+            }
+        }
+        let guard = self.cache.read().await;
+        if guard.as_ref().is_some_and(|cache| cache.head >= commit) {
+            Ok(guard)
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// The records a commit's state holds, beyond what the mirror shows: for
+    /// each record a commit in `(commit, mirror]` changed, its state before
+    /// the earliest such change.
+    async fn overlay(
+        &self,
+        commit: u64,
+        mirror: u64,
+    ) -> Result<BTreeMap<RecordKey, Option<Entry>>, StoreError> {
+        let mut overlay = BTreeMap::new();
+        // Newest first, so the earliest change's `before` is the one left.
+        for id in ((commit + 1)..=mirror).rev() {
+            for (key, (before, _)) in self.undo_log(id).await?.iter() {
+                overlay.insert(*key, before.clone().map(|stored| Entry::new(*key, stored)));
+            }
+        }
+        Ok(overlay)
+    }
+
+    /// Run `scan` over every record of `commit`'s state, in key order.
+    ///
+    /// The mirror answers for head; an older commit is the mirror with the
+    /// undo logs since laid over it. Either way nothing is read per record.
+    pub(crate) async fn scan_at<R>(
         &self,
         commit: CommitId,
-    ) -> Result<BTreeMap<RecordKey, Stored>, StoreError> {
+        scan: impl FnOnce(View<'_>) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
         let head = self.head().await?;
         if commit.0 > head {
             return Err(StoreError::NotFound);
         }
-
-        let mut state = self.committed_state().await?;
-        // Walk back from head, undoing each commit in turn.
-        for id in ((commit.0 + 1)..=head).rev() {
-            for change in self.changes(CommitId(id)).await? {
-                match change.before {
-                    Some(record) => state.insert(change.key, stored_from_record(&record)),
-                    None => state.remove(&change.key),
-                };
-            }
+        if commit == CommitId::GENESIS {
+            // Commit 0 is the empty state, by definition.
+            return scan(View::new(&BTreeMap::new(), &BTreeMap::new()));
         }
-        Ok(state)
+        let guard = self.cache_covering(commit.0).await?;
+        let cache = guard.as_ref().ok_or(StoreError::Internal)?;
+        let overlay = self.overlay(commit.0, cache.head).await?;
+        scan(View::new(&cache.records, &overlay))
+    }
+
+    /// The index root `commit` was sealed with.
+    async fn index_root_at(&self, commit: CommitId) -> Result<[u8; 32], StoreError> {
+        if commit == CommitId::GENESIS {
+            return Ok([0u8; 32]);
+        }
+        let raw: Option<Vec<u8>> = self
+            .client
+            .get(self.namespace.commit_index(commit.0))
+            .await
+            .map_err(internal)?;
+        if raw.is_some() {
+            return fixed_32(raw);
+        }
+        // A commit made before index roots were kept: fold it from the state.
+        self.scan_at(commit, |view| {
+            let mut root = [0u8; 32];
+            for (key, entry) in view {
+                if let Some(digest) = cache::index_digest(key, &entry.stored) {
+                    codec::fold_digest(&mut root, digest);
+                }
+            }
+            Ok(root)
+        })
+        .await
     }
 
     // -- branches ----------------------------------------------------------
@@ -304,10 +536,22 @@ impl Backend {
                 Box::pin(self.read(ReadTarget::Commit(origin), key)).await
             }
             ReadTarget::Commit(commit) => {
-                if commit.0 == self.head().await? {
-                    return self.committed_record(key).await;
+                let head = self.head().await?;
+                if commit.0 > head {
+                    return Err(StoreError::NotFound);
                 }
-                Ok(self.state_at(commit).await?.get(&key).cloned())
+                if commit == CommitId::GENESIS {
+                    // The empty state, which no undo log needs to be read for.
+                    return Ok(None);
+                }
+                // The record as the first later commit to change it found
+                // it, or as it is now if none has.
+                for id in (commit.0 + 1)..=head {
+                    if let Some((before, _)) = self.undo_log(id).await?.get(&key) {
+                        return Ok(before.clone());
+                    }
+                }
+                self.committed_record(key).await
             }
         }
     }
@@ -1140,34 +1384,70 @@ impl Backend {
             return Err(StoreError::Conflict);
         }
 
-        let diff = self.branch_diff(root).await?;
         let mut digest = self.digest().await?;
-        let mut changes = Vec::new();
-
-        for (key, after) in diff {
-            let before = self.committed_record(key).await?;
-            if before.as_ref().map(|r| &r.cells) == after.as_ref().map(|r| &r.cells) {
-                // Content-equal: not a change, and it must not move the digest.
-                continue;
-            }
-            if let Some(record) = &before {
-                codec::fold_digest(&mut digest, codec::record_digest(key, record));
-            }
-            if let Some(record) = &after {
-                codec::fold_digest(&mut digest, codec::record_digest(key, record));
-            }
-            changes.push(codec::encode_change(key, before.as_ref(), after.as_ref()));
-            self.write_committed(key, after.as_ref()).await?;
-        }
-
+        let mut index_root = self.index_root_at(CommitId(head)).await?;
         let commit = CommitId(head + 1);
-        if !changes.is_empty() {
-            let _: u64 = self
-                .client
-                .rpush(self.namespace.commit_undo(commit.0), changes)
-                .await
-                .map_err(internal)?;
+        // What the mirror needs to follow this commit, kept only when there is
+        // a mirror at this head to follow it: an importer that never queries
+        // has no reason to hold its whole genesis in memory twice.
+        let mut applied: Option<Vec<(RecordKey, Option<Stored>)>> = self
+            .cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|cache| cache.head == head)
+            .then(Vec::new);
+
+        let mut pages = DiffPages::new(&self.namespace, root);
+        while let Some(page) = pages.next(self).await? {
+            let keys: Vec<RecordKey> = page.iter().map(|(key, _)| *key).collect();
+            // Nothing is committed before the first commit: no reads needed.
+            let befores = if head == 0 {
+                vec![None; keys.len()]
+            } else {
+                self.committed_records(&keys).await?
+            };
+            let mut writes = Vec::new();
+            let mut changes = Vec::new();
+            for ((key, after), before) in page.into_iter().zip(befores) {
+                if before.as_ref().map(|r| &r.cells) == after.as_ref().map(|r| &r.cells) {
+                    // Content-equal: not a change, and it must not move the digest.
+                    continue;
+                }
+                if let Some(record) = &before {
+                    codec::fold_digest(&mut digest, codec::record_digest(key, record));
+                }
+                if let Some(record) = &after {
+                    codec::fold_digest(&mut digest, codec::record_digest(key, record));
+                }
+                cache::fold_index(&mut index_root, key, before.as_ref(), after.as_ref());
+                changes.push(codec::encode_change(key, before.as_ref(), after.as_ref()));
+                writes.push((key, after));
+            }
+            self.write_committed(&writes).await?;
+            if !changes.is_empty() {
+                let _: u64 = self
+                    .client
+                    .rpush(self.namespace.commit_undo(commit.0), changes)
+                    .await
+                    .map_err(internal)?;
+            }
+            if let Some(applied) = applied.as_mut() {
+                applied.extend(writes);
+            }
         }
+
+        let _: Option<()> = self
+            .client
+            .set(
+                self.namespace.commit_index(commit.0),
+                index_root.to_vec(),
+                None,
+                None,
+                false,
+            )
+            .await
+            .map_err(internal)?;
         let _: Option<()> = self
             .client
             .set(
@@ -1226,58 +1506,72 @@ impl Backend {
             .map_err(internal)?;
 
         self.drop_branch(root).await?;
+
+        // Follow the commit in the mirror -- unless a reader already rolled it
+        // forward through the undo log just written, which is just as good.
+        let mut guard = self.cache.write().await;
+        match (guard.as_mut(), applied) {
+            (Some(cache), Some(applied)) if cache.head == head => {
+                for (key, after) in applied {
+                    cache.apply(key, after);
+                }
+                cache.head = commit.0;
+            }
+            (Some(cache), _) if cache.head >= commit.0 => {}
+            _ => *guard = None,
+        }
         Ok(commit)
     }
 
-    /// Write one record into committed state, keeping the record index in step.
+    /// Write a page of records into committed state, keeping the record index
+    /// in step: one pipelined round trip for the lot.
     async fn write_committed(
         &self,
-        key: RecordKey,
-        record: Option<&Stored>,
+        writes: &[(RecordKey, Option<Stored>)],
     ) -> Result<(), StoreError> {
-        match record {
-            Some(record) => {
-                let _: u64 = self
-                    .client
-                    .del(self.namespace.record(key))
-                    .await
-                    .map_err(internal)?;
-                let mut fields: Vec<(String, Vec<u8>)> = record
-                    .cells
-                    .iter()
-                    .map(|(name, cell)| {
-                        let mut value = vec![cell.tag()];
-                        value.extend_from_slice(&cell.value);
-                        (name.clone(), value)
-                    })
-                    .collect();
-                fields.push((
-                    VERSION_FIELD.to_owned(),
-                    record.version.0.to_string().into_bytes(),
-                ));
-                let _: u64 = self
-                    .client
-                    .hset(self.namespace.record(key), fields)
-                    .await
-                    .map_err(internal)?;
-                let _: u64 = self
-                    .client
-                    .sadd(self.namespace.records(), keys::hex(&key.0))
-                    .await
-                    .map_err(internal)?;
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let pipeline = self.client.pipeline();
+        for (key, record) in writes {
+            let _: () = pipeline
+                .del(self.namespace.record(*key))
+                .await
+                .map_err(internal)?;
+            match record {
+                Some(record) => {
+                    let mut fields: Vec<(String, Vec<u8>)> = record
+                        .cells
+                        .iter()
+                        .map(|(name, cell)| {
+                            let mut value = vec![cell.tag()];
+                            value.extend_from_slice(&cell.value);
+                            (name.clone(), value)
+                        })
+                        .collect();
+                    fields.push((
+                        VERSION_FIELD.to_owned(),
+                        record.version.0.to_string().into_bytes(),
+                    ));
+                    let _: () = pipeline
+                        .hset(self.namespace.record(*key), fields)
+                        .await
+                        .map_err(internal)?;
+                    let _: () = pipeline
+                        .sadd(self.namespace.records(), keys::hex(&key.0))
+                        .await
+                        .map_err(internal)?;
+                }
+                None => {
+                    let _: () = pipeline
+                        .srem(self.namespace.records(), keys::hex(&key.0))
+                        .await
+                        .map_err(internal)?;
+                }
             }
-            None => {
-                let _: u64 = self
-                    .client
-                    .del(self.namespace.record(key))
-                    .await
-                    .map_err(internal)?;
-                let _: u64 = self
-                    .client
-                    .srem(self.namespace.records(), keys::hex(&key.0))
-                    .await
-                    .map_err(internal)?;
-            }
+        }
+        for reply in pipeline.try_all::<Value>().await {
+            reply.map_err(internal)?;
         }
         Ok(())
     }
@@ -1297,32 +1591,18 @@ impl Backend {
     /// folded in. Linear in the size of the diff, not of the state.
     /// The index root: the same fold, over **attribute** cells alone.
     pub(crate) async fn index_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
+        // The origin's root, with the branch's writes folded over it: linear
+        // in the diff, where it used to be linear in the whole state.
         let origin = self.grounding_commit(branch).await?;
-        let mut state = self.state_at(origin).await?;
-        for (key, after) in self.branch_diff(branch).await? {
-            match after {
-                Some(record) => state.insert(key, record),
-                None => state.remove(&key),
-            };
-        }
-        let mut digest = [0u8; 32];
-        for (key, record) in &state {
-            let indexed: Vec<_> = record
-                .cells
-                .iter()
-                .filter(|(_, cell)| cell.kind == CellKind::Attribute)
-                .map(|(n, c)| (n.clone(), c.clone()))
-                .collect();
-            if indexed.is_empty() {
-                continue;
+        let mut root = self.index_root_at(origin).await?;
+        let mut pages = DiffPages::new(&self.namespace, branch);
+        while let Some(page) = pages.next(self).await? {
+            for (key, after) in page {
+                let before = self.read(ReadTarget::Commit(origin), key).await?;
+                cache::fold_index(&mut root, key, before.as_ref(), after.as_ref());
             }
-            let only_indexed = Stored {
-                cells: indexed.into_iter().collect(),
-                ..record.clone()
-            };
-            codec::fold_digest(&mut digest, codec::record_digest(*key, &only_indexed));
         }
-        Ok(digest)
+        Ok(root)
     }
 
     pub(crate) async fn branch_hash(&self, branch: BranchId) -> Result<[u8; 32], StoreError> {
@@ -1333,16 +1613,19 @@ impl Backend {
             self.commit_hash(origin).await?
         };
 
-        for (key, after) in self.branch_diff(branch).await? {
-            let before = self.read(ReadTarget::Commit(origin), key).await?;
-            if before.as_ref().map(|r| &r.cells) == after.as_ref().map(|r| &r.cells) {
-                continue;
-            }
-            if let Some(record) = &before {
-                codec::fold_digest(&mut digest, codec::record_digest(key, record));
-            }
-            if let Some(record) = &after {
-                codec::fold_digest(&mut digest, codec::record_digest(key, record));
+        let mut pages = DiffPages::new(&self.namespace, branch);
+        while let Some(page) = pages.next(self).await? {
+            for (key, after) in page {
+                let before = self.read(ReadTarget::Commit(origin), key).await?;
+                if before.as_ref().map(|r| &r.cells) == after.as_ref().map(|r| &r.cells) {
+                    continue;
+                }
+                if let Some(record) = &before {
+                    codec::fold_digest(&mut digest, codec::record_digest(key, record));
+                }
+                if let Some(record) = &after {
+                    codec::fold_digest(&mut digest, codec::record_digest(key, record));
+                }
             }
         }
         Ok(digest)
@@ -1458,14 +1741,66 @@ fn decode_record_hash(mut fields: HashMap<String, Vec<u8>>) -> Option<Stored> {
     Some(Stored { version, cells })
 }
 
-/// Turn a caller-facing [`Record`](arkiv_interfaces::store::Record) back into
-/// storage form — the inverse of [`Stored::to_record`], used when replaying
-/// changesets.
-fn stored_from_record(record: &arkiv_interfaces::store::Record) -> Stored {
-    Stored {
-        version: record.version,
-        cells: record.cells.iter().cloned().collect(),
+/// A branch's staged writes, page by page, each record once.
+///
+/// `HSCAN` may return a field twice, and the digests fold by XOR, so a repeat
+/// would cancel itself out: `seen` is what makes each record count once. A
+/// page at a time is what keeps a prefilled genesis -- a diff of gigabytes --
+/// out of a single reply.
+struct DiffPages {
+    key: String,
+    cursor: Option<String>,
+    seen: HashSet<RecordKey>,
+}
+
+impl DiffPages {
+    fn new(namespace: &Namespace, branch: BranchId) -> Self {
+        Self {
+            key: namespace.branch_diff(branch.0),
+            cursor: Some("0".to_owned()),
+            seen: HashSet::new(),
+        }
     }
+
+    /// The next non-empty page, or `None` once the diff is exhausted.
+    async fn next(
+        &mut self,
+        backend: &Backend,
+    ) -> Result<Option<Vec<(RecordKey, Option<Stored>)>>, StoreError> {
+        while let Some(cursor) = self.cursor.take() {
+            let (next, page) = backend.diff_page(&self.key, &cursor).await?;
+            if next != "0" {
+                self.cursor = Some(next);
+            }
+            let page: Vec<_> = page
+                .into_iter()
+                .filter(|(key, _)| self.seen.insert(*key))
+                .collect();
+            if !page.is_empty() {
+                return Ok(Some(page));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Split a `SCAN`-family reply into its next cursor and its items.
+fn scan_reply(reply: Value) -> Result<(String, Vec<Value>), StoreError> {
+    let Value::Array(mut parts) = reply else {
+        return Err(StoreError::Internal);
+    };
+    if parts.len() != 2 {
+        return Err(StoreError::Internal);
+    }
+    let items = match parts.pop() {
+        Some(Value::Array(items)) => items,
+        _ => return Err(StoreError::Internal),
+    };
+    let cursor = parts
+        .pop()
+        .and_then(|cursor| cursor.as_string())
+        .ok_or(StoreError::Internal)?;
+    Ok((cursor, items))
 }
 
 /// A stored digest must be exactly 32 bytes; absent means the empty state.

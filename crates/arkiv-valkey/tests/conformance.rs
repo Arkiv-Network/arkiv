@@ -132,3 +132,107 @@ fn committed_state_survives_reconnection() {
     );
     reopened.drop_namespace().expect("clean up");
 }
+
+/// A handle whose mirror is already loaded still answers for commits another
+/// handle made since, and still answers for the commits before them -- the
+/// two ways an in-process mirror could go stale.
+#[test]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+fn queries_follow_commits_made_by_another_handle() {
+    use arkiv_interfaces::store::{
+        AndGroup, Cell, CompareOp, Filter, Page, Predicate, Query, ReadTarget, RecordKey, Store,
+        TypeId,
+    };
+
+    let namespace = format!("arkiv-test:mirror:{}", std::process::id());
+    let writer = ValkeyStore::connect(&url(), &namespace).expect("connect writer");
+    let reader = ValkeyStore::connect(&url(), &namespace).expect("connect reader");
+
+    let colour = |value: &str| {
+        vec![(
+            "colour".to_owned(),
+            Cell::attribute(TypeId::STR, value.as_bytes().to_vec()),
+        )]
+    };
+    let red = || {
+        Filter(vec![AndGroup(vec![Predicate {
+            cell: "colour".to_owned(),
+            op: CompareOp::Eq,
+            type_id: TypeId::STR,
+            value: b"red".to_vec(),
+            negated: false,
+        }])])
+    };
+    let keys_of = |at| {
+        reader
+            .query(
+                Some(at),
+                &Query {
+                    filter: red(),
+                    page: Page {
+                        offset: 0,
+                        limit: 10,
+                    },
+                    ..Query::default()
+                },
+                None,
+            )
+            .expect("query")
+            .into_value()
+            .records
+            .into_iter()
+            .map(|record| record.key.0[0])
+            .collect::<Vec<_>>()
+    };
+
+    // Commit 1: two red records. The reader loads its mirror here.
+    let branch = writer.begin(None).expect("begin");
+    for byte in [1u8, 2] {
+        writer
+            .create(branch, RecordKey([byte; 32]), colour("red"), None)
+            .expect("create");
+    }
+    let first = writer.commit(branch).expect("commit 1");
+    assert_eq!(keys_of(first), [1, 2]);
+
+    // Commit 2, by the writer alone: one record turns blue, a third arrives.
+    let branch = writer.begin(None).expect("begin");
+    writer
+        .patch(
+            branch,
+            RecordKey([1; 32]),
+            None,
+            vec![(
+                "colour".to_owned(),
+                arkiv_interfaces::store::CellChange::Set(Cell::attribute(
+                    TypeId::STR,
+                    b"blue".to_vec(),
+                )),
+            )],
+            None,
+        )
+        .expect("patch");
+    writer
+        .create(branch, RecordKey([3; 32]), colour("red"), None)
+        .expect("create");
+    let second = writer.commit(branch).expect("commit 2");
+
+    assert_eq!(keys_of(second), [2, 3], "the reader rolled forward");
+    assert_eq!(keys_of(first), [1, 2], "and still answers for the past");
+    assert_eq!(
+        reader
+            .count(Some(second), &red(), None)
+            .expect("count")
+            .into_value(),
+        2
+    );
+    assert!(
+        reader
+            .get(ReadTarget::Commit(first), RecordKey([3; 32]), None, None)
+            .expect("historical get")
+            .into_value()
+            .is_none(),
+        "a record made later is absent from an earlier commit",
+    );
+    writer.drop_namespace().expect("clean up");
+}
