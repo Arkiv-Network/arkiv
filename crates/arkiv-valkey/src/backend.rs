@@ -235,6 +235,29 @@ impl Backend {
         Ok((next, page))
     }
 
+    /// The records `keys` held at `origin`, for a page of a branch diff.
+    ///
+    /// The empty state needs no reads, and head -- the origin of every branch
+    /// a block builds -- is one pipelined round trip for the page. Only an
+    /// older origin falls back to a historical read per record.
+    async fn origin_records(
+        &self,
+        origin: CommitId,
+        keys: &[RecordKey],
+    ) -> Result<Vec<Option<Stored>>, StoreError> {
+        if origin == CommitId::GENESIS {
+            return Ok(vec![None; keys.len()]);
+        }
+        if origin.0 == self.head().await? {
+            return self.committed_records(keys).await;
+        }
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            records.push(self.read(ReadTarget::Commit(origin), *key).await?);
+        }
+        Ok(records)
+    }
+
     /// Read the whole committed state into a fresh mirror.
     ///
     /// Retried if a commit lands while it reads, so the mirror is always one
@@ -536,13 +559,13 @@ impl Backend {
                 Box::pin(self.read(ReadTarget::Commit(origin), key)).await
             }
             ReadTarget::Commit(commit) => {
-                let head = self.head().await?;
-                if commit.0 > head {
-                    return Err(StoreError::NotFound);
-                }
                 if commit == CommitId::GENESIS {
                     // The empty state, which no undo log needs to be read for.
                     return Ok(None);
+                }
+                let head = self.head().await?;
+                if commit.0 > head {
+                    return Err(StoreError::NotFound);
                 }
                 // The record as the first later commit to change it found
                 // it, or as it is now if none has.
@@ -1401,12 +1424,7 @@ impl Backend {
         let mut pages = DiffPages::new(&self.namespace, root);
         while let Some(page) = pages.next(self).await? {
             let keys: Vec<RecordKey> = page.iter().map(|(key, _)| *key).collect();
-            // Nothing is committed before the first commit: no reads needed.
-            let befores = if head == 0 {
-                vec![None; keys.len()]
-            } else {
-                self.committed_records(&keys).await?
-            };
+            let befores = self.origin_records(CommitId(head), &keys).await?;
             let mut writes = Vec::new();
             let mut changes = Vec::new();
             for ((key, after), before) in page.into_iter().zip(befores) {
@@ -1597,8 +1615,9 @@ impl Backend {
         let mut root = self.index_root_at(origin).await?;
         let mut pages = DiffPages::new(&self.namespace, branch);
         while let Some(page) = pages.next(self).await? {
-            for (key, after) in page {
-                let before = self.read(ReadTarget::Commit(origin), key).await?;
+            let keys: Vec<RecordKey> = page.iter().map(|(key, _)| *key).collect();
+            let befores = self.origin_records(origin, &keys).await?;
+            for ((key, after), before) in page.into_iter().zip(befores) {
                 cache::fold_index(&mut root, key, before.as_ref(), after.as_ref());
             }
         }
@@ -1615,8 +1634,9 @@ impl Backend {
 
         let mut pages = DiffPages::new(&self.namespace, branch);
         while let Some(page) = pages.next(self).await? {
-            for (key, after) in page {
-                let before = self.read(ReadTarget::Commit(origin), key).await?;
+            let keys: Vec<RecordKey> = page.iter().map(|(key, _)| *key).collect();
+            let befores = self.origin_records(origin, &keys).await?;
+            for ((key, after), before) in page.into_iter().zip(befores) {
                 if before.as_ref().map(|r| &r.cells) == after.as_ref().map(|r| &r.cells) {
                     continue;
                 }
