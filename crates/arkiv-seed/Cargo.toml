@@ -25,6 +25,8 @@ reth-cli.workspace = true
 reth-chainspec.workspace = true
 
 alloy-primitives.workspace = true
+# The alloc, read exactly as the node's chain spec reads it.
+alloy-genesis.workspace = true
 base64 = "0.22"
 serde.workspace = true
 serde_json.workspace = true
