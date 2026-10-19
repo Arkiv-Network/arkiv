@@ -18,7 +18,7 @@
 
 mod parser;
 
-pub use parser::ArkivChainSpecParser;
+pub use parser::{ArkivChainSpecParser, STATE_HASH_FIELD};
 pub use reth_ethereum::chainspec::ChainSpec;
 
 use alloy_consensus::Header;

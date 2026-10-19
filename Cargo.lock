@@ -1581,6 +1581,7 @@ dependencies = [
  "reth-ethereum",
  "reth-ethereum-cli",
  "reth-network-peers",
+ "serde",
  "serde_json",
 ]
 
