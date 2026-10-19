@@ -1732,6 +1732,7 @@ dependencies = [
 name = "arkiv-seed"
 version = "0.5.1"
 dependencies = [
+ "alloy-genesis",
  "alloy-primitives",
  "arkiv-bindings",
  "arkiv-golemdb-state",

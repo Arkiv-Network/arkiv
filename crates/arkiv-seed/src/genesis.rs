@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
-use serde::Deserialize;
 use serde_json::Value;
 
 /// The genesis field naming the block-0 state root: the chain spec parser's.
@@ -43,14 +42,6 @@ pub struct Funded {
     pub nonce: u64,
 }
 
-#[derive(Deserialize)]
-struct AllocEntry {
-    #[serde(default)]
-    balance: U256,
-    #[serde(default)]
-    nonce: Option<u64>,
-}
-
 /// A genesis's chain id.
 pub fn chain_id(genesis: &Value) -> Result<u64> {
     genesis["config"]["chainId"]
@@ -67,22 +58,25 @@ pub fn state_hash(genesis: &Value) -> Result<Option<B256>> {
         .transpose()
 }
 
-/// A genesis's alloc. Code and storage are not read: a GolemDB genesis holds
-/// balances and nonces, and nothing else of an account.
+/// A genesis's alloc, read with alloy's `GenesisAccount` -- the type the
+/// node's chain spec parses it with, so every spelling the node accepts (a
+/// nonce as a number, a decimal or a hex string) reads the same here. Code and
+/// storage are dropped: a GolemDB genesis holds balances and nonces, and
+/// nothing else of an account.
 pub fn alloc(genesis: &Value) -> Result<BTreeMap<Address, Funded>> {
     let Some(entries) = genesis.get("alloc").filter(|value| !value.is_null()) else {
         return Ok(BTreeMap::new());
     };
-    let entries: BTreeMap<Address, AllocEntry> =
+    let entries: BTreeMap<Address, alloy_genesis::GenesisAccount> =
         serde_json::from_value(entries.clone()).wrap_err("alloc")?;
     Ok(entries
         .into_iter()
-        .map(|(address, entry)| {
+        .map(|(address, account)| {
             (
                 address,
                 Funded {
-                    balance: entry.balance,
-                    nonce: entry.nonce.unwrap_or_default(),
+                    balance: account.balance,
+                    nonce: account.nonce.unwrap_or_default(),
                 },
             )
         })
@@ -118,6 +112,31 @@ pub fn genesis_hash(genesis: &Value) -> Result<B256> {
     Ok(spec.genesis_hash())
 }
 
+/// How many alloc accounts carry code or storage -- which a GolemDB genesis
+/// commit does not hold: it keeps balances and nonces.
+pub fn accounts_with_code(genesis: &Value) -> usize {
+    genesis["alloc"].as_object().map_or(0, |alloc| {
+        alloc
+            .values()
+            .filter(|account| {
+                let code = account["code"]
+                    .as_str()
+                    .is_some_and(|code| code != "0x" && !code.is_empty());
+                let storage = account["storage"]
+                    .as_object()
+                    .is_some_and(|slots| !slots.is_empty());
+                code || storage
+            })
+            .count()
+    })
+}
+
+/// Empty the alloc: what a genesis naming its state root carries, its
+/// accounts being inside that root.
+pub fn clear_alloc(genesis: &mut Value) {
+    genesis["alloc"] = serde_json::json!({});
+}
+
 /// Name `root` as the genesis state root.
 pub fn set_state_hash(genesis: &mut Value, root: B256) {
     genesis[STATE_HASH_FIELD] = serde_json::to_value(root).expect("a B256 serializes");
@@ -151,6 +170,45 @@ mod tests {
         let plain = genesis_hash(&genesis).unwrap();
         set_state_hash(&mut genesis, B256::repeat_byte(4));
         assert_ne!(genesis_hash(&genesis).unwrap(), plain);
+    }
+
+    #[test]
+    fn an_emptied_alloc_keeps_the_genesis_hash() {
+        // The header carries the stateHash either way, and nothing else of
+        // the alloc reaches it.
+        let mut genesis = dev_genesis(1);
+        fund(&mut genesis, [(Address::repeat_byte(1), U256::from(5))]);
+        set_state_hash(&mut genesis, B256::repeat_byte(4));
+        let with_alloc = genesis_hash(&genesis).unwrap();
+        clear_alloc(&mut genesis);
+        assert_eq!(genesis_hash(&genesis).unwrap(), with_alloc);
+        assert!(alloc(&genesis).unwrap().is_empty());
+    }
+
+    /// The consensus-genesis generator writes nonces as decimal strings.
+    #[test]
+    fn an_alloc_reads_in_every_spelling_the_node_accepts() {
+        let mut genesis = dev_genesis(1);
+        genesis["alloc"] = serde_json::json!({
+            "0x0000000000000000000000000000000000000001": {"balance": "0x10", "nonce": "1"},
+            "0x0000000000000000000000000000000000000002": {"balance": "16", "nonce": "0x2"},
+            "0x0000000000000000000000000000000000000003": {"balance": "0x0", "nonce": 3},
+        });
+        let alloc = alloc(&genesis).unwrap();
+        let nonces: Vec<u64> = alloc.values().map(|funded| funded.nonce).collect();
+        assert_eq!(nonces, [1, 2, 3]);
+        assert_eq!(alloc[&Address::with_last_byte(2)].balance, U256::from(16));
+    }
+
+    #[test]
+    fn accounts_with_code_or_storage_are_counted() {
+        let mut genesis = dev_genesis(1);
+        genesis["alloc"] = serde_json::json!({
+            "0x0000000000000000000000000000000000000001": {"balance": "0x1"},
+            "0x0000000000000000000000000000000000000002": {"balance": "0x0", "code": "0x60"},
+            "0x0000000000000000000000000000000000000003": {"balance": "0x0", "storage": {"0x00": "0x01"}},
+        });
+        assert_eq!(accounts_with_code(&genesis), 2);
     }
 
     #[test]
