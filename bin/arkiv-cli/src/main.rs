@@ -1,3 +1,4 @@
+mod seed;
 mod simulate;
 
 use alloy_network::EthereumWallet;
@@ -51,6 +52,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prefill a GolemDB chain's genesis: write seeded entities into the
+    /// Arkiv Store as its genesis commit, and the genesis that names its root
+    /// (`stateHash`). Offline: it talks to the store, never to a node.
+    SeedGenesis(Box<seed::SeedGenesisArgs>),
     /// Create an entity. Either `--payload` or `--random-payload` must be set.
     Create {
         /// Content type MIME string.
@@ -880,6 +885,11 @@ async fn main() -> Result<()> {
     if let Command::InjectPredeploy { file, out } = &cli.command {
         return inject_predeploy(file, out.as_deref());
     }
+    // `seed-genesis` talks to the store, never to a node. The store's client
+    // blocks, so it runs off the async runtime.
+    if let Command::SeedGenesis(args) = cli.command {
+        return tokio::task::spawn_blocking(move || seed::run(*args)).await?;
+    }
     // `simulate` builds its own multi-signer provider; bypass the
     // single-signer setup below.
     if let Command::Simulate(args) = cli.command {
@@ -1036,6 +1046,7 @@ async fn main() -> Result<()> {
 
         Command::InjectPredeploy { .. } => unreachable!("handled at top of main"),
         Command::Simulate(_) => unreachable!("handled at top of main"),
+        Command::SeedGenesis(_) => unreachable!("handled at top of main"),
 
         Command::Batch { file } => {
             let json = std::fs::read_to_string(&file)

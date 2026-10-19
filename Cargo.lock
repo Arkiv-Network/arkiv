@@ -1473,7 +1473,10 @@ dependencies = [
  "arkiv-bindings",
  "arkiv-genesis",
  "arkiv-interfaces",
+ "arkiv-reth-statemanager",
  "arkiv-rpc-types",
+ "arkiv-seed",
+ "arkiv-valkey",
  "clap",
  "eyre",
  "hex",
@@ -1742,6 +1745,25 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "arkiv-interfaces",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "arkiv-seed"
+version = "0.5.1"
+dependencies = [
+ "alloy-primitives",
+ "arkiv-bindings",
+ "arkiv-golemdb-state",
+ "arkiv-interfaces",
+ "arkiv-reth-chainspec",
+ "arkiv-reth-executor",
+ "arkiv-reth-statemanager",
+ "base64 0.22.1",
+ "eyre",
+ "reth-chainspec",
+ "reth-cli",
  "serde",
  "serde_json",
 ]
