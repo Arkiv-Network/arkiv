@@ -13,13 +13,17 @@ use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
-use arkiv_interfaces::store::Store;
+use arkiv_interfaces::entity::annotations;
+use arkiv_interfaces::entity_records;
+use arkiv_interfaces::store::{
+    AndGroup, CommitId, CompareOp, Filter, Page, Predicate, Query, Store, TypeId,
+};
 use arkiv_reth_executor::ARKIV_ADDRESS;
 use arkiv_reth_rpc::store_reads;
 use arkiv_reth_statemanager::{
     BlockSeals, ExecutionKey, HostStore, SegmentWrite, segments::rows_for_block,
 };
-use chain_pruning_map::{ChainPruningMap, PruningEntry};
+use chain_pruning_map::{ChainPruningMap, GenesisBootstrapWriter, PruningEntry};
 use futures_util::StreamExt;
 use reth_basic_payload_builder::{
     BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
@@ -293,9 +297,23 @@ where
         + Sync
         + 'static,
 {
-    // No genesis walk: genesis holds no entities now that there is no seeding,
-    // so the map learns everything it needs from the logs replayed below.
     let _guard = pruning_map.update_guard().await;
+    // Once per datadir, before any block: the genesis commit's expiring
+    // entities. A prefilled genesis holds entities no block's logs mention,
+    // so the replay below would never learn of them.
+    if store.head() >= CommitId::CHAIN_GENESIS && !pruning_map.genesis_bootstrapped().await? {
+        let walk_store = store.clone();
+        let walk_map = pruning_map.clone();
+        let walked = tokio::task::spawn_blocking(move || {
+            let cursor = walk_map.genesis_cursor_blocking()?;
+            let writer = walk_map.genesis_bootstrap_writer_blocking()?;
+            genesis_walk(&walk_store, writer, cursor)
+        })
+        .await
+        .map_err(|error| eyre::eyre!("join the genesis pruning walk: {error}"))??;
+        pruning_map.mark_genesis_bootstrapped().await?;
+        info!(target: "arkiv-reth", entities = walked, "genesis entities folded into the chain pruning map");
+    }
     loop {
         let watermark = pruning_map.watermark().await?;
         let tip = provider
@@ -313,6 +331,70 @@ where
         .await
         .map_err(|error| eyre::eyre!("join pruning replay for block {height}: {error}"))??;
         pruning_map.apply_next(height, &entries, &removed).await?;
+    }
+}
+
+/// Genesis entities read per bootstrap batch.
+const GENESIS_WALK_PAGE: u64 = 10_000;
+
+/// Fold the genesis commit's entities with a finite expiry into the pruning
+/// map, resuming at `cursor`; returns how many it has folded in all.
+///
+/// An entity that never expires needs no entry, so the query asks only for
+/// the others -- on a prefill of permanent entities that is nothing at all.
+/// The genesis commit never changes, so an offset into its answer is a stable
+/// cursor across restarts.
+fn genesis_walk(
+    store: &HostStore,
+    mut writer: GenesisBootstrapWriter,
+    mut cursor: u64,
+) -> eyre::Result<u64> {
+    let expiration = core::str::from_utf8(annotations::EXPIRATION)
+        .expect("annotation names are ASCII")
+        .to_owned();
+    let filter = Filter(vec![AndGroup(vec![Predicate {
+        cell: expiration,
+        op: CompareOp::Lt,
+        type_id: TypeId::U64,
+        value: u64::MAX.to_be_bytes().to_vec(),
+        negated: false,
+    }])]);
+    loop {
+        let records = store
+            .query(
+                Some(CommitId::CHAIN_GENESIS),
+                &Query {
+                    filter: filter.clone(),
+                    sort: None,
+                    page: Page {
+                        offset: cursor,
+                        limit: GENESIS_WALK_PAGE,
+                    },
+                    projection: None,
+                    total_matched: false,
+                },
+                None,
+            )
+            .map_err(|error| eyre::eyre!("query the genesis commit: {error:?}"))?
+            .into_value()
+            .records;
+        if records.is_empty() {
+            return Ok(cursor);
+        }
+        let mut entries = records
+            .iter()
+            .map(|record| {
+                let entity = entity_records::from_record(record)
+                    .map_err(|error| eyre::eyre!("decode a genesis entity: {error:?}"))?;
+                Ok(PruningEntry {
+                    key: B256::from(entity.key),
+                    expires_at: entity.expires_at,
+                    attribute_count: entity.attributes.len(),
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        cursor += records.len() as u64;
+        writer.write_blocking(&mut entries, cursor)?;
     }
 }
 
