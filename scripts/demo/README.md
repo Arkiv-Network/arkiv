@@ -15,6 +15,7 @@ Nothing it starts is shared. Valkey gets a free port and its own data directory,
 | `seconds` | How long to let the chain run (default 30) |
 | `--out DIR` | Where to write the bundle (default `target/demo/<timestamp>`) |
 | `--keep` | Leave Valkey and the chain up, and print how to reach them |
+| `--restart` | Stop the node and start it again against the same store, and check it comes back where the store says the chain is |
 | `ARKIV_RETH_BINARY` | Use this binary instead of looking in `target/{dev-fast,debug,release}` |
 
 Foundry is optional. With `cast` on PATH the run sends one transfer so the chain has something to execute; without it the chain just idles and the summary says so.
@@ -34,7 +35,7 @@ One directory, named in the last line of output:
 
 ## What the store actually holds
 
-A plain transfer leaves **no entity records**. That is the design, not a fault: Ethereum balances and nonces live on reth, and only Arkiv's own state goes to GolemDB (`HostStateView`). So an idle or transfer-only run leaves commit bookkeeping and nothing else:
+A plain transfer leaves **no entity records**, which is the design rather than a fault: entity records are written by Arkiv operations, and a transfer is not one. It does leave an account record, because balances and nonces are GolemDB's too since the accounts cutover. So an idle or transfer-only run holds commit bookkeeping and accounts, and no entities:
 
 ```
 by kind:
@@ -57,6 +58,30 @@ ARKIV_STORE_URL=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=scratch \
 ```
 
 When a record is present the summary prints its cell names, which is where the prefix split shows: `$`-prefixed cells are Arkiv's, under the one prefix GolemDB's grammar leaves to a host protocol, and `#v` is the engine's own.
+
+## Restart
+
+`--restart` is the one that shows why any of this exists. The run stops the node with SIGTERM, leaves Valkey up, starts the node again on the same datadir and namespace, and then checks three things:
+
+- it resumes at the height it stopped at, rather than at whatever reth last flushed to its own database;
+- the transfer recipient still holds its ether, which is GolemDB's record and not reth's;
+- it goes on building new blocks, because coming back up and then stalling is not recovery.
+
+`restart.json` in the bundle has the before and after numbers. A typical run:
+
+```json
+{
+  "block_before_shutdown": 16,
+  "block_after_restart": 16,
+  "block_after_running_on": 18,
+  "recipient_balance_before_shutdown": "0xde0b6b3a7640000",
+  "recipient_balance_after_restart": "0xde0b6b3a7640000"
+}
+```
+
+Without `cast` on PATH nothing is ever spent, so the balance check compares zero with zero; the run says so rather than letting it read as though it proved something.
+
+This is the graceful stop, the one an operator performs. The abrupt one — SIGKILL — is covered by `arkiv-reth::recovery`, which needs a Valkey of its own.
 
 ## Exit status
 
