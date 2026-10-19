@@ -1597,6 +1597,96 @@ mod tx_bounds_tests {
 }
 
 #[cfg(test)]
+mod genesis_store_tests {
+    use super::check_genesis_store;
+    use alloy_primitives::{Address, B256, U256};
+    use arkiv_interfaces::store::reference::MemStore;
+    use arkiv_interfaces::store::{Cell, CellName, RecordKey, Store, StoreExt, TypeId};
+    use arkiv_reth_statemanager::{GenesisAccount, HostStore, seed_genesis};
+    use reth_chainspec::{ChainSpec, DEV, EthChainSpec};
+    use reth_primitives_traits::SealedHeader;
+    use std::sync::Arc;
+
+    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+    fn store() -> HostStore {
+        Arc::new(MemStore::new())
+    }
+
+    /// The dev chain, with its genesis header naming `root` as `stateHash`
+    /// would.
+    fn seeded(root: B256) -> ChainSpec {
+        let mut spec = (**DEV).clone();
+        let mut header = spec.genesis_header.clone_header();
+        header.state_root = root;
+        spec.genesis_header = SealedHeader::seal_slow(header);
+        spec
+    }
+
+    fn funded() -> Vec<GenesisAccount> {
+        vec![GenesisAccount {
+            address: Address::repeat_byte(1),
+            balance: U256::from(1),
+            nonce: 0,
+        }]
+    }
+
+    #[test]
+    fn a_plain_genesis_starts_on_an_empty_store() {
+        check_genesis_store(&store(), &**DEV).expect("nothing to refuse");
+    }
+
+    #[test]
+    fn a_prefilled_genesis_refuses_an_empty_store() {
+        let err = check_genesis_store(&store(), &seeded(B256::repeat_byte(7))).unwrap_err();
+        assert!(err.to_string().contains("seed-genesis"), "{err}");
+    }
+
+    #[test]
+    fn a_store_holding_another_chain_is_refused() {
+        let store = store();
+        seed_genesis(&store, [9; 32], funded())
+            .expect("seed")
+            .expect("fresh");
+        let err = check_genesis_store(&store, &**DEV).unwrap_err();
+        assert!(err.to_string().contains("another chain"), "{err}");
+    }
+
+    #[test]
+    fn a_store_holding_this_chain_is_adopted() {
+        let store = store();
+        seed_genesis(&store, DEV.genesis_hash().0, funded())
+            .expect("seed")
+            .expect("fresh");
+        check_genesis_store(&store, &**DEV).expect("the same chain");
+    }
+
+    /// The prefill path: a genesis commit sealed over a seeded record, its
+    /// root named by the header, its tag the resulting genesis hash.
+    #[test]
+    fn a_prefilled_store_must_match_the_named_root() {
+        let store = store();
+        let branch = store.begin(None).expect("begin");
+        let cells: Vec<(CellName, Cell)> =
+            vec![("n".into(), Cell::attribute(TypeId::U64, vec![1; 8]))];
+        store
+            .create(branch, RecordKey([3; 32]), cells, None)
+            .expect("create");
+        let root = B256::from(store.seal(branch).expect("seal").state_root);
+        let spec = seeded(root);
+        store
+            .commit_tagged(branch, spec.genesis_hash().0)
+            .expect("commit");
+        check_genesis_store(&store, &spec).expect("the root matches");
+
+        // The same tag cannot name two headers, so a mismatching root is only
+        // reachable through a store written for a different stateHash.
+        let other = seeded(B256::repeat_byte(1));
+        let err = check_genesis_store(&store, &other).unwrap_err();
+        assert!(err.to_string().contains("another chain"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod head_only_tests {
     use super::head_only;
     use arkiv_interfaces::store::CommitId;
@@ -1991,6 +2081,7 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         // runs once before the chain moves. On a store that already has a
         // commit this is a no-op, so a restart costs one `head()`.
         let spec = factory.chain_spec();
+        check_genesis_store(&self.store, &*spec)?;
         let alloc = spec.genesis().alloc.iter().map(|(address, account)| {
             arkiv_reth_statemanager::GenesisAccount {
                 address: *address,
@@ -2075,6 +2166,59 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         };
         Ok(ArkivProvider::new(inner, self.store))
     }
+}
+
+/// Refuse a store that cannot be this chain's.
+///
+/// Two ways to get it wrong, both silent without this:
+///
+/// - **A store holding another chain** -- a namespace reused across genesis
+///   files, or pointed at the wrong one. Its genesis commit carries another
+///   genesis hash; adopting it would run this chain on that state.
+/// - **A prefilled genesis on an empty store.** A genesis that names its own
+///   `stateHash` (a root other than the one its alloc alone gives) was sealed
+///   over seeded entities by `arkiv-cli seed-genesis`. Writing just the alloc
+///   here would start the chain without them, under a header that claims
+///   otherwise.
+///
+/// A store that does hold this chain must also have sealed its genesis
+/// commit to the root the header names, when the header names one.
+fn check_genesis_store<C: EthChainSpec>(store: &HostStore, spec: &C) -> eyre::Result<()> {
+    let genesis_hash = spec.genesis_hash();
+    let header_root = spec.genesis_header().state_root();
+    let seeded = header_root != reth_trie::root::state_root_ref_unhashed(&spec.genesis().alloc);
+
+    if store.head() == CommitId::GENESIS {
+        eyre::ensure!(
+            !seeded,
+            "this genesis names its own state root (stateHash {header_root}), so its genesis \
+             commit must be imported before the node starts -- run `arkiv-cli seed-genesis` \
+             against this Arkiv store first; the store is empty"
+        );
+        return Ok(());
+    }
+
+    let tagged = store
+        .commit_by_tag(genesis_hash.0)
+        .map_err(|e| eyre::eyre!("look up the genesis commit in the Arkiv store: {e:?}"))?;
+    eyre::ensure!(
+        tagged == Some(CommitId::CHAIN_GENESIS),
+        "the Arkiv store holds another chain: its genesis commit is not tagged with this \
+         genesis hash {genesis_hash} (found {tagged:?}); point ARKIV_STORE_NAMESPACE at this \
+         chain's store"
+    );
+    if seeded {
+        let root = store
+            .commit_hash(CommitId::CHAIN_GENESIS)
+            .map_err(|e| eyre::eyre!("read the genesis commit's root: {e:?}"))?;
+        eyre::ensure!(
+            B256::from(root) == header_root,
+            "the Arkiv store's genesis commit has root {}, but the genesis names stateHash \
+             {header_root}",
+            B256::from(root)
+        );
+    }
+    Ok(())
 }
 
 /// The commit a parent block names, for a view execution will read.
