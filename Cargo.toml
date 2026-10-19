@@ -139,6 +139,7 @@ arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
 arkiv-golemdb-state = { path = "crates/arkiv-golemdb-state" }
 arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
+arkiv-seed = { path = "crates/arkiv-seed" }
 
 # Copied from yagna (.cargo/config). A dev build without debug info or
 # incremental state, with dependencies optimized — much faster to link and to

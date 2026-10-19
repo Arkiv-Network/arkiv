@@ -1,0 +1,34 @@
+[package]
+name = "arkiv-seed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Prefill an Arkiv chain on GolemDB: entities written into the store's genesis commit"
+
+[dependencies]
+# Entity types, the entity -> record mapping, and the store seam.
+arkiv-interfaces.workspace = true
+# `Ident32` -- attribute-name validation, so a seed never writes a name the
+# node's decoder would have refused.
+arkiv-bindings.workspace = true
+# `derive_entity_address`: minted keys are the node's own.
+arkiv-reth-executor.workspace = true
+# The genesis accounts, written exactly as the node writes them.
+arkiv-reth-statemanager.workspace = true
+# The account record layout (`$minted`).
+arkiv-golemdb-state.workspace = true
+# The node's own `--chain` parser: the genesis hash the commit is tagged with
+# is whatever the node will compute for the written genesis.
+arkiv-reth-chainspec.workspace = true
+reth-cli.workspace = true
+reth-chainspec.workspace = true
+
+alloy-primitives.workspace = true
+base64 = "0.22"
+serde.workspace = true
+serde_json.workspace = true
+eyre.workspace = true
+
+[dev-dependencies]
+arkiv-interfaces = { workspace = true, features = ["conformance"] }

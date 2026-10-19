@@ -19,7 +19,7 @@
 
 use alloy_primitives::{Address, U256};
 use arkiv_golemdb_state::accounts::{CELL_BALANCE, CELL_NONCE, record_key};
-use arkiv_interfaces::store::{Cell, CellName, CommitId, Store, StoreError, TypeId};
+use arkiv_interfaces::store::{BranchId, Cell, CellName, CommitId, Store, StoreError, TypeId};
 
 use crate::host::HostStore;
 
@@ -56,6 +56,26 @@ pub fn seed_genesis(
     }
 
     let branch = store.begin(None)?;
+    if let Err(error) = write_genesis_accounts(&**store, branch, alloc) {
+        // Leave nothing half-written for the next start-up to puzzle over.
+        let _ = store.discard(branch);
+        return Err(error);
+    }
+    store.commit_tagged(branch, genesis_hash).map(Some)
+}
+
+/// Write `alloc`'s account records into `branch`, exactly as
+/// [`seed_genesis`] writes them into the genesis commit.
+///
+/// The half of genesis a prefill shares with the node: `arkiv-cli
+/// seed-genesis` writes the funded accounts through this, then its entities,
+/// into one branch, so a seeded genesis commit and a plain one agree on every
+/// account record.
+pub fn write_genesis_accounts<S: Store + ?Sized>(
+    store: &S,
+    branch: BranchId,
+    alloc: impl IntoIterator<Item = GenesisAccount>,
+) -> Result<(), StoreError> {
     for account in alloc {
         let cells = vec![
             (
@@ -69,18 +89,14 @@ pub fn seed_genesis(
         ];
         // Genesis is not a metered transaction; it is the state every metered
         // transaction starts from.
-        if let Err(error) = store.create(
+        store.create(
             branch,
             record_key(account.address.into_array()),
             cells,
             None,
-        ) {
-            // Leave nothing half-written for the next start-up to puzzle over.
-            let _ = store.discard(branch);
-            return Err(error);
-        }
+        )?;
     }
-    store.commit_tagged(branch, genesis_hash).map(Some)
+    Ok(())
 }
 
 #[cfg(test)]
