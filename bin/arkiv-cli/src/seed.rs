@@ -7,9 +7,16 @@
 //! start that node with (`arkiv-reth node --chain <out>`, with the same
 //! `ARKIV_STORE_URL` and `ARKIV_STORE_NAMESPACE`).
 //!
-//! Given a base genesis that already names a `stateHash`, the run is a
-//! **replay**: it writes the same seed into another (empty) store -- a second
-//! node's -- and refuses to commit unless it seals to that same root.
+//! The genesis is written with an **empty alloc** by default: the funded
+//! accounts are inside the store's genesis commit, so inside `stateHash`, and
+//! "`stateHash`, empty alloc" is the shape the consensus-genesis tooling (with
+//! arkiv-prefill's stateHash patch) and db-chain's registry already expect of
+//! a seeded genesis. `--keep-alloc` writes them out as well.
+//!
+//! A **replay** writes the same seed into another (empty) store -- a second
+//! node's -- from the same base genesis, and refuses to commit unless it seals
+//! to the expected root: `--expect-state-root`, or the base genesis's own
+//! `stateHash` when it names one.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -96,6 +103,18 @@ pub struct SeedGenesisArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub fund_dev_accounts: bool,
 
+    /// Keep the funded accounts in the written genesis's `alloc` as well. By
+    /// default the alloc is emptied: the accounts are already inside the
+    /// store's genesis commit, and so inside `stateHash`.
+    #[arg(long)]
+    pub keep_alloc: bool,
+
+    /// The root the seed must seal to, or nothing is committed: a replay, into
+    /// another node's store, of a genesis written earlier (pass that run's base
+    /// genesis as `--genesis`). Defaults to the base genesis's own `stateHash`.
+    #[arg(long)]
+    pub expect_state_root: Option<B256>,
+
     /// The Arkiv store the genesis commit is written into: a Valkey URL, the
     /// node's `ARKIV_STORE_URL`.
     #[arg(long, env = "ARKIV_STORE_URL")]
@@ -169,7 +188,12 @@ fn seed(args: &SeedGenesisArgs, mut progress: Option<&mut ProgressFile>) -> Resu
     {
         bail!("--chain-id {wanted} disagrees with the base genesis chainId {chain_id}");
     }
-    let expected_root = genesis::state_hash(&genesis)?;
+    let expected_root = match (args.expect_state_root, genesis::state_hash(&genesis)?) {
+        (Some(flag), Some(named)) if flag != named => {
+            bail!("--expect-state-root {flag} disagrees with the base genesis's stateHash {named}")
+        }
+        (flag, named) => flag.or(named),
+    };
     if args.fund_dev_accounts {
         let dev = arkiv_genesis::genesis_alloc()?
             .into_iter()
@@ -207,6 +231,13 @@ fn seed(args: &SeedGenesisArgs, mut progress: Option<&mut ProgressFile>) -> Resu
         })
         .collect();
 
+    let with_code = genesis::accounts_with_code(&genesis);
+    if with_code > 0 {
+        eprintln!(
+            "note: {with_code} alloc accounts carry code or storage; a GolemDB genesis keeps \
+             their balance and nonce only"
+        );
+    }
     eprintln!(
         "seeding {total} entities and {} funded accounts into {} (namespace {}) for chain {chain_id}",
         alloc.len(),
@@ -259,12 +290,15 @@ fn seed(args: &SeedGenesisArgs, mut progress: Option<&mut ProgressFile>) -> Resu
     {
         sealed.discard()?;
         bail!(
-            "the seed seals to {}, but the base genesis names stateHash {expected}: this is \
-             not the seed that genesis was written for",
+            "the seed seals to {}, but {expected} was expected: this is not the seed (or not \
+             the base genesis) that root was written for",
             summary.state_root
         );
     }
     genesis::set_state_hash(&mut genesis, summary.state_root);
+    if !args.keep_alloc {
+        genesis::clear_alloc(&mut genesis);
+    }
     let genesis_hash = genesis::genesis_hash(&genesis)?;
     eprintln!(
         "state root {}, genesis hash {genesis_hash}; committing ...",
