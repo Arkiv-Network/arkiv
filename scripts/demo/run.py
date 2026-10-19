@@ -14,10 +14,14 @@ cells carry the `$` prefix the GolemDB spec reserves for a host.
 Processes and the scratch data are removed on the way out, including after a
 failure or a Ctrl-C. The log directory is what survives.
 
-Usage: scripts/demo/run.py [seconds] [--keep] [--out DIR]
+Usage: scripts/demo/run.py [seconds] [--keep] [--restart] [--out DIR]
 
   seconds     how long to let the chain run (default 30)
   --keep      leave Valkey and the chain running, and say how to reach them
+  --restart   stop the node and start it again, against the same store, and
+              check it comes back where the store says the chain is -- the
+              store outlives the node, which is the point of keeping the
+              chain outside reth's database
   --out DIR   where to write the bundle (default target/demo/<timestamp>)
 """
 
@@ -42,6 +46,9 @@ ROOT = Path(__file__).resolve().parents[2]
 # throwaway dev chain -- it is here so the run can spend something.
 DEV_ACCOUNT = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 DEV_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+# Where the demo transfer goes. The recipient does not matter except that its
+# balance is a thing the store has to remember across a restart.
+SPEND_RECIPIENT = "0x000000000000000000000000000000000000dEaD"
 
 
 def log(message):
@@ -142,7 +149,7 @@ def spend_something(rpc_port, out):
             DEV_KEY,
             # Somewhere to send it. The recipient does not matter; the point
             # is that the sender is debited.
-            "0x000000000000000000000000000000000000dEaD",
+            SPEND_RECIPIENT,
             "--value",
             "1ether",
         ],
@@ -206,6 +213,11 @@ def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("seconds", nargs="?", type=int, default=30)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="stop the node and start it again, and check it resumes from the store",
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -236,6 +248,64 @@ def main():
     # Valkey and a chain behind.
     def on_signal(signum, _frame):
         raise KeyboardInterrupt(f"signal {signum}")
+
+    def start_node(log_name):
+        """Launch the node against this run's store, and wait for its RPC.
+
+        Same datadir, store URL and namespace every time, which is what makes
+        a restart a restart rather than a second chain.
+        """
+        handle = subprocess.Popen(
+            [
+                str(node_bin),
+                "node",
+                "--dev",
+                "--dev.block-time",
+                "1sec",
+                "--datadir",
+                str(scratch / "chain"),
+                "--http",
+                # `arkiv` is not a selectable module: the arkiv_*
+                # namespace is merged by extend_rpc_modules and rides
+                # on whichever transports are already on.
+                "--http.api",
+                "eth,net,web3",
+                "--http.port",
+                str(rpc_port),
+                *shlex.split(os.environ.get("ARKIV_DEMO_NODE_ARGS", "")),
+            ],
+            env={
+                **os.environ,
+                "ARKIV_STORE_URL": f"redis://127.0.0.1:{valkey_port}",
+                "ARKIV_STORE_NAMESPACE": namespace,
+            },
+            stdout=(out / log_name).open("w"),
+            stderr=subprocess.STDOUT,
+        )
+        processes.append(("arkiv-reth", handle))
+        wait_for(
+            f"rpc on {rpc_port}",
+            lambda: rpc(rpc_port, "eth_blockNumber") is not None,
+            timeout=120,
+        )
+        return handle
+
+    def stop_node():
+        """SIGTERM the node and wait for it, the way an operator would.
+
+        Not a kill: a graceful stop is the case an operator actually performs,
+        and the one a demo should show. `arkiv-reth::recovery` covers the
+        abrupt one.
+        """
+        name, handle = processes.pop()
+        assert name == "arkiv-reth", f"expected the node on top, found {name}"
+        handle.terminate()
+        try:
+            handle.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            handle.kill()
+            handle.wait(timeout=10)
+            raise SystemExit("the node did not stop on SIGTERM")
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
@@ -273,44 +343,7 @@ def main():
         )
         log(f"valkey up on {valkey_port}, namespace {namespace}")
 
-        node_log = (out / "node.log").open("w")
-        processes.append(
-            (
-                "arkiv-reth",
-                subprocess.Popen(
-                    [
-                        str(node_bin),
-                        "node",
-                        "--dev",
-                        "--dev.block-time",
-                        "1sec",
-                        "--datadir",
-                        str(scratch / "chain"),
-                        "--http",
-                        # `arkiv` is not a selectable module: the arkiv_*
-                        # namespace is merged by extend_rpc_modules and rides
-                        # on whichever transports are already on.
-                        "--http.api",
-                        "eth,net,web3",
-                        "--http.port",
-                        str(rpc_port),
-                        *shlex.split(os.environ.get("ARKIV_DEMO_NODE_ARGS", "")),
-                    ],
-                    env={
-                        **os.environ,
-                        "ARKIV_STORE_URL": f"redis://127.0.0.1:{valkey_port}",
-                        "ARKIV_STORE_NAMESPACE": namespace,
-                    },
-                    stdout=node_log,
-                    stderr=subprocess.STDOUT,
-                ),
-            )
-        )
-        wait_for(
-            f"rpc on {rpc_port}",
-            lambda: rpc(rpc_port, "eth_blockNumber") is not None,
-            timeout=120,
-        )
+        start_node("node.log")
         log(f"node up on {rpc_port}, running for {args.seconds}s")
 
         spend = spend_something(rpc_port, out)
@@ -334,6 +367,79 @@ def main():
             )
             time.sleep(max(1, args.seconds // 10))
         (out / "progress.json").write_text(json.dumps(samples, indent=2) + "\n")
+
+        if args.restart:
+            # The point of the whole exercise: the chain is in the store, not
+            # in reth's database, so a node that stops and starts again picks
+            # up where the store says it is rather than where reth last
+            # managed to flush.
+            before = int(rpc(rpc_port, "eth_blockNumber"), 16)
+            entities_before = rpc(rpc_port, "arkiv_getEntityCount")
+            # Balances live in GolemDB, not in reth's database, so the
+            # recipient of the transfer is the thing worth re-reading: if the
+            # store did not carry the chain across, this comes back zero.
+            paid_before = rpc(rpc_port, "eth_getBalance", [SPEND_RECIPIENT, "latest"])
+            log(f"stopping the node at block {before}")
+            stop_node()
+            log("node stopped; the store is still up and still holds the chain")
+
+            start_node("node-after-restart.log")
+            resumed = int(rpc(rpc_port, "eth_blockNumber"), 16)
+            entities_after = rpc(rpc_port, "arkiv_getEntityCount")
+            paid_after = rpc(rpc_port, "eth_getBalance", [SPEND_RECIPIENT, "latest"])
+            log(f"node back up, resumed at block {resumed}")
+
+            # Let it make new blocks, because resuming is only half of it: a
+            # node that comes up and then cannot build is not recovered.
+            deadline = time.monotonic() + 30
+            advanced = resumed
+            while advanced <= resumed and time.monotonic() < deadline:
+                time.sleep(2)
+                advanced = int(rpc(rpc_port, "eth_blockNumber"), 16)
+
+            (out / "restart.json").write_text(
+                json.dumps(
+                    {
+                        "block_before_shutdown": before,
+                        "block_after_restart": resumed,
+                        "block_after_running_on": advanced,
+                        "entities_before_shutdown": entities_before,
+                        "entities_after_restart": entities_after,
+                        "recipient_balance_before_shutdown": paid_before,
+                        "recipient_balance_after_restart": paid_after,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+
+            if resumed < before:
+                raise SystemExit(
+                    f"the restart lost blocks: stopped at {before}, resumed at {resumed}"
+                )
+            if entities_after != entities_before:
+                raise SystemExit(
+                    "the restart lost entities: "
+                    f"{entities_before} before, {entities_after} after"
+                )
+            if paid_after != paid_before:
+                raise SystemExit(
+                    "the restart lost account state: recipient held "
+                    f"{paid_before} before, {paid_after} after"
+                )
+            if paid_before in (None, "0x0"):
+                # Without `cast` nothing was ever spent, so the balance check
+                # above compared zero with zero. Say so rather than let the
+                # run read as though it proved something.
+                log("note: no transfer landed, so the balance check was vacuous")
+            if advanced <= resumed:
+                raise SystemExit(
+                    f"the node resumed at {resumed} but did not build on it"
+                )
+            log(
+                f"resumed at {resumed} and advanced to {advanced}; "
+                f"recipient still holds {paid_after}"
+            )
 
         keys = dump_store(valkey_port, namespace, out, spend)
         first, last = samples[0]["block"], samples[-1]["block"]
