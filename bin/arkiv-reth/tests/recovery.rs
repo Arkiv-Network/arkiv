@@ -25,17 +25,6 @@ const READY: Duration = Duration::from_secs(90);
 /// persistence would have run, had this node not replaced it with its own.
 const PERSISTED: u64 = 60;
 
-/// Where the Valkey server is, or a clear explanation of why we cannot proceed.
-///
-/// Panics rather than silently passing: a green restart test that never had a
-/// store able to survive the restart is worse than no test.
-fn valkey_url() -> String {
-    std::env::var("VALKEY_URL").expect(
-        "this test needs a store that outlives the node process: set VALKEY_URL \
-         (for example redis://127.0.0.1:6379)",
-    )
-}
-
 /// A create carrying `payload` under `text/plain`, with a purely relative
 /// lifetime — `$contentType` / `$payload` ride in the attribute list now.
 fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
@@ -125,10 +114,10 @@ async fn wait_for_physical_purge(
 ///   cargo nextest run -p arkiv-reth --run-ignored only -- restart
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+#[ignore = "needs a durable store; set ARKIV_TEST_STORE=golemdb or VALKEY_URL, and run with --ignored"]
 async fn state_and_index_survive_shutdown_and_restart() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
-        .valkey_store(valkey_url())
+        .durable_store()
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();

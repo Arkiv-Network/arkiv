@@ -1558,6 +1558,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",
+ "arkiv-golemdb",
  "arkiv-harness",
  "arkiv-interfaces",
  "arkiv-reth-chainspec",
