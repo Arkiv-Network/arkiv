@@ -54,6 +54,7 @@ mod equality_index;
 mod error;
 mod index;
 mod interpret;
+mod metrics;
 mod range_index;
 mod slot;
 

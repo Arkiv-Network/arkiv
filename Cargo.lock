@@ -1585,6 +1585,9 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "arkiv-interfaces",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
  "roaring",
 ]
 

@@ -65,6 +65,10 @@ jsonrpsee = { version = "0.26", features = ["server"] }
 clap = { version = "4", features = ["derive", "env"] }
 eyre = "0.6"
 tracing = "0.1"
+metrics = "0.24"
+# Used by index instrumentation tests with the same recorder/prefix as reth.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+metrics-util = { version = "0.20", default-features = false }
 turso = { version = "=0.7.2", default-features = false }
 
 # alloy primitives used by the Arkiv protocol crates.

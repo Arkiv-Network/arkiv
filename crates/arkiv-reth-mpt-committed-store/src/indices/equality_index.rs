@@ -14,6 +14,7 @@ use crate::entities::AccountCode;
 use crate::indices::address::{all_entities_bucket, pair_address};
 use crate::indices::bitmap::Bitmap;
 use crate::indices::error::AuxError;
+use crate::indices::metrics::{BucketObservation, record_rewrite};
 
 /// Tier 1: the per-`(attribute, value)` entity bitmaps, over an [`AccountCode`]
 /// backend.
@@ -31,12 +32,19 @@ where
 
     /// The bitmap stored at `addr` (empty if the account has no code).
     pub(crate) fn bucket(&mut self, addr: Address) -> Result<Bitmap, AuxError<E>> {
+        self.load_bucket(addr).map(|(bitmap, _)| bitmap)
+    }
+
+    /// Preserve the original byte length for telemetry, without reserializing
+    /// the old bitmap or reading the account a second time.
+    fn load_bucket(&mut self, addr: Address) -> Result<(Bitmap, usize), AuxError<E>> {
         let code = self.backend.code(addr).map_err(AuxError::Backend)?;
-        if code.is_empty() {
-            Ok(Bitmap::new())
+        let bitmap = if code.is_empty() {
+            Bitmap::new()
         } else {
-            Ok(Bitmap::from_bytes(&code)?)
-        }
+            Bitmap::from_bytes(&code)?
+        };
+        Ok((bitmap, code.len()))
     }
 
     /// The entities carrying `(attr, value)` — `value_bytes` being the value's
@@ -67,12 +75,14 @@ where
         entity_id: u64,
     ) -> Result<bool, AuxError<E>> {
         let addr = pair_address(attr, ty, value_bytes);
-        let mut bitmap = self.bucket(addr)?;
+        let (mut bitmap, old_bytes) = self.load_bucket(addr)?;
+        let before = BucketObservation {
+            bytes: old_bytes,
+            members: bitmap.len(),
+        };
         let was_empty = bitmap.is_empty();
         bitmap.insert(entity_id);
-        self.backend
-            .set_code(addr, bitmap.to_bytes())
-            .map_err(AuxError::Backend)?;
+        self.write_bucket(attr, addr, &bitmap, before)?;
         Ok(was_empty)
     }
 
@@ -88,14 +98,154 @@ where
         entity_id: u64,
     ) -> Result<bool, AuxError<E>> {
         let addr = pair_address(attr, ty, value_bytes);
-        let mut bitmap = self.bucket(addr)?;
+        let (mut bitmap, old_bytes) = self.load_bucket(addr)?;
         if bitmap.is_empty() {
             return Ok(false);
         }
+        let before = BucketObservation {
+            bytes: old_bytes,
+            members: bitmap.len(),
+        };
         bitmap.remove(entity_id);
-        self.backend
-            .set_code(addr, bitmap.to_bytes())
-            .map_err(AuxError::Backend)?;
+        self.write_bucket(attr, addr, &bitmap, before)?;
         Ok(bitmap.is_empty())
+    }
+
+    fn write_bucket(
+        &mut self,
+        attr: &[u8],
+        addr: Address,
+        bitmap: &Bitmap,
+        before: BucketObservation,
+    ) -> Result<(), AuxError<E>> {
+        let code = bitmap.to_bytes();
+        let after = BucketObservation {
+            bytes: code.len(),
+            members: bitmap.len(),
+        };
+        self.backend
+            .set_code(addr, code)
+            .map_err(AuxError::Backend)?;
+        // A successful overlay write is not a disk commit. Count the work even
+        // if the enclosing execution is later discarded or replayed.
+        record_rewrite(attr, before, after);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use metrics_util::layers::{PrefixLayer, Stack};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Backend {
+        code: HashMap<Address, Vec<u8>>,
+        writes: usize,
+        fail_write: bool,
+    }
+
+    impl AccountCode for Backend {
+        type Error = &'static str;
+
+        fn code(&mut self, addr: Address) -> Result<Vec<u8>, Self::Error> {
+            Ok(self.code.get(&addr).cloned().unwrap_or_default())
+        }
+
+        fn set_code(&mut self, addr: Address, code: Vec<u8>) -> Result<(), Self::Error> {
+            if self.fail_write {
+                return Err("write failed");
+            }
+            self.writes += 1;
+            self.code.insert(addr, code);
+            Ok(())
+        }
+
+        fn clear_code(&mut self, addr: Address) -> Result<(), Self::Error> {
+            self.code.remove(&addr);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn instrumentation_preserves_bytes_and_counts_only_successful_rewrites() {
+        const ATTR: &[u8] = b"telemetry_mutation_test";
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let recorder = Stack::new(recorder).push(PrefixLayer::new("reth"));
+        let addr = pair_address(ATTR, AttributeType::Str, b"value");
+        // Start from an existing/imported bucket: the first growth observation
+        // must use its serialized length, not assume it was empty at startup.
+        let initial = Bitmap::from_iter([1, 2]).to_bytes();
+        let one = Bitmap::from_iter([1]).to_bytes();
+        let empty = Bitmap::new().to_bytes();
+        let mut backend = Backend::default();
+        backend.code.insert(addr, initial.clone());
+        metrics::with_local_recorder(&recorder, || {
+            let mut index = EqualityIndex::new(&mut backend);
+            assert_eq!(
+                index.get(ATTR, AttributeType::Str, b"value").unwrap().len(),
+                2
+            );
+            assert!(
+                !handle.render().contains("telemetry_mutation_test"),
+                "query reads must not register write metrics"
+            );
+            // These two operations still rewrite the whole bucket, although no
+            // memberships or serialized size change.
+            assert!(!index.insert(ATTR, AttributeType::Str, b"value", 1).unwrap());
+            assert!(
+                !index
+                    .remove(ATTR, AttributeType::Str, b"value", 99)
+                    .unwrap()
+            );
+            assert_eq!(index.backend.code.get(&addr).unwrap(), &initial);
+            assert!(!index.remove(ATTR, AttributeType::Str, b"value", 2).unwrap());
+            assert_eq!(index.backend.code.get(&addr).unwrap(), &one);
+            assert!(index.remove(ATTR, AttributeType::Str, b"value", 1).unwrap());
+            assert_eq!(index.backend.code.get(&addr).unwrap(), &empty);
+            assert!(!index.remove(ATTR, AttributeType::Str, b"value", 1).unwrap());
+            assert!(
+                !index
+                    .remove(ATTR, AttributeType::Str, b"absent", 1)
+                    .unwrap()
+            );
+            assert_eq!(index.backend.writes, 4, "empty removals do not rewrite");
+
+            index.backend.fail_write = true;
+            assert!(index.insert(ATTR, AttributeType::Str, b"value", 3).is_err());
+            assert_eq!(index.backend.code.get(&addr).unwrap(), &empty);
+            index.backend.fail_write = false;
+            assert!(index.insert(ATTR, AttributeType::Str, b"value", 1).unwrap());
+            assert_eq!(index.backend.code.get(&addr).unwrap(), &one);
+        });
+        let output = handle.render();
+        for (name, value) in [
+            ("rewrites_total", 5),
+            (
+                "rewritten_bytes_total",
+                2 * initial.len() + 2 * one.len() + empty.len(),
+            ),
+            (
+                "loaded_bytes_total",
+                3 * initial.len() + one.len() + empty.len(),
+            ),
+            ("growth_bytes_total", one.len() - empty.len()),
+            ("shrink_bytes_total", initial.len() - empty.len()),
+            ("members_added_total", 1),
+            ("members_removed_total", 2),
+            ("largest_observed_bucket_bytes", initial.len()),
+            ("largest_observed_bucket_members", 2),
+        ] {
+            let sample = format!(
+                "reth_arkiv_index_equality_{name}{{attribute=\"telemetry_mutation_test\"}} {value}"
+            );
+            assert!(
+                output.lines().any(|line| line == sample),
+                "{sample}\n{output}"
+            );
+        }
     }
 }

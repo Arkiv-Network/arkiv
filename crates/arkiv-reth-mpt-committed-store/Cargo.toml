@@ -20,6 +20,11 @@ license.workspace = true
 arkiv-interfaces.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp = { workspace = true, features = ["derive"] }
+metrics.workspace = true
 # Roaring bitmaps back the index's tier-1 equality buckets; see the pin note in
 # the workspace manifest — the serialization is consensus state.
 roaring.workspace = true
+
+[dev-dependencies]
+metrics-exporter-prometheus.workspace = true
+metrics-util.workspace = true
