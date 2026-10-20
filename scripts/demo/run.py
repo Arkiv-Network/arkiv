@@ -433,9 +433,7 @@ def main():
                 # run read as though it proved something.
                 log("note: no transfer landed, so the balance check was vacuous")
             if advanced <= resumed:
-                raise SystemExit(
-                    f"the node resumed at {resumed} but did not build on it"
-                )
+                raise SystemExit(f"the node resumed at {resumed} but did not build on it")
             log(
                 f"resumed at {resumed} and advanced to {advanced}; "
                 f"recipient still holds {paid_after}"
