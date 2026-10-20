@@ -21,6 +21,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -115,8 +116,10 @@ pub struct SeedGenesisArgs {
     #[arg(long)]
     pub expect_state_root: Option<B256>,
 
-    /// The Arkiv store the genesis commit is written into: a Valkey URL, the
-    /// node's `ARKIV_STORE_URL`.
+    /// The Arkiv store the genesis commit is written into, the node's
+    /// `ARKIV_STORE_URL`: a GolemDB directory (`golemdb:///path`) or a Valkey
+    /// URL. A GolemDB directory is open by one process at a time, so seed it
+    /// before the node starts.
     #[arg(long, env = "ARKIV_STORE_URL")]
     pub store_url: String,
 
@@ -244,8 +247,19 @@ fn seed(args: &SeedGenesisArgs, mut progress: Option<&mut ProgressFile>) -> Resu
         args.store_url,
         args.store_namespace
     );
-    let store = arkiv_valkey::ValkeyStore::connect(&args.store_url, &args.store_namespace)
-        .map_err(|e| eyre::eyre!("connect to the Arkiv store at {}: {e:?}", args.store_url))?;
+    let store: arkiv_reth_statemanager::HostStore =
+        match arkiv_golemdb::GolemDbStore::open_url(&args.store_url) {
+            Some(opened) => Arc::new(
+                opened
+                    .map_err(|e| eyre::eyre!("open the Arkiv store at {}: {e}", args.store_url))?,
+            ),
+            None => Arc::new(
+                arkiv_valkey::ValkeyStore::connect(&args.store_url, &args.store_namespace)
+                    .map_err(|e| {
+                        eyre::eyre!("connect to the Arkiv store at {}: {e:?}", args.store_url)
+                    })?,
+            ),
+        };
 
     let started = Instant::now();
     if let Some(progress) = progress.as_deref_mut() {

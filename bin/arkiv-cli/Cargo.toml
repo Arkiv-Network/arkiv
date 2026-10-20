@@ -18,6 +18,7 @@ arkiv-genesis.workspace = true
 # `seed-genesis`: the seed itself, the store it is written into, and the
 # genesis account type.
 arkiv-seed.workspace = true
+arkiv-golemdb.workspace = true
 arkiv-valkey.workspace = true
 arkiv-reth-statemanager.workspace = true
 alloy-primitives.workspace = true

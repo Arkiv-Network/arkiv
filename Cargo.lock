@@ -1472,6 +1472,7 @@ dependencies = [
  "alloy-sol-types",
  "arkiv-bindings",
  "arkiv-genesis",
+ "arkiv-golemdb",
  "arkiv-interfaces",
  "arkiv-reth-statemanager",
  "arkiv-rpc-types",
