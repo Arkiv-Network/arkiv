@@ -40,3 +40,7 @@ rocksdb.workspace = true
 reth-node-builder.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The reference `MemStore`, for the genesis-store checks.
+arkiv-interfaces = { workspace = true, features = ["conformance"] }

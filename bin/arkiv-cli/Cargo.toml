@@ -15,6 +15,12 @@ arkiv-interfaces.workspace = true
 # The node's own arkiv_* response types, rather than local restatements.
 arkiv-rpc-types.workspace = true
 arkiv-genesis.workspace = true
+# `seed-genesis`: the seed itself, the store it is written into, and the
+# genesis account type.
+arkiv-seed.workspace = true
+arkiv-golemdb.workspace = true
+arkiv-valkey.workspace = true
+arkiv-reth-statemanager.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 alloy-provider.workspace = true
