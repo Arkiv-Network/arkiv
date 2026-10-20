@@ -579,3 +579,37 @@ fn queries_match_page_and_count() {
     assert_eq!(ns, [6, 4, 2]);
     assert!(result.records.iter().all(|record| record.cells.len() == 1));
 }
+
+/// A client pages at the commit its first page was answered at: the head
+/// moving on does not change the set it pages through.
+#[test]
+fn paging_at_an_older_commit_keeps_its_match_set() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 2);
+    let at = commit_record(&store, 4);
+    let any = predicate("n", CompareOp::Gte, TypeId::U64, &0u64.to_be_bytes(), false);
+    let page = |at, offset| -> Vec<u8> {
+        store
+            .query(
+                at,
+                &Query {
+                    filter: Filter(vec![AndGroup(vec![any.clone()])]),
+                    page: Page { offset, limit: 1 },
+                    ..Query::default()
+                },
+                None,
+            )
+            .unwrap()
+            .into_value()
+            .records
+            .iter()
+            .map(|record| record.key.0[0])
+            .collect()
+    };
+    assert_eq!(page(Some(at), 0), [2]);
+    // A record keyed before both lands at the head.
+    commit_record(&store, 1);
+    assert_eq!(page(Some(at), 1), [4]);
+    assert_eq!(page(None, 0), [1]);
+}

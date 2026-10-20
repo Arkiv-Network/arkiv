@@ -72,15 +72,20 @@ pub const URL_SCHEME: &str = "golemdb://";
 #[derive(Clone)]
 pub struct GolemDbStore {
     database: golemdb::Database,
-    /// The last match set, for the head and filter it was computed at.
+    /// The last match set, for the commit and filter it was asked for.
     ///
     /// GolemDB does not page, so every page of a query is the whole match set
     /// sliced here; a client walking a large result page by page would
-    /// otherwise pay for the whole set once per page.
+    /// otherwise pay for the whole set once per page. A client pages at a
+    /// fixed commit, which falls behind the head as blocks come: keyed by the
+    /// head, the set would be recomputed for nearly every page of a large
+    /// result. Keyed by the commit asked for, an older commit is answered
+    /// from the head as it was when first asked, which is no further from
+    /// that commit than the head is now.
     last_match: Arc<Mutex<Option<LastMatch>>>,
 }
 
-/// A match set: the head and filter it was computed at, and the keys.
+/// A match set: the commit and filter it was asked for, and the keys.
 type LastMatch = (CommitId, Filter, Arc<Vec<RecordKey>>);
 
 impl core::fmt::Debug for GolemDbStore {
@@ -124,30 +129,31 @@ impl GolemDbStore {
         }
     }
 
-    /// The keys of every committed record matching `filter`, ascending.
-    fn matching(&self, filter: &Filter) -> Result<Arc<Vec<RecordKey>>, StoreError> {
-        let head = self.head();
-        if let Some((at, cached, keys)) = &*self.last_match.lock().expect("not poisoned")
-            && *at == head
+    /// The keys of every committed record matching `filter`, ascending, for
+    /// a query at `at` (answered from the head).
+    fn matching(&self, at: CommitId, filter: &Filter) -> Result<Arc<Vec<RecordKey>>, StoreError> {
+        if let Some((cached_at, cached, keys)) = &*self.last_match.lock().expect("not poisoned")
+            && *cached_at == at
             && cached == filter
         {
             return Ok(Arc::clone(keys));
         }
         let keys = Arc::new(self.evaluate(filter)?);
-        // Keyed by the head read before evaluating: if it moved meanwhile,
-        // the entry is merely never hit.
         *self.last_match.lock().expect("not poisoned") =
-            Some((head, filter.clone(), Arc::clone(&keys)));
+            Some((at, filter.clone(), Arc::clone(&keys)));
         Ok(keys)
     }
 
     fn evaluate(&self, filter: &Filter) -> Result<Vec<RecordKey>, StoreError> {
         let lowered = query::lower(filter)?;
-        let operation = golemdb::QueryOp::from_filter(lowered.filter)
-            .only(Vec::<&[u8]>::new())
-            .budget(golemdb::Budget::Unlimited);
-        let page = self.database.query(None, operation).map_err(store_error)?;
-        let mut keys: Vec<_> = page.records.iter().map(|r| RecordKey(r.key.0)).collect();
+        let operation = golemdb::CountOp::filter(lowered.filter).budget(golemdb::Budget::Unlimited);
+        let mut keys: Vec<_> = self
+            .database
+            .query_keys(None, operation)
+            .map_err(store_error)?
+            .into_iter()
+            .map(|key| RecordKey(key.0))
+            .collect();
         if lowered.negations {
             let mut kept = Vec::with_capacity(keys.len());
             for key in keys {
@@ -159,7 +165,6 @@ impl GolemDbStore {
             }
             keys = kept;
         }
-        keys.sort_unstable();
         Ok(keys)
     }
 
@@ -352,12 +357,13 @@ impl Store for GolemDbStore {
     /// here.
     fn query(
         &self,
-        _at: Option<CommitId>,
+        at: Option<CommitId>,
         query: &Query,
         _budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
-        let matched = self.matching(&query.filter)?;
-        let at = ReadTarget::Commit(self.head());
+        let head = self.head();
+        let matched = self.matching(at.unwrap_or(head), &query.filter)?;
+        let at = ReadTarget::Commit(head);
         let mut sorted_keys = None;
         if let Some(sort) = &query.sort {
             // As the reference store sorts: records lacking the cell last,
@@ -403,13 +409,14 @@ impl Store for GolemDbStore {
 
     fn count(
         &self,
-        _at: Option<CommitId>,
+        at: Option<CommitId>,
         filter: &Filter,
         _budget: Option<Budget>,
     ) -> Result<Metered<u64>, StoreError> {
         let lowered = query::lower(filter)?;
         if lowered.negations {
-            return Ok(metered(self.matching(filter)?.len() as u64));
+            let at = at.unwrap_or_else(|| self.head());
+            return Ok(metered(self.matching(at, filter)?.len() as u64));
         }
         let operation = golemdb::CountOp::filter(lowered.filter).budget(golemdb::Budget::Unlimited);
         self.database
