@@ -2028,7 +2028,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -4019,7 +4019,7 @@ dependencies = [
 [[package]]
 name = "golemdb-api"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4038,7 +4038,7 @@ dependencies = [
 [[package]]
 name = "golemdb-branch"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-cells",
  "golemdb-immutable-data",
@@ -4051,7 +4051,7 @@ dependencies = [
 [[package]]
 name = "golemdb-cells"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-merkle",
  "golemdb-storage",
@@ -4062,7 +4062,7 @@ dependencies = [
 [[package]]
 name = "golemdb-immutable-data"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-cells",
  "golemdb-storage",
@@ -4074,7 +4074,7 @@ dependencies = [
 [[package]]
 name = "golemdb-index"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-cells",
  "golemdb-merkle",
@@ -4086,7 +4086,7 @@ dependencies = [
 [[package]]
 name = "golemdb-merkle"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "blake3",
  "golemdb-storage",
@@ -4099,7 +4099,7 @@ dependencies = [
 [[package]]
 name = "golemdb-query"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4113,7 +4113,7 @@ dependencies = [
 [[package]]
 name = "golemdb-record"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4125,12 +4125,12 @@ dependencies = [
 [[package]]
 name = "golemdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 
 [[package]]
 name = "golemdb-storage-mdbx"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#acc41652f889215e746cecddb7be6d09aa9ff37b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-storage",
  "libmdbx",
