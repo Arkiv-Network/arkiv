@@ -1,5 +1,7 @@
 use super::*;
 use arkiv_interfaces::store::{CellKind, TypeId};
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 fn config() -> GolemDbConfig {
@@ -166,6 +168,102 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
     let mut other = config();
     other.cell_limits.max_str_len += 1;
     assert!(GolemDbStore::open(dir.path(), &other).is_err());
+}
+
+/// Create record `n`, patch record `n - 1` and commit, as a block would.
+fn commit_block(store: &GolemDbStore, n: u8) -> SealedCommit {
+    let branch = store.begin(Some(store.head())).unwrap();
+    let value = |n: u8| attribute(TypeId::U64, &u64::from(n).to_be_bytes());
+    store
+        .create(
+            branch,
+            RecordKey([n; 32]),
+            vec![("n".into(), value(n))],
+            None,
+        )
+        .unwrap();
+    if n > 1 {
+        let changes = vec![("n".into(), CellChange::Set(value(0)))];
+        store
+            .patch(branch, RecordKey([n - 1; 32]), None, changes, None)
+            .unwrap();
+    }
+    let sealed = store.seal(branch).unwrap();
+    store.commit(branch).unwrap();
+    sealed
+}
+
+/// Every node must seal the same roots for the same writes, whether or not it
+/// restarted in between.
+#[test]
+fn roots_do_not_depend_on_a_restart() {
+    let (steady_dir, restarted_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let steady = open(&steady_dir);
+    let mut state_roots = Vec::new();
+    for n in 1..=3 {
+        let restarted = open(&restarted_dir);
+        let sealed = commit_block(&steady, n);
+        assert_eq!(commit_block(&restarted, n), sealed, "commit {n}");
+        state_roots.push(sealed.state_root);
+    }
+    state_roots.dedup();
+    assert_eq!(state_roots.len(), 3, "every commit changes the root");
+}
+
+/// Set in the child process of `a_killed_process_keeps_only_its_commits`: the
+/// directory it opens.
+const CHILD_DIR: &str = "ARKIV_GOLEMDB_TEST_CHILD_DIR";
+
+/// A child process commits record 1, writes record 2 on a branch it never
+/// commits, and is killed while it holds the store, so no cleanup runs.
+#[test]
+fn a_killed_process_keeps_only_its_commits() {
+    if let Some(dir) = std::env::var_os(CHILD_DIR) {
+        let store = GolemDbStore::open(dir.as_ref(), &config()).unwrap();
+        commit_record(&store, 1);
+        let branch = store.begin(None).unwrap();
+        let cells = vec![("n".into(), attribute(TypeId::U64, &2u64.to_be_bytes()))];
+        store
+            .create(branch, RecordKey([2; 32]), cells, None)
+            .unwrap();
+        eprintln!("ready");
+        loop {
+            std::thread::park();
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::a_killed_process_keeps_only_its_commits",
+            "--nocapture",
+        ])
+        .env(CHILD_DIR, dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ready = BufReader::new(child.stderr.take().unwrap())
+        .lines()
+        .next()
+        .and_then(Result::ok);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(ready.as_deref(), Some("ready"));
+
+    let store = open(&dir);
+    assert_eq!(store.head(), CommitId(1));
+    assert!(read(&store, ReadTarget::Commit(CommitId(1)), 1).is_ok());
+    let uncommitted = store
+        .get(
+            ReadTarget::Commit(CommitId(1)),
+            RecordKey([2; 32]),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(uncommitted.into_value().is_none());
 }
 
 /// A round trip cannot catch a wrong sign flip, because the flip undoes
