@@ -1,5 +1,5 @@
 use super::*;
-use arkiv_interfaces::store::{CellKind, TypeId};
+use arkiv_interfaces::store::{AndGroup, CellKind, CompareOp, Page, Predicate, Sort, TypeId};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -81,16 +81,43 @@ fn every_type_round_trips() {
 
 /// GolemDB has no key type: only the entity's own `$key` comes back as `KEY`.
 #[test]
-fn other_key_cells_read_back_as_bytes32() {
+fn key_cells_keep_their_type_and_answer_equality() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
     let branch = store.begin(None).unwrap();
-    let cells = vec![("ref".into(), attribute(TypeId::KEY, &[5; 32]))];
+    // A high first byte, so the sign-bit flip has something to undo.
+    let reference = [0xf5; 32];
+    let cells = vec![
+        ("ref".into(), attribute(TypeId::KEY, &reference)),
+        ("hash".into(), attribute(TypeId::BYTES32, &reference)),
+    ];
     store
         .create(branch, RecordKey([1; 32]), cells, None)
         .unwrap();
     let record = read(&store, ReadTarget::Branch(branch), 1).unwrap();
-    assert_eq!(record.cell("ref").unwrap().type_id, TypeId::BYTES32);
+    assert_eq!(
+        record.cell("ref").unwrap(),
+        &attribute(TypeId::KEY, &reference)
+    );
+    assert_eq!(
+        record.cell("hash").unwrap(),
+        &attribute(TypeId::BYTES32, &reference)
+    );
+    store.commit(branch).unwrap();
+
+    let by = |type_id| {
+        let filter = Filter(vec![AndGroup(vec![Predicate {
+            cell: "ref".into(),
+            op: CompareOp::Eq,
+            type_id,
+            value: reference.to_vec(),
+            negated: false,
+        }])]);
+        store.count(None, &filter, None).unwrap().into_value()
+    };
+    assert_eq!(by(TypeId::KEY), 1);
+    // A cell of another type under the name is absent, as for any type.
+    assert_eq!(by(TypeId::BYTES32), 0);
 }
 
 /// Arkiv's `$creationFlags` is a `BOOL` holding up to 3; GolemDB takes 0 or 1.
@@ -132,17 +159,15 @@ fn a_stale_branch_is_dead() {
 }
 
 #[test]
-fn no_branch_or_read_over_an_older_commit() {
+fn no_branch_over_an_older_commit_and_its_reads_answer_from_the_head() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
     let first = commit_record(&store, 1);
     commit_record(&store, 2);
 
     assert_eq!(store.begin(Some(first)), Err(StoreError::HandleInvalid));
-    assert_eq!(
-        read(&store, ReadTarget::Commit(first), 1).map(|_| ()),
-        Err(StoreError::HandleInvalid)
-    );
+    // Record 2 did not exist at `first`: the read is the head's.
+    assert!(read(&store, ReadTarget::Commit(first), 2).is_ok());
 }
 
 #[test]
@@ -295,4 +320,296 @@ fn rolling_back_past_the_first_frame_is_handle_invalid() {
     let branch = store.begin(None).unwrap();
     store.rollback(branch).unwrap();
     assert_eq!(store.rollback(branch), Err(StoreError::HandleInvalid));
+}
+
+fn tagged(
+    store: &GolemDbStore,
+    n: u8,
+    rows: &[(&str, Option<SegmentKey>, SegmentRow)],
+) -> CommitId {
+    let branch = store.begin(None).unwrap();
+    let cells = vec![(
+        "n".into(),
+        attribute(TypeId::U64, &u64::from(n).to_be_bytes()),
+    )];
+    store
+        .create(branch, RecordKey([n; 32]), cells, None)
+        .unwrap();
+    store.seal(branch).unwrap();
+    store.segment_append_many(branch, rows).unwrap();
+    store.commit_tagged(branch, [n; 32]).unwrap()
+}
+
+#[test]
+fn commit_tags_resolve_both_ways_and_keep_the_root() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let untagged = commit_record(&store, 1);
+    let branch = store.begin(None).unwrap();
+    let sealed = store.seal(branch).unwrap();
+    let commit = store.commit_tagged(branch, [0xaa; 32]).unwrap();
+
+    assert_eq!(commit, sealed.commit_nr);
+    assert_eq!(store.commit_by_tag([0xaa; 32]), Ok(Some(commit)));
+    assert_eq!(store.commit_by_tag([0xbb; 32]), Ok(None));
+    assert_eq!(store.tag_of(commit), Ok(Some([0xaa; 32])));
+    assert_eq!(store.tag_of(untagged), Ok(None));
+    assert_eq!(store.commit_hash(commit), Ok(sealed.state_root));
+    assert_eq!(store.commit_hash(untagged), Err(StoreError::NotFound));
+
+    // A tag names one commit.
+    let branch = store.begin(None).unwrap();
+    assert_eq!(
+        store.commit_tagged(branch, [0xaa; 32]),
+        Err(StoreError::AlreadyExists)
+    );
+}
+
+#[test]
+fn segments_group_rows_by_commit_and_resolve_names() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let tx = |n: u8| (vec![n; 40], vec![n; 20], vec![n; 32]);
+    let row = |n: u8| {
+        let (a, b, c) = tx(n);
+        vec![a, b, c]
+    };
+    let first = tagged(
+        &store,
+        1,
+        &[
+            ("transactions", Some(SegmentKey([1; 32])), row(1)),
+            ("transactions", Some(SegmentKey([2; 32])), row(2)),
+            ("receipts", Some(SegmentKey([1; 32])), vec![vec![9]]),
+        ],
+    );
+    let empty = tagged(&store, 2, &[]);
+    let third = tagged(
+        &store,
+        3,
+        &[("transactions", Some(SegmentKey([3; 32])), row(3))],
+    );
+
+    assert_eq!(store.segment_range_of("transactions", first), Ok(0..2));
+    assert_eq!(store.segment_range_of("transactions", empty), Ok(2..2));
+    assert_eq!(store.segment_range_of("transactions", third), Ok(2..3));
+    assert_eq!(store.segment_range_of("blocks", third), Ok(0..0));
+    assert_eq!(store.segment_range_of("never_declared", third), Ok(0..0));
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Key(SegmentKey([2; 32]))),
+        Ok(Some(row(2)))
+    );
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Ordinal(2)),
+        Ok(Some(row(3)))
+    );
+    assert_eq!(
+        store.segment_get("transactions", SegmentAddress::Ordinal(3)),
+        Ok(None)
+    );
+    assert_eq!(
+        store.segment_ordinal_of("transactions", SegmentKey([3; 32])),
+        Ok(Some(2))
+    );
+    assert_eq!(
+        store.segment_ordinal_of("transactions", SegmentKey([7; 32])),
+        Ok(None)
+    );
+    assert_eq!(
+        store.segment_rows_of("transactions", first),
+        Ok(vec![row(1), row(2)])
+    );
+    assert_eq!(store.segment_rows_of("receipts", empty), Ok(vec![]));
+
+    // The tags segment is the adapter's, not a host's.
+    let branch = store.begin(None).unwrap();
+    assert_eq!(
+        store.segment_append(branch, "commit_tags", None, vec![vec![]]),
+        Err(StoreError::InvalidArgument)
+    );
+}
+
+fn predicate(cell: &str, op: CompareOp, type_id: TypeId, value: &[u8], negated: bool) -> Predicate {
+    Predicate {
+        cell: cell.into(),
+        op,
+        type_id,
+        value: value.to_vec(),
+        negated,
+    }
+}
+
+#[test]
+fn queries_match_page_and_count() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    for n in 1..=6u8 {
+        let kind = if n % 2 == 0 { "even" } else { "odd" };
+        let cells = vec![
+            (
+                "n".into(),
+                attribute(TypeId::U64, &u64::from(n).to_be_bytes()),
+            ),
+            ("kind".into(), attribute(TypeId::STR, kind.as_bytes())),
+            ("blob".into(), cell(CellKind::Field, TypeId::BYTES, &[n; 4])),
+        ];
+        // Keys out of creation order, to show results come back by key.
+        store
+            .create(branch, RecordKey([7 - n; 32]), cells, None)
+            .unwrap();
+    }
+    store.commit(branch).unwrap();
+
+    let even = predicate("kind", CompareOp::Eq, TypeId::STR, b"even", false);
+    let big = predicate("n", CompareOp::Gte, TypeId::U64, &4u64.to_be_bytes(), false);
+    let one = predicate("n", CompareOp::Eq, TypeId::U64, &1u64.to_be_bytes(), false);
+    let keys = |filter: Filter, offset, limit| -> Vec<u8> {
+        store
+            .query(
+                None,
+                &Query {
+                    filter,
+                    page: Page { offset, limit },
+                    ..Query::default()
+                },
+                None,
+            )
+            .unwrap()
+            .into_value()
+            .records
+            .iter()
+            .map(|record| record.key.0[0])
+            .collect()
+    };
+
+    // n = 2, 4, 6 live at keys 5, 3, 1.
+    assert_eq!(
+        keys(Filter(vec![AndGroup(vec![even.clone()])]), 0, 10),
+        [1, 3, 5]
+    );
+    assert_eq!(keys(Filter(vec![AndGroup(vec![even.clone()])]), 1, 1), [3]);
+    assert_eq!(
+        keys(
+            Filter(vec![AndGroup(vec![even.clone(), big.clone()])]),
+            0,
+            10
+        ),
+        [1, 3]
+    );
+    assert_eq!(
+        keys(
+            Filter(vec![
+                AndGroup(vec![even.clone(), big.clone()]),
+                AndGroup(vec![one.clone()])
+            ]),
+            0,
+            10
+        ),
+        [1, 3, 6]
+    );
+    // A negated predicate is applied to the positive matches.
+    let not_even = Predicate {
+        negated: true,
+        ..even.clone()
+    };
+    assert_eq!(
+        keys(
+            Filter(vec![AndGroup(vec![big.clone(), not_even.clone()])]),
+            0,
+            10
+        ),
+        [2]
+    );
+    assert_eq!(
+        keys(
+            Filter(vec![AndGroup(vec![predicate(
+                "kind",
+                CompareOp::Prefix,
+                TypeId::STR,
+                b"od",
+                false
+            )])]),
+            0,
+            10
+        ),
+        [2, 4, 6]
+    );
+
+    let count = |filter: Filter| store.count(None, &filter, None).unwrap().into_value();
+    assert_eq!(count(Filter(vec![AndGroup(vec![even.clone()])])), 3);
+    assert_eq!(
+        count(Filter(vec![AndGroup(vec![big.clone(), not_even])])),
+        1
+    );
+    assert_eq!(
+        store
+            .count(None, &Filter::default(), None)
+            .map(|c| c.into_value()),
+        Err(StoreError::NotImplemented)
+    );
+
+    // Sorted descending by n, projected to it.
+    let result = store
+        .query(
+            None,
+            &Query {
+                filter: Filter(vec![AndGroup(vec![even])]),
+                sort: Some(Sort {
+                    cell: "n".into(),
+                    direction: SortDirection::Descending,
+                }),
+                page: Page {
+                    offset: 0,
+                    limit: 10,
+                },
+                projection: Some(vec!["n".into()]),
+                total_matched: true,
+            },
+            None,
+        )
+        .unwrap()
+        .into_value();
+    assert_eq!(result.total_matched, Some(3));
+    let ns: Vec<u8> = result
+        .records
+        .iter()
+        .map(|record| record.cell("n").unwrap().value[7])
+        .collect();
+    assert_eq!(ns, [6, 4, 2]);
+    assert!(result.records.iter().all(|record| record.cells.len() == 1));
+}
+
+/// A client pages at the commit its first page was answered at: the head
+/// moving on does not change the set it pages through.
+#[test]
+fn paging_at_an_older_commit_keeps_its_match_set() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 2);
+    let at = commit_record(&store, 4);
+    let any = predicate("n", CompareOp::Gte, TypeId::U64, &0u64.to_be_bytes(), false);
+    let page = |at, offset| -> Vec<u8> {
+        store
+            .query(
+                at,
+                &Query {
+                    filter: Filter(vec![AndGroup(vec![any.clone()])]),
+                    page: Page { offset, limit: 1 },
+                    ..Query::default()
+                },
+                None,
+            )
+            .unwrap()
+            .into_value()
+            .records
+            .iter()
+            .map(|record| record.key.0[0])
+            .collect()
+    };
+    assert_eq!(page(Some(at), 0), [2]);
+    // A record keyed before both lands at the head.
+    commit_record(&store, 1);
+    assert_eq!(page(Some(at), 1), [4]);
+    assert_eq!(page(None, 0), [1]);
 }

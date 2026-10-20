@@ -1558,6 +1558,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",
+ "arkiv-golemdb",
  "arkiv-harness",
  "arkiv-interfaces",
  "arkiv-reth-chainspec",
@@ -3027,7 +3028,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.3",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4018,10 +4019,11 @@ dependencies = [
 [[package]]
 name = "golemdb-api"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
+ "golemdb-immutable-data",
  "golemdb-index",
  "golemdb-merkle",
  "golemdb-query",
@@ -4036,9 +4038,10 @@ dependencies = [
 [[package]]
 name = "golemdb-branch"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-cells",
+ "golemdb-immutable-data",
  "golemdb-index",
  "golemdb-merkle",
  "golemdb-storage",
@@ -4048,7 +4051,7 @@ dependencies = [
 [[package]]
 name = "golemdb-cells"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-merkle",
  "golemdb-storage",
@@ -4057,9 +4060,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "golemdb-immutable-data"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
+dependencies = [
+ "golemdb-cells",
+ "golemdb-storage",
+ "reth-nippy-jar 2.1.0",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "golemdb-index"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-cells",
  "golemdb-merkle",
@@ -4071,7 +4086,7 @@ dependencies = [
 [[package]]
 name = "golemdb-merkle"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "blake3",
  "golemdb-storage",
@@ -4084,7 +4099,7 @@ dependencies = [
 [[package]]
 name = "golemdb-query"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4098,7 +4113,7 @@ dependencies = [
 [[package]]
 name = "golemdb-record"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4110,12 +4125,12 @@ dependencies = [
 [[package]]
 name = "golemdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 
 [[package]]
 name = "golemdb-storage-mdbx"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=scx1332%2Farkiv-integration#0e35111b726bac8aa8299889bb9074561bef49e8"
 dependencies = [
  "golemdb-storage",
  "libmdbx",
@@ -7485,7 +7500,7 @@ dependencies = [
  "reth-etl",
  "reth-evm",
  "reth-exex",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-net-nat",
  "reth-network",
  "reth-network-p2p",
@@ -7542,7 +7557,7 @@ dependencies = [
  "eyre",
  "libc",
  "rand 0.8.7",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "secp256k1 0.30.0",
  "serde",
  "thiserror 2.0.20",
@@ -7661,10 +7676,10 @@ dependencies = [
  "metrics",
  "page_size",
  "reth-db-api",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-libmdbx",
  "reth-metrics",
- "reth-nippy-jar",
+ "reth-nippy-jar 2.7.0",
  "reth-primitives-traits",
  "reth-static-file-types",
  "reth-storage-errors",
@@ -7717,7 +7732,7 @@ dependencies = [
  "reth-db-api",
  "reth-etl",
  "reth-execution-errors",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-node-types",
  "reth-primitives-traits",
  "reth-provider",
@@ -7996,7 +8011,7 @@ dependencies = [
  "reth-engine-tree",
  "reth-errors",
  "reth-evm",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-revm",
@@ -8037,7 +8052,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "reth-era",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "sha2 0.10.9",
  "tokio",
 ]
@@ -8057,7 +8072,7 @@ dependencies = [
  "reth-era",
  "reth-era-downloader",
  "reth-etl",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-primitives-traits",
  "reth-provider",
  "reth-stages-types",
@@ -8402,7 +8417,7 @@ dependencies = [
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-exex-types",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-metrics",
  "reth-node-api",
  "reth-node-core",
@@ -8433,6 +8448,16 @@ dependencies = [
  "reth-primitives-traits",
  "serde",
  "serde_with",
+]
+
+[[package]]
+name = "reth-fs-util"
+version = "2.1.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=d58c6e3d0723a28f655e89da83c3738e47dcc364#d58c6e3d0723a28f655e89da83c3738e47dcc364"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -8587,7 +8612,7 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-evm",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-metrics",
  "reth-net-banlist",
  "reth-net-nat",
@@ -8692,6 +8717,23 @@ dependencies = [
 
 [[package]]
 name = "reth-nippy-jar"
+version = "2.1.0"
+source = "git+https://github.com/paradigmxyz/reth?rev=d58c6e3d0723a28f655e89da83c3738e47dcc364#d58c6e3d0723a28f655e89da83c3738e47dcc364"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "derive_more",
+ "lz4_flex",
+ "memmap2",
+ "reth-fs-util 2.1.0",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "reth-nippy-jar"
 version = "2.7.0"
 source = "git+ssh://git@github.com/Arkiv-Network/reth?branch=arkiv%2Fcustom-golemdb#a91d8516b17a5eedb5e738b69000af8612c70faa"
 dependencies = [
@@ -8700,7 +8742,7 @@ dependencies = [
  "derive_more",
  "lz4_flex",
  "memmap2",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "serde",
  "smallvec",
  "thiserror 2.0.20",
@@ -8766,7 +8808,7 @@ dependencies = [
  "reth-engine-util",
  "reth-evm",
  "reth-exex",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-invalid-block-hooks",
  "reth-network",
  "reth-network-api",
@@ -9119,9 +9161,9 @@ dependencies = [
  "reth-errors",
  "reth-ethereum-primitives",
  "reth-execution-types",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-metrics",
- "reth-nippy-jar",
+ "reth-nippy-jar 2.7.0",
  "reth-node-types",
  "reth-primitives-traits",
  "reth-prune-types",
@@ -9569,7 +9611,7 @@ dependencies = [
  "reth-evm",
  "reth-execution-types",
  "reth-exex",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-libmdbx",
  "reth-network-p2p",
  "reth-primitives-traits",
@@ -9829,7 +9871,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
- "reth-fs-util",
+ "reth-fs-util 2.7.0",
  "reth-metrics",
  "reth-primitives-traits",
  "reth-storage-api",

@@ -9,6 +9,10 @@
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
 //! by default is in-process and so goes with the process — a test that wants to
 //! watch state survive a restart needs [`NodeBuilder::valkey_store`].
+//!
+//! `ARKIV_TEST_STORE=golemdb` on the test process puts every node that has not
+//! chosen a store on GolemDB instead, in a directory inside its datadir, so
+//! the whole suite can run against GolemDB and its state survives a restart.
 
 use std::fs::File;
 use std::net::TcpListener;
@@ -137,6 +141,22 @@ impl NodeBuilder {
             .env("ARKIV_STORE_NAMESPACE", namespace)
     }
 
+    /// Put the node's Arkiv state on a store that outlives the process:
+    /// GolemDB when `ARKIV_TEST_STORE=golemdb`, else the Valkey server at
+    /// `VALKEY_URL`. Panics with what to set when neither is there, because a
+    /// restart test that passes without a durable store proves nothing.
+    pub fn durable_store(self) -> Self {
+        if std::env::var("ARKIV_TEST_STORE").as_deref() == Ok("golemdb") {
+            // `Node::start` places it in the datadir, which a restart keeps.
+            return self;
+        }
+        let url = std::env::var("VALKEY_URL").expect(
+            "this test needs a store that outlives the node process: set \
+             ARKIV_TEST_STORE=golemdb, or VALKEY_URL (for example redis://127.0.0.1:6379)",
+        );
+        self.valkey_store(url)
+    }
+
     /// Launch the node.
     pub fn spawn(self) -> Node {
         Node::start(self)
@@ -170,6 +190,18 @@ impl Node {
         let (http, http_port) = reserve_port();
         let (authrpc, authrpc_port) = reserve_port();
         let (p2p, p2p_port) = reserve_port();
+
+        let mut config = config;
+        if config.store.is_none()
+            && !config.env.iter().any(|(key, _)| key == "ARKIV_STORE_URL")
+            && std::env::var("ARKIV_TEST_STORE").as_deref() == Ok("golemdb")
+        {
+            let directory = datadir.join("arkiv-golemdb");
+            config = config.env(
+                "ARKIV_STORE_URL",
+                format!("golemdb://{}", directory.display()),
+            );
+        }
 
         let mut node = Self {
             config,

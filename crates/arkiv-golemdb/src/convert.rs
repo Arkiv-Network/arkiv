@@ -49,14 +49,18 @@ pub(crate) fn record_key(key: RecordKey) -> golemdb::RecordKey {
     golemdb::RecordKey(key.0)
 }
 
-/// GolemDB has no key type, so `KEY` is stored as 32 fixed bytes.
+/// GolemDB has no key type, so `KEY` takes the one 32-byte type Arkiv has no
+/// other use for, `Int(W32)`, and reads back as itself. A key is compared for
+/// equality only, so the signed order GolemDB gives that type never shows; the
+/// sign-bit flip below is undone on the way out like any other `Int`'s.
 fn cell_type(type_id: TypeId) -> Result<CellType, StoreError> {
     Ok(match type_id {
         TypeId::BOOL => CellType::Bool,
         TypeId::I32 => CellType::Int(Width::W4),
         TypeId::U256 => CellType::Uint(Width::W32),
         TypeId::DEC => CellType::Decimal(Width::W32),
-        TypeId::BYTES32 | TypeId::KEY => CellType::FixedBytes(Width::W32),
+        TypeId::KEY => CellType::Int(Width::W32),
+        TypeId::BYTES32 => CellType::FixedBytes(Width::W32),
         TypeId::BYTES => CellType::Bytes,
         TypeId::STR => CellType::Str,
         TypeId::U64 => CellType::Uint(Width::W8),
@@ -65,12 +69,13 @@ fn cell_type(type_id: TypeId) -> Result<CellType, StoreError> {
     })
 }
 
-/// The inverse of [`cell_type`]. A 32-byte cell reads back as `KEY` only for
-/// the entity's own `$key`.
+/// The inverse of [`cell_type`]. A fixed 32-byte `$key` is `KEY` as well: the
+/// first adapter stored every key that way.
 fn type_id(name: &[u8], cell_type: CellType) -> Result<TypeId, StoreError> {
     Ok(match cell_type {
         CellType::Bool => TypeId::BOOL,
         CellType::Int(Width::W4) => TypeId::I32,
+        CellType::Int(Width::W32) => TypeId::KEY,
         CellType::Uint(Width::W32) => TypeId::U256,
         CellType::Decimal(Width::W32) => TypeId::DEC,
         CellType::FixedBytes(Width::W32) if name == annotations::KEY => TypeId::KEY,

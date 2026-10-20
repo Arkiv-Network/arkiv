@@ -48,12 +48,20 @@ use tracing::info;
 
 /// The store Arkiv's state lives in.
 ///
-/// `ARKIV_STORE_URL` names a Valkey server; unset, the node runs the in-process
-/// reference store, which is what `--dev` wants and what the black-box tests
-/// spawn. Either way there is exactly one store, and it holds every entity,
-/// the query index and the minting nonces.
+/// `ARKIV_STORE_URL` names a GolemDB directory (`golemdb:///path`) or a Valkey
+/// server; unset, the node runs the in-process reference store, which is what
+/// `--dev` wants and what the black-box tests spawn. Either way there is
+/// exactly one store, and it holds every entity, the query index and the
+/// minting nonces.
 fn open_store() -> eyre::Result<HostStore> {
     match std::env::var("ARKIV_STORE_URL") {
+        Ok(url) if url.starts_with(arkiv_golemdb::URL_SCHEME) => {
+            let store = arkiv_golemdb::GolemDbStore::open_url(&url)
+                .expect("a golemdb URL")
+                .map_err(|e| eyre::eyre!("open the Arkiv store at {url}: {e}"))?;
+            info!(target: "arkiv-reth", %url, "Arkiv state on GolemDB");
+            Ok(Arc::new(store))
+        }
         Ok(url) => {
             let namespace =
                 std::env::var("ARKIV_STORE_NAMESPACE").unwrap_or_else(|_| "arkiv".to_owned());

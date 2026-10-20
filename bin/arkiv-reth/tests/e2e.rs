@@ -1615,16 +1615,11 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
 ///   cargo nextest run -p arkiv-reth --run-ignored only -- tier
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+#[ignore = "needs a durable store; set ARKIV_TEST_STORE=golemdb or VALKEY_URL, and run with --ignored"]
 async fn a_transaction_and_receipt_are_read_from_the_tier() {
-    let url = std::env::var("VALKEY_URL").expect(
-        "this test needs the node on a store that survives a restart: \
-         set VALKEY_URL (for example redis://127.0.0.1:6379)",
-    );
-
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .block_time("50ms")
-        .valkey_store(url)
+        .durable_store()
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let client = connect(&node.http_url(), signer);
