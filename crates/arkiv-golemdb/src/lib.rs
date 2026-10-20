@@ -25,6 +25,7 @@ mod query;
 mod segments;
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, Filter,
@@ -71,7 +72,16 @@ pub const URL_SCHEME: &str = "golemdb://";
 #[derive(Clone)]
 pub struct GolemDbStore {
     database: golemdb::Database,
+    /// The last match set, for the head and filter it was computed at.
+    ///
+    /// GolemDB does not page, so every page of a query is the whole match set
+    /// sliced here; a client walking a large result page by page would
+    /// otherwise pay for the whole set once per page.
+    last_match: Arc<Mutex<Option<LastMatch>>>,
 }
+
+/// A match set: the head and filter it was computed at, and the keys.
+type LastMatch = (CommitId, Filter, Arc<Vec<RecordKey>>);
 
 impl core::fmt::Debug for GolemDbStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -89,7 +99,10 @@ impl GolemDbStore {
             Some(segments::declaration()),
         );
         let database = golemdb::Database::open(directory, &golemdb::OpenConfig::new(genesis))?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            last_match: Arc::default(),
+        })
     }
 
     /// Open the directory a `golemdb://` URL names, with [`GolemDbConfig::arkiv`].
@@ -112,7 +125,23 @@ impl GolemDbStore {
     }
 
     /// The keys of every committed record matching `filter`, ascending.
-    fn matching(&self, filter: &Filter) -> Result<Vec<RecordKey>, StoreError> {
+    fn matching(&self, filter: &Filter) -> Result<Arc<Vec<RecordKey>>, StoreError> {
+        let head = self.head();
+        if let Some((at, cached, keys)) = &*self.last_match.lock().expect("not poisoned")
+            && *at == head
+            && cached == filter
+        {
+            return Ok(Arc::clone(keys));
+        }
+        let keys = Arc::new(self.evaluate(filter)?);
+        // Keyed by the head read before evaluating: if it moved meanwhile,
+        // the entry is merely never hit.
+        *self.last_match.lock().expect("not poisoned") =
+            Some((head, filter.clone(), Arc::clone(&keys)));
+        Ok(keys)
+    }
+
+    fn evaluate(&self, filter: &Filter) -> Result<Vec<RecordKey>, StoreError> {
         let lowered = query::lower(filter)?;
         let operation = golemdb::QueryOp::from_filter(lowered.filter)
             .only(Vec::<&[u8]>::new())
@@ -327,13 +356,14 @@ impl Store for GolemDbStore {
         query: &Query,
         _budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
-        let mut keys = self.matching(&query.filter)?;
+        let matched = self.matching(&query.filter)?;
         let at = ReadTarget::Commit(self.head());
+        let mut sorted_keys = None;
         if let Some(sort) = &query.sort {
             // As the reference store sorts: records lacking the cell last,
             // ascending key as the tie-break.
-            let mut sorted = Vec::with_capacity(keys.len());
-            for key in keys {
+            let mut sorted = Vec::with_capacity(matched.len());
+            for &key in matched.iter() {
                 let value = self
                     .read(at, key, Some(core::slice::from_ref(&sort.cell)))?
                     .and_then(|record| record.sort_key(&sort.cell));
@@ -351,12 +381,13 @@ impl Store for GolemDbStore {
                 };
                 ordering.then(left_key.cmp(right_key))
             });
-            keys = sorted.into_iter().map(|(_, key)| key).collect();
+            sorted_keys = Some(sorted.into_iter().map(|(_, key)| key).collect::<Vec<_>>());
         }
+        let keys = sorted_keys.as_deref().unwrap_or(&matched);
         let total_matched = query.total_matched.then_some(keys.len() as u64);
         let mut records = Vec::new();
-        for key in keys
-            .into_iter()
+        for &key in keys
+            .iter()
             .skip(query.page.offset as usize)
             .take(query.page.limit as usize)
         {
