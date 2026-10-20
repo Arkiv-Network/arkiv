@@ -1,0 +1,16 @@
+[package]
+name = "arkiv-golemdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Arkiv's `arkiv_interfaces::store::Store` over GolemDB, in-process: the store
+# that holds Arkiv's state and its blocks, transactions and receipts.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+golemdb-api.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

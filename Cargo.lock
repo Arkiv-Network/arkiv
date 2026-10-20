@@ -951,6 +951,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "annotate-snippets"
+version = "0.12.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a5b0a5ab8561c603f16c3b78c24a386b1f70e7fc1b1b1e8c15738828e4a176"
+dependencies = [
+ "anstyle",
+ "memchr",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1487,6 +1498,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-golemdb"
+version = "0.5.1"
+dependencies = [
+ "arkiv-interfaces",
+ "golemdb-api",
+ "tempfile",
+]
+
+[[package]]
 name = "arkiv-golemdb-state"
 version = "0.5.1"
 dependencies = [
@@ -1732,6 +1752,12 @@ dependencies = [
  "fred",
  "tokio",
 ]
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "arrayref"
@@ -2682,6 +2708,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3316,6 +3348,29 @@ dependencies = [
  "serdect",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
+]
+
+[[package]]
+name = "encoding_rs_io"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba3fe847045ecff794b9c138293a80db914678c453ad63fbf0c6a9eb6e00b22"
+dependencies = [
+ "encoding_rs",
 ]
 
 [[package]]
@@ -3958,6 +4013,123 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "golemdb-api"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-branch",
+ "golemdb-cells",
+ "golemdb-index",
+ "golemdb-merkle",
+ "golemdb-query",
+ "golemdb-record",
+ "golemdb-storage",
+ "golemdb-storage-mdbx",
+ "serde",
+ "serde-saphyr",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-branch"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-cells",
+ "golemdb-index",
+ "golemdb-merkle",
+ "golemdb-storage",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-cells"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-merkle",
+ "golemdb-storage",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-index"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-cells",
+ "golemdb-merkle",
+ "golemdb-storage",
+ "roaring",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-merkle"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "blake3",
+ "golemdb-storage",
+ "serde",
+ "serde-saphyr",
+ "sha3 0.10.9",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-query"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-branch",
+ "golemdb-cells",
+ "golemdb-index",
+ "golemdb-merkle",
+ "golemdb-record",
+ "golemdb-storage",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-record"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-branch",
+ "golemdb-cells",
+ "golemdb-merkle",
+ "golemdb-storage",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "golemdb-storage"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+
+[[package]]
+name = "golemdb-storage-mdbx"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f406036a215825df974d406b8192308cde60952b"
+dependencies = [
+ "golemdb-storage",
+ "libmdbx",
+ "mdbx-sys",
+]
+
+[[package]]
+name = "granit-parser"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e20f99e46474f56bd905c56e817ebddcf377a611f94c53ac4649e4d3fa3c0cd0"
+dependencies = [
+ "arraydeque",
+ "smallvec",
 ]
 
 [[package]]
@@ -5291,6 +5463,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmdbx"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1da773dcce45661428e2b51ca984eb3c64c08f2aa54865397e4b77d1f61c9f07"
+dependencies = [
+ "bitflags 2.13.1",
+ "derive_more",
+ "indexmap 2.14.0",
+ "libc",
+ "mdbx-sys",
+ "parking_lot",
+ "sealed",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "libp2p-identity"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5542,6 +5730,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdbx-sys"
+version = "13.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4002b9ffed3dd01364ab005bca653a99b8f550ca4cd755470a9d3a31a44f466"
+dependencies = [
+ "bindgen 0.72.1",
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5784,6 +5983,12 @@ checksum = "577c63b00ad74d57e8c9aa870b5fccebf2fd64a308a5aee9f1bb88e4aea19447"
 dependencies = [
  "unsigned-varint",
 ]
+
+[[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "ndk-context"
@@ -10062,9 +10267,9 @@ dependencies = [
 
 [[package]]
 name = "roaring"
-version = "0.11.4"
+version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dedc5658c6ecb3bdb5ef5f3295bb9253f42dcf3fd1402c03f6b1f7659c3c4a9"
+checksum = "18bd8a37d17a58532776dcdf6041ce64929adca78e8489d5cacbafe99229d3e1"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -10390,6 +10595,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "sealed"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f968c5ea23d555e670b449c1c5e7b2fc399fdaec1d304a17cd48e288abc107"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10506,6 +10722,20 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-saphyr"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
+dependencies = [
+ "annotate-snippets",
+ "encoding_rs_io",
+ "granit-parser",
+ "num-traits",
+ "serde_core",
+ "smallvec",
 ]
 
 [[package]]
