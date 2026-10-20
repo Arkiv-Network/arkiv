@@ -120,9 +120,24 @@ impl<'s, S: Store + ?Sized> GenesisWriter<'s, S> {
         self.entities += 1;
         self.staged += 1;
         if self.chunk.is_some_and(|chunk| self.staged >= chunk) {
+            // Sealed apart from the commit only to say which of the two a
+            // slow chunk spent its time in; committing seals anyway.
+            let started = std::time::Instant::now();
             self.store
+                .seal(self.branch)
+                .map_err(store_error("seal a chunk of the genesis"))?;
+            let sealed = started.elapsed();
+            let commit = self
+                .store
                 .commit(self.branch)
                 .map_err(store_error("commit a chunk of the genesis"))?;
+            eprintln!(
+                "  chunk committed as commit {} at {} entities: seal {:.1} s, commit {:.1} s",
+                commit.0,
+                self.entities,
+                sealed.as_secs_f64(),
+                (started.elapsed() - sealed).as_secs_f64(),
+            );
             self.branch = self
                 .store
                 .begin(None)
