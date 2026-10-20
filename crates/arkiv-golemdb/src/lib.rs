@@ -6,6 +6,14 @@
 //! reports it and never retries or rebases it. Reads are at the head only, as
 //! GolemDB keeps no history yet. Segments (blocks, transactions, receipts) and
 //! the `StoreExt` host extensions are not implemented yet.
+//!
+//! A commit is durable once it returns; a branch not yet committed is lost
+//! when the store closes or the process dies. Dropping the last clone closes
+//! the database.
+//!
+//! `head` panics if it cannot read the head. A full disk or database, and any
+//! other I/O failure, is `Internal`, which callers must treat as fatal. A stale
+//! branch or commit is `HandleInvalid`.
 
 mod convert;
 
