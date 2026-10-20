@@ -93,7 +93,8 @@ alloy-primitives = { version = "1.6", features = ["rlp"] }
 alloy-consensus = "2.5"
 alloy-evm = "0.39"
 
-golemdb-api = { git = "https://github.com/Arkiv-Network/golemdb", branch = "main" }
+# main + immutable data (golemdb #56/#72) + And/Or queries (#74) + range_of/ordinal_of.
+golemdb-api = { git = "https://github.com/Arkiv-Network/golemdb", branch = "scx1332/arkiv-integration" }
 
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
 # arkiv-genesis (mnemonic-derived dev signers). Kept on the same 2.5 line reth
@@ -132,6 +133,7 @@ arkiv-reth-chainspec = { path = "crates/arkiv-reth-chainspec" }
 arkiv-reth-uncommitted-store = { path = "crates/arkiv-reth-uncommitted-store" }
 arkiv-reth-statemanager = { path = "crates/arkiv-reth-statemanager" }
 arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
+arkiv-golemdb = { path = "crates/arkiv-golemdb" }
 arkiv-golemdb-state = { path = "crates/arkiv-golemdb-state" }
 arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
 
