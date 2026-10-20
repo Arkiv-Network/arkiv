@@ -2201,15 +2201,17 @@ fn check_genesis_store<C: EthChainSpec>(store: &HostStore, spec: &C) -> eyre::Re
     let tagged = store
         .commit_by_tag(genesis_hash.0)
         .map_err(|e| eyre::eyre!("look up the genesis commit in the Arkiv store: {e:?}"))?;
-    eyre::ensure!(
-        tagged == Some(CommitId::CHAIN_GENESIS),
-        "the Arkiv store holds another chain: its genesis commit is not tagged with this \
-         genesis hash {genesis_hash} (found {tagged:?}); point ARKIV_STORE_NAMESPACE at this \
-         chain's store"
-    );
+    // Commit 1, or later for a seed committed in chunks: the tag is what
+    // names it.
+    let Some(genesis_commit) = tagged else {
+        eyre::bail!(
+            "the Arkiv store holds another chain, or an unfinished seed: no commit is tagged \
+             with this genesis hash {genesis_hash}; point ARKIV_STORE_URL at this chain's store"
+        );
+    };
     if seeded {
         let root = store
-            .commit_hash(CommitId::CHAIN_GENESIS)
+            .commit_hash(genesis_commit)
             .map_err(|e| eyre::eyre!("read the genesis commit's root: {e:?}"))?;
         eyre::ensure!(
             B256::from(root) == header_root,

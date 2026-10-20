@@ -344,6 +344,23 @@ const GENESIS_WALK_PAGE: u64 = 10_000;
 /// the others -- on a prefill of permanent entities that is nothing at all.
 /// The genesis commit never changes, so an offset into its answer is a stable
 /// cursor across restarts.
+/// The genesis commit: the first tagged one. A seed committed in chunks puts
+/// untagged commits ahead of it; otherwise it is [`CommitId::CHAIN_GENESIS`].
+fn genesis_commit(store: &HostStore) -> eyre::Result<CommitId> {
+    let head = store.head();
+    let mut commit = CommitId::CHAIN_GENESIS;
+    while commit < head {
+        let tag = store
+            .tag_of(commit)
+            .map_err(|error| eyre::eyre!("read commit {}'s tag: {error:?}", commit.0))?;
+        if tag.is_some() {
+            break;
+        }
+        commit = CommitId(commit.0 + 1);
+    }
+    Ok(commit)
+}
+
 fn genesis_walk(
     store: &HostStore,
     mut writer: GenesisBootstrapWriter,
@@ -359,10 +376,11 @@ fn genesis_walk(
         value: u64::MAX.to_be_bytes().to_vec(),
         negated: false,
     }])]);
+    let genesis = genesis_commit(store)?;
     loop {
         let records = store
             .query(
-                Some(CommitId::CHAIN_GENESIS),
+                Some(genesis),
                 &Query {
                     filter: filter.clone(),
                     sort: None,

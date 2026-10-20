@@ -18,9 +18,20 @@ pub const SAMPLE_KEYS: usize = 16;
 
 /// The genesis commit being built: the funded accounts, then the entities,
 /// staged on one branch of an **empty** store.
+///
+/// With [`commit_every`](Self::commit_every) the entities are committed in
+/// chunks instead, untagged, and the genesis is the last commit -- the one the
+/// genesis hash tags. Whether the root is the same either way is the
+/// store's: the reference store's root is over content alone, but GolemDB's
+/// covers its commit history, so there the chunk size is part of the seed. A
+/// chunk is durable once committed, so a run that fails part-way leaves an
+/// unfinished store to seed again from empty, rather than nothing.
 pub struct GenesisWriter<'s, S: Store + ?Sized> {
     store: &'s S,
     branch: BranchId,
+    /// Commit after this many entities, if set; and how many are staged now.
+    chunk: Option<u64>,
+    staged: u64,
     funded: BTreeSet<Address>,
     minted: BTreeMap<Address, u64>,
     creators: BTreeSet<Address>,
@@ -65,12 +76,22 @@ impl<'s, S: Store + ?Sized> GenesisWriter<'s, S> {
         Ok(Self {
             store,
             branch,
+            chunk: None,
+            staged: 0,
             funded,
             minted: BTreeMap::new(),
             creators: BTreeSet::new(),
             entities: 0,
             sample_keys: Vec::new(),
         })
+    }
+
+    /// Commit every `entities` entities, rather than all of them at once:
+    /// what keeps a seed larger than memory writable. `0` is refused.
+    pub fn commit_every(mut self, entities: u64) -> Result<Self> {
+        ensure!(entities > 0, "a chunk holds at least one entity");
+        self.chunk = Some(entities);
+        Ok(self)
     }
 
     /// Stage one entity.
@@ -97,6 +118,17 @@ impl<'s, S: Store + ?Sized> GenesisWriter<'s, S> {
             self.sample_keys.push(key);
         }
         self.entities += 1;
+        self.staged += 1;
+        if self.chunk.is_some_and(|chunk| self.staged >= chunk) {
+            self.store
+                .commit(self.branch)
+                .map_err(store_error("commit a chunk of the genesis"))?;
+            self.branch = self
+                .store
+                .begin(None)
+                .map_err(store_error("open the next genesis branch"))?;
+            self.staged = 0;
+        }
         Ok(())
     }
 
@@ -170,18 +202,13 @@ impl<S: StoreExt + ?Sized> SealedGenesis<'_, S> {
     /// Commit, tagged with the genesis hash a header naming
     /// [`state_root`](Summary::state_root) hashes to -- the tag the node looks
     /// its genesis commit up by.
+    ///
+    /// Without chunks that is [`CommitId::CHAIN_GENESIS`]; with them, the
+    /// commit after the last chunk.
     pub fn commit(self, genesis_hash: B256) -> Result<CommitId> {
-        let commit = self
-            .store
+        self.store
             .commit_tagged(self.branch, genesis_hash.0)
-            .map_err(store_error("commit the genesis"))?;
-        ensure!(
-            commit == CommitId::CHAIN_GENESIS,
-            "the genesis landed as commit {} rather than {}",
-            commit.0,
-            CommitId::CHAIN_GENESIS.0
-        );
-        Ok(commit)
+            .map_err(store_error("commit the genesis"))
     }
 
     /// Drop the branch: nothing reaches the store.
@@ -245,6 +272,47 @@ mod tests {
         );
         let b = MemStore::new();
         assert_eq!(written(&b, 5, &[Address::repeat_byte(1)]), summary);
+    }
+
+    #[test]
+    fn a_chunked_genesis_seals_to_the_same_root_one_commit_later_per_chunk() {
+        let whole = MemStore::new();
+        let summary = written(&whole, 5, &[Address::repeat_byte(1)]);
+
+        let chunked = MemStore::new();
+        let mut spec = SeedSpec::new(1337, owners());
+        spec.count = 5;
+        spec.payload_size = 64;
+        let alloc = vec![GenesisAccount {
+            address: Address::repeat_byte(1),
+            balance: U256::from(5),
+            nonce: 0,
+        }];
+        let mut writer = GenesisWriter::begin(&chunked, alloc)
+            .unwrap()
+            .commit_every(2)
+            .unwrap();
+        for i in 0..5 {
+            writer.add(spec.entity(i).unwrap()).unwrap();
+        }
+        let sealed = writer.seal().unwrap();
+        assert_eq!(sealed.summary, summary);
+        // Two full chunks, then the genesis over the last entity.
+        assert_eq!(sealed.commit(B256::repeat_byte(0xee)).unwrap(), CommitId(3));
+        assert_eq!(
+            chunked.commit_by_tag([0xee; 32]).unwrap(),
+            Some(CommitId(3))
+        );
+        assert_eq!(
+            chunked.commit_hash(CommitId(3)).unwrap(),
+            summary.state_root.0
+        );
+        assert!(
+            GenesisWriter::begin(&MemStore::new(), vec![])
+                .unwrap()
+                .commit_every(0)
+                .is_err()
+        );
     }
 
     #[test]

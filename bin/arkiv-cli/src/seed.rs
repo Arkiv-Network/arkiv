@@ -128,6 +128,15 @@ pub struct SeedGenesisArgs {
     #[arg(long, env = "ARKIV_STORE_NAMESPACE", default_value = "arkiv")]
     pub store_namespace: String,
 
+    /// Commit the genesis in chunks of this many entities rather than all at
+    /// once, so a seed larger than memory can be written. The genesis is then
+    /// the last commit, and a run that fails part-way leaves the store to be
+    /// seeded again from empty. On GolemDB the root depends on the chunk
+    /// size (its root covers commit history), so a replay that must reach the
+    /// same `stateHash` uses the same one.
+    #[arg(long)]
+    pub commit_every: Option<u64>,
+
     /// Where to write the genesis JSON, `stateHash` included.
     #[arg(long)]
     pub out: PathBuf,
@@ -266,6 +275,9 @@ fn seed(args: &SeedGenesisArgs, mut progress: Option<&mut ProgressFile>) -> Resu
         progress.start(total);
     }
     let mut writer = GenesisWriter::begin(&store, alloc)?;
+    if let Some(entities) = args.commit_every {
+        writer = writer.commit_every(entities)?;
+    }
     let mut report = Report::new(total, started);
     let mut add = |writer: &mut GenesisWriter<'_, _>, entity: SeedEntity| -> Result<()> {
         writer.add(entity)?;
