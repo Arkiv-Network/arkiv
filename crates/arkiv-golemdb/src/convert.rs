@@ -105,13 +105,21 @@ pub(crate) fn golemdb_cell(cell: &Cell) -> Result<golemdb::CellValue, StoreError
         .map_err(|_| StoreError::InvalidArgument)
 }
 
-/// GolemDB has no record versions, so every record is version 0. Its engine
-/// cells (`#` and `@` names) are not part of Arkiv's record.
+/// The first byte of a cell name GolemDB keeps for itself, such as `#key`.
+const ENGINE_NAME_PREFIX: u8 = b'#';
+/// The first byte of a cell name on GolemDB's admin records.
+const ADMIN_NAME_PREFIX: u8 = b'@';
+
+/// GolemDB has no record versions, so every record is version 0. Its own
+/// engine and admin cells are not part of Arkiv's record.
 pub(crate) fn arkiv_record(record: &golemdb::Record) -> Result<Record, StoreError> {
     let mut cells = Vec::new();
     for (name, value) in &record.cells {
         let name = name.as_bytes();
-        if matches!(name.first(), Some(b'#' | b'@')) {
+        if matches!(
+            name.first(),
+            Some(&(ENGINE_NAME_PREFIX | ADMIN_NAME_PREFIX))
+        ) {
             continue;
         }
         let mut bytes = value.value().to_vec();
