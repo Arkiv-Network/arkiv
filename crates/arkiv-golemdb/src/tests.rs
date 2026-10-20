@@ -81,16 +81,43 @@ fn every_type_round_trips() {
 
 /// GolemDB has no key type: only the entity's own `$key` comes back as `KEY`.
 #[test]
-fn other_key_cells_read_back_as_bytes32() {
+fn key_cells_keep_their_type_and_answer_equality() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
     let branch = store.begin(None).unwrap();
-    let cells = vec![("ref".into(), attribute(TypeId::KEY, &[5; 32]))];
+    // A high first byte, so the sign-bit flip has something to undo.
+    let reference = [0xf5; 32];
+    let cells = vec![
+        ("ref".into(), attribute(TypeId::KEY, &reference)),
+        ("hash".into(), attribute(TypeId::BYTES32, &reference)),
+    ];
     store
         .create(branch, RecordKey([1; 32]), cells, None)
         .unwrap();
     let record = read(&store, ReadTarget::Branch(branch), 1).unwrap();
-    assert_eq!(record.cell("ref").unwrap().type_id, TypeId::BYTES32);
+    assert_eq!(
+        record.cell("ref").unwrap(),
+        &attribute(TypeId::KEY, &reference)
+    );
+    assert_eq!(
+        record.cell("hash").unwrap(),
+        &attribute(TypeId::BYTES32, &reference)
+    );
+    store.commit(branch).unwrap();
+
+    let by = |type_id| {
+        let filter = Filter(vec![AndGroup(vec![Predicate {
+            cell: "ref".into(),
+            op: CompareOp::Eq,
+            type_id,
+            value: reference.to_vec(),
+            negated: false,
+        }])]);
+        store.count(None, &filter, None).unwrap().into_value()
+    };
+    assert_eq!(by(TypeId::KEY), 1);
+    // A cell of another type under the name is absent, as for any type.
+    assert_eq!(by(TypeId::BYTES32), 0);
 }
 
 /// Arkiv's `$creationFlags` is a `BOOL` holding up to 3; GolemDB takes 0 or 1.
