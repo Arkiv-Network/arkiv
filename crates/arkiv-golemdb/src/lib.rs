@@ -34,8 +34,9 @@ use golemdb_api::{Api, ApiError};
 pub use golemdb_api::{CellLimits, HashAlgorithm, OpenError};
 
 use convert::{
-    arkiv_record, branch_id, commit_id, golemdb_cell, golemdb_commit, immutable_data_address,
-    immutable_data_key, immutable_data_row, metered, record_key, segment_row, store_error,
+    arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_cell, golemdb_commit,
+    immutable_data_address, immutable_data_key, immutable_data_row, metered, query_op, record_key,
+    segment_row, store_error,
 };
 use tags::TagRow;
 
@@ -359,24 +360,34 @@ impl Store for GolemDbStore {
             .map_err(store_error)
     }
 
-    /// Out of scope here, and GolemDB cannot yet run Arkiv's queries, which
-    /// always combine predicates.
+    /// The query runs as converted, so what GolemDB cannot run yet is
+    /// `NotImplemented`: a filter that combines predicates, which every
+    /// `arkiv_query` does, and paging, which every Arkiv query asks for.
     fn query(
         &self,
-        _at: Option<CommitId>,
-        _query: &Query,
-        _budget: Option<Budget>,
+        at: Option<CommitId>,
+        query: &Query,
+        budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
-        Err(StoreError::NotImplemented)
+        let page = self
+            .database
+            .query(at.map(golemdb_commit), query_op(query, budget)?)
+            .map_err(store_error)?;
+        arkiv_query_result(&page).map(metered)
     }
 
+    /// A count does not page, so it runs whenever GolemDB can express the
+    /// filter.
     fn count(
         &self,
-        _at: Option<CommitId>,
-        _filter: &Filter,
-        _budget: Option<Budget>,
+        at: Option<CommitId>,
+        filter: &Filter,
+        budget: Option<Budget>,
     ) -> Result<Metered<u64>, StoreError> {
-        Err(StoreError::NotImplemented)
+        self.database
+            .count(at.map(golemdb_commit), count_op(filter, budget)?)
+            .map(metered)
+            .map_err(store_error)
     }
 
     /// A constant. The one production caller discards it, and GolemDB has no

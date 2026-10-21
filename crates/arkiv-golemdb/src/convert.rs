@@ -8,6 +8,10 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{ApiError, CellType, Width};
 
+mod query;
+
+pub(crate) use query::{arkiv_query_result, count_op, query_op};
+
 /// GolemDB reports no cost yet, so every receipt is empty.
 pub(crate) fn metered<T>(value: T) -> Metered<T> {
     Metered::new(value, Receipt::default())

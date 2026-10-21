@@ -1,5 +1,5 @@
 use super::*;
-use arkiv_interfaces::store::{CellKind, TypeId};
+use arkiv_interfaces::store::{AndGroup, CellKind, CompareOp, Page, Predicate, TypeId};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -580,4 +580,54 @@ fn rolling_back_past_the_first_frame_is_handle_invalid() {
     let branch = store.begin(None).unwrap();
     store.rollback(branch).unwrap();
     assert_eq!(store.rollback(branch), Err(StoreError::HandleInvalid));
+}
+
+/// The filter `n >= at_least`, on [`commit_record`]'s cell.
+fn n_at_least(at_least: u64) -> Filter {
+    Filter(vec![AndGroup(vec![Predicate {
+        cell: "n".into(),
+        op: CompareOp::Gte,
+        type_id: TypeId::U64,
+        value: at_least.to_be_bytes().to_vec(),
+        negated: false,
+    }])])
+}
+
+/// A count does not page, so GolemDB runs it, at the head only.
+#[test]
+fn a_count_runs_at_the_head() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let first = commit_record(&store, 1);
+    let head = commit_record(&store, 2);
+    let count = |at| {
+        store
+            .count(at, &n_at_least(2), None)
+            .map(|n| n.into_value())
+    };
+    assert_eq!(count(None), Ok(1));
+    assert_eq!(count(Some(head)), Ok(1));
+    assert_eq!(count(Some(first)), Err(StoreError::HandleInvalid));
+}
+
+/// Every Arkiv query asks for a page, which GolemDB does not run yet.
+#[test]
+fn a_query_waits_for_golemdb_to_page() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 1);
+    let query = Query {
+        filter: n_at_least(1),
+        page: Page {
+            offset: 0,
+            limit: 10,
+        },
+        ..Query::default()
+    };
+    assert_eq!(
+        store
+            .query(None, &query, None)
+            .map(|page| page.into_value()),
+        Err(StoreError::NotImplemented)
+    );
 }
