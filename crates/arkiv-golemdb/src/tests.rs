@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+const SEGMENT: &str = "rows";
+
 fn config() -> GolemDbConfig {
     GolemDbConfig {
         hash_function: HashAlgorithm::Keccak256,
@@ -12,7 +14,31 @@ fn config() -> GolemDbConfig {
             max_str_len: 128,
             max_bytes_len: 128 * 1024,
         },
+        segments: vec![SegmentSpec {
+            name: SEGMENT.into(),
+            columns: 2,
+        }],
     }
+}
+
+/// A row of [`SEGMENT`], told apart by `n`.
+fn row(n: u8) -> SegmentRow {
+    vec![vec![n], Vec::new()]
+}
+
+/// Record `n` and a row on a sealed branch, left uncommitted.
+fn stage(store: &GolemDbStore, n: u8) -> BranchId {
+    let branch = store.begin(None).unwrap();
+    let cells = vec![(
+        "n".into(),
+        attribute(TypeId::U64, &u64::from(n).to_be_bytes()),
+    )];
+    store
+        .create(branch, RecordKey([n; 32]), cells, None)
+        .unwrap();
+    store.seal(branch).unwrap();
+    store.segment_append(branch, SEGMENT, None, row(n)).unwrap();
+    branch
 }
 
 fn open(dir: &TempDir) -> GolemDbStore {
@@ -214,18 +240,15 @@ fn roots_do_not_depend_on_a_restart() {
 /// directory it opens.
 const CHILD_DIR: &str = "ARKIV_GOLEMDB_TEST_CHILD_DIR";
 
-/// A child process commits record 1, writes record 2 on a branch it never
-/// commits, and is killed while it holds the store, so no cleanup runs.
+/// A child process commits record 1 and a row under a tag, stages record 2
+/// and another row on a branch it never commits, and is killed while it holds
+/// the store, so no cleanup runs.
 #[test]
 fn a_killed_process_keeps_only_its_commits() {
     if let Some(dir) = std::env::var_os(CHILD_DIR) {
         let store = GolemDbStore::open(dir.as_ref(), &config()).unwrap();
-        commit_record(&store, 1);
-        let branch = store.begin(None).unwrap();
-        let cells = vec![("n".into(), attribute(TypeId::U64, &2u64.to_be_bytes()))];
-        store
-            .create(branch, RecordKey([2; 32]), cells, None)
-            .unwrap();
+        store.commit_tagged(stage(&store, 1), [1; 32]).unwrap();
+        stage(&store, 2);
         eprintln!("ready");
         loop {
             std::thread::park();
@@ -264,6 +287,268 @@ fn a_killed_process_keeps_only_its_commits() {
         )
         .unwrap();
     assert!(uncommitted.into_value().is_none());
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Ordinal(0)),
+        Ok(Some(row(1)))
+    );
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Ordinal(1)),
+        Ok(None)
+    );
+    assert_eq!(store.commit_by_tag([1; 32]), Ok(Some(CommitId(1))));
+    assert_eq!(store.tag_of(CommitId(1)), Ok(Some([1; 32])));
+}
+
+/// Rows staged on a sealed branch appear with its commit, each readable by
+/// its ordinal, by its key if it has one, and among its commit's rows.
+#[test]
+fn segment_rows_appear_with_their_commit() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    store.seal(branch).unwrap();
+    let key = SegmentKey([7; 32]);
+    let writes = [(SEGMENT, Some(key), row(0)), (SEGMENT, None, row(1))];
+    assert_eq!(store.segment_append_many(branch, &writes), Ok(vec![0, 1]));
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Ordinal(0)),
+        Ok(None)
+    );
+
+    let commit = store.commit(branch).unwrap();
+    assert_eq!(
+        store.segment_rows_of(SEGMENT, commit),
+        Ok(vec![row(0), row(1)])
+    );
+    assert_eq!(store.segment_rows_of(SEGMENT, CommitId(0)), Ok(vec![]));
+    assert_eq!(
+        store.segment_rows_of(SEGMENT, CommitId(commit.0 + 1)),
+        Err(StoreError::NotFound)
+    );
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Key(key)),
+        Ok(Some(row(0)))
+    );
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Ordinal(1)),
+        Ok(Some(row(1)))
+    );
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Ordinal(2)),
+        Ok(None)
+    );
+}
+
+/// Arkiv appends only after seal, so a row can never move a root.
+#[test]
+fn appends_need_a_sealed_branch() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    assert_eq!(
+        store.segment_append(branch, SEGMENT, None, row(0)),
+        Err(StoreError::NotSealed)
+    );
+    assert_eq!(
+        store.segment_append_many(branch, &[(SEGMENT, None, row(0))]),
+        Err(StoreError::NotSealed)
+    );
+}
+
+/// A key names one row: a second row under it is refused, whether the first
+/// is staged or committed.
+#[test]
+fn a_segment_key_names_one_row() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let key = Some(SegmentKey([7; 32]));
+    let branch = store.begin(None).unwrap();
+    store.seal(branch).unwrap();
+    store.segment_append(branch, SEGMENT, key, row(0)).unwrap();
+    assert_eq!(
+        store.segment_append(branch, SEGMENT, key, row(1)),
+        Err(StoreError::AlreadyExists)
+    );
+    store.commit(branch).unwrap();
+
+    let branch = store.begin(None).unwrap();
+    store.seal(branch).unwrap();
+    assert_eq!(
+        store.segment_append(branch, SEGMENT, key, row(1)),
+        Err(StoreError::AlreadyExists)
+    );
+}
+
+/// A row goes only to a segment the host declared, with that segment's column
+/// count.
+#[test]
+fn a_row_must_fit_a_declared_segment() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    store.seal(branch).unwrap();
+    assert_eq!(
+        store.segment_append(branch, "other", None, row(0)),
+        Err(StoreError::NotFound)
+    );
+    assert_eq!(
+        store.segment_append(branch, SEGMENT, None, vec![vec![0]]),
+        Err(StoreError::InvalidArgument)
+    );
+    assert_eq!(
+        store.segment_append(branch, tags::SEGMENT, None, row(0)),
+        Err(StoreError::InvalidArgument)
+    );
+}
+
+/// Every commit keeps its tag, if it has one, and the state root it sealed.
+#[test]
+fn a_commit_keeps_its_tag_and_its_root() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let commit = |n: u8, tag: Option<[u8; 32]>| {
+        let branch = stage(&store, n);
+        let sealed = store.seal(branch).unwrap();
+        let committed = match tag {
+            Some(tag) => store.commit_tagged(branch, tag),
+            None => store.commit(branch),
+        };
+        assert_eq!(committed, Ok(sealed.commit_nr));
+        sealed
+    };
+    let untagged = commit(1, None);
+    let tagged = commit(2, Some([9; 32]));
+
+    assert_eq!(store.commit_by_tag([9; 32]), Ok(Some(tagged.commit_nr)));
+    assert_eq!(store.tag_of(tagged.commit_nr), Ok(Some([9; 32])));
+    assert_eq!(store.tag_of(untagged.commit_nr), Ok(None));
+    for sealed in [untagged, tagged] {
+        assert_eq!(store.commit_hash(sealed.commit_nr), Ok(sealed.state_root));
+    }
+
+    // Nothing for an unused tag, the empty genesis, or a commit yet to come.
+    assert_eq!(store.commit_by_tag([8; 32]), Ok(None));
+    assert_eq!(store.tag_of(CommitId(0)), Ok(None));
+    assert_eq!(store.tag_of(CommitId(3)), Ok(None));
+    assert_eq!(store.commit_hash(CommitId(0)), Err(StoreError::NotFound));
+}
+
+/// A tag names one commit. A refused tag leaves the branch usable, and it
+/// still commits with a single row.
+#[test]
+fn a_tag_names_one_commit() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let first = store.commit_tagged(stage(&store, 1), [9; 32]).unwrap();
+    let branch = stage(&store, 2);
+    assert_eq!(
+        store.commit_tagged(branch, [9; 32]),
+        Err(StoreError::AlreadyExists)
+    );
+
+    let second = store.commit_tagged(branch, [8; 32]).unwrap();
+    assert_eq!(second, CommitId(first.0 + 1));
+    assert_eq!(store.tag_of(second), Ok(Some([8; 32])));
+    assert_eq!(store.commit_by_tag([9; 32]), Ok(Some(first)));
+}
+
+/// Tags and roots are read back from disk after a reopen, both ways.
+#[test]
+fn tags_and_roots_survive_a_reopen() {
+    let dir = TempDir::new().unwrap();
+    let sealed = {
+        let store = open(&dir);
+        let branch = stage(&store, 1);
+        let sealed = store.seal(branch).unwrap();
+        store.commit_tagged(branch, [9; 32]).unwrap();
+        sealed
+    };
+
+    let store = open(&dir);
+    assert_eq!(store.commit_by_tag([9; 32]), Ok(Some(sealed.commit_nr)));
+    assert_eq!(store.tag_of(sealed.commit_nr), Ok(Some([9; 32])));
+    assert_eq!(store.commit_hash(sealed.commit_nr), Ok(sealed.state_root));
+}
+
+/// `commit_tags` is the adapter's own, so a host segment of that name is a
+/// duplicate GolemDB refuses at open.
+#[test]
+fn a_host_segment_may_not_be_named_commit_tags() {
+    let dir = TempDir::new().unwrap();
+    let mut config = config();
+    config.segments.push(SegmentSpec {
+        name: tags::SEGMENT.into(),
+        columns: 1,
+    });
+    let error = GolemDbStore::open(dir.path(), &config).unwrap_err();
+    assert!(error.to_string().contains("duplicate"), "{error}");
+}
+
+/// A commit's tag row is found by the commit that published it, not by
+/// position, so a stray second row spoils only that commit's tag.
+#[test]
+fn a_stray_tag_row_spoils_only_its_commit() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = stage(&store, 1);
+    // What a second, racing commit of the same branch would stage.
+    let stray = TagRow {
+        commit: 1,
+        tag: None,
+        state_root: [0; 32],
+    };
+    store
+        .database
+        .immutable_data_append(branch_id(branch), tags::SEGMENT, None, stray.to_row())
+        .unwrap();
+    let spoiled = store.commit(branch).unwrap();
+    let next = store.commit_tagged(stage(&store, 2), [9; 32]).unwrap();
+
+    assert_eq!(store.tag_of(spoiled), Err(StoreError::Internal));
+    assert_eq!(store.tag_of(next), Ok(Some([9; 32])));
+    assert!(store.commit_hash(next).is_ok());
+}
+
+/// A commit that fails in storage takes its tag row back off: a retry fails
+/// the same way, not on its own leftover row, and the tag stays free.
+#[test]
+fn a_failed_commit_leaves_no_tag_row() {
+    let dir = TempDir::new().unwrap();
+    // Too small for the branch below, so its commit fails as full.
+    let options = golemdb::MdbxOptions {
+        max_map_size: 1024 * 1024,
+        growth_step: 64 * 1024,
+        ..Default::default()
+    };
+    let store = GolemDbStore {
+        database: golemdb::Database::open_with_options(
+            dir.path(),
+            &golemdb::OpenConfig::new(config().genesis()),
+            options,
+        )
+        .unwrap(),
+    };
+    let branch = store.begin(None).unwrap();
+    for n in 0..10 {
+        let payload = vec![n; 128 * 1024];
+        let cells = vec![("p".into(), cell(CellKind::Field, TypeId::BYTES, &payload))];
+        store
+            .create(branch, RecordKey([n; 32]), cells, None)
+            .unwrap();
+    }
+    assert_eq!(
+        store.commit_tagged(branch, [9; 32]),
+        Err(StoreError::Internal)
+    );
+    assert_eq!(
+        store.commit_tagged(branch, [9; 32]),
+        Err(StoreError::Internal)
+    );
+
+    store.discard(branch).unwrap();
+    let commit = store.commit_tagged(stage(&store, 1), [9; 32]).unwrap();
+    assert_eq!(commit, CommitId(1));
+    assert_eq!(store.tag_of(commit), Ok(Some([9; 32])));
 }
 
 /// A round trip cannot catch a wrong sign flip, because the flip undoes

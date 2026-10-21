@@ -3,7 +3,7 @@
 use arkiv_interfaces::entity::annotations;
 use arkiv_interfaces::store::{
     BranchId, Cell, CellKind, CommitId, Metered, Receipt, Record, RecordKey, RecordVersion,
-    StoreError, TypeId,
+    SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
 };
 use golemdb_api as golemdb;
 use golemdb_api::{ApiError, CellType, Width};
@@ -47,6 +47,29 @@ pub(crate) fn golemdb_commit(commit: CommitId) -> golemdb::CommitId {
 
 pub(crate) fn record_key(key: RecordKey) -> golemdb::RecordKey {
     golemdb::RecordKey(key.0)
+}
+
+pub(crate) fn immutable_data_key(key: SegmentKey) -> golemdb::ImmutableDataKey {
+    golemdb::ImmutableDataKey(key.0)
+}
+
+pub(crate) fn immutable_data_row(row: &SegmentRow) -> golemdb::ImmutableDataRow {
+    golemdb::ImmutableDataRow::new(
+        row.iter()
+            .map(|column| golemdb::CellValue::from_bytes(column))
+            .collect(),
+    )
+}
+
+pub(crate) fn segment_row(row: &golemdb::ImmutableDataRow) -> SegmentRow {
+    row.payloads().map(<[u8]>::to_vec).collect()
+}
+
+pub(crate) fn immutable_data_address(address: SegmentAddress) -> golemdb::ImmutableDataAddress {
+    match address {
+        SegmentAddress::Ordinal(ordinal) => golemdb::ImmutableDataAddress::Ordinal(ordinal),
+        SegmentAddress::Key(key) => golemdb::ImmutableDataAddress::Key(immutable_data_key(key)),
+    }
 }
 
 /// GolemDB has no key type, so `KEY` is stored as 32 fixed bytes.
