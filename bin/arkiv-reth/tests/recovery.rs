@@ -13,11 +13,11 @@ use std::time::Duration;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{B256, Bytes, U256};
 use alloy_provider::Provider;
-use alloy_rpc_types::TransactionRequest;
+use alloy_rpc_types::{TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{Attribute, AttributeValue, Ident32, Operation};
 use arkiv_harness::{
-    DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce, NodeBuilder, connect,
+    ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce, NodeBuilder, connect,
     derive_entity_address, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::rpc_error_codes;
@@ -72,6 +72,19 @@ fn patch_payload(key: B256, payload: Bytes) -> Operation {
             .unwrap(),
         ],
     )
+}
+
+/// Wait until the store holds the block `receipt` is in.
+///
+/// The store commits a block just after reth makes it canonical, and reth
+/// serves the receipt from that moment, so a read straight after it can still
+/// see the block before. On a healthy chain the store lags reth by at most that
+/// one block, so once the next block is out, the store has this one.
+async fn wait_for_store(client: &ArkivClient<impl Provider>, receipt: &TransactionReceipt) {
+    let mined = receipt.block_number.expect("mined");
+    client
+        .wait_for_block(mined + 1, Duration::from_secs(60))
+        .await;
 }
 
 fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
@@ -265,12 +278,13 @@ async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
             create_op(1000, Bytes::from_static(b"beta"), attrs(20, "blue")),
         ])
         .await;
-    client
+    let changed = client
         .execute(vec![
             patch_payload(key(0), Bytes::from_static(b"v2")),
             Operation::delete(key(1)),
         ])
         .await;
+    wait_for_store(&client, &changed).await;
     let entity_before = client.get_entity(key(0)).await;
     assert_eq!(entity_before["payload"], "0x7632", "the patch landed"); // "v2"
     assert!(
@@ -313,6 +327,7 @@ async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
         .await
         .expect("mined");
     assert!(receipt.status(), "the transfer succeeds");
+    wait_for_store(&client, &receipt).await;
     let balance_before = provider
         .get_balance(recipient)
         .await
@@ -351,9 +366,10 @@ async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
     client
         .wait_for_block(tip + 10, Duration::from_secs(60))
         .await;
-    client
+    let gamma = client
         .execute(vec![create_op(1000, Bytes::from_static(b"gamma"), vec![])])
         .await;
+    wait_for_store(&client, &gamma).await;
     assert!(
         !client.get_entity(key(2)).await.is_null(),
         "new writes work after recovery"
