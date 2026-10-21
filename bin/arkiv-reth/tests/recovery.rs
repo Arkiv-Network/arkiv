@@ -10,13 +10,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alloy_primitives::{B256, Bytes};
+use alloy_network::TransactionBuilder;
+use alloy_primitives::{B256, Bytes, U256};
+use alloy_provider::Provider;
+use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{Attribute, AttributeValue, Ident32, Operation};
 use arkiv_harness::{
-    DEV_CHAIN_ID, DEV_KEY_0, EntityCreationNonce, NodeBuilder, connect, derive_entity_address,
-    hex_quantity, result_keys,
+    DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce, NodeBuilder, connect,
+    derive_entity_address, hex_quantity, result_keys,
 };
+use arkiv_interfaces::constants::rpc_error_codes;
 
 const READY: Duration = Duration::from_secs(90);
 
@@ -54,6 +58,20 @@ fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Op
         .unwrap(),
     );
     Operation::create(0, 0, min_lifetime, 0, attrs)
+}
+
+/// A patch that replaces just the payload.
+fn patch_payload(key: B256, payload: Bytes) -> Operation {
+    Operation::patch(
+        key,
+        vec![
+            Attribute::from_value(
+                Ident32::system("$payload").unwrap(),
+                &AttributeValue::Bytes(payload.to_vec()),
+            )
+            .unwrap(),
+        ],
+    )
 }
 
 fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
@@ -207,6 +225,137 @@ async fn state_and_index_survive_shutdown_and_restart() {
     assert_eq!(
         client.entity_count(None, None).await,
         3,
+        "new writes work after recovery"
+    );
+}
+
+/// On GolemDB, entities and balances survive a shutdown and restart, and the
+/// node goes on producing blocks and taking writes afterwards.
+///
+/// Like the restart above, and past the persistence threshold for the same
+/// reasons, but GolemDB needs no server, so this one always runs. It reads
+/// entities by key: GolemDB does not answer queries or counts yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    assert!(
+        node.datadir().join("golemdb").is_dir(),
+        "the node runs on GolemDB"
+    );
+    let provider = client.provider();
+    let key = |nonce| {
+        B256::from(derive_entity_address(
+            DEV_CHAIN_ID,
+            &caller.into_array(),
+            EntityCreationNonce::new(nonce),
+            0,
+        ))
+    };
+
+    // Two entities, then a patch of the first and a delete of the second.
+    client
+        .execute(vec![
+            create_op(1000, Bytes::from_static(b"alpha"), attrs(10, "red")),
+            create_op(1000, Bytes::from_static(b"beta"), attrs(20, "blue")),
+        ])
+        .await;
+    client
+        .execute(vec![
+            patch_payload(key(0), Bytes::from_static(b"v2")),
+            Operation::delete(key(1)),
+        ])
+        .await;
+    let entity_before = client.get_entity(key(0)).await;
+    assert_eq!(entity_before["payload"], "0x7632", "the patch landed"); // "v2"
+    assert!(
+        client.get_entity(key(1)).await.is_null(),
+        "the delete landed"
+    );
+
+    // GolemDB keeps only the head's state, so a read at an older block is
+    // refused as such, not answered from the head or failed as internal.
+    let created = hex_quantity(&entity_before["createdAt"]);
+    let past = provider
+        .raw_request::<_, serde_json::Value>("arkiv_getEntity".into(), (key(0), created))
+        .await
+        .expect_err("a read at a past block");
+    assert_eq!(
+        past.as_error_resp().map(|error| error.code),
+        Some(rpc_error_codes::BLOCK_UNAVAILABLE.into()),
+        "{past}"
+    );
+
+    // A plain transfer, so there is a balance to read back.
+    let recipient = DEV_KEY_1.parse::<PrivateKeySigner>().unwrap().address();
+    let funded = provider
+        .get_balance(recipient)
+        .await
+        .expect("eth_getBalance");
+    let transfer = TransactionRequest::default()
+        .with_to(recipient)
+        .with_value(U256::from(1_000))
+        .with_nonce(provider.get_transaction_count(caller).await.expect("nonce"))
+        .with_gas_limit(21_000)
+        .with_max_fee_per_gas(3_000_000_000)
+        .with_max_priority_fee_per_gas(1_000_000_000)
+        .with_chain_id(DEV_CHAIN_ID);
+    let receipt = provider
+        .send_transaction(transfer)
+        .await
+        .expect("the pool accepts the transfer")
+        .get_receipt()
+        .await
+        .expect("mined");
+    assert!(receipt.status(), "the transfer succeeds");
+    let balance_before = provider
+        .get_balance(recipient)
+        .await
+        .expect("eth_getBalance");
+    assert_eq!(balance_before, funded + U256::from(1_000));
+
+    let mined = receipt.block_number.expect("mined");
+    client
+        .wait_for_block(mined + PERSISTED, Duration::from_secs(60))
+        .await;
+    node.terminate();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node.restart();
+    node.wait_ready(&client, READY).await;
+
+    assert_eq!(
+        client.get_entity(key(0)).await,
+        entity_before,
+        "the patched entity survives"
+    );
+    assert!(
+        client.get_entity(key(1)).await.is_null(),
+        "the deleted entity stays deleted"
+    );
+    assert_eq!(
+        provider
+            .get_balance(recipient)
+            .await
+            .expect("eth_getBalance"),
+        balance_before,
+        "the balance survives"
+    );
+
+    // Sustained block production and a new write, as above.
+    let tip = client.block_number().await;
+    client
+        .wait_for_block(tip + 10, Duration::from_secs(60))
+        .await;
+    client
+        .execute(vec![create_op(1000, Bytes::from_static(b"gamma"), vec![])])
+        .await;
+    assert!(
+        !client.get_entity(key(2)).await.is_null(),
         "new writes work after recovery"
     );
 }

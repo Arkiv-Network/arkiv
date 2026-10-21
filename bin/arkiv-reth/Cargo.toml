@@ -36,9 +36,10 @@ reth-node-builder.workspace = true
 reth-storage-overlay.workspace = true
 alloy-rpc-types-engine.workspace = true
 reth-db.workspace = true
-# The node's backing store: the reference one in-process by default, Valkey
-# when ARKIV_STORE_URL names a server.
+# The node's backing store: the reference one in-process by default, GolemDB
+# or Valkey when ARKIV_STORE_URL names one.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
+arkiv-golemdb.workspace = true
 arkiv-valkey.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.

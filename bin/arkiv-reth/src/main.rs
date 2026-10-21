@@ -43,29 +43,57 @@ use reth_db::DatabaseEnv;
 type ArkivNodeTypes = NodeTypesWithDBAdapter<ArkivNode, DatabaseEnv>;
 use reth::{beacon_consensus::EthBeaconConsensus, cli::Cli};
 use reth_node_ethereum::EthEvmConfig;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::info;
 
 /// The store Arkiv's state lives in.
 ///
-/// `ARKIV_STORE_URL` names a Valkey server; unset, the node runs the in-process
-/// reference store, which is what `--dev` wants and what the black-box tests
-/// spawn. Either way there is exactly one store, and it holds every entity,
-/// the query index and the minting nonces.
+/// `ARKIV_STORE_URL` chooses it: `golemdb://<directory>` opens GolemDB in-process
+/// in that directory, any other URL names a Valkey server, and unset runs the
+/// in-process reference store, which is what `--dev` wants and what the
+/// black-box tests spawn. Either way there is exactly one store, and it holds
+/// every entity, the query index and the minting nonces.
+///
+/// A relative GolemDB directory is taken from the working directory, not from
+/// `--datadir`.
 fn open_store() -> eyre::Result<HostStore> {
-    match std::env::var("ARKIV_STORE_URL") {
-        Ok(url) => {
-            let namespace =
-                std::env::var("ARKIV_STORE_NAMESPACE").unwrap_or_else(|_| "arkiv".to_owned());
-            let store = arkiv_valkey::ValkeyStore::connect(&url, &namespace)
-                .map_err(|e| eyre::eyre!("connect to the Arkiv store at {url}: {e:?}"))?;
-            info!(target: "arkiv-reth", %url, %namespace, "Arkiv state on Valkey");
-            Ok(Arc::new(store))
-        }
-        Err(_) => {
-            info!(target: "arkiv-reth", "Arkiv state in-process (set ARKIV_STORE_URL for Valkey)");
-            Ok(Arc::new(arkiv_interfaces::store::reference::MemStore::new()))
-        }
+    let Ok(url) = std::env::var("ARKIV_STORE_URL") else {
+        info!(target: "arkiv-reth", "Arkiv state in-process (set ARKIV_STORE_URL for GolemDB or Valkey)");
+        return Ok(Arc::new(arkiv_interfaces::store::reference::MemStore::new()));
+    };
+    if let Some(directory) = url.strip_prefix("golemdb://") {
+        let store = arkiv_golemdb::GolemDbStore::open(directory.as_ref(), &golemdb_config())
+            .map_err(|e| eyre::eyre!("open GolemDB at {directory}: {e}"))?;
+        info!(target: "arkiv-reth", %directory, "Arkiv state on GolemDB");
+        return Ok(Arc::new(store));
+    }
+    let namespace = std::env::var("ARKIV_STORE_NAMESPACE").unwrap_or_else(|_| "arkiv".to_owned());
+    let store = arkiv_valkey::ValkeyStore::connect(&url, &namespace)
+        .map_err(|e| eyre::eyre!("connect to the Arkiv store at {url}: {e:?}"))?;
+    info!(target: "arkiv-reth", %url, %namespace, "Arkiv state on Valkey");
+    Ok(Arc::new(store))
+}
+
+/// GolemDB's settings for Arkiv, from Arkiv's own limits and segments. They are
+/// fixed when a database is created and part of its state root, so every node
+/// of a chain must use the same.
+fn golemdb_config() -> arkiv_golemdb::GolemDbConfig {
+    use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_PAYLOAD_BYTES, MAX_STR_BYTES};
+    let limit = |bytes: usize| u32::try_from(bytes).expect("Arkiv's limits fit in u32");
+    arkiv_golemdb::GolemDbConfig {
+        hash_function: arkiv_golemdb::HashAlgorithm::Keccak256,
+        cell_limits: arkiv_golemdb::CellLimits {
+            max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
+            max_str_len: limit(MAX_STR_BYTES),
+            max_bytes_len: limit(MAX_PAYLOAD_BYTES),
+        },
+        segments: arkiv_reth_statemanager::segments::ALL
+            .iter()
+            .map(|&(name, columns)| arkiv_golemdb::SegmentSpec {
+                name: name.to_owned(),
+                columns,
+            })
+            .collect(),
     }
 }
 
@@ -84,31 +112,36 @@ fn main() {
         .with_log_file_filter("debug,turso_core=info,turso=info".to_owned())
         .try_init();
 
-    // `run_with_components` rather than `run`: the latter is bound to reth's
-    // `ChainSpec`. The components closure gives the non-`node` subcommands
-    // (`init`, `import`, `db`, ...) the same executor and consensus the node uses.
-    let store = match open_store() {
-        Ok(store) => store,
-        Err(err) => {
-            eprintln!("Error: {err:?}");
-            std::process::exit(1);
-        }
+    // The store opens on first use: after the command line is parsed and
+    // tracing is up, and only for a command that runs Arkiv's state. So
+    // `--version` creates no database, and `db` does not trip over the lock of
+    // a node running on the same one.
+    let store = Arc::new(OnceLock::<HostStore>::new());
+    let open = move || {
+        store
+            .get_or_init(|| open_store().unwrap_or_else(|err| exit_with(&err)))
+            .clone()
     };
     let seals = Arc::new(BlockSeals::new());
-    let factory_store = store.clone();
     let factory_seals = seals.clone();
+    let factory_open = open.clone();
+    // `run_with_components` rather than `run`: the latter is bound to reth's
+    // `ChainSpec`. The components closure gives the non-`node` subcommands
+    // (`import`, `stage`, `re-execute`) the same executor and consensus the node
+    // uses.
     let result = Cli::<ArkivChainSpecParser>::parse().run_with_components::<ArkivNode>(
         move |spec| {
             (
                 EthEvmConfig::new_with_evm_factory(
                     spec.clone(),
-                    ArkivEvmFactory::new(factory_store.clone(), factory_seals.clone()),
+                    ArkivEvmFactory::new(factory_open(), factory_seals.clone()),
                 ),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
         },
         async move |builder, _| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
+            let store = open();
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone());
@@ -139,7 +172,11 @@ fn main() {
         },
     );
     if let Err(err) = result {
-        eprintln!("Error: {err:?}");
-        std::process::exit(1);
+        exit_with(&err);
     }
+}
+
+fn exit_with(err: &eyre::Report) -> ! {
+    eprintln!("Error: {err:?}");
+    std::process::exit(1);
 }
