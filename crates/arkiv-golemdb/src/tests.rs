@@ -631,3 +631,14 @@ fn a_query_waits_for_golemdb_to_page() {
         Err(StoreError::NotImplemented)
     );
 }
+
+/// A filter over GolemDB's caps is a structural limit, not a fatal store
+/// failure.
+#[test]
+fn a_query_over_a_cap_is_limit_exceeded() {
+    let error = golemdb::ApiError::LimitExceeded {
+        limit: "filter depth",
+        max: 64,
+    };
+    assert_eq!(convert::store_error(error), StoreError::LimitExceeded);
+}

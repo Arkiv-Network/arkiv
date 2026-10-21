@@ -361,8 +361,8 @@ impl Store for GolemDbStore {
     }
 
     /// The query runs as converted, so what GolemDB cannot run yet is
-    /// `NotImplemented`: a filter that combines predicates, which every
-    /// `arkiv_query` does, and paging, which every Arkiv query asks for.
+    /// `NotImplemented`: a negated predicate, and paging, which every Arkiv
+    /// query asks for.
     fn query(
         &self,
         at: Option<CommitId>,

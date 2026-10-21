@@ -6,7 +6,7 @@ use arkiv_interfaces::store::{
     SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
 };
 use golemdb_api as golemdb;
-use golemdb_api::{ApiError, CellType, Width};
+use golemdb_api::{ApiError, CellType, FloatWidth, Width};
 
 mod query;
 
@@ -28,11 +28,15 @@ pub(crate) fn store_error(error: ApiError) -> StoreError {
         ApiError::AlreadyExists => StoreError::AlreadyExists,
         ApiError::Reserved | ApiError::InvalidArgument { .. } => StoreError::InvalidArgument,
         ApiError::InvalidQuery { .. } => StoreError::InvalidQuery,
+        ApiError::LimitExceeded { .. } => StoreError::LimitExceeded,
         ApiError::HandleInvalid
         | ApiError::Conflict
         | ApiError::Sealed
         | ApiError::CommitUnavailable { .. }
         | ApiError::NoFrameToRollback => StoreError::HandleInvalid,
+        ApiError::StoreFull | ApiError::Internal { .. } => StoreError::Internal,
+        // `ApiError` is non-exhaustive, so the compiler requires this arm: an
+        // error GolemDB adds later is a machine failure until it is mapped.
         _ => StoreError::Internal,
     }
 }
@@ -106,7 +110,14 @@ fn type_id(name: &[u8], cell_type: CellType) -> Result<TypeId, StoreError> {
         CellType::Str => TypeId::STR,
         CellType::Uint(Width::W8) => TypeId::U64,
         CellType::Bytes20 => TypeId::ADDR,
-        _ => return Err(StoreError::Internal),
+        // Types Arkiv never writes.
+        CellType::Int(Width::W8 | Width::W16 | Width::W32)
+        | CellType::Uint(Width::W4 | Width::W16)
+        | CellType::Decimal(Width::W4 | Width::W8 | Width::W16)
+        | CellType::FixedBytes(Width::W4 | Width::W8 | Width::W16)
+        | CellType::Float(FloatWidth::F32 | FloatWidth::F64)
+        | CellType::Date32
+        | CellType::Timestamp64 => return Err(StoreError::Internal),
     })
 }
 

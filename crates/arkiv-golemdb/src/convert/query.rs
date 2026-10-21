@@ -2,11 +2,18 @@
 //! [`QueryOp`](golemdb::QueryOp) and [`CountOp`](golemdb::CountOp), as far as
 //! GolemDB can express them, and GolemDB's page back as a [`QueryResult`].
 //!
-//! A GolemDB filter is a single leaf, with no AND, OR or NOT. So only a filter
-//! of one predicate, or an OR of equalities on one cell, has a counterpart.
-//! Anything else that would change the answer is
-//! [`StoreError::NotImplemented`], as the rest of the adapter reports what
-//! GolemDB lacks. An offset of 0 is no offset, so it is dropped.
+//! Arkiv's filter, an OR of AND-groups, becomes GolemDB's `Or` of `And`s.
+//! What has no counterpart is [`StoreError::NotImplemented`], as the rest of
+//! the adapter reports what GolemDB lacks:
+//!
+//! - a negated predicate: GolemDB has no NOT;
+//! - a filter that matches every record, with no group or an empty one:
+//!   GolemDB has no filter for that;
+//! - a prefix that ends inside a character: GolemDB's prefix is text;
+//! - a sort on a cell the filter does not hold to one type: a GolemDB sort
+//!   names one.
+//!
+//! An offset of 0 is no offset, so it is dropped.
 //!
 //! One difference is not in the query at all: unsorted, and as a sort's
 //! tie-break, GolemDB returns records in record ID order and Arkiv in key
@@ -16,10 +23,10 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use arkiv_interfaces::store::{
     AndGroup, Budget, Cell, CellKind, CompareOp, Filter, Predicate, Query, QueryResult, Sort,
-    SortDirection, StoreError,
+    SortDirection, StoreError, TypeId,
 };
 use golemdb_api as golemdb;
-use golemdb_api::{Bounds, CellType, EqValue, InValues};
+use golemdb_api::{Bounds, EqValue, InValues};
 
 use super::{arkiv_record, cell_type, golemdb_cell};
 
@@ -33,7 +40,7 @@ pub(crate) fn query_op(
     let sort = query
         .sort
         .as_ref()
-        .map(|sort| sort_key(sort, &filter))
+        .map(|sort| sort_key(sort, &query.filter))
         .transpose()?;
     let mut op = golemdb::QueryOp::from_filter(filter)
         .sort(sort)
@@ -82,7 +89,9 @@ pub(crate) fn arkiv_query_result(page: &golemdb::QueryPage) -> Result<QueryResul
     })
 }
 
-/// Arkiv's DNF as one GolemDB leaf.
+/// Arkiv's DNF as GolemDB's tree: an `Or` of the groups, each an `And` of its
+/// predicates, with a node of one child left out. Both evaluate their children
+/// in the written order, as Arkiv's groups and predicates are.
 ///
 /// Every predicate is checked against its type's index first, as Arkiv checks
 /// it: a range on a `str` is invalid even though GolemDB could run it.
@@ -92,27 +101,74 @@ fn golemdb_filter(filter: &Filter) -> Result<golemdb::Filter, StoreError> {
             return Err(StoreError::InvalidQuery);
         }
     }
-    // One predicate per group, not negated. An empty group matches every
-    // record, which GolemDB cannot ask for either.
-    let leaves = filter
+    if let Some(any_of) = equalities_on_one_cell(filter)? {
+        return Ok(any_of);
+    }
+    let groups = filter
         .0
         .iter()
-        .map(|AndGroup(group)| match group.as_slice() {
-            [predicate] if !predicate.negated => Ok(predicate),
-            _ => Err(StoreError::NotImplemented),
+        .map(|AndGroup(predicates)| {
+            let leaves = predicates.iter().map(leaf).collect::<Result<_, _>>()?;
+            node(leaves, golemdb::Filter::And)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    match leaves.as_slice() {
-        // No group: every record.
-        [] => Err(StoreError::NotImplemented),
-        [predicate] => leaf(predicate),
-        [first, ..] => any_of(first, &leaves),
+        .collect::<Result<_, _>>()?;
+    node(groups, golemdb::Filter::Or)
+}
+
+/// `children` under `node`, or the one child alone. No child matches every
+/// record, an empty group as much as an empty filter, and GolemDB has no
+/// filter for that.
+fn node(
+    mut children: Vec<golemdb::Filter>,
+    node: fn(Vec<golemdb::Filter>) -> golemdb::Filter,
+) -> Result<golemdb::Filter, StoreError> {
+    match children.len() {
+        0 => Err(StoreError::NotImplemented),
+        1 => Ok(children.remove(0)),
+        2.. => Ok(node(children)),
     }
 }
 
-/// One predicate as a leaf. `KEY` and `BYTES32` are one GolemDB type, so a
-/// leaf of either matches both.
+/// An OR of equalities on one cell, of one type, is GolemDB's `In`: one leaf
+/// rather than an `Or` of several. `None` for any other filter.
+fn equalities_on_one_cell(filter: &Filter) -> Result<Option<golemdb::Filter>, StoreError> {
+    let equalities: Option<Vec<&Predicate>> = filter
+        .0
+        .iter()
+        .map(|AndGroup(predicates)| match predicates.as_slice() {
+            [predicate] => {
+                (predicate.op == CompareOp::Eq && !predicate.negated).then_some(predicate)
+            }
+            [] | [_, _, ..] => None,
+        })
+        .collect();
+    let (first, equalities) = match equalities.as_deref() {
+        Some(equalities @ [first, _, ..]) => (*first, equalities),
+        // A group that is not one equality, or fewer than two groups.
+        None | Some([] | [_]) => return Ok(None),
+    };
+    let alike =
+        |predicate: &&Predicate| predicate.cell == first.cell && predicate.type_id == first.type_id;
+    if !equalities.iter().all(alike) {
+        return Ok(None);
+    }
+    let values = equalities
+        .iter()
+        .map(|predicate| operand(predicate))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(golemdb::Filter::In {
+        field: cell_name(&first.cell),
+        values: InValues::try_from(values).map_err(invalid_query)?,
+    }))
+}
+
+/// One predicate as a leaf. GolemDB has no NOT, so a negated predicate has
+/// none. `KEY` and `BYTES32` are one GolemDB type, so a leaf of either matches
+/// both.
 fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
+    if predicate.negated {
+        return Err(StoreError::NotImplemented);
+    }
     let field = cell_name(&predicate.cell);
     let bounds = |lower, upper| {
         Bounds::try_new(cell_type(predicate.type_id)?, lower, upper).map_err(invalid_query)
@@ -148,48 +204,32 @@ fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
     })
 }
 
-/// An OR of equalities on one cell, of one type, is GolemDB's `In`. Any other
-/// OR has no counterpart.
-fn any_of(first: &Predicate, predicates: &[&Predicate]) -> Result<golemdb::Filter, StoreError> {
-    let alike = |predicate: &&Predicate| {
-        predicate.op == CompareOp::Eq
-            && predicate.cell == first.cell
-            && predicate.type_id == first.type_id
-    };
-    if !predicates.iter().all(alike) {
-        return Err(StoreError::NotImplemented);
-    }
-    let values = predicates
-        .iter()
-        .map(|predicate| operand(predicate))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(golemdb::Filter::In {
-        field: cell_name(&first.cell),
-        values: InValues::try_from(values).map_err(invalid_query)?,
-    })
-}
-
 /// Arkiv sorts by whatever type the cell holds, GolemDB by the cell read as one
 /// type. The two agree when the filter holds the cell to one type, since every
 /// match then holds that type there. Otherwise there is no type to give.
-fn sort_key(sort: &Sort, filter: &golemdb::Filter) -> Result<golemdb::SortKey, StoreError> {
-    let ty = held_type(filter, &sort.cell).ok_or(StoreError::NotImplemented)?;
+fn sort_key(sort: &Sort, filter: &Filter) -> Result<golemdb::SortKey, StoreError> {
+    let type_id = held_type(filter, &sort.cell).ok_or(StoreError::NotImplemented)?;
+    let ty = cell_type(type_id)?;
     Ok(match sort.direction {
         SortDirection::Ascending => golemdb::SortKey::asc(&sort.cell, ty),
         SortDirection::Descending => golemdb::SortKey::desc(&sort.cell, ty),
     })
 }
 
-/// The type `filter` holds the cell `name` to, if its leaf is on that cell.
-fn held_type(filter: &golemdb::Filter, name: &str) -> Option<CellType> {
-    let (field, ty) = match filter {
-        golemdb::Filter::Eq { field, value } => (field, value.cell_type()),
-        golemdb::Filter::In { field, values } => (field, values.as_slice().first()?.cell_type()),
-        golemdb::Filter::Range { field, bounds } => (field, bounds.cell_type()),
-        golemdb::Filter::Prefix { field, .. } => (field, CellType::Str),
-        _ => return None,
-    };
-    (field.as_bytes() == name.as_bytes()).then_some(ty)
+/// The type `filter` holds the cell `name` to, if it holds it to one: a group
+/// does when any of its predicates is on that cell, unless negated, and the
+/// filter when every group does, to the same type.
+fn held_type(filter: &Filter, name: &str) -> Option<TypeId> {
+    let mut groups = filter.0.iter().map(|AndGroup(predicates)| {
+        predicates
+            .iter()
+            .find(|predicate| predicate.cell == name && !predicate.negated)
+            .map(|predicate| predicate.type_id)
+    });
+    let first = groups.next()??;
+    groups
+        .all(|type_id| type_id == Some(first))
+        .then_some(first)
 }
 
 /// A predicate's value encoded as [`golemdb_cell`] writes a cell, so a leaf
@@ -216,9 +256,10 @@ fn invalid_query(_: golemdb::ValuesError) -> StoreError {
 mod tests {
     use super::*;
     use crate::{GolemDbConfig, GolemDbStore};
-    use arkiv_interfaces::store::{Page, RecordKey, Store, TypeId};
+    use arkiv_interfaces::store::{Page, RecordKey, Store};
     use golemdb_api::marker::{I32, Str, U64};
-    use golemdb_api::{Api, CellLimits, HashAlgorithm, Width};
+    use golemdb_api::{Api, CellLimits, CellType, HashAlgorithm, Width};
+    use std::ops::Bound;
     use tempfile::TempDir;
 
     fn predicate(cell: &str, op: CompareOp, type_id: TypeId, value: &[u8]) -> Predicate {
@@ -237,6 +278,31 @@ mod tests {
 
     fn i32_is(cell: &str, op: CompareOp, value: i32) -> Predicate {
         predicate(cell, op, TypeId::I32, &value.to_be_bytes())
+    }
+
+    fn str_is(cell: &str, op: CompareOp, value: &str) -> Predicate {
+        predicate(cell, op, TypeId::STR, value.as_bytes())
+    }
+
+    fn str_leaf(cell: &str, value: &str) -> golemdb::Filter {
+        golemdb::Filter::Eq {
+            field: cell_name(cell),
+            value: EqValue::of(Str, value),
+        }
+    }
+
+    fn u64_leaf(cell: &str, value: u64) -> golemdb::Filter {
+        golemdb::Filter::Eq {
+            field: cell_name(cell),
+            value: EqValue::of(U64, value),
+        }
+    }
+
+    fn u64_range(cell: &str, lower: Bound<u64>, upper: Bound<u64>) -> golemdb::Filter {
+        golemdb::Filter::Range {
+            field: cell_name(cell),
+            bounds: Bounds::new(U64, lower, upper),
+        }
     }
 
     fn query(groups: Vec<Vec<Predicate>>) -> Query {
@@ -406,9 +472,85 @@ mod tests {
     }
 
     #[test]
+    fn a_group_is_an_and_of_its_predicates() {
+        let arkiv = query(vec![vec![
+            str_is("color", CompareOp::Eq, "blue"),
+            u64_is("n", CompareOp::Gte, 2),
+        ]]);
+        let expected = golemdb::Filter::And(vec![
+            str_leaf("color", "blue"),
+            u64_range("n", Included(2), Unbounded),
+        ]);
+        assert_eq!(query_op(&arkiv, None).unwrap().filter, expected);
+    }
+
+    /// A group of one predicate is its leaf, not an `And` of one.
+    #[test]
+    fn groups_are_an_or_of_their_ands() {
+        let arkiv = query(vec![
+            vec![
+                str_is("color", CompareOp::Eq, "blue"),
+                u64_is("n", CompareOp::Eq, 1),
+            ],
+            vec![str_is("color", CompareOp::Eq, "red")],
+        ]);
+        let expected = golemdb::Filter::Or(vec![
+            golemdb::Filter::And(vec![str_leaf("color", "blue"), u64_leaf("n", 1)]),
+            str_leaf("color", "red"),
+        ]);
+        assert_eq!(query_op(&arkiv, None).unwrap().filter, expected);
+    }
+
+    /// Only equalities on one cell, of one type, make an `In`.
+    #[test]
+    fn any_other_or_of_leaves_is_an_or() {
+        let cases = [
+            (
+                "across cells",
+                vec![
+                    vec![str_is("color", CompareOp::Eq, "blue")],
+                    vec![u64_is("n", CompareOp::Eq, 1)],
+                ],
+                vec![str_leaf("color", "blue"), u64_leaf("n", 1)],
+            ),
+            (
+                "of ranges",
+                vec![
+                    vec![u64_is("n", CompareOp::Lt, 1)],
+                    vec![u64_is("n", CompareOp::Gt, 5)],
+                ],
+                vec![
+                    u64_range("n", Unbounded, Excluded(1)),
+                    u64_range("n", Excluded(5), Unbounded),
+                ],
+            ),
+            (
+                "across types",
+                vec![
+                    vec![u64_is("n", CompareOp::Eq, 1)],
+                    vec![i32_is("n", CompareOp::Eq, 1)],
+                ],
+                vec![
+                    u64_leaf("n", 1),
+                    golemdb::Filter::Eq {
+                        field: cell_name("n"),
+                        value: EqValue::of(I32, 1),
+                    },
+                ],
+            ),
+        ];
+        for (case, groups, children) in cases {
+            assert_eq!(
+                query_op(&query(groups), None).unwrap().filter,
+                golemdb::Filter::Or(children),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn a_filter_golemdb_cannot_express_is_not_implemented() {
-        let blue = predicate("color", CompareOp::Eq, TypeId::STR, b"blue");
-        let one = u64_is("n", CompareOp::Eq, 1);
+        let blue = str_is("color", CompareOp::Eq, "blue");
         let not_blue = Predicate {
             negated: true,
             ..blue.clone()
@@ -416,19 +558,12 @@ mod tests {
         let cases = [
             ("every record", vec![]),
             ("every record, as an empty group", vec![vec![]]),
-            ("and", vec![vec![blue.clone(), one.clone()]]),
             (
-                "or across cells",
-                vec![vec![blue.clone()], vec![one.clone()]],
+                "every record, as an empty group beside another",
+                vec![vec![blue.clone()], vec![]],
             ),
-            (
-                "or of ranges",
-                vec![
-                    vec![u64_is("n", CompareOp::Lt, 1)],
-                    vec![u64_is("n", CompareOp::Gt, 5)],
-                ],
-            ),
-            ("not", vec![vec![not_blue]]),
+            ("not", vec![vec![not_blue.clone()]]),
+            ("a not inside an and", vec![vec![blue.clone(), not_blue]]),
             (
                 "a prefix inside a character",
                 vec![vec![predicate(
@@ -467,6 +602,46 @@ mod tests {
         assert_eq!(query_op(&arkiv, None), Err(StoreError::NotImplemented));
     }
 
+    /// An `And` holds a cell to the type any child holds it to, an `Or` to the
+    /// one every child holds it to.
+    #[test]
+    fn a_sort_takes_its_type_through_and_and_or() {
+        let sorted = |groups: Vec<Vec<Predicate>>| {
+            let mut arkiv = query(groups);
+            arkiv.sort = Some(Sort {
+                cell: "n".into(),
+                direction: SortDirection::Ascending,
+            });
+            query_op(&arkiv, None).map(|op| op.sort)
+        };
+        let by_n = Ok(vec![golemdb::SortKey::asc("n", CellType::Uint(Width::W8))]);
+        let blue = || str_is("color", CompareOp::Eq, "blue");
+        assert_eq!(
+            sorted(vec![vec![blue(), u64_is("n", CompareOp::Gte, 1)]]),
+            by_n
+        );
+        assert_eq!(
+            sorted(vec![
+                vec![u64_is("n", CompareOp::Eq, 1)],
+                vec![u64_is("n", CompareOp::Gt, 5)],
+            ]),
+            by_n
+        );
+        assert_eq!(
+            sorted(vec![vec![u64_is("n", CompareOp::Eq, 1)], vec![blue()]]),
+            Err(StoreError::NotImplemented),
+            "one child leaves `n` out"
+        );
+        assert_eq!(
+            sorted(vec![
+                vec![u64_is("n", CompareOp::Eq, 1)],
+                vec![i32_is("n", CompareOp::Eq, 1)],
+            ]),
+            Err(StoreError::NotImplemented),
+            "the children hold `n` to two types"
+        );
+    }
+
     /// A converted filter finds the cells the adapter wrote, and its page and
     /// count read back as Arkiv's. GolemDB does not page yet, so the op runs
     /// without its limit.
@@ -501,8 +676,8 @@ mod tests {
         }
         store.commit(branch).unwrap();
 
-        let found = |predicates: Vec<Predicate>| {
-            let arkiv = query(predicates.into_iter().map(|p| vec![p]).collect());
+        let found = |groups: Vec<Vec<Predicate>>| {
+            let arkiv = query(groups);
             let mut op = query_op(&arkiv, None).unwrap().with_total();
             op.limit = None;
             let page = store.database.query(None, op).unwrap();
@@ -517,23 +692,33 @@ mod tests {
             keys.sort_unstable();
             keys
         };
-        assert_eq!(found(vec![i32_is("level", CompareOp::Lt, 0)]), [1]);
-        assert_eq!(found(vec![i32_is("level", CompareOp::Gte, 3)]), [2, 3]);
+        let below_zero = || i32_is("level", CompareOp::Lt, 0);
+        let at_least_three = || i32_is("level", CompareOp::Gte, 3);
+        let al = || str_is("name", CompareOp::Prefix, "al");
+        assert_eq!(found(vec![vec![below_zero()]]), [1]);
+        assert_eq!(found(vec![vec![at_least_three()]]), [2, 3]);
+        assert_eq!(found(vec![vec![al()]]), [1, 3]);
         assert_eq!(
             found(vec![
-                i32_is("level", CompareOp::Eq, -5),
-                i32_is("level", CompareOp::Eq, 10),
+                vec![i32_is("level", CompareOp::Eq, -5)],
+                vec![i32_is("level", CompareOp::Eq, 10)],
             ]),
-            [1, 3]
+            [1, 3],
+            "in"
+        );
+        assert_eq!(found(vec![vec![at_least_three(), al()]]), [3], "and");
+        assert_eq!(
+            found(vec![
+                vec![below_zero()],
+                vec![str_is("name", CompareOp::Eq, "beta")]
+            ]),
+            [1, 2],
+            "or across cells"
         );
         assert_eq!(
-            found(vec![predicate(
-                "name",
-                CompareOp::Prefix,
-                TypeId::STR,
-                b"al"
-            )]),
-            [1, 3]
+            found(vec![vec![at_least_three(), al()], vec![below_zero()]]),
+            [1, 3],
+            "or of an and"
         );
     }
 }

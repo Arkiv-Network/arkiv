@@ -1502,6 +1502,7 @@ name = "arkiv-golemdb"
 version = "0.5.1"
 dependencies = [
  "arkiv-interfaces",
+ "arkiv-query",
  "golemdb-api",
  "tempfile",
 ]
