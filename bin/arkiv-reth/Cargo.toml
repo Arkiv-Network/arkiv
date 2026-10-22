@@ -36,8 +36,9 @@ reth-node-builder.workspace = true
 reth-storage-overlay.workspace = true
 alloy-rpc-types-engine.workspace = true
 reth-db.workspace = true
-# The node's backing store, as ARKIV_STORE_URL names it: GolemDB, or the
-# in-process reference store or Valkey when ALLOW_EXPERIMENTAL_BACKENDS=true.
+# The node's backing store: GolemDB in the directory ARKIV_STORE_PATH names,
+# or the in-process reference store or Valkey that ARKIV_EXPERIMENTAL_STORE
+# names.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-golemdb.workspace = true
 arkiv-valkey.workspace = true
@@ -51,8 +52,6 @@ clap.workspace = true
 tracing.workspace = true
 # `block_in_place`, to open the store outside async code.
 tokio.workspace = true
-# Reads ARKIV_STORE_URL.
-url.workspace = true
 
 [dev-dependencies]
 # The black-box tests spawn this node binary and drive it through the harness:
@@ -70,3 +69,5 @@ alloy-rpc-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 alloy-primitives.workspace = true
+# GolemDB directories for the store-opening unit tests.
+tempfile.workspace = true

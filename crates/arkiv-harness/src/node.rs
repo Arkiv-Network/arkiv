@@ -7,7 +7,7 @@
 //! datadir, so a test can prove crash recovery (state resumes after a restart).
 //!
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
-//! by default is the in-process one (`memory://`) and so goes with the process —
+//! by default is the in-process one (`memory`) and so goes with the process —
 //! a test that wants to watch state survive a restart needs
 //! [`NodeBuilder::valkey_store`] or [`NodeBuilder::golemdb_store`].
 
@@ -106,8 +106,9 @@ impl NodeBuilder {
     /// Set one environment variable on the node process, for both the first
     /// launch and every [`restart`](Node::restart).
     ///
-    /// This is how a test chooses the node's backing store: `ARKIV_STORE_URL`
-    /// and `ARKIV_STORE_NAMESPACE` are read by the binary at startup, and
+    /// This is how a test chooses the node's backing store:
+    /// `ARKIV_EXPERIMENTAL_STORE` and `ARKIV_STORE_NAMESPACE` are read by the
+    /// binary at startup, and
     /// setting them per node rather than on the test process keeps nodes
     /// running side by side out of each other's state.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -137,7 +138,7 @@ impl NodeBuilder {
         let namespace = format!("arkiv-test:node:{}:{nanos}", std::process::id());
         let url = url.into();
         self.store = Some((url.clone(), namespace.clone()));
-        self.env("ARKIV_STORE_URL", url)
+        self.env("ARKIV_EXPERIMENTAL_STORE", url)
             .env("ARKIV_STORE_NAMESPACE", namespace)
     }
 
@@ -153,8 +154,12 @@ impl NodeBuilder {
     /// Launch the node.
     pub fn spawn(self) -> Node {
         assert!(
-            !(self.golemdb && self.env.iter().any(|(key, _)| key == "ARKIV_STORE_URL")),
-            "golemdb_store() and another ARKIV_STORE_URL: a node has one store",
+            !(self.golemdb
+                && self
+                    .env
+                    .iter()
+                    .any(|(key, _)| key == "ARKIV_EXPERIMENTAL_STORE")),
+            "golemdb_store() and an ARKIV_EXPERIMENTAL_STORE: a node has one store",
         );
         Node::start(self)
     }
@@ -243,22 +248,18 @@ impl Node {
             "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
-        // The node refuses to start without a store, and runs on anything but
-        // GolemDB only when allowed. Tests run on the in-process store unless
-        // the test process names another, as the suite pointed at a Valkey does.
-        if std::env::var_os("ARKIV_STORE_URL").is_none() {
-            cmd.env("ARKIV_STORE_URL", "memory://");
+        // The node refuses to start without a store. Tests run on the
+        // in-process one unless the test process names another, as the suite
+        // pointed at a Valkey does. A node has one store, so a GolemDB path the
+        // test process carries is not passed on.
+        if std::env::var_os("ARKIV_EXPERIMENTAL_STORE").is_none() {
+            cmd.env("ARKIV_EXPERIMENTAL_STORE", "memory");
         }
-        cmd.env("ALLOW_EXPERIMENTAL_BACKENDS", "true");
+        cmd.env_remove("ARKIV_STORE_PATH");
         cmd.envs(self.config.env.iter().map(|(k, v)| (k, v)));
         if self.config.golemdb {
-            let directory = self.datadir.join("golemdb");
-            cmd.env(
-                "ARKIV_STORE_URL",
-                format!("golemdb://{}", directory.display()),
-            )
-            // GolemDB needs no permission, so run it as production does.
-            .env_remove("ALLOW_EXPERIMENTAL_BACKENDS");
+            cmd.env("ARKIV_STORE_PATH", self.datadir.join("golemdb"))
+                .env_remove("ARKIV_EXPERIMENTAL_STORE");
         }
         // An escape hatch for diagnosing a node under test: extra flags without
         // editing the test that spawns it. Used for raising the log filter when

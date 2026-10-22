@@ -276,10 +276,8 @@ def main():
             ],
             env={
                 **os.environ,
-                "ARKIV_STORE_URL": f"redis://127.0.0.1:{valkey_port}",
+                "ARKIV_EXPERIMENTAL_STORE": f"redis://127.0.0.1:{valkey_port}",
                 "ARKIV_STORE_NAMESPACE": namespace,
-                # Valkey is not GolemDB, so the node runs on it only when allowed.
-                "ALLOW_EXPERIMENTAL_BACKENDS": "true",
             },
             stdout=(out / log_name).open("w"),
             stderr=subprocess.STDOUT,
