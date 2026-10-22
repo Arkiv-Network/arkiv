@@ -468,3 +468,38 @@ async fn pruning_schedule_rebuilds_from_chain_history() {
         .await;
     wait_for_physical_purge(&client, key).await;
 }
+
+/// A transaction sent right after the previous one's receipt lands too. reth
+/// serves a block's receipts as soon as the block is canonical, a moment before
+/// the store commits it, so the pool must not check the next transaction
+/// against the state from before that block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn golemdb_back_to_back_transactions_all_land() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    let provider = client.provider();
+    let recipient = DEV_KEY_1.parse::<PrivateKeySigner>().unwrap().address();
+
+    for sent in 0..10 {
+        let transfer = TransactionRequest::default()
+            .with_to(recipient)
+            .with_value(U256::from(1))
+            .with_gas_limit(21_000)
+            .with_max_fee_per_gas(3_000_000_000)
+            .with_max_priority_fee_per_gas(1_000_000_000)
+            .with_chain_id(DEV_CHAIN_ID);
+        let receipt = provider
+            .send_transaction(transfer)
+            .await
+            .expect("the pool accepts the transfer")
+            .with_timeout(Some(Duration::from_secs(30)))
+            .get_receipt()
+            .await
+            .unwrap_or_else(|error| panic!("transfer {sent} was not mined: {error}"));
+        assert!(receipt.status(), "transfer {sent} succeeds");
+    }
+}
