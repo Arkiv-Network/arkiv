@@ -132,6 +132,39 @@ fn a_bool_above_one_is_refused() {
     );
 }
 
+/// Which is why Arkiv stores them as one `BYTES` byte: an entity with every
+/// creation flag set, plus an unindexed blob, writes and reads back whole.
+#[test]
+fn an_entity_with_creation_flags_round_trips() {
+    use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, Entity};
+    use arkiv_interfaces::entity_records::{from_record, record_key, to_cells};
+
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    let entity = Entity {
+        key: [1; 32],
+        creation_flags: CreationFlags::READONLY | CreationFlags::PERMISSIONLESS_EXTENSION,
+        attributes: vec![
+            Attribute::unindexed(b"body".to_vec(), AttributeValue::Bytes(vec![7; 3])),
+            Attribute::new(b"level".to_vec(), AttributeValue::Int(1)),
+        ],
+        ..Entity::default()
+    };
+    store
+        .create(
+            branch,
+            record_key(entity.key),
+            to_cells(&entity).unwrap(),
+            None,
+        )
+        .unwrap();
+    let record = read(&store, ReadTarget::Branch(branch), 1).unwrap();
+    let mut back = from_record(&record).unwrap();
+    back.attributes.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(back, entity);
+}
+
 /// Once another branch commits, every call on an older one is refused, reads
 /// included.
 #[test]

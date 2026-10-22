@@ -21,7 +21,7 @@
 //! | `$createdAtBlock`       | attribute | `U64`   | `created_at_block`         |
 //! | `$expiration`           | attribute | `U64`   | `expires_at`               |
 //! | [`CELL_LAST_MODIFIED`]  | **field** | `U64`   | `last_modified_at_block`   |
-//! | [`CELL_CREATION_FLAGS`] | **field** | `BOOL`* | `creation_flags`           |
+//! | [`CELL_CREATION_FLAGS`] | **field** | `BYTES`* | `creation_flags`          |
 //! | *user attribute name*   | attribute if `indexed`, else field | per value | `attributes` |
 //!
 //! Attributes are indexed and queryable; fields are not. The split follows the
@@ -29,8 +29,9 @@
 //! user attribute is whichever its writer flagged, and everything else is a field,
 //! so nothing is paying for an index it cannot use.
 //!
-//! \* `creation_flags` is a byte, and `BOOL` is the only single-byte core type. It is
-//! a field, so it is never compared or indexed and the tag is only a width marker.
+//! \* `creation_flags` is one byte holding up to `0b11`, so it is a one-byte `BYTES`
+//! value. Not `BOOL`: a store may refuse a `BOOL` other than 0 or 1, as GolemDB
+//! does, and an entity with `permissionless_extension` would then fail to write.
 //!
 //! # Two numbering schemes that must not be confused
 //!
@@ -125,7 +126,7 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         ),
         (
             CellName::from(CELL_CREATION_FLAGS),
-            Cell::field(TypeId::BOOL, alloc::vec![entity.creation_flags.bits()]),
+            Cell::field(TypeId::BYTES, alloc::vec![entity.creation_flags.bits()]),
         ),
     ];
 
@@ -188,13 +189,12 @@ pub fn from_record(record: &Record) -> Result<Entity, RecordError> {
     let flags_raw = cell(
         record,
         CELL_CREATION_FLAGS,
-        TypeId::BOOL,
+        TypeId::BYTES,
         CELL_CREATION_FLAGS,
     )?;
-    let flags = flags_raw
-        .first()
-        .and_then(|bits| CreationFlags::from_bits(*bits))
-        .ok_or(RecordError::Malformed(CELL_CREATION_FLAGS))?;
+    let [bits] = fixed::<1>(flags_raw, CELL_CREATION_FLAGS)?;
+    let flags =
+        CreationFlags::from_bits(bits).ok_or(RecordError::Malformed(CELL_CREATION_FLAGS))?;
 
     let mut entity = Entity {
         key: fixed(key_bytes, "$key")?,
