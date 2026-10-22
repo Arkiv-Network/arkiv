@@ -232,9 +232,9 @@ fn is_live(expires_at: BlockNumber, block: BlockNumber) -> bool {
     expires_at > block
 }
 
-/// The same rule as a query bound — `query AND $expiration > block`.
+/// The same rule as a query bound — `query AND $expiresAt > block`.
 ///
-/// `$expiration` is an indexed built-in, so this filters inside the index rather
+/// `$expiresAt` is an indexed built-in, so this filters inside the index rather
 /// than after the fact: pages come back full instead of pocked with holes, and
 /// the match-set cardinality behind `arkiv_getEntityCount` excludes dead rows.
 fn live_at(query: Query, block: BlockNumber) -> Query {
@@ -242,7 +242,7 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
         Box::new(query),
         Box::new(Query::Gt {
             key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
-            // U64, not U256: `entity_records` stores `$expiration` as a
+            // U64, not U256: `entity_records` stores `$expiresAt` as a
             // U64 cell, and a predicate never crosses types — a U256 bound
             // would silently match nothing.
             value: AnnotVal::U64(block),
