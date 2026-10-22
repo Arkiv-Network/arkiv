@@ -17,7 +17,7 @@
 //! head, and before this there was nothing at head on a fresh store: block 1
 //! was the first commit, so the store's commit numbers started one short.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use arkiv_golemdb_state::accounts::{CELL_BALANCE, CELL_NONCE, record_key};
 use arkiv_interfaces::store::{Cell, CellName, CommitId, Store, StoreError, TypeId};
 
@@ -81,6 +81,29 @@ pub fn seed_genesis(
         }
     }
     store.commit_tagged(branch, genesis_hash).map(Some)
+}
+
+/// Check that `store` holds the chain whose genesis block is `genesis_hash`.
+///
+/// A store with commits holds a chain, and its genesis commit carries that
+/// chain's genesis hash as its tag. A store left over from another chain, such
+/// as a GolemDB directory kept across a chain reset, is refused rather than
+/// carried on as if it were this one. A fresh store holds no chain yet, so it
+/// passes.
+pub fn check_chain(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<()> {
+    if store.head() == CommitId::GENESIS {
+        return Ok(());
+    }
+    let genesis = store
+        .commit_by_tag(genesis_hash)
+        .map_err(|e| eyre::eyre!("read the Arkiv store's genesis: {e:?}"))?;
+    eyre::ensure!(
+        genesis.is_some(),
+        "the Arkiv store holds another chain: none of its commits is this chain's genesis \
+         block {}. Use a new store, such as a new GolemDB directory",
+        B256::from(genesis_hash)
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -154,6 +177,21 @@ mod tests {
             U256::from(1_000),
             "and the original balance stands",
         );
+    }
+
+    /// A store left over from another chain is refused; this chain's is not.
+    #[test]
+    fn a_store_from_another_chain_is_refused() {
+        let store = store();
+        assert!(
+            check_chain(&store, HASH).is_ok(),
+            "a fresh store holds no chain yet",
+        );
+        seed_genesis(&store, HASH, alice(1))
+            .expect("seed")
+            .expect("fresh");
+        assert!(check_chain(&store, HASH).is_ok(), "this chain");
+        assert!(check_chain(&store, [8; 32]).is_err(), "another chain");
     }
 
     /// An account allocated zero still exists, because the cells are written.

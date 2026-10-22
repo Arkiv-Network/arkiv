@@ -31,7 +31,7 @@ use alloy_rpc_types_engine::ForkchoiceState;
 use arkiv_interfaces::store::{
     CommitId, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
 };
-use arkiv_reth_statemanager::{GolemAccounts, HostStore, seed_genesis, segments};
+use arkiv_reth_statemanager::{GolemAccounts, HostStore, check_chain, seed_genesis, segments};
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
     ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
@@ -1988,9 +1988,12 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
 
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
         // The one place that holds both the store and the chain spec, and it
-        // runs once before the chain moves. On a store that already has a
-        // commit this is a no-op, so a restart costs one `head()`.
+        // runs once before the chain moves. On a store that already has
+        // commits it only checks they are this chain's, so a restart costs a
+        // `head()` and one tag lookup.
         let spec = factory.chain_spec();
+        let genesis_hash = spec.genesis_hash();
+        check_chain(&self.store, genesis_hash.0)?;
         let alloc = spec.genesis().alloc.iter().map(|(address, account)| {
             arkiv_reth_statemanager::GenesisAccount {
                 address: *address,
@@ -1998,7 +2001,7 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
                 nonce: account.nonce.unwrap_or_default(),
             }
         });
-        if let Some(commit) = seed_genesis(&self.store, spec.genesis_hash().0, alloc)
+        if let Some(commit) = seed_genesis(&self.store, genesis_hash.0, alloc)
             .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}"))?
         {
             tracing::info!(
