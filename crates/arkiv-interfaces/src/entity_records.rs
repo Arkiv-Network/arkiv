@@ -18,9 +18,9 @@
 //! | `$key`                  | attribute | `KEY`   | `key`                      |
 //! | `$creator`              | attribute | `ADDR`  | `creator`                  |
 //! | `$owner`                | attribute | `ADDR`  | `owner`                    |
-//! | `$createdAtBlock`       | attribute | `U64`   | `created_at_block`         |
+//! | `$createdAtBlock`       | attribute | `U64`   | `created_at`         |
 //! | `$expiration`           | attribute | `U64`   | `expires_at`               |
-//! | [`CELL_LAST_MODIFIED`]  | **field** | `U64`   | `last_modified_at_block`   |
+//! | [`CELL_LAST_MODIFIED`]  | **field** | `U64`   | `updated_at`   |
 //! | [`CELL_CREATION_FLAGS`] | **field** | `BYTES`* | `creation_flags`          |
 //! | *user attribute name*   | attribute if `indexed`, else field | per value | `attributes` |
 //!
@@ -111,7 +111,7 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         ),
         (
             system(annotations::CREATED_AT_BLOCK),
-            Cell::attribute(TypeId::U64, entity.created_at_block.to_be_bytes().to_vec()),
+            Cell::attribute(TypeId::U64, entity.created_at.to_be_bytes().to_vec()),
         ),
         (
             system(annotations::EXPIRATION),
@@ -119,10 +119,7 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         ),
         (
             CellName::from(CELL_LAST_MODIFIED),
-            Cell::field(
-                TypeId::U64,
-                entity.last_modified_at_block.to_be_bytes().to_vec()
-            ),
+            Cell::field(TypeId::U64, entity.updated_at.to_be_bytes().to_vec()),
         ),
         (
             CellName::from(CELL_CREATION_FLAGS),
@@ -211,8 +208,8 @@ pub fn from_record(record: &Record) -> Result<Entity, RecordError> {
             cell(record, &system(annotations::OWNER), TypeId::ADDR, "$owner")?,
             "$owner",
         )?,
-        created_at_block: u64::from_be_bytes(fixed(created, "$createdAtBlock")?),
-        last_modified_at_block: u64::from_be_bytes(fixed(modified, CELL_LAST_MODIFIED)?),
+        created_at: u64::from_be_bytes(fixed(created, "$createdAtBlock")?),
+        updated_at: u64::from_be_bytes(fixed(modified, CELL_LAST_MODIFIED)?),
         expires_at: u64::from_be_bytes(fixed(expires, "$expiration")?),
         creation_flags: flags,
         attributes: Vec::new(),
@@ -265,8 +262,8 @@ mod tests {
             key: [0x11; 32],
             creator: [0x22; 20],
             owner: [0x33; 20],
-            created_at_block: 100,
-            last_modified_at_block: 150,
+            created_at: 100,
+            updated_at: 150,
             expires_at: 200,
             creation_flags: CreationFlags::NONE,
             attributes: alloc::vec![

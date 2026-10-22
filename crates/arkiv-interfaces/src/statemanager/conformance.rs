@@ -83,8 +83,8 @@ fn entity(key: u8) -> Entity {
         key: [key; 32],
         owner: ALICE,
         creator: ALICE,
-        created_at_block: 1,
-        last_modified_at_block: 1,
+        created_at: 1,
+        updated_at: 1,
         expires_at: 100,
         attributes: vec![
             crate::entity::Attribute::unindexed(

@@ -20,9 +20,9 @@ pub struct Entity {
     /// Who owns it now. Changes on transfer.
     pub owner: UserAddress,
     /// The block it was created in.
-    pub created_at_block: BlockNumber,
+    pub created_at: BlockNumber,
     /// The block of its last change (create, update, extend, or transfer).
-    pub last_modified_at_block: BlockNumber,
+    pub updated_at: BlockNumber,
     /// The block it expires in.
     pub expires_at: BlockNumber,
     /// Entity properties fixed at creation. Set from the create op's
@@ -48,8 +48,8 @@ pub struct EntityMeta {
     pub key: EntityAddress,
     pub creator: UserAddress,
     pub owner: UserAddress,
-    pub created_at_block: BlockNumber,
-    pub last_modified_at_block: BlockNumber,
+    pub created_at: BlockNumber,
+    pub updated_at: BlockNumber,
     pub expires_at: BlockNumber,
 }
 

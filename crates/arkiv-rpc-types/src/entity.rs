@@ -315,10 +315,8 @@ pub fn entity_data_from(entity: Entity, projection: &Projection) -> EntityData {
         key: projection.key.then_some(B256::from(entity.key)),
         owner: projection.owner.then_some(Address::from(entity.owner)),
         creator: projection.creator.then_some(Address::from(entity.creator)),
-        created_at: projection.created_at.then_some(entity.created_at_block),
-        updated_at: projection
-            .updated_at
-            .then_some(entity.last_modified_at_block),
+        created_at: projection.created_at.then_some(entity.created_at),
+        updated_at: projection.updated_at.then_some(entity.updated_at),
         expires_at: projection.expires_at.then_some(entity.expires_at),
         creation_flags: projection
             .creation_flags
@@ -452,8 +450,8 @@ mod tests {
             key: [0x11; 32],
             creator: [0x22; 20],
             owner: [0x33; 20],
-            created_at_block: 0x191,
-            last_modified_at_block: 0x1bb,
+            created_at: 0x191,
+            updated_at: 0x1bb,
             expires_at: 0x2000,
             creation_flags: entity::CreationFlags::NONE,
             attributes: vec![

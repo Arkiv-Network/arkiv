@@ -281,8 +281,8 @@ mod tests {
             key: [key; 32],
             creator: [1; 20],
             owner: [2; 20],
-            created_at_block: 1,
-            last_modified_at_block: 1,
+            created_at: 1,
+            updated_at: 1,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
             attributes: vec![
