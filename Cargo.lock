@@ -2030,7 +2030,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -4021,13 +4021,14 @@ dependencies = [
 [[package]]
 name = "golemdb-api"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
  "golemdb-immutable-data",
  "golemdb-index",
  "golemdb-merkle",
+ "golemdb-metering",
  "golemdb-query",
  "golemdb-record",
  "golemdb-storage",
@@ -4040,7 +4041,7 @@ dependencies = [
 [[package]]
 name = "golemdb-branch"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-cells",
  "golemdb-immutable-data",
@@ -4053,7 +4054,7 @@ dependencies = [
 [[package]]
 name = "golemdb-cells"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-merkle",
  "golemdb-storage",
@@ -4064,7 +4065,7 @@ dependencies = [
 [[package]]
 name = "golemdb-immutable-data"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-cells",
  "golemdb-storage",
@@ -4076,7 +4077,7 @@ dependencies = [
 [[package]]
 name = "golemdb-index"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-cells",
  "golemdb-merkle",
@@ -4088,7 +4089,7 @@ dependencies = [
 [[package]]
 name = "golemdb-merkle"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "blake3",
  "golemdb-storage",
@@ -4099,14 +4100,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "golemdb-metering"
+version = "0.1.0"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
+
+[[package]]
 name = "golemdb-query"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
  "golemdb-index",
  "golemdb-merkle",
+ "golemdb-metering",
  "golemdb-record",
  "golemdb-storage",
  "thiserror 2.0.20",
@@ -4115,11 +4122,12 @@ dependencies = [
 [[package]]
 name = "golemdb-record"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
  "golemdb-merkle",
+ "golemdb-metering",
  "golemdb-storage",
  "thiserror 2.0.20",
 ]
@@ -4127,12 +4135,12 @@ dependencies = [
 [[package]]
 name = "golemdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 
 [[package]]
 name = "golemdb-storage-mdbx"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#5c9e8cf1851e6d7180814475b15e511fda793501"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#f300a976cc8bfb4e5e78642eb202678c0219ed1f"
 dependencies = [
  "golemdb-storage",
  "libmdbx",

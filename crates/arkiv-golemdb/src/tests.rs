@@ -652,9 +652,39 @@ fn a_count_runs_at_the_head() {
     assert_eq!(count(Some(first)), Err(StoreError::HandleInvalid));
 }
 
-/// Every Arkiv query asks for a page, which GolemDB does not run yet.
+/// GolemDB pages now, so an Arkiv query runs: the page skips its offset and
+/// holds the matches its limit admits. An offset past the last match is an
+/// empty page, not an error.
 #[test]
-fn a_query_waits_for_golemdb_to_page() {
+fn a_query_pages_at_the_head() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 1);
+    commit_record(&store, 2);
+    let keys = |offset, limit| {
+        let query = Query {
+            filter: n_at_least(1),
+            page: Page { offset, limit },
+            ..Query::default()
+        };
+        store.query(None, &query, None).map(|page| {
+            page.into_value()
+                .records
+                .iter()
+                .map(|record| record.key.0[0])
+                .collect::<Vec<u8>>()
+        })
+    };
+    assert_eq!(keys(0, 10), Ok(vec![1, 2]));
+    assert_eq!(keys(0, 1), Ok(vec![1]));
+    assert_eq!(keys(1, 10), Ok(vec![2]));
+    assert_eq!(keys(2, 10), Ok(vec![]));
+}
+
+/// GolemDB caps a page at its own query limit, which is below the one
+/// `arkiv_query` admits, so an over-cap page is a structural limit.
+#[test]
+fn a_page_over_golemdbs_query_limit_is_limit_exceeded() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
     commit_record(&store, 1);
@@ -662,7 +692,7 @@ fn a_query_waits_for_golemdb_to_page() {
         filter: n_at_least(1),
         page: Page {
             offset: 0,
-            limit: 10,
+            limit: 1_000,
         },
         ..Query::default()
     };
@@ -670,7 +700,7 @@ fn a_query_waits_for_golemdb_to_page() {
         store
             .query(None, &query, None)
             .map(|page| page.into_value()),
-        Err(StoreError::NotImplemented)
+        Err(StoreError::LimitExceeded)
     );
 }
 

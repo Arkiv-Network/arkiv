@@ -23,8 +23,8 @@ mod tags;
 use std::path::Path;
 
 use arkiv_interfaces::store::{
-    BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, Filter,
-    Metered, Origin, Query, QueryResult, ReadTarget, Record, RecordChange, RecordKey,
+    BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellKind, CellName, CommitId,
+    Filter, Metered, Origin, Query, QueryResult, ReadTarget, Record, RecordChange, RecordKey,
     RecordVersion, SealedCommit, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
     StoreError, StoreExt, WriteOp, WriteOutcome,
 };
@@ -34,9 +34,9 @@ use golemdb_api::{Api, ApiError};
 pub use golemdb_api::{CellLimits, HashAlgorithm, OpenError};
 
 use convert::{
-    arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_cell, golemdb_commit,
-    immutable_data_address, immutable_data_key, immutable_data_row, metered, query_op, record_key,
-    segment_row, store_error,
+    arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
+    golemdb_commit, immutable_data_address, immutable_data_key, immutable_data_row, metered,
+    query_op, record_key, segment_row, store_error,
 };
 use tags::TagRow;
 
@@ -279,16 +279,19 @@ impl Store for GolemDbStore {
         branch: BranchId,
         key: RecordKey,
         cells: Vec<(CellName, Cell)>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<RecordKey>, StoreError> {
-        let mut operation = golemdb::RecordOp::create(record_key(key));
+        let mut operation = golemdb::RecordOp::create(record_key(key), golemdb_budget(budget));
         for (name, cell) in &cells {
-            operation = operation
-                .insert(name, golemdb_cell(cell)?)
-                .map_err(store_error)?;
+            let value = golemdb_cell(cell)?;
+            operation = match cell.kind {
+                CellKind::Attribute => operation.attribute(name, value),
+                CellKind::Field => operation.field(name, value),
+            };
         }
         self.database
             .create(branch_id(branch), operation)
+            .into_result()
             .map(|key| metered(RecordKey(key.0)))
             .map_err(store_error)
     }
@@ -298,17 +301,17 @@ impl Store for GolemDbStore {
         target: ReadTarget,
         key: RecordKey,
         projection: Option<&[CellName]>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<Option<Record>>, StoreError> {
         let target = match target {
             ReadTarget::Branch(branch) => golemdb::ReadTarget::Branch(branch_id(branch)),
             ReadTarget::Commit(commit) => golemdb::ReadTarget::Commit(golemdb_commit(commit)),
         };
-        let mut operation = golemdb::RecordOp::get(record_key(key));
+        let mut operation = golemdb::RecordOp::get(record_key(key), golemdb_budget(budget));
         if let Some(names) = projection {
             operation = operation.only(names.iter().map(String::as_bytes));
         }
-        match self.database.get(target, operation) {
+        match self.database.get(target, operation).into_result() {
             Ok(record) => Ok(metered(Some(arkiv_record(&record)?))),
             Err(ApiError::NotFound) => Ok(metered(None)),
             Err(error) => Err(store_error(error)),
@@ -322,21 +325,21 @@ impl Store for GolemDbStore {
         key: RecordKey,
         expected_version: Option<RecordVersion>,
         changes: Vec<(CellName, CellChange)>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<RecordVersion>, StoreError> {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
         }
-        let mut operation = golemdb::RecordOp::patch(record_key(key));
+        let mut operation = golemdb::RecordOp::patch(record_key(key), golemdb_budget(budget));
         for (name, change) in &changes {
             operation = match change {
                 CellChange::Set(cell) => operation.set(name, golemdb_cell(cell)?),
                 CellChange::Remove => operation.remove(name),
-            }
-            .map_err(store_error)?;
+            };
         }
         self.database
             .patch(branch_id(branch), operation)
+            .into_result()
             .map(|()| metered(RecordVersion(0)))
             .map_err(store_error)
     }
@@ -346,7 +349,7 @@ impl Store for GolemDbStore {
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<()>, StoreError> {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
@@ -354,15 +357,16 @@ impl Store for GolemDbStore {
         self.database
             .delete(
                 branch_id(branch),
-                golemdb::RecordOp::delete(record_key(key)),
+                golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
             )
+            .into_result()
             .map(metered)
             .map_err(store_error)
     }
 
     /// The query runs as converted, so what GolemDB cannot run yet is
-    /// `NotImplemented`: a negated predicate, and paging, which every Arkiv
-    /// query asks for.
+    /// `NotImplemented`: a negated predicate, and a sort. Paging runs, within
+    /// GolemDB's own query limit, over which a page is `LimitExceeded`.
     fn query(
         &self,
         at: Option<CommitId>,
@@ -372,6 +376,7 @@ impl Store for GolemDbStore {
         let page = self
             .database
             .query(at.map(golemdb_commit), query_op(query, budget)?)
+            .into_result()
             .map_err(store_error)?;
         arkiv_query_result(&page).map(metered)
     }
@@ -386,6 +391,7 @@ impl Store for GolemDbStore {
     ) -> Result<Metered<u64>, StoreError> {
         self.database
             .count(at.map(golemdb_commit), count_op(filter, budget)?)
+            .into_result()
             .map(metered)
             .map_err(store_error)
     }

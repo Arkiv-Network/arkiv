@@ -10,7 +10,7 @@ use golemdb_api::{ApiError, CellType, FloatWidth, Width};
 
 mod query;
 
-pub(crate) use query::{arkiv_query_result, count_op, query_op};
+pub(crate) use query::{arkiv_query_result, count_op, golemdb_budget, query_op};
 
 /// GolemDB reports no cost yet, so every receipt is empty.
 pub(crate) fn metered<T>(value: T) -> Metered<T> {

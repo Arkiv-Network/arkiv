@@ -42,10 +42,9 @@ pub(crate) fn query_op(
         .as_ref()
         .map(|sort| sort_key(sort, &query.filter))
         .transpose()?;
-    let mut op = golemdb::QueryOp::from_filter(filter)
+    let mut op = golemdb::QueryOp::from_filter(filter, golemdb_budget(budget))
         .sort(sort)
-        .limit(query.page.limit)
-        .budget(golemdb_budget(budget));
+        .limit(query.page.limit);
     if query.page.offset > 0 {
         op = op.offset(query.page.offset);
     }
@@ -63,13 +62,16 @@ pub(crate) fn count_op(
     filter: &Filter,
     budget: Option<Budget>,
 ) -> Result<golemdb::CountOp, StoreError> {
-    Ok(golemdb::CountOp::filter(golemdb_filter(filter)?).budget(golemdb_budget(budget)))
+    Ok(golemdb::CountOp::filter(
+        golemdb_filter(filter)?,
+        golemdb_budget(budget),
+    ))
 }
 
 /// Arkiv's budget as GolemDB's. No budget is an unbudgeted call, which GolemDB
 /// spells `Unlimited`. A cap carries over as the same number: GolemDB prices
 /// no work yet, so its units and Arkiv's cost units are not reconciled.
-fn golemdb_budget(budget: Option<Budget>) -> golemdb::Budget {
+pub(crate) fn golemdb_budget(budget: Option<Budget>) -> golemdb::Budget {
     match budget {
         Some(Budget(cap)) => golemdb::Budget::Limited(cap),
         None => golemdb::Budget::Unlimited,
@@ -331,15 +333,17 @@ mod tests {
         arkiv.projection = Some(vec!["size".into(), "color".into()]);
         arkiv.total_matched = true;
 
-        let expected = golemdb::QueryOp::from_filter(golemdb::Filter::Eq {
-            field: cell_name("color"),
-            value: EqValue::of(Str, "blue"),
-        })
+        let expected = golemdb::QueryOp::from_filter(
+            golemdb::Filter::Eq {
+                field: cell_name("color"),
+                value: EqValue::of(Str, "blue"),
+            },
+            golemdb::Budget::Limited(1_000),
+        )
         .only(["color", "size"])
         .limit(10)
         .offset(20)
-        .with_total()
-        .budget(golemdb::Budget::Limited(1_000));
+        .with_total();
         assert_eq!(query_op(&arkiv, Some(Budget(1_000))), Ok(expected));
     }
 
@@ -377,12 +381,12 @@ mod tests {
         ] {
             assert_eq!(
                 query_op(&arkiv, budget).unwrap().budget,
-                Some(expected),
+                expected,
                 "{budget:?}"
             );
             assert_eq!(
                 count_op(&arkiv.filter, budget).unwrap().budget,
-                Some(expected),
+                expected,
                 "{budget:?}"
             );
         }
@@ -680,7 +684,7 @@ mod tests {
             let arkiv = query(groups);
             let mut op = query_op(&arkiv, None).unwrap().with_total();
             op.limit = None;
-            let page = store.database.query(None, op).unwrap();
+            let page = store.database.query(None, op).into_result().unwrap();
             let result = arkiv_query_result(&page).unwrap();
             let count = store.count(None, &arkiv.filter, None).unwrap().into_value();
             assert_eq!(result.total_matched, Some(count));
