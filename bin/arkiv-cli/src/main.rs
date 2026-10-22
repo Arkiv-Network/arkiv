@@ -226,21 +226,23 @@ enum Command {
     Simulate(simulate::SimulateArgs),
 }
 
-/// The `$contentType` triple — a `str` attribute, since content type is a
-/// user-managed system attribute rather than its own operation field now.
+/// The `contentType` triple. The protocol has no content type of its own; this
+/// is a CLI convention — an ordinary unindexed `str` user attribute.
 fn content_type_attr(s: &str) -> Result<Attribute> {
     Attribute::from_value(
-        Ident32::system("$contentType")?,
+        Ident32::encode("contentType")?,
         &arkiv_interfaces::entity::AttributeValue::Str(s.to_string()),
+        false,
     )
     .map_err(|e| eyre::eyre!("content type: {e}"))
 }
 
-/// The `$payload` triple.
+/// The `payload` triple: an unindexed `bytes` user attribute, by CLI convention.
 fn payload_attr(b: &Bytes) -> Result<Attribute> {
     Attribute::from_value(
-        Ident32::system("$payload")?,
+        Ident32::encode("payload")?,
         &arkiv_interfaces::entity::AttributeValue::Bytes(b.to_vec()),
+        false,
     )
     .map_err(|e| eyre::eyre!("payload: {e}"))
 }
@@ -357,6 +359,10 @@ impl<'de> Deserialize<'de> for EntityKeyRef {
     }
 }
 
+fn indexed_by_default() -> bool {
+    true
+}
+
 fn default_content_type() -> String {
     "application/octet-stream".to_string()
 }
@@ -368,6 +374,10 @@ fn default_content_type() -> String {
 struct BatchAttribute {
     /// `Ident32` name (ASCII letters, digits, `.`, `-`, `_`; starts with a letter).
     name: String,
+    /// Whether the node indexes it. Unindexed attributes are stored and
+    /// returned, but cannot be queried.
+    #[serde(default = "indexed_by_default")]
+    indexed: bool,
     #[serde(flatten)]
     value: BatchAttributeValue,
 }
@@ -479,7 +489,7 @@ fn build_attribute(
             AttributeValue::EntityKey(resolve(entity_key)?.0)
         }
     };
-    Attribute::from_value(name, &value)
+    Attribute::from_value(name, &value, attr.indexed)
         .map_err(|e| eyre::eyre!("invalid value for attribute '{}': {}", attr.name, e))
 }
 
@@ -709,6 +719,7 @@ fn parse_cli_attribute(raw: &str) -> Result<BatchAttribute> {
 
     Ok(BatchAttribute {
         name: name.to_string(),
+        indexed: true,
         value: parsed_value,
     })
 }

@@ -21,6 +21,10 @@
 //! | word types        | ABI encoded data, exactly one 32 bytes  |
 //! | `string`, `bytes` | raw bytes, unpadded                     |
 //!
+//! Bit 7 of `typeId` is the [indexed flag](INDEXED_FLAG); the low seven bits are
+//! the type. `bytes` with the flag set is rejected — it has no index — and a
+//! tombstone is `0x00` exactly, never `0x80`.
+//!
 //! See the [Contract ABI Specification](https://docs.soliditylang.org/en/latest/abi-spec.html) for more details.
 //!
 //! Where word types can be any of the following below.
@@ -43,7 +47,7 @@ use core::fmt;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
 use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
-use arkiv_interfaces::entity::{AttributeType, AttributeValue, TOMBSTONE_TYPE_ID};
+use arkiv_interfaces::entity::{AttributeType, AttributeValue, INDEXED_FLAG, TOMBSTONE_TYPE_ID};
 
 use crate::{
     Attribute, Create, Delete, ExtendExpiry, Ident32, OP_CREATE, OP_DELETE, OP_EXTEND_EXPIRY,
@@ -53,7 +57,7 @@ use crate::{
 /// The protocol's value limits — `arkiv-engine.md` §2. Re-exported rather than
 /// restated so the check this crate runs before a transaction is sent is the same
 /// number the engine applies on decode.
-pub use arkiv_interfaces::constants::{MAX_PAYLOAD_BYTES, MAX_STR_BYTES};
+pub use arkiv_interfaces::constants::{MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 
 // -----------------------------------------------------------------------------
 // Operation constructors
@@ -180,14 +184,26 @@ fn alloc_string(s: &str) -> String {
 // -----------------------------------------------------------------------------
 
 impl Attribute {
-    /// The ABI attribute carrying `value` under `name`.
-    pub fn from_value(name: Ident32, value: &AttributeValue) -> Result<Self, AttrAbiError> {
+    /// The ABI attribute carrying `value` under `name`, indexed or not.
+    pub fn from_value(
+        name: Ident32,
+        value: &AttributeValue,
+        indexed: bool,
+    ) -> Result<Self, AttrAbiError> {
+        if indexed && !value.attr_type().is_indexable() {
+            return Err(AttrAbiError::NotIndexable(value.type_id()));
+        }
         let bytes = encode_value(value)?;
         Ok(Self {
             name: name.0,
-            typeId: value.type_id(),
+            typeId: value.type_id() | if indexed { INDEXED_FLAG } else { 0 },
             value: Bytes::from(bytes),
         })
+    }
+
+    /// Whether the indexed flag is set.
+    pub fn is_indexed(&self) -> bool {
+        self.typeId & INDEXED_FLAG != 0
     }
 
     /// A **tombstone**: unset `name`. Valid only in a `patch` mutation list —
@@ -218,8 +234,11 @@ impl Attribute {
                 Err(AttrAbiError::TombstoneNotEmpty(self.value.len()))
             };
         }
-        let ty =
-            AttributeType::from_id(self.typeId).ok_or(AttrAbiError::UnknownType(self.typeId))?;
+        let ty = AttributeType::from_id(self.typeId & !INDEXED_FLAG)
+            .ok_or(AttrAbiError::UnknownType(self.typeId))?;
+        if self.is_indexed() && !ty.is_indexable() {
+            return Err(AttrAbiError::NotIndexable(self.typeId));
+        }
         decode_value(ty, &self.value).map(Some)
     }
 
@@ -258,8 +277,8 @@ fn encode_value(value: &AttributeValue) -> Result<Vec<u8>, AttrAbiError> {
             Vec::from(s.as_bytes())
         }
         AttributeValue::Bytes(b) => {
-            if b.len() > MAX_PAYLOAD_BYTES {
-                return Err(AttrAbiError::PayloadTooLong(b.len()));
+            if b.len() > MAX_BYTES_VALUE_LEN {
+                return Err(AttrAbiError::BytesTooLong(b.len()));
             }
             b.clone()
         }
@@ -279,8 +298,8 @@ fn decode_value(ty: AttributeType, bytes: &[u8]) -> Result<AttributeValue, AttrA
                 .map_err(|_| AttrAbiError::NotUtf8);
         }
         AttributeType::Bytes => {
-            if bytes.len() > MAX_PAYLOAD_BYTES {
-                return Err(AttrAbiError::PayloadTooLong(bytes.len()));
+            if bytes.len() > MAX_BYTES_VALUE_LEN {
+                return Err(AttrAbiError::BytesTooLong(bytes.len()));
             }
             return Ok(AttributeValue::Bytes(bytes.to_vec()));
         }
@@ -365,8 +384,11 @@ impl std::error::Error for OpAbiError {}
 /// Why an attribute value didn't survive the ABI boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttrAbiError {
-    /// The `typeId` byte names no type.
+    /// The `typeId` byte's low seven bits name no type, or it is `0x80` — a
+    /// tombstone carrying the indexed flag.
     UnknownType(u8),
+    /// The indexed flag is set on a type that has no index (`bytes`).
+    NotIndexable(u8),
     /// A tombstone (`typeId` 0) carried a value; the only canonical spelling
     /// is zero-length.
     TombstoneNotEmpty(usize),
@@ -382,14 +404,20 @@ pub enum AttrAbiError {
     NotUtf8,
     /// A `string` value exceeded [`MAX_STR_BYTES`].
     StringTooLong(usize),
-    /// A `bytes` value exceeded [`MAX_PAYLOAD_BYTES`].
-    PayloadTooLong(usize),
+    /// A `bytes` value exceeded [`MAX_BYTES_VALUE_LEN`].
+    BytesTooLong(usize),
 }
 
 impl fmt::Display for AttrAbiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownType(t) => write!(f, "unknown attribute value type {t}"),
+            Self::NotIndexable(t) => {
+                write!(
+                    f,
+                    "attribute value type {t} is flagged indexed but has no index"
+                )
+            }
             Self::TombstoneNotEmpty(n) => {
                 write!(f, "tombstone must carry no value, got {n} bytes")
             }
@@ -401,8 +429,8 @@ impl fmt::Display for AttrAbiError {
             Self::StringTooLong(n) => {
                 write!(f, "string value exceeds {MAX_STR_BYTES} bytes ({n})")
             }
-            Self::PayloadTooLong(n) => {
-                write!(f, "payload exceeds {MAX_PAYLOAD_BYTES} bytes ({n})")
+            Self::BytesTooLong(n) => {
+                write!(f, "bytes value exceeds {MAX_BYTES_VALUE_LEN} bytes ({n})")
             }
         }
     }
@@ -419,7 +447,7 @@ mod tests {
     }
 
     fn attr(n: &str, value: &AttributeValue) -> Attribute {
-        Attribute::from_value(name(n), value).unwrap()
+        Attribute::from_value(name(n), value, value.attr_type().is_indexable()).unwrap()
     }
 
     fn u256(n: &str, v: u64) -> Attribute {
@@ -525,10 +553,58 @@ mod tests {
             AttributeValue::EntityKey([0x77; 32]),
         ];
         for value in values {
-            let a = Attribute::from_value(name("a"), &value).unwrap();
-            assert_eq!(a.typeId, value.type_id());
-            assert_eq!(a.to_value().unwrap(), Some(value.clone()), "{value:?}");
+            for indexed in [false, true] {
+                if indexed && !value.attr_type().is_indexable() {
+                    continue;
+                }
+                let a = Attribute::from_value(name("a"), &value, indexed).unwrap();
+                assert_eq!(a.typeId & !INDEXED_FLAG, value.type_id());
+                assert_eq!(a.is_indexed(), indexed);
+                assert_eq!(a.to_value().unwrap(), Some(value.clone()), "{value:?}");
+            }
         }
+    }
+
+    /// Bit 7 is the indexed flag: `str` is `0x08` stored-only, `0x88` indexed.
+    #[test]
+    fn the_indexed_flag_is_bit_seven_of_the_type_id() {
+        let s = AttributeValue::Str("x".into());
+        assert_eq!(
+            Attribute::from_value(name("a"), &s, false).unwrap().typeId,
+            0x08
+        );
+        assert_eq!(
+            Attribute::from_value(name("a"), &s, true).unwrap().typeId,
+            0x88
+        );
+    }
+
+    /// `bytes` has no index, whichever side tries to set the flag.
+    #[test]
+    fn indexed_bytes_is_rejected() {
+        let blob = AttributeValue::Bytes(vec![1]);
+        assert_eq!(
+            Attribute::from_value(name("b"), &blob, true),
+            Err(AttrAbiError::NotIndexable(AttributeType::Bytes.id()))
+        );
+        let forged = Attribute {
+            name: name("b").0,
+            typeId: AttributeType::Bytes.id() | INDEXED_FLAG,
+            value: Bytes::from_static(&[1]),
+        };
+        assert_eq!(forged.to_value(), Err(AttrAbiError::NotIndexable(0x87)));
+    }
+
+    /// A tombstone has one spelling: `0x00`. The flag alone names no type.
+    #[test]
+    fn a_flagged_tombstone_is_not_a_tombstone() {
+        let bad = Attribute {
+            name: name("x").0,
+            typeId: INDEXED_FLAG,
+            value: Bytes::new(),
+        };
+        assert!(!bad.is_tombstone());
+        assert_eq!(bad.to_value(), Err(AttrAbiError::UnknownType(INDEXED_FLAG)));
     }
 
     /// Word types occupy exactly one word; the variable ones are unpadded.
@@ -602,20 +678,21 @@ mod tests {
     fn rejects_oversized_values() {
         let long = AttributeValue::Str("x".repeat(MAX_STR_BYTES + 1));
         assert_eq!(
-            Attribute::from_value(name("big"), &long),
+            Attribute::from_value(name("big"), &long, true),
             Err(AttrAbiError::StringTooLong(MAX_STR_BYTES + 1))
         );
         assert!(
             Attribute::from_value(
                 name("full"),
-                &AttributeValue::Str("x".repeat(MAX_STR_BYTES))
+                &AttributeValue::Str("x".repeat(MAX_STR_BYTES)),
+                true
             )
             .is_ok()
         );
-        let huge = AttributeValue::Bytes(vec![0; MAX_PAYLOAD_BYTES + 1]);
+        let huge = AttributeValue::Bytes(vec![0; MAX_BYTES_VALUE_LEN + 1]);
         assert_eq!(
-            Attribute::from_value(name("p"), &huge),
-            Err(AttrAbiError::PayloadTooLong(MAX_PAYLOAD_BYTES + 1))
+            Attribute::from_value(name("p"), &huge, false),
+            Err(AttrAbiError::BytesTooLong(MAX_BYTES_VALUE_LEN + 1))
         );
     }
 

@@ -154,14 +154,16 @@ fn open_golemdb(directory: &Path) -> eyre::Result<HostStore> {
 /// fixed when a database is created and part of its state root, so every node
 /// of a chain must use the same.
 fn golemdb_config() -> arkiv_golemdb::GolemDbConfig {
-    use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_PAYLOAD_BYTES, MAX_STR_BYTES};
+    use arkiv_interfaces::constants::{
+        MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
+    };
     let limit = |bytes: usize| u32::try_from(bytes).expect("Arkiv's limits fit in u32");
     arkiv_golemdb::GolemDbConfig {
         hash_function: arkiv_golemdb::HashAlgorithm::Keccak256,
         cell_limits: arkiv_golemdb::CellLimits {
             max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
             max_str_len: limit(MAX_STR_BYTES),
-            max_bytes_len: limit(MAX_PAYLOAD_BYTES),
+            max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
         },
         segments: arkiv_reth_statemanager::segments::ALL
             .iter()

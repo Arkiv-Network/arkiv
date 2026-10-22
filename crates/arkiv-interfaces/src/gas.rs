@@ -39,14 +39,16 @@ const G_EXTEND_EXPIRY: Gas = 10_000;
 const G_TRANSFER: Gas = 20_000;
 /// Base cost to delete an entity.
 const G_DELETE: Gas = 10_000;
-/// Per byte of `content_type` + `payload` a write carries.
+/// Per byte of attribute value a write carries.
 const G_BYTE: Gas = 16;
-/// Per attribute a write carries (index maintenance).
+/// Per indexed attribute a write carries (index maintenance). Unindexed
+/// attributes do not pay it — they have no index to maintain.
 const G_ATTRIBUTE: Gas = 5_000;
 
-/// Protocol cost of physically purging one expired entity.
-pub const fn purge_cost(attribute_count: usize) -> Gas {
-    G_DELETE.saturating_add(G_ATTRIBUTE.saturating_mul(attribute_count as Gas))
+/// Protocol cost of physically purging one expired entity with
+/// `indexed_attributes` index entries to remove.
+pub const fn purge_cost(indexed_attributes: usize) -> Gas {
+    G_DELETE.saturating_add(G_ATTRIBUTE.saturating_mul(indexed_attributes as Gas))
 }
 /// Per entity a query scans.
 const G_SCANNED: Gas = 100;
@@ -56,11 +58,12 @@ const G_INDEX_LOOKUP: Gas = 2_000;
 const G_RETURNED: Gas = 500;
 
 /// The size-dependent surcharge on a write: bytes stored plus attributes indexed.
-fn data_cost(content_type: &[u8], payload: &[u8], attributes: &[Attribute]) -> Gas {
-    let bytes = (content_type.len() as Gas).saturating_add(payload.len() as Gas);
-    bytes
-        .saturating_mul(G_BYTE)
-        .saturating_add((attributes.len() as Gas).saturating_mul(G_ATTRIBUTE))
+fn data_cost(attributes: &[Attribute]) -> Gas {
+    attributes.iter().fold(0, |acc, a| {
+        let bytes = (a.value.encode().len() as Gas).saturating_mul(G_BYTE);
+        let index = if a.indexed { G_ATTRIBUTE } else { 0 };
+        acc.saturating_add(bytes).saturating_add(index)
+    })
 }
 
 /// A patch costs its *mutations*, not the entity it touches.
@@ -70,11 +73,18 @@ fn data_cost(content_type: &[u8], payload: &[u8], attributes: &[Attribute]) -> G
 /// callers have no incentive to batch unrelated writes to amortise a floor —
 /// which is also what lets disjoint patches compose instead of racing.
 ///
-/// An unset (tombstone) still costs a touch: removing an index entry is work.
+/// An indexed set costs a touch. So does an unset (tombstone): the attribute it
+/// removes may have been indexed, and removing an index entry is work. An
+/// unindexed set pays only for its bytes.
 fn mutation_cost(mutations: &[AttributeMutation]) -> Gas {
     mutations.iter().fold(0, |acc, m| {
         let bytes = m.value.as_ref().map_or(0, |v| v.encode().len() as Gas);
-        acc.saturating_add(G_ATTRIBUTE)
+        let touch = if m.indexed || m.value.is_none() {
+            G_ATTRIBUTE
+        } else {
+            0
+        };
+        acc.saturating_add(touch)
             .saturating_add(bytes.saturating_mul(G_BYTE))
     })
 }
@@ -87,12 +97,7 @@ pub struct PlaceholderCost;
 impl CostModel for PlaceholderCost {
     fn op_cost(&self, op: &Op) -> Gas {
         match op {
-            Op::Create {
-                content_type,
-                payload,
-                attributes,
-                ..
-            } => G_CREATE.saturating_add(data_cost(content_type, payload, attributes)),
+            Op::Create { attributes, .. } => G_CREATE.saturating_add(data_cost(attributes)),
             Op::Patch { mutations, .. } => G_PATCH.saturating_add(mutation_cost(mutations)),
             Op::ExtendExpiry { .. } => G_EXTEND_EXPIRY,
             Op::Transfer { .. } => G_TRANSFER,
@@ -112,25 +117,23 @@ impl CostModel for PlaceholderCost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::CreationFlags;
+    use crate::entity::{AttributeValue, CreationFlags};
     use alloc::vec;
 
     #[test]
     fn writes_charge_for_size_and_attributes() {
         let key = [0u8; 32];
-        let one_attr = vec![Attribute::new(
-            b"k".to_vec(),
-            crate::entity::AttributeValue::Str("v".into()),
-        )];
+        let attributes = vec![
+            Attribute::new(b"k".to_vec(), AttributeValue::Str("ab".into())), // 2 bytes
+            Attribute::unindexed(b"b".to_vec(), AttributeValue::Bytes(b"cde".to_vec())), // 3 bytes
+        ];
         let cost = PlaceholderCost.op_cost(&Op::Create {
             key,
             expires_at: 1,
             creation_flags: CreationFlags::NONE,
-            content_type: b"ab".to_vec(), // 2 bytes
-            payload: b"cde".to_vec(),     // 3 bytes
-            attributes: one_attr,
+            attributes,
         });
-        // base + 5 bytes * G_BYTE + 1 attr * G_ATTRIBUTE
+        // base + 5 bytes * G_BYTE + 1 indexed attr * G_ATTRIBUTE
         assert_eq!(cost, G_CREATE + 5 * G_BYTE + G_ATTRIBUTE);
     }
 
@@ -144,7 +147,6 @@ mod tests {
     /// so cost scales with the mutation count and nothing else.
     #[test]
     fn patch_cost_scales_with_mutations_not_entity_size() {
-        use crate::entity::AttributeValue;
         let key = [0u8; 32];
         let patch = |mutations| PlaceholderCost.op_cost(&Op::Patch { key, mutations });
 
@@ -167,6 +169,15 @@ mod tests {
         assert_eq!(
             patch(vec![AttributeMutation::unset(b"k".to_vec())]),
             G_PATCH + G_ATTRIBUTE
+        );
+
+        // An unindexed set has no index entry to move: bytes only.
+        assert_eq!(
+            patch(vec![AttributeMutation::set_unindexed(
+                b"k".to_vec(),
+                AttributeValue::Str("v".into()),
+            )]),
+            G_PATCH + G_BYTE
         );
     }
 

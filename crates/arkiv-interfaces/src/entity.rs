@@ -9,8 +9,8 @@ use core::fmt;
 
 use crate::primitives::{BlockNumber, EntityAddress, EthAddress, UserAddress};
 
-/// A stored entity: a fixed identity, a changing lifecycle, opaque contents, and
-/// queryable attributes.
+/// A stored entity: a fixed identity, a changing lifecycle, and user attributes,
+/// each of which is indexed (queryable) or stored only.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Entity {
     /// Unique key. Set at creation, never changes.
@@ -29,16 +29,20 @@ pub struct Entity {
     /// `creationFlags` and immutable thereafter — no op changes them, which is
     /// what lets a reader trust them without checking history.
     pub creation_flags: CreationFlags,
-    /// Opaque content type (e.g. a MIME string).
-    pub content_type: Vec<u8>,
-    /// Opaque application payload.
-    pub payload: Vec<u8>,
-    /// Queryable attributes.
+    /// User attributes, indexed and unindexed alike.
     pub attributes: Vec<Attribute>,
 }
 
-/// An [`Entity`] without its payload or attributes — enough for a query that only
-/// needs identity and lifecycle.
+impl Entity {
+    /// How many of its attributes are indexed — what purging it costs, since
+    /// only those have index entries to remove.
+    pub fn indexed_attribute_count(&self) -> usize {
+        self.attributes.iter().filter(|a| a.indexed).count()
+    }
+}
+
+/// An [`Entity`] without its attributes — enough for a query that only needs
+/// identity and lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EntityMeta {
     pub key: EntityAddress,
@@ -47,23 +51,38 @@ pub struct EntityMeta {
     pub created_at_block: BlockNumber,
     pub last_modified_at_block: BlockNumber,
     pub expires_at: BlockNumber,
-    pub content_type: Vec<u8>,
 }
 
-/// A `(key, value)` attribute. The value carries its own type — see
+/// A `(key, value, indexed)` attribute. The value carries its own type — see
 /// [`AttributeValue`].
+///
+/// `indexed` is the user's choice, made per attribute on every write: an indexed
+/// attribute can appear in a query predicate, an unindexed one is stored and
+/// returned but never filtered on. [`Bytes`](AttributeValue::Bytes) is never
+/// indexed — see [`AttributeType::is_indexable`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute {
     pub key: Vec<u8>,
     pub value: AttributeValue,
+    pub indexed: bool,
 }
 
 impl Attribute {
-    /// A named attribute with `value`.
+    /// An **indexed** attribute named `key` with `value`.
     pub fn new(key: impl Into<Vec<u8>>, value: AttributeValue) -> Self {
         Self {
             key: key.into(),
             value,
+            indexed: true,
+        }
+    }
+
+    /// An **unindexed** attribute: stored and returned, never queryable.
+    pub fn unindexed(key: impl Into<Vec<u8>>, value: AttributeValue) -> Self {
+        Self {
+            key: key.into(),
+            value,
+            indexed: false,
         }
     }
 
@@ -79,21 +98,22 @@ impl Attribute {
 /// needing an out-of-band tag to read. Each variant maps to one `typeId`
 /// ([`AttributeType`]), one ABI/Solidity wire type, and one indexing behaviour:
 ///
-/// | typeId | variant                | ABI type  | indexing            |
-/// |--------|------------------------|-----------|---------------------|
+/// | typeId | variant                | ABI type  | indexing (when flagged) |
+/// |--------|------------------------|-----------|-------------------------|
 /// | 1      | [`Bool`](Self::Bool)   | `bool`    | equality            |
 /// | 2      | [`Int`](Self::Int)     | `int32`   | equality + range    |
 /// | 3      | [`U64`](Self::U64)     | `uint64`  | equality + range    |
 /// | 4      | [`U256`](Self::U256)   | `uint256` | equality + range    |
 /// | 5      | [`Decimal`](Self::Decimal) | `int256` | equality + range |
 /// | 6      | [`Bytes32`](Self::Bytes32) | `bytes32` | equality        |
-/// | 7      | [`Bytes`](Self::Bytes) | `bytes`   | none — system-only  |
+/// | 7      | [`Bytes`](Self::Bytes) | `bytes`   | none — never indexed |
 /// | 8      | [`Str`](Self::Str)     | `string`  | equality + prefix   |
 /// | 9      | [`EthereumAddress`](Self::EthereumAddress) | `address` | equality |
 /// | 10     | [`EntityKey`](Self::EntityKey) | `bytes32` | equality    |
 ///
 /// `typeId` **0** is not a type: it is the [tombstone](TOMBSTONE_TYPE_ID) tag,
-/// which only ever appears on the wire in a `patch` mutation list.
+/// which only ever appears on the wire in a `patch` mutation list. On the wire
+/// the `typeId` byte also carries the [indexed flag](INDEXED_FLAG) in bit 7.
 ///
 /// Two byte encodings hang off this type, and they are **not** the same thing:
 /// [`encode`](Self::encode) is the canonical *storage* form (natural width, no
@@ -115,8 +135,7 @@ pub enum AttributeValue {
     Decimal([u8; 32]),
     /// 32 opaque bytes.
     Bytes32([u8; 32]),
-    /// Opaque variable-length bytes. **System-only** (`$payload`): it never appears
-    /// in an operation's attribute array and is never indexed.
+    /// Opaque variable-length bytes — a blob. Never indexed.
     Bytes(Vec<u8>),
     /// A UTF-8 string.
     Str(String),
@@ -363,6 +382,11 @@ impl core::ops::BitOr for CreationFlags {
 /// is a revert too: on a fresh entity, "absent" is said by omission.
 pub const TOMBSTONE_TYPE_ID: u8 = 0;
 
+/// Bit 7 of the wire `typeId` byte: set means the attribute is indexed. The low
+/// seven bits are the [`AttributeType`]. Mirrors Golem DB's cell `typeTag`, where
+/// the same bit separates an indexed attribute from a stored-only field.
+pub const INDEXED_FLAG: u8 = 0x80;
+
 impl AttributeType {
     /// The `typeId` byte.
     pub const fn id(self) -> u8 {
@@ -386,11 +410,10 @@ impl AttributeType {
         }
     }
 
-    /// Whether a client may set an attribute of this type.
+    /// Whether an attribute of this type may carry the indexed flag.
     ///
-    /// [`Bytes`](Self::Bytes) is system-only — it backs `$payload`, which travels
-    /// in its own operation field, never in the attribute array.
-    pub const fn is_user_settable(self) -> bool {
+    /// [`Bytes`](Self::Bytes) has no index: it is a blob, stored and returned only.
+    pub const fn is_indexable(self) -> bool {
         !matches!(self, Self::Bytes)
     }
 
@@ -444,8 +467,7 @@ impl fmt::Display for AttributeValueError {
 /// The attribute names the protocol sets on every entity.
 ///
 /// Some never change (`$creator`, `$createdAtBlock`, `$key`); `$owner` changes on
-/// transfer, `$expiration` on extend, `$contentType` on update. `$all` matches
-/// every live entity.
+/// transfer, `$expiration` on extend. `$all` matches every live entity.
 pub mod annotations {
     /// Matches every live entity.
     pub const ALL: &[u8] = b"$all";
@@ -459,35 +481,21 @@ pub mod annotations {
     pub const KEY: &[u8] = b"$key";
     /// The expiry block, as a big-endian `u64` (changes on extend).
     pub const EXPIRATION: &[u8] = b"$expiration";
-    /// The content type (changes on patch). User-managed.
-    pub const CONTENT_TYPE: &[u8] = b"$contentType";
-    /// The opaque payload bytes. User-managed, and not indexed — `bytes` has no
-    /// ordering, so it is never queryable.
-    pub const PAYLOAD: &[u8] = b"$payload";
 
     /// The `$` prefix marking a system attribute. Reserved: a user attribute
     /// name may never start with it.
     pub const SYSTEM_PREFIX: u8 = b'$';
 
-    /// The only system attributes a `create` or `patch` may name.
+    /// Whether `name` is reserved for the engine.
     ///
-    /// Every other `$` attribute is **engine-controlled** — filled from the
+    /// Every `$` attribute is **engine-controlled** — filled from the
     /// transaction context at creation (`$creator`, `$createdAtBlock`) or
     /// maintained by the protocol (`$owner`, `$expiration`) — and naming one in
     /// a triple list is a revert, set or tombstone alike. That is what keeps
     /// "the engine owns these cells" true by construction rather than by
     /// convention.
-    pub const USER_MANAGED: [&[u8]; 2] = [PAYLOAD, CONTENT_TYPE];
-
-    /// Whether `name` is a system attribute a client may write.
-    pub fn is_user_managed(name: &[u8]) -> bool {
-        USER_MANAGED.contains(&name)
-    }
-
-    /// Whether `name` is reserved for the engine — a system name that is not
-    /// user-managed.
     pub fn is_engine_controlled(name: &[u8]) -> bool {
-        name.first() == Some(&SYSTEM_PREFIX) && !is_user_managed(name)
+        name.first() == Some(&SYSTEM_PREFIX)
     }
 }
 
@@ -639,10 +647,19 @@ mod tests {
     }
 
     #[test]
-    fn only_bytes_is_system_only() {
+    fn only_bytes_is_unindexable() {
         for id in 1..=10u8 {
             let ty = AttributeType::from_id(id).unwrap();
-            assert_eq!(ty.is_user_settable(), ty != AttributeType::Bytes);
+            assert_eq!(ty.is_indexable(), ty != AttributeType::Bytes);
+        }
+    }
+
+    /// The flag sits above every type id, so it can never be mistaken for one.
+    #[test]
+    fn the_indexed_flag_is_clear_of_every_type_id() {
+        for id in 1..=10u8 {
+            assert_eq!(id & INDEXED_FLAG, 0);
+            assert_eq!(AttributeType::from_id(id | INDEXED_FLAG), None);
         }
     }
 }

@@ -63,8 +63,11 @@ pub mod rpc_error_codes {
 /// The longest `str` value in bytes, allowed in arkiv.
 pub const MAX_STR_BYTES: usize = 128;
 
-/// The longest `$payload` in bytes, allowed in arkiv.
-pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
+/// The longest `bytes` value, per attribute, allowed in arkiv.
+///
+/// Per attribute, not per entity: with [`ENTITY_MAX_ATTRIBUTES`] blobs an entity
+/// can hold 32 × 128 KiB. The per-entity cap is an open question (#155).
+pub const MAX_BYTES_VALUE_LEN: usize = 128 * 1024;
 
 /// The most attributes one entity operation may carry.
 pub const OP_MAX_ATTRIBUTES: usize = 32;

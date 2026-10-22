@@ -50,6 +50,7 @@ LIMIT ?3
 pub(crate) struct PruningEntry {
     pub(crate) key: B256,
     pub(crate) expires_at: u64,
+    /// Indexed attributes only — what [`purge_cost`] charges for.
     pub(crate) attribute_count: usize,
 }
 

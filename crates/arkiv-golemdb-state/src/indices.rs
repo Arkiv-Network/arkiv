@@ -285,8 +285,6 @@ mod tests {
             last_modified_at_block: 1,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
-            content_type: b"text/plain".to_vec(),
-            payload: vec![],
             attributes: vec![
                 Attribute::new(b"level".to_vec(), AttributeValue::Int(level)),
                 Attribute::new(b"name".to_vec(), AttributeValue::Str(String::from(name))),
@@ -386,6 +384,22 @@ mod tests {
                 .expect("query")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn an_unindexed_attribute_is_stored_but_never_matched() {
+        // The whole of rule 4 ("unindexed attributes cannot appear in `where`")
+        // rests on the store answering only attribute cells. Pin it.
+        let mut stored_only = entity(1, 10, "a");
+        stored_only.attributes[0].indexed = false;
+        let (store, at) = stored(&[stored_only, entity(2, 10, "b")]);
+        let indices = StoreIndices::new(&store, at);
+        assert_eq!(
+            indices
+                .equal(b"level", &AttributeValue::Int(10))
+                .expect("query"),
+            vec![[2u8; 32]]
         );
     }
 
