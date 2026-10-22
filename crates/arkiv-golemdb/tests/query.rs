@@ -6,7 +6,7 @@
 //! block`: `a_count_combines_predicates` counts in that shape.
 
 use arkiv_golemdb::{CellLimits, GolemDbConfig, GolemDbStore, HashAlgorithm};
-use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_PAYLOAD_BYTES, MAX_STR_BYTES};
+use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::store::{Filter, Page, Query, Store, StoreError};
@@ -21,7 +21,7 @@ fn config() -> GolemDbConfig {
         cell_limits: CellLimits {
             max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
             max_str_len: limit(MAX_STR_BYTES),
-            max_bytes_len: limit(MAX_PAYLOAD_BYTES),
+            max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
         },
         segments: vec![],
     }
