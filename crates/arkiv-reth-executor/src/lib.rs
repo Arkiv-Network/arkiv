@@ -754,8 +754,9 @@ fn arkiv_purge_expired<DB: Database>(
         if entity.expires_at > block_number {
             continue;
         }
-        modeled_gas =
-            modeled_gas.saturating_add(arkiv_interfaces::gas::purge_cost(entity.attributes.len()));
+        modeled_gas = modeled_gas.saturating_add(arkiv_interfaces::gas::purge_cost(
+            entity.indexed_attribute_count(),
+        ));
         if modeled_gas > tx.gas_limit {
             return Ok(out_of_gas());
         }
@@ -1009,8 +1010,8 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
     })
 }
 
-/// `attributeTypeId(entityKey, name)`: the `typeId` that attribute holds, or
-/// **0** if it is not set.
+/// `attributeTypeId(entityKey, name)`: the wire `typeId` that attribute holds —
+/// indexed flag in bit 7, as a client writes it — or **0** if it is not set.
 ///
 /// 0 is [`TOMBSTONE_TYPE_ID`](arkiv_interfaces::entity::TOMBSTONE_TYPE_ID) — the
 /// tag that means "unset" on the wire — so "absent" reads the same here as it
@@ -1034,10 +1035,14 @@ fn arkiv_attribute_type_id_call<DB: Database>(
             block_number,
         )
         .and_then(|e| {
-            e.attributes
-                .iter()
-                .find(|a| a.key == wanted)
-                .map(|a| a.value.type_id())
+            e.attributes.iter().find(|a| a.key == wanted).map(|a| {
+                let flag = if a.indexed {
+                    arkiv_interfaces::entity::INDEXED_FLAG
+                } else {
+                    0
+                };
+                a.value.type_id() | flag
+            })
         })
         .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
         Ok(Ok(

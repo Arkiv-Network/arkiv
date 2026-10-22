@@ -359,7 +359,8 @@ where
             Some(entity) => entries.push(PruningEntry {
                 key,
                 expires_at: entity.expires_at,
-                attribute_count: entity.attributes.len(),
+                // Must match the executor's purge pricing, which counts these.
+                attribute_count: entity.indexed_attribute_count(),
             }),
             None => removed.push(key),
         }

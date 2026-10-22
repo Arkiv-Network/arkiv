@@ -15,7 +15,8 @@
 //!   added without changing `execute`'s signature.
 //! - [`Attribute`] is one `(name, typeId, value)` triple, shared by `create`'s
 //!   attributes and `patch`'s mutations. Its `value` is variable-length
-//!   `bytes`, so the same list carries a `bool` and a 128 KiB `$payload`.
+//!   `bytes`, so the same list carries a `bool` and a 128 KiB blob. Bit 7 of
+//!   `typeId` is the [indexed flag](arkiv_interfaces::entity::INDEXED_FLAG).
 //!   `typeId = 0` is a [tombstone](arkiv_interfaces::entity::TOMBSTONE_TYPE_ID)
 //!   — "unset this attribute" — valid only in `patch`.
 //!
@@ -36,7 +37,8 @@ alloy_sol_types::sol! {
 
     /// The one wire shape shared by `create`'s attributes and `patch`'s
     /// mutations. `value` is variable-length `bytes` (not a fixed word array),
-    /// which is what lets `$payload` ride in the same list as a `bool`.
+    /// which is what lets a blob ride in the same list as a `bool`. Bit 7 of
+    /// `typeId` is the indexed flag.
     #[derive(Debug, PartialEq, Eq)]
     struct Attribute {
         Ident32 name;
@@ -147,7 +149,7 @@ pub use arkiv_interfaces::entity::CreationFlags;
 
 /// The attribute type set. The `typeId`s belong to the protocol, not the ABI, so
 /// they live in the spec crate and are re-exported here rather than mirrored.
-pub use arkiv_interfaces::entity::{AttributeType, AttributeValue, DECIMAL_SCALE};
+pub use arkiv_interfaces::entity::{AttributeType, AttributeValue, DECIMAL_SCALE, INDEXED_FLAG};
 
 /// Attribute-count limits for an operation and for the resulting entity. The
 /// engine rejects either excess with `TooManyAttributes`; SDKs can validate

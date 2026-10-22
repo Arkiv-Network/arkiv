@@ -25,7 +25,7 @@ pub mod provider;
 pub mod segments;
 
 pub use accounts::{BalanceAccess, NonceAccess};
-pub use genesis::{GenesisAccount, seed_genesis};
+pub use genesis::{GenesisAccount, check_chain, seed_genesis};
 pub use host::{
     BlockSeals, ExecutionKey, HostError, HostStateView, HostStore, host_manager, open_block_branch,
 };

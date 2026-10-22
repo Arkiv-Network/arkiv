@@ -7,9 +7,9 @@
 //! datadir, so a test can prove crash recovery (state resumes after a restart).
 //!
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
-//! by default is in-process and so goes with the process — a test that wants to
-//! watch state survive a restart needs [`NodeBuilder::valkey_store`] or
-//! [`NodeBuilder::golemdb_store`].
+//! by default is the in-process one (`memory://`) and so goes with the process —
+//! a test that wants to watch state survive a restart needs
+//! [`NodeBuilder::valkey_store`] or [`NodeBuilder::golemdb_store`].
 
 use std::fs::File;
 use std::net::TcpListener;
@@ -243,13 +243,22 @@ impl Node {
             "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
+        // The node refuses to start without a store, and runs on anything but
+        // GolemDB only when allowed. Tests run on the in-process store unless
+        // the test process names another, as the suite pointed at a Valkey does.
+        if std::env::var_os("ARKIV_STORE_URL").is_none() {
+            cmd.env("ARKIV_STORE_URL", "memory://");
+        }
+        cmd.env("ALLOW_EXPERIMENTAL_BACKENDS", "true");
         cmd.envs(self.config.env.iter().map(|(k, v)| (k, v)));
         if self.config.golemdb {
             let directory = self.datadir.join("golemdb");
             cmd.env(
                 "ARKIV_STORE_URL",
                 format!("golemdb://{}", directory.display()),
-            );
+            )
+            // GolemDB needs no permission, so run it as production does.
+            .env_remove("ALLOW_EXPERIMENTAL_BACKENDS");
         }
         // An escape hatch for diagnosing a node under test: extra flags without
         // editing the test that spawns it. Used for raising the log filter when

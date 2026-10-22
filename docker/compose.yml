@@ -35,6 +35,11 @@ services:
     image: arkiv-reth:dev
     ports:
       - "8545:8545"
+    # The node needs a store named. This dev stack runs on the in-process one,
+    # which only runs when allowed.
+    environment:
+      ARKIV_STORE_URL: memory://
+      ALLOW_EXPERIMENTAL_BACKENDS: "true"
     command:
       - node
       - --dev

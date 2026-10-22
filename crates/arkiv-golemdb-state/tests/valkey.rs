@@ -54,12 +54,13 @@ fn entity(key: u8, level: i32) -> Entity {
         last_modified_at_block: 1,
         expires_at: 100,
         creation_flags: CreationFlags::NONE,
-        content_type: b"text/plain".to_vec(),
-        payload: vec![key],
-        attributes: vec![Attribute::new(
-            b"level".to_vec(),
-            AttributeValue::Int(level),
-        )],
+        attributes: vec![
+            arkiv_interfaces::entity::Attribute::unindexed(
+                b"body".to_vec(),
+                arkiv_interfaces::entity::AttributeValue::Bytes(vec![key]),
+            ),
+            Attribute::new(b"level".to_vec(), AttributeValue::Int(level)),
+        ],
     }
 }
 

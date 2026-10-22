@@ -73,8 +73,6 @@ pub struct EntityUpdates {
     pub last_modified_at_block: Option<BlockNumber>,
     pub expires_at: Option<BlockNumber>,
     pub creation_flags: Option<CreationFlags>,
-    pub content_type: Option<Vec<u8>>,
-    pub payload: Option<Vec<u8>>,
     pub attributes: Option<Vec<Attribute>>,
 }
 
@@ -89,8 +87,6 @@ impl EntityUpdates {
             last_modified_at_block: Some(entity.last_modified_at_block),
             expires_at: Some(entity.expires_at),
             creation_flags: Some(entity.creation_flags),
-            content_type: Some(entity.content_type),
-            payload: Some(entity.payload),
             attributes: Some(entity.attributes),
         }
     }
@@ -122,12 +118,6 @@ impl EntityUpdates {
         }
         if let Some(v) = self.creation_flags {
             entity.creation_flags = v;
-        }
-        if let Some(v) = &self.content_type {
-            entity.content_type = v.clone();
-        }
-        if let Some(v) = &self.payload {
-            entity.payload = v.clone();
         }
         if let Some(v) = &self.attributes {
             entity.attributes = v.clone();
@@ -541,7 +531,7 @@ mod tests {
             key: [1; 32],
             owner: [2; 20],
             expires_at: 50,
-            payload: vec![1, 2, 3],
+            created_at_block: 7,
             ..Entity::default()
         };
         let updates = EntityUpdates {
@@ -553,7 +543,7 @@ mod tests {
         updates.apply_to(&mut entity);
         assert_eq!(entity.owner, [9; 20]);
         assert_eq!(entity.expires_at, 80);
-        assert_eq!(entity.payload, vec![1, 2, 3], "untouched field survives");
+        assert_eq!(entity.created_at_block, 7, "untouched field survives");
     }
 
     #[test]
@@ -565,7 +555,10 @@ mod tests {
             created_at_block: 10,
             last_modified_at_block: 10,
             expires_at: 99,
-            payload: vec![0xAA],
+            attributes: vec![Attribute::unindexed(
+                b"body".to_vec(),
+                AttributeValue::Bytes(vec![0xAA]),
+            )],
             ..Entity::default()
         };
         let mut rebuilt = Entity::default();

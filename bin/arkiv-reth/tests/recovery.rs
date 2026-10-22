@@ -41,37 +41,43 @@ fn valkey_url() -> String {
 }
 
 /// A create carrying `payload` under `text/plain`, with a purely relative
-/// lifetime — `$contentType` / `$payload` ride in the attribute list now.
+/// lifetime. Both are ordinary **unindexed** user attributes: stored and
+/// returned, never queryable.
 fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
     attrs.push(
         Attribute::from_value(
-            Ident32::system("$contentType").unwrap(),
+            Ident32::encode("contentType").unwrap(),
             &AttributeValue::Str("text/plain".into()),
+            false,
         )
         .unwrap(),
     );
-    attrs.push(
-        Attribute::from_value(
-            Ident32::system("$payload").unwrap(),
-            &AttributeValue::Bytes(payload.to_vec()),
-        )
-        .unwrap(),
-    );
+    attrs.push(payload_attr(payload));
     Operation::create(0, 0, min_lifetime, 0, attrs)
+}
+
+/// The unindexed `bytes` attribute named `payload`.
+fn payload_attr(payload: Bytes) -> Attribute {
+    Attribute::from_value(
+        Ident32::encode("payload").unwrap(),
+        &AttributeValue::Bytes(payload.to_vec()),
+        false,
+    )
+    .unwrap()
+}
+
+/// The JSON value of the attribute `name` in an entity read back over RPC, or
+/// null when the entity does not carry it.
+fn attr_value<'a>(entity: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    entity["attributes"]
+        .as_array()
+        .and_then(|attrs| attrs.iter().find(|a| a["name"] == name))
+        .map_or(&serde_json::Value::Null, |a| &a["value"])
 }
 
 /// A patch that replaces just the payload.
 fn patch_payload(key: B256, payload: Bytes) -> Operation {
-    Operation::patch(
-        key,
-        vec![
-            Attribute::from_value(
-                Ident32::system("$payload").unwrap(),
-                &AttributeValue::Bytes(payload.to_vec()),
-            )
-            .unwrap(),
-        ],
-    )
+    Operation::patch(key, vec![payload_attr(payload)])
 }
 
 /// Wait until the store holds the block `receipt` is in.
@@ -89,7 +95,7 @@ async fn wait_for_store(client: &ArkivClient<impl Provider>, receipt: &Transacti
 
 fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
     let attr = |name: &str, value: AttributeValue| {
-        Attribute::from_value(Ident32::encode(name).unwrap(), &value).unwrap()
+        Attribute::from_value(Ident32::encode(name).unwrap(), &value, true).unwrap()
     };
     vec![
         attr("rank", AttributeValue::u256_from_u64(rank)),
@@ -211,7 +217,8 @@ async fn state_and_index_survive_shutdown_and_restart() {
     );
     let entity_after = client.get_entity(key0).await;
     assert_eq!(
-        entity_after["payload"], entity_before["payload"],
+        attr_value(&entity_after, "payload"),
+        attr_value(&entity_before, "payload"),
         "payload survives"
     );
     assert_eq!(
@@ -286,7 +293,11 @@ async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
         .await;
     wait_for_store(&client, &changed).await;
     let entity_before = client.get_entity(key(0)).await;
-    assert_eq!(entity_before["payload"], "0x7632", "the patch landed"); // "v2"
+    assert_eq!(
+        attr_value(&entity_before, "payload"),
+        "0x7632",
+        "the patch landed"
+    ); // "v2"
     assert!(
         client.get_entity(key(1)).await.is_null(),
         "the delete landed"

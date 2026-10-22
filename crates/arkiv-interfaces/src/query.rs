@@ -73,8 +73,6 @@ pub enum BuiltIn {
     ExpiresAt,
     /// `$createdAt` — the creation block.
     CreatedAt,
-    /// `$contentType` — the payload's MIME string.
-    ContentType,
 }
 
 /// A value a predicate compares against.

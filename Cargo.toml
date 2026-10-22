@@ -9,14 +9,12 @@ rust-version = "1.97"
 license = "MIT"
 
 [workspace.dependencies]
-# reth, from our private fork at ~/Projects/arkiv/reth rather than upstream.
+# reth, from our fork at github.com/Arkiv-Network/reth rather than upstream.
 # `arkiv/custom-golemdb` is the long-lived Arkiv line: it carries the seams that
 # let the engine run on a provider of our own, keep its chain outside reth's
 # database, and anchor the overlays on frontiers we supply.
 #
-# The fork is PRIVATE, so cargo needs credentials to fetch it. Locally that is your
-# SSH key, via the `ssh://` URL plus `net.git-fetch-with-cli` in .cargo/config.toml.
-# CI has no credential yet -- see the branch's README notes.
+# The fork is public, so cargo fetches it over HTTPS with no credentials.
 #
 # Docker builds the workspace in isolation, so reth must be a git dependency.
 # Default features are off: v2.5.0 added "jit" to reth's defaults, which pulls
@@ -120,6 +118,7 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+url = "2"
 
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
