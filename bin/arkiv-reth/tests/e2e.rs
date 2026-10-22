@@ -97,44 +97,50 @@ async fn wait_for_all_purged(client: &ArkivClient<impl Provider>, keys: &[B256])
 }
 
 /// A create carrying `payload` under `text/plain`, with a purely relative
-/// lifetime — `$contentType` / `$payload` ride in the attribute list now.
+/// lifetime. Both are ordinary **unindexed** user attributes: stored and
+/// returned, never queryable.
 fn create_op(min_lifetime: u64, payload: Bytes, mut attrs: Vec<Attribute>) -> Operation {
     attrs.push(
         Attribute::from_value(
-            Ident32::system("$contentType").unwrap(),
+            Ident32::encode("contentType").unwrap(),
             &AttributeValue::Str("text/plain".into()),
+            false,
         )
         .unwrap(),
     );
-    attrs.push(
-        Attribute::from_value(
-            Ident32::system("$payload").unwrap(),
-            &AttributeValue::Bytes(payload.to_vec()),
-        )
-        .unwrap(),
-    );
+    attrs.push(payload_attr(payload));
     Operation::create(0, 0, min_lifetime, 0, attrs)
+}
+
+/// The unindexed `bytes` attribute named `payload`.
+fn payload_attr(payload: Bytes) -> Attribute {
+    Attribute::from_value(
+        Ident32::encode("payload").unwrap(),
+        &AttributeValue::Bytes(payload.to_vec()),
+        false,
+    )
+    .unwrap()
+}
+
+/// The JSON value of the attribute `name` in an entity read back over RPC, or
+/// null when the entity does not carry it.
+fn attr_value<'a>(entity: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    entity["attributes"]
+        .as_array()
+        .and_then(|attrs| attrs.iter().find(|a| a["name"] == name))
+        .map_or(&serde_json::Value::Null, |a| &a["value"])
 }
 
 /// A patch that replaces just the payload.
 fn patch_payload(key: B256, payload: Bytes) -> Operation {
-    Operation::patch(
-        key,
-        vec![
-            Attribute::from_value(
-                Ident32::system("$payload").unwrap(),
-                &AttributeValue::Bytes(payload.to_vec()),
-            )
-            .unwrap(),
-        ],
-    )
+    Operation::patch(key, vec![payload_attr(payload)])
 }
 
 /// A `rank` (uint) + `team` (string) attribute pair — the two axes the query
 /// matrix filters on.
 fn attrs(rank: u64, team: &str) -> Vec<Attribute> {
     let attr = |name: &str, value: AttributeValue| {
-        Attribute::from_value(Ident32::encode(name).unwrap(), &value).unwrap()
+        Attribute::from_value(Ident32::encode(name).unwrap(), &value, true).unwrap()
     };
     vec![
         attr("rank", AttributeValue::u256_from_u64(rank)),
@@ -190,14 +196,16 @@ async fn create_then_get_entity_over_a_live_node() {
         entity["creator"].as_str(),
         Some(format!("{caller:#x}").as_str())
     );
-    assert_eq!(entity["contentType"], "text/plain");
-    assert_eq!(entity["payload"], "0x68656c6c6f"); // "hello"
+    assert_eq!(attr_value(&entity, "contentType"), "text/plain");
+    assert_eq!(attr_value(&entity, "payload"), "0x68656c6c6f"); // "hello"
     let created = hex_quantity(&entity["createdAt"]);
     assert_eq!(hex_quantity(&entity["expiresAt"]), created + 100); // btl resolved
     // Attributes are typed, in the same shape `arkiv_query` answers with.
     assert_eq!(
         entity["attributes"],
         serde_json::json!([
+            { "name": "contentType", "type": "str", "value": "text/plain" },
+            { "name": "payload", "type": "bytes", "value": "0x68656c6c6f" },
             { "name": "rank", "type": "u256", "value": "0x7" },
             { "name": "team", "type": "str", "value": "red" },
         ])
@@ -211,13 +219,40 @@ async fn create_then_get_entity_over_a_live_node() {
             serde_json::json!({ "select": {
                 "key": true, "owner": true, "creator": true,
                 "createdAt": true, "updatedAt": true, "expiresAt": true,
-                "creationFlags": true,
-                "contentType": true, "payload": true, "attributes": true,
+                "creationFlags": true, "attributes": true,
             }}),
         )
         .await
         .expect("query by key");
     assert_eq!(queried["data"][0], entity, "getEntity and query must agree");
+
+    // 3b) The schema reports each attribute's indexed flag, and the
+    //     `attributeTypeId` view answers with the wire byte, bit 7 included.
+    let schema = client
+        .query_raw(
+            &format!("$key = key({key:#x})"),
+            serde_json::json!({ "select": { "attributeSchema": true } }),
+        )
+        .await
+        .expect("schema by key");
+    assert_eq!(
+        schema["data"][0]["attributeSchema"],
+        serde_json::json!([
+            { "name": "contentType", "type": "str", "indexed": false },
+            { "name": "payload", "type": "bytes", "indexed": false },
+            { "name": "rank", "type": "u256", "indexed": true },
+            { "name": "team", "type": "str", "indexed": true },
+        ])
+    );
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+    for (name, type_id) in [("payload", 0x07), ("rank", 0x84), ("missing", 0x00)] {
+        let got = registry
+            .attributeTypeId(key, Ident32::encode(name).unwrap().into_word())
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(got, type_id, "{name}");
+    }
 
     // 4) A key that was never created reads back as null.
     let missing = client.get_entity(B256::repeat_byte(0xAB)).await;
@@ -494,13 +529,15 @@ async fn query_operator_classes_over_a_live_node() {
         ),
         expect(&[0, 1, 2, 3, 4]),
     );
+    // Every entity carries `contentType = 'text/plain'`, but unindexed: stored
+    // and returned, never matched.
     assert_eq!(
         result_keys(
             &client
-                .query("$contentType = str('text/plain')", 100, None)
+                .query("contentType = str('text/plain')", 100, None)
                 .await
         ),
-        expect(&[0, 1, 2, 3, 4]),
+        expect(&[]),
     );
     // Block heights are u64 and must say so — an untagged number means i32.
     assert_eq!(
@@ -657,7 +694,6 @@ async fn query_operator_classes_over_a_live_node() {
             .is_some_and(|b| b.starts_with("0x")),
         "chain quantities are hex: {entity}"
     );
-    assert!(entity.get("payload").is_none(), "payload not requested");
     assert!(
         entity.get("creator").is_none(),
         "creator not requested → absent"
@@ -753,18 +789,12 @@ async fn write_path_ops_over_a_live_node() {
     client
         .execute(vec![{
             let mut muts = attrs(100, "gold");
-            muts.push(
-                Attribute::from_value(
-                    Ident32::system("$payload").unwrap(),
-                    &AttributeValue::Bytes(b"v2".to_vec()),
-                )
-                .unwrap(),
-            );
+            muts.push(payload_attr(Bytes::from_static(b"v2")));
             Operation::patch(key(0), muts)
         }])
         .await;
     let e0 = client.get_entity(key(0)).await;
-    assert_eq!(e0["payload"], "0x7632"); // "v2"
+    assert_eq!(attr_value(&e0, "payload"), "0x7632"); // "v2"
     assert!(
         hex_quantity(&e0["updatedAt"]) > hex_quantity(&e0["createdAt"]),
         "patch should advance updatedAt",
@@ -862,19 +892,16 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
     client
         .execute(vec![{
             let mut muts = attrs(100, "red");
-            muts.push(
-                Attribute::from_value(
-                    Ident32::system("$payload").unwrap(),
-                    &AttributeValue::Bytes(b"v2".to_vec()),
-                )
-                .unwrap(),
-            );
+            muts.push(payload_attr(Bytes::from_static(b"v2")));
             Operation::patch(key, muts)
         }])
         .await;
 
     // The tip reflects the update.
-    assert_eq!(client.get_entity(key).await["payload"], "0x7632"); // "v2"
+    assert_eq!(
+        attr_value(&client.get_entity(key).await, "payload"),
+        "0x7632"
+    ); // "v2"
     assert_eq!(
         result_keys(&client.query("rank = u256(100)", 100, None).await),
         BTreeSet::from([ks.clone()]),
@@ -883,7 +910,7 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
 
     // As of the create block, both the entity and the query see the ORIGINAL state.
     assert_eq!(
-        client.get_entity_at(key, created).await["payload"],
+        attr_value(&client.get_entity_at(key, created).await, "payload"),
         "0x7631"
     ); // "v1"
     assert_eq!(
@@ -925,7 +952,10 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
         EntityCreationNonce::new(0),
         0,
     ));
-    assert_eq!(owner.get_entity(key).await["payload"], "0x7631"); // "v1"
+    assert_eq!(
+        attr_value(&owner.get_entity(key).await, "payload"),
+        "0x7631"
+    ); // "v1"
 
     // The stranger cannot update or delete the owner's entity — both revert.
     assert!(
@@ -939,7 +969,7 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
         "non-owner delete must revert",
     );
     assert_eq!(
-        owner.get_entity(key).await["payload"],
+        attr_value(&owner.get_entity(key).await, "payload"),
         "0x7631",
         "entity unchanged after failed writes",
     );
@@ -1124,8 +1154,9 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
         })
         .collect();
 
+    // Bare creates: the patches below use the whole attribute budget.
     let mut ops: Vec<_> = (0..6)
-        .map(|i| create_op(8, Bytes::from(vec![i]), vec![]))
+        .map(|_| Operation::create(0, 0, 8, 0, vec![]))
         .collect();
     // Each patch grows the stored entity to the per-operation maximum. Six
     // purges would cost 1.02m gas, so only five fit in the 1m transaction.
@@ -1136,6 +1167,7 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
                 Attribute::from_value(
                     Ident32::encode(&name).unwrap(),
                     &AttributeValue::u256_from_u64(offset as u64),
+                    true,
                 )
                 .unwrap()
             })
@@ -1366,7 +1398,7 @@ async fn a_pooled_create_transaction_does_not_stall_block_production() {
         0,
     ));
     assert_eq!(
-        bystander.get_entity(key).await["payload"],
+        attr_value(&bystander.get_entity(key).await, "payload"),
         "0x616c697665", // "alive"
         "the bystander's create must land while the deploy is pooled",
     );
@@ -1426,7 +1458,7 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
         0,
     ));
     assert_eq!(
-        bystander.get_entity(key).await["payload"],
+        attr_value(&bystander.get_entity(key).await, "payload"),
         "0x7374696c6c2d6275696c64696e67"
     );
     assert!(

@@ -152,8 +152,6 @@ pub enum Op {
         expires_at: BlockNumber,
         /// Entity properties fixed at creation. Immutable thereafter.
         creation_flags: CreationFlags,
-        content_type: Vec<u8>,
-        payload: Vec<u8>,
         attributes: Vec<Attribute>,
     },
     /// Partially mutate an entity: set some attributes, unset others, leave the
@@ -182,24 +180,36 @@ pub enum Op {
 /// One entry in a [`Patch`](Op::Patch)'s mutation list: set an attribute, or
 /// unset it.
 ///
-/// `key` may name a user attribute or one of the two **user-managed** system
-/// attributes (`$payload`, `$contentType`); any engine-controlled `$` name is
-/// rejected while decoding, so the engine's authority over `$owner`,
-/// `$expiresAt` and friends is never in question here.
+/// `key` names a user attribute; every `$` name is rejected while decoding, so
+/// the engine's authority over `$owner`, `$expiresAt` and friends is never in
+/// question here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeMutation {
     pub key: Vec<u8>,
     /// The value to set, or `None` to unset the attribute — a *tombstone* on
     /// the wire (`typeId` 0).
     pub value: Option<AttributeValue>,
+    /// Whether the set value is indexed. A set replaces the attribute whole, so
+    /// this may flip an existing attribute either way. `false` on a tombstone.
+    pub indexed: bool,
 }
 
 impl AttributeMutation {
-    /// Set `key` to `value`.
+    /// Set `key` to `value`, indexed.
     pub fn set(key: impl Into<Vec<u8>>, value: AttributeValue) -> Self {
         Self {
             key: key.into(),
             value: Some(value),
+            indexed: true,
+        }
+    }
+
+    /// Set `key` to `value`, unindexed.
+    pub fn set_unindexed(key: impl Into<Vec<u8>>, value: AttributeValue) -> Self {
+        Self {
+            key: key.into(),
+            value: Some(value),
+            indexed: false,
         }
     }
 
@@ -208,6 +218,7 @@ impl AttributeMutation {
         Self {
             key: key.into(),
             value: None,
+            indexed: false,
         }
     }
 }

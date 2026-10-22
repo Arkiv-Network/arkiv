@@ -21,10 +21,8 @@
 //!   reading and advancing the caller's persistent nonce is the wiring step's
 //!   job, which is why `start_nonce` is a parameter and decode stays a pure
 //!   function.
-//! - **`$payload` / `$contentType`.** They travel as ordinary triples in the
-//!   attribute list; a `Create` lifts them out into the entity's own fields,
-//!   since a create always yields a whole entity. A `Patch` leaves them in its
-//!   mutation list — a patch is a delta, and the executor routes them there.
+//! - **The indexed flag.** Bit 7 of each triple's `typeId` becomes the
+//!   attribute's `indexed` bit; `bytes` with the flag set is rejected.
 //!
 //! What decode does *not* do is check state: ownership, liveness, and whether an
 //! entity exists are the executor's business. Everything rejected here is a
@@ -41,7 +39,7 @@ use arkiv_bindings::{
     OP_EXTEND_EXPIRY, OP_MAX_ATTRIBUTES, OP_PATCH, OP_TRANSFER_OWNERSHIP, Operation, Patch,
     TransferOwnership,
     encode::{AttrAbiError, OpAbiError},
-    types::{Ident32ByteError, validate_ident32_bytes, validate_system_ident32_bytes},
+    types::{Ident32ByteError, validate_ident32_bytes},
 };
 use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
@@ -84,18 +82,11 @@ pub fn decode_ops(
                 };
                 let nonce = start_nonce.advanced_by(create_index);
                 create_index += 1;
-                let SystemSplit {
-                    content_type,
-                    payload,
-                    attributes,
-                } = split_create_attributes(&c.attributes)?;
                 Op::Create {
                     key: derive_entity_address(env.chain_id, &env.caller, nonce, c.salt),
                     expires_at: resolve_expiry(env.block_number, c.expiresAt, c.minLifetime)?,
                     creation_flags,
-                    content_type,
-                    payload,
-                    attributes,
+                    attributes: convert_create_attributes(&c.attributes)?,
                 }
             }
             OP_PATCH => {
@@ -209,38 +200,26 @@ pub fn derive_entity_address(
     keccak256(&buf).0
 }
 
-/// A create's attribute list, split into the entity's system fields and its
-/// user attributes.
-struct SystemSplit {
-    content_type: Vec<u8>,
-    payload: Vec<u8>,
-    attributes: Vec<Attribute>,
-}
-
-/// Validate a `create`'s attribute list and lift `$payload` / `$contentType`
-/// out of it.
+/// Validate a `create`'s attribute list.
 ///
 /// Tombstones are rejected: on a fresh entity there is nothing to unset, so
 /// "absent" is said by omission — one canonical way to encode it.
-fn split_create_attributes(attrs: &[AbiAttribute]) -> Result<SystemSplit, DecodeError> {
+fn convert_create_attributes(attrs: &[AbiAttribute]) -> Result<Vec<Attribute>, DecodeError> {
     check_triple_list(attrs)?;
-    let mut out = SystemSplit {
-        content_type: Vec::new(),
-        payload: Vec::new(),
-        attributes: Vec::with_capacity(attrs.len()),
-    };
-    for a in attrs {
-        let name = attr_name(a);
-        let Some(value) = decode_attr_value(a)? else {
-            return Err(DecodeError::TombstoneInCreate { name });
-        };
-        match name.as_slice() {
-            annotations::PAYLOAD => out.payload = value.encode(),
-            annotations::CONTENT_TYPE => out.content_type = value.encode(),
-            _ => out.attributes.push(Attribute { key: name, value }),
-        }
-    }
-    Ok(out)
+    attrs
+        .iter()
+        .map(|a| {
+            let key = attr_name(a);
+            match decode_attr_value(a)? {
+                Some(value) => Ok(Attribute {
+                    key,
+                    value,
+                    indexed: a.is_indexed(),
+                }),
+                None => Err(DecodeError::TombstoneInCreate { name: key }),
+            }
+        })
+        .collect()
 }
 
 /// Validate a `patch`'s mutation list. Tombstones are what make it a patch, so
@@ -253,6 +232,7 @@ fn convert_mutations(attrs: &[AbiAttribute]) -> Result<Vec<AttributeMutation>, D
             Ok(AttributeMutation {
                 key: attr_name(a),
                 value: decode_attr_value(a)?,
+                indexed: a.is_indexed(),
             })
         })
         .collect()
@@ -260,7 +240,7 @@ fn convert_mutations(attrs: &[AbiAttribute]) -> Result<Vec<AttributeMutation>, D
 
 /// The structural rules every triple list obeys, whichever op carries it: at
 /// most [`OP_MAX_ATTRIBUTES`], valid `Ident32` names, strictly ascending by name
-/// (which also enforces uniqueness), and no engine-controlled `$` name.
+/// (which also enforces uniqueness), and no `$` name — the engine owns those.
 fn check_triple_list(attrs: &[AbiAttribute]) -> Result<(), DecodeError> {
     if attrs.len() > OP_MAX_ATTRIBUTES {
         return Err(DecodeError::TooManyAttributes {
@@ -270,20 +250,12 @@ fn check_triple_list(attrs: &[AbiAttribute]) -> Result<(), DecodeError> {
     }
     for a in attrs {
         let name = attr_name(a);
-        // System names (`$…`) are protocol-defined and exempt from the `A-Z a-z`
-        // leading-byte rule for user attributes — `$` is the byte that
-        // separates the two namespaces. Which of them a client may write is
-        // the allow-list's call, checked first so the error names the real
-        // problem ("the engine owns this") rather than a charset violation.
-        let validate = if name.first() == Some(&annotations::SYSTEM_PREFIX) {
-            if annotations::is_engine_controlled(&name) {
-                return Err(DecodeError::SystemAttributeNotWritable { name });
-            }
-            validate_system_ident32_bytes
-        } else {
-            validate_ident32_bytes
-        };
-        if let Err(e) = validate(&a.name.0) {
+        // Checked before the charset, so the error names the real problem ("the
+        // engine owns this") rather than a `$` failing the `A-Z a-z` rule.
+        if annotations::is_engine_controlled(&name) {
+            return Err(DecodeError::SystemAttributeNotWritable { name });
+        }
+        if let Err(e) = validate_ident32_bytes(&a.name.0) {
             return Err(match e {
                 Ident32ByteError::Empty => DecodeError::AttributeNameEmpty,
                 Ident32ByteError::InvalidByte { position, value } => {
@@ -352,7 +324,7 @@ pub enum DecodeError {
     ReservedCreationFlags(u8),
     /// A `create` carried a tombstone; nothing exists yet to unset.
     TombstoneInCreate { name: Vec<u8> },
-    /// A triple named a `$` attribute the engine owns.
+    /// A triple named a `$` attribute — the engine owns all of them.
     SystemAttributeNotWritable { name: Vec<u8> },
     /// A `Transfer` named the zero address as the new owner.
     TransferToZeroAddress { key: EntityAddress },
@@ -451,7 +423,11 @@ mod tests {
     }
 
     fn attr(name: &str, value: &AttributeValue) -> AbiAttribute {
-        AbiAttribute::from_value(ident(name), value).unwrap()
+        AbiAttribute::from_value(ident(name), value, true).unwrap()
+    }
+
+    fn stored(name: &str, value: &AttributeValue) -> AbiAttribute {
+        AbiAttribute::from_value(ident(name), value, false).unwrap()
     }
 
     /// A relative-lifetime create: `expiresAt = 0`, so the floor decides.
@@ -537,31 +513,62 @@ mod tests {
         );
     }
 
+    /// Every user attribute carries its own indexed bit, and a blob is just
+    /// one more attribute — two of them, under any names, are fine.
     #[test]
-    fn create_lifts_payload_and_content_type_out_of_the_attributes() {
+    fn create_carries_each_attributes_indexed_flag() {
         let cd = calldata(vec![create_in(
             1,
             vec![
-                attr("$contentType", &AttributeValue::Str("text/plain".into())),
-                attr("$payload", &AttributeValue::Bytes(b"hi".to_vec())),
+                stored("body", &AttributeValue::Bytes(b"hi".to_vec())),
+                stored("mimeType", &AttributeValue::Str("text/plain".into())),
                 attr("rank", &AttributeValue::u256_from_u64(3)),
+                stored("thumbnail", &AttributeValue::Bytes(vec![])),
             ],
         )]);
         let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityCreationNonce::new(0)).unwrap();
-        let Op::Create {
-            content_type,
-            payload,
-            attributes,
-            ..
-        } = &ops[0]
-        else {
+        let Op::Create { attributes, .. } = &ops[0] else {
             panic!("expected create");
         };
-        assert_eq!(content_type, b"text/plain");
-        assert_eq!(payload, b"hi");
-        // Only the user attribute is left.
-        assert_eq!(attributes.len(), 1);
-        assert_eq!(attributes[0].key, b"rank");
+        assert_eq!(
+            attributes,
+            &vec![
+                Attribute::unindexed(b"body".to_vec(), AttributeValue::Bytes(b"hi".to_vec())),
+                Attribute::unindexed(
+                    b"mimeType".to_vec(),
+                    AttributeValue::Str("text/plain".into())
+                ),
+                Attribute::new(b"rank".to_vec(), AttributeValue::u256_from_u64(3)),
+                Attribute::unindexed(b"thumbnail".to_vec(), AttributeValue::Bytes(vec![])),
+            ]
+        );
+    }
+
+    /// `bytes` has no index; flagging it indexed is a revert, not a silent drop
+    /// of the flag.
+    #[test]
+    fn indexed_bytes_is_rejected() {
+        let forged = AbiAttribute {
+            name: ident("body").into_word(),
+            typeId: AttributeType::Bytes.id() | arkiv_bindings::INDEXED_FLAG,
+            value: Bytes::from_static(b"hi"),
+        };
+        for op in [
+            create_in(1, vec![forged.clone()]),
+            Operation::patch(B256::repeat_byte(1), vec![forged]),
+        ] {
+            assert!(matches!(
+                decode_ops(
+                    &env([0xAA; 20], 1, 1),
+                    &calldata(vec![op]),
+                    EntityCreationNonce::ZERO
+                ),
+                Err(DecodeError::InvalidAttributeValue {
+                    reason: AttrAbiError::NotIndexable(_),
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -661,19 +668,29 @@ mod tests {
         assert_eq!(mutations[1], AttributeMutation::unset(b"size".to_vec()));
     }
 
-    /// `$payload` / `$contentType` stay in the mutation list — a patch is a
-    /// delta, so "not mentioned" and "set to empty" must stay distinguishable.
     #[test]
-    fn patch_keeps_user_managed_system_attributes_as_mutations() {
+    fn patch_carries_each_mutations_indexed_flag() {
         let cd = calldata(vec![Operation::patch(
             B256::repeat_byte(1),
-            vec![attr("$payload", &AttributeValue::Bytes(b"new".to_vec()))],
+            vec![
+                stored("body", &AttributeValue::Bytes(b"new".to_vec())),
+                attr("rank", &AttributeValue::Int(1)),
+            ],
         )]);
         let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityCreationNonce::new(0)).unwrap();
         let Op::Patch { mutations, .. } = &ops[0] else {
             panic!("expected patch");
         };
-        assert_eq!(mutations[0].key, b"$payload");
+        assert_eq!(
+            mutations,
+            &vec![
+                AttributeMutation::set_unindexed(
+                    b"body".to_vec(),
+                    AttributeValue::Bytes(b"new".to_vec())
+                ),
+                AttributeMutation::set(b"rank".to_vec(), AttributeValue::Int(1)),
+            ]
+        );
     }
 
     #[test]
@@ -699,9 +716,11 @@ mod tests {
             "$createdAtBlock",
             "$expiration",
             "$key",
+            // No longer special: the engine owns every `$` name now.
+            "$payload",
+            "$contentType",
         ] {
-            let set =
-                AbiAttribute::from_value(ident(name), &AttributeValue::u256_from_u64(1)).unwrap();
+            let set = attr(name, &AttributeValue::u256_from_u64(1));
             for op in [
                 Operation::create(0, 0, 1, 0, vec![set.clone()]),
                 Operation::patch(B256::repeat_byte(1), vec![set.clone()]),

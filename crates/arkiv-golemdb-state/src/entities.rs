@@ -73,12 +73,6 @@ fn merge(base: &mut EntityUpdates, next: EntityUpdates) {
     if next.creation_flags.is_some() {
         base.creation_flags = next.creation_flags;
     }
-    if next.content_type.is_some() {
-        base.content_type = next.content_type;
-    }
-    if next.payload.is_some() {
-        base.payload = next.payload;
-    }
     if next.attributes.is_some() {
         base.attributes = next.attributes;
     }
@@ -207,9 +201,10 @@ mod tests {
             last_modified_at_block: 1,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
-            content_type: b"text/plain".to_vec(),
-            payload: vec![key],
-            attributes: vec![Attribute::new(b"level".to_vec(), AttributeValue::Int(10))],
+            attributes: vec![
+                Attribute::unindexed(b"body".to_vec(), AttributeValue::Bytes(vec![key])),
+                Attribute::new(b"level".to_vec(), AttributeValue::Int(10)),
+            ],
         }
     }
 
@@ -257,8 +252,11 @@ mod tests {
             .expect("read")
             .unwrap();
         assert_eq!(back.owner, [9; 20]);
-        assert_eq!(back.payload, vec![1], "untouched fields survive");
-        assert_eq!(back.attributes.len(), 1);
+        assert_eq!(
+            back.attributes,
+            entity(1).attributes,
+            "untouched fields survive"
+        );
     }
 
     #[test]
@@ -336,8 +334,8 @@ mod tests {
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].owner, Some([9; 20]), "the later write wins");
         assert_eq!(
-            deltas[0].payload,
-            Some(vec![1]),
+            deltas[0].attributes,
+            Some(entity(1).attributes),
             "the earlier one is not lost"
         );
     }

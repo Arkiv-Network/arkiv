@@ -20,19 +20,18 @@
 //! | `$owner`                | attribute | `ADDR`  | `owner`                    |
 //! | `$createdAtBlock`       | attribute | `U64`   | `created_at_block`         |
 //! | `$expiration`           | attribute | `U64`   | `expires_at`               |
-//! | `$contentType`          | attribute | `STR`   | `content_type`             |
-//! | `$payload`              | **field** | `BYTES` | `payload`                  |
 //! | [`CELL_LAST_MODIFIED`]  | **field** | `U64`   | `last_modified_at_block`   |
-//! | [`CELL_CREATION_FLAGS`] | **field** | `BOOL`* | `creation_flags`           |
-//! | *user attribute name*   | attribute | per value | `attributes`             |
+//! | [`CELL_CREATION_FLAGS`] | **field** | `BYTES`* | `creation_flags`          |
+//! | *user attribute name*   | attribute if `indexed`, else field | per value | `attributes` |
 //!
 //! Attributes are indexed and queryable; fields are not. The split follows the
-//! language exactly: the six [`BuiltIn`](crate::query::BuiltIn) keys are attributes,
-//! and everything a query cannot name is a field, so nothing is paying for an index
-//! it cannot use.
+//! language exactly: the [`BuiltIn`](crate::query::BuiltIn) keys are attributes, a
+//! user attribute is whichever its writer flagged, and everything else is a field,
+//! so nothing is paying for an index it cannot use.
 //!
-//! \* `creation_flags` is a byte, and `BOOL` is the only single-byte core type. It is
-//! a field, so it is never compared or indexed and the tag is only a width marker.
+//! \* `creation_flags` is one byte holding up to `0b11`, so it is a one-byte `BYTES`
+//! value. Not `BOOL`: a store may refuse a `BOOL` other than 0 or 1, as GolemDB
+//! does, and an entity with `permissionless_extension` would then fail to write.
 //!
 //! # Two numbering schemes that must not be confused
 //!
@@ -119,14 +118,6 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
             Cell::attribute(TypeId::U64, entity.expires_at.to_be_bytes().to_vec()),
         ),
         (
-            system(annotations::CONTENT_TYPE),
-            Cell::attribute(TypeId::STR, entity.content_type.clone()),
-        ),
-        (
-            system(annotations::PAYLOAD),
-            Cell::field(TypeId::BYTES, entity.payload.clone()),
-        ),
-        (
             CellName::from(CELL_LAST_MODIFIED),
             Cell::field(
                 TypeId::U64,
@@ -135,21 +126,28 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         ),
         (
             CellName::from(CELL_CREATION_FLAGS),
-            Cell::field(TypeId::BOOL, alloc::vec![entity.creation_flags.bits()]),
+            Cell::field(TypeId::BYTES, alloc::vec![entity.creation_flags.bits()]),
         ),
     ];
 
-    for Attribute { key, value } in &entity.attributes {
+    for Attribute {
+        key,
+        value,
+        indexed,
+    } in &entity.attributes
+    {
         let name = core::str::from_utf8(key).map_err(|_| RecordError::AttributeNameNotUtf8)?;
         // The engine owns every `$` cell. A user attribute that shadowed one would
         // silently overwrite lifecycle state, so reject rather than let it through.
         if key.first() == Some(&annotations::SYSTEM_PREFIX) {
             return Err(RecordError::AttributeNameReserved(String::from(name)));
         }
-        cells.push((
-            CellName::from(name),
-            Cell::attribute(type_id_of(value), value.encode()),
-        ));
+        let cell = if *indexed {
+            Cell::attribute(type_id_of(value), value.encode())
+        } else {
+            Cell::field(type_id_of(value), value.encode())
+        };
+        cells.push((CellName::from(name), cell));
     }
     Ok(cells)
 }
@@ -191,13 +189,12 @@ pub fn from_record(record: &Record) -> Result<Entity, RecordError> {
     let flags_raw = cell(
         record,
         CELL_CREATION_FLAGS,
-        TypeId::BOOL,
+        TypeId::BYTES,
         CELL_CREATION_FLAGS,
     )?;
-    let flags = flags_raw
-        .first()
-        .and_then(|bits| CreationFlags::from_bits(*bits))
-        .ok_or(RecordError::Malformed(CELL_CREATION_FLAGS))?;
+    let [bits] = fixed::<1>(flags_raw, CELL_CREATION_FLAGS)?;
+    let flags =
+        CreationFlags::from_bits(bits).ok_or(RecordError::Malformed(CELL_CREATION_FLAGS))?;
 
     let mut entity = Entity {
         key: fixed(key_bytes, "$key")?,
@@ -218,36 +215,23 @@ pub fn from_record(record: &Record) -> Result<Entity, RecordError> {
         last_modified_at_block: u64::from_be_bytes(fixed(modified, CELL_LAST_MODIFIED)?),
         expires_at: u64::from_be_bytes(fixed(expires, "$expiration")?),
         creation_flags: flags,
-        content_type: cell(
-            record,
-            &system(annotations::CONTENT_TYPE),
-            TypeId::STR,
-            "$contentType",
-        )?
-        .to_vec(),
-        payload: cell(
-            record,
-            &system(annotations::PAYLOAD),
-            TypeId::BYTES,
-            "$payload",
-        )?
-        .to_vec(),
         attributes: Vec::new(),
     };
 
-    // Everything that is not a system cell is a user attribute. Driven off the `$`
-    // prefix rather than a list of known names, so a system cell added later cannot
-    // start silently appearing in user attributes.
+    // Everything that is not a system cell is a user attribute, and its cell kind
+    // is its indexed flag. Driven off the `$` prefix rather than a list of known
+    // names, so a system cell added later cannot start silently appearing in user
+    // attributes.
     for (name, stored) in &record.cells {
-        if name.as_bytes().first() == Some(&annotations::SYSTEM_PREFIX)
-            || stored.kind != CellKind::Attribute
-        {
+        if name.as_bytes().first() == Some(&annotations::SYSTEM_PREFIX) {
             continue;
         }
         let value = decode(stored).ok_or(RecordError::Malformed("user attribute"))?;
-        entity
-            .attributes
-            .push(Attribute::new(name.as_bytes(), value));
+        entity.attributes.push(Attribute {
+            key: name.as_bytes().to_vec(),
+            value,
+            indexed: stored.kind == CellKind::Attribute,
+        });
     }
     Ok(entity)
 }
@@ -285,12 +269,16 @@ mod tests {
             last_modified_at_block: 150,
             expires_at: 200,
             creation_flags: CreationFlags::NONE,
-            content_type: b"text/plain".to_vec(),
-            payload: alloc::vec![1, 2, 3],
             attributes: alloc::vec![
                 Attribute::new(b"level".to_vec(), AttributeValue::Int(-7)),
                 Attribute::new(b"name".to_vec(), AttributeValue::Str(String::from("bob"))),
                 Attribute::new(b"big".to_vec(), AttributeValue::U256([0xcd; 32])),
+                Attribute::unindexed(b"title".to_vec(), AttributeValue::Str(String::from("hi"))),
+                Attribute::unindexed(
+                    b"body".to_vec(),
+                    AttributeValue::Bytes(alloc::vec![1, 2, 3])
+                ),
+                Attribute::unindexed(b"thumb".to_vec(), AttributeValue::Bytes(alloc::vec![])),
             ],
         }
     }
@@ -325,7 +313,6 @@ mod tests {
             annotations::OWNER,
             annotations::CREATED_AT_BLOCK,
             annotations::EXPIRATION,
-            annotations::CONTENT_TYPE,
         ] {
             let name = core::str::from_utf8(name).unwrap();
             let cell = record
@@ -336,15 +323,24 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_is_a_field_so_it_is_never_indexed() {
+    fn the_indexed_flag_picks_the_cell_kind() {
+        // An unindexed attribute stored as an attribute cell would be silently
+        // queryable; an indexed one stored as a field would silently stop matching.
         let record = as_record(&sample());
-        let payload = record
-            .cell(core::str::from_utf8(annotations::PAYLOAD).unwrap())
-            .unwrap();
-        assert_eq!(payload.kind, CellKind::Field);
-        assert_eq!(payload.type_id, TypeId::BYTES);
+        assert_eq!(record.cell("level").unwrap().kind, CellKind::Attribute);
+        assert_eq!(record.cell("title").unwrap().kind, CellKind::Field);
+        let body = record.cell("body").unwrap();
+        assert_eq!(body.kind, CellKind::Field);
+        assert_eq!(body.type_id, TypeId::BYTES);
         // `bytes` is field-only in the store, so an attribute of it would be rejected.
         assert!(!TypeId::BYTES.indexable());
+    }
+
+    #[test]
+    fn an_entity_needs_no_user_attributes_at_all() {
+        let mut entity = sample();
+        entity.attributes.clear();
+        assert_eq!(from_record(&as_record(&entity)), Ok(entity));
     }
 
     #[test]

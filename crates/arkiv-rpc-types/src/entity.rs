@@ -2,8 +2,8 @@
 //!
 //! ## What "projection" means here
 //!
-//! A stored [`Entity`] has more on it than most callers want: the payload can
-//! be 128 KiB, and a query answers a whole page of them. So a read names which
+//! A stored [`Entity`] has more on it than most callers want: each `bytes`
+//! attribute can be 128 KiB, and a query answers a whole page of them. So a read names which
 //! fields it wants — its **projection** — and everything else is left off the
 //! response entirely rather than sent as null. A field that was asked for is a
 //! *projected field*; the rest are absent, and `serde` skips them, so a caller
@@ -16,7 +16,7 @@
 //! Two rules from the spec drive everything here:
 //!
 //! - **Projections are opt-in.** `select` defaults to `{"key": true}`; every other
-//!   field is off unless asked for. Returning a payload nobody asked for is the
+//!   field is off unless asked for. Returning a blob nobody asked for is the
 //!   expensive mistake, so the default is the cheap one.
 //! - **Values are typed on the wire too.** An attribute reports its `type` using
 //!   the same tag the query language uses (`i32`, `u256`, `dec`, `str`, `addr`,
@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, U256};
 use arkiv_interfaces::entity::{self, AttributeValue, DECIMAL_SCALE, Entity};
 use serde::{Deserialize, Serialize};
 
@@ -48,8 +48,6 @@ pub struct Select {
     pub updated_at: Option<bool>,
     pub expires_at: Option<bool>,
     pub creation_flags: Option<bool>,
-    pub content_type: Option<bool>,
-    pub payload: Option<bool>,
     pub attribute_schema: Option<bool>,
     pub attributes: Option<AttributeSelect>,
 }
@@ -85,8 +83,6 @@ pub struct Projection {
     pub updated_at: bool,
     pub expires_at: bool,
     pub creation_flags: bool,
-    pub content_type: bool,
-    pub payload: bool,
     pub attribute_schema: bool,
     pub attributes: AttributeProjection,
 }
@@ -102,8 +98,6 @@ impl Default for Projection {
             updated_at: false,
             expires_at: false,
             creation_flags: false,
-            content_type: false,
-            payload: false,
             attribute_schema: false,
             attributes: AttributeProjection::Off,
         }
@@ -126,8 +120,6 @@ impl Projection {
             updated_at: true,
             expires_at: true,
             creation_flags: true,
-            content_type: true,
-            payload: true,
             attribute_schema: false,
             attributes: AttributeProjection::All,
         }
@@ -146,8 +138,6 @@ impl Projection {
             updated_at: select.updated_at.unwrap_or(false),
             expires_at: select.expires_at.unwrap_or(false),
             creation_flags: select.creation_flags.unwrap_or(false),
-            content_type: select.content_type.unwrap_or(false),
-            payload: select.payload.unwrap_or(false),
             attribute_schema: select.attribute_schema.unwrap_or(false),
             attributes: match &select.attributes {
                 None | Some(AttributeSelect::All(false)) => AttributeProjection::Off,
@@ -175,8 +165,6 @@ impl Projection {
             u8::from(self.updated_at),
             u8::from(self.expires_at),
             u8::from(self.creation_flags),
-            u8::from(self.content_type),
-            u8::from(self.payload),
             u8::from(self.attribute_schema),
         ];
         match &self.attributes {
@@ -197,12 +185,14 @@ impl Projection {
 
 // ── Wire types ────────────────────────────────────────────────────────
 
-/// One attribute's name and type, without its value — `select.attributeSchema`.
+/// One attribute's name, type and indexed flag, without its value —
+/// `select.attributeSchema`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaEntry {
     pub name: String,
     #[serde(rename = "type")]
     pub value_type: String,
+    pub indexed: bool,
 }
 
 /// An entity's creation flags, decoded.
@@ -230,7 +220,8 @@ impl CreationFlags {
     }
 }
 
-/// One attribute with its value — `select.attributes`.
+/// One attribute with its value — `select.attributes`. Indexed and unindexed
+/// alike; the flag is reported by [`SchemaEntry`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AttributeEntry {
     pub name: String,
@@ -278,10 +269,6 @@ pub struct EntityData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_flags: Option<CreationFlags>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribute_schema: Option<Vec<SchemaEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<Vec<AttributeEntry>>,
@@ -306,6 +293,7 @@ pub fn entity_data_from(entity: Entity, projection: &Projection) -> EntityData {
             .map(|attribute| SchemaEntry {
                 name: String::from_utf8_lossy(&attribute.key).into_owned(),
                 value_type: attribute.value.attr_type().name().to_string(),
+                indexed: attribute.indexed,
             })
             .collect()
     });
@@ -335,10 +323,6 @@ pub fn entity_data_from(entity: Entity, projection: &Projection) -> EntityData {
         creation_flags: projection
             .creation_flags
             .then(|| CreationFlags::from_flags(entity.creation_flags)),
-        content_type: projection
-            .content_type
-            .then(|| String::from_utf8_lossy(&entity.content_type).into_owned()),
-        payload: projection.payload.then(|| Bytes::from(entity.payload)),
         attribute_schema,
         attributes,
     }
@@ -472,8 +456,6 @@ mod tests {
             last_modified_at_block: 0x1bb,
             expires_at: 0x2000,
             creation_flags: entity::CreationFlags::NONE,
-            content_type: b"application/json".to_vec(),
-            payload: vec![0x7b, 0x22],
             attributes: vec![
                 Attribute::new(b"projectId".to_vec(), AttributeValue::Str("alice".into())),
                 Attribute::new(b"version".to_vec(), AttributeValue::Int(4)),
@@ -481,6 +463,7 @@ mod tests {
                     b"balance".to_vec(),
                     AttributeValue::u256_from_u64(1_000_000),
                 ),
+                Attribute::unindexed(b"body".to_vec(), AttributeValue::Bytes(vec![0x7b, 0x22])),
             ],
         }
     }
@@ -503,13 +486,10 @@ mod tests {
         let projection = select(serde_json::json!({
             "key": true, "owner": true, "creator": true,
             "createdAt": true, "updatedAt": true, "expiresAt": true,
-            "contentType": true, "payload": true,
         }));
         let json = serde_json::to_value(entity_data_from(entity(), &projection)).unwrap();
         assert_eq!(json["owner"], format!("0x{}", "33".repeat(20)));
         assert_eq!(json["creator"], format!("0x{}", "22".repeat(20)));
-        assert_eq!(json["contentType"], "application/json");
-        assert_eq!(json["payload"], "0x7b22");
         // Chain quantities are hex, like the eth_* namespace.
         assert_eq!(json["createdAt"], "0x191");
         assert_eq!(json["updatedAt"], "0x1bb");
@@ -526,9 +506,10 @@ mod tests {
         assert_eq!(
             json["attributeSchema"],
             serde_json::json!([
-                { "name": "projectId", "type": "str" },
-                { "name": "version", "type": "i32" },
-                { "name": "balance", "type": "u256" },
+                { "name": "projectId", "type": "str", "indexed": true },
+                { "name": "version", "type": "i32", "indexed": true },
+                { "name": "balance", "type": "u256", "indexed": true },
+                { "name": "body", "type": "bytes", "indexed": false },
             ])
         );
         assert!(json.get("attributes").is_none());
@@ -544,6 +525,7 @@ mod tests {
                 { "name": "projectId", "type": "str", "value": "alice" },
                 { "name": "version", "type": "i32", "value": 4 },
                 { "name": "balance", "type": "u256", "value": "0xf4240" },
+                { "name": "body", "type": "bytes", "value": "0x7b22" },
             ])
         );
     }
@@ -660,7 +642,7 @@ mod tests {
 
     #[test]
     fn an_unknown_select_field_is_rejected() {
-        let bad = serde_json::from_value::<Select>(serde_json::json!({ "payloadd": true }));
+        let bad = serde_json::from_value::<Select>(serde_json::json!({ "ownerr": true }));
         assert!(
             bad.is_err(),
             "a typo'd projection must not silently do nothing"
