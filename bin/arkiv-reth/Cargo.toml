@@ -36,9 +36,10 @@ reth-node-builder.workspace = true
 reth-storage-overlay.workspace = true
 alloy-rpc-types-engine.workspace = true
 reth-db.workspace = true
-# The node's backing store: the reference one in-process by default, Valkey
-# when ARKIV_STORE_URL names a server.
+# The node's backing store, as ARKIV_STORE_URL names it: GolemDB, or the
+# in-process reference store or Valkey when ALLOW_EXPERIMENTAL_BACKENDS=true.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
+arkiv-golemdb.workspace = true
 arkiv-valkey.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
@@ -48,6 +49,10 @@ alloy-rpc-types.workspace = true
 eyre.workspace = true
 clap.workspace = true
 tracing.workspace = true
+# `block_in_place`, to open the store outside async code.
+tokio.workspace = true
+# Reads ARKIV_STORE_URL.
+url.workspace = true
 
 [dev-dependencies]
 # The black-box tests spawn this node binary and drive it through the harness:
@@ -62,7 +67,6 @@ alloy-sol-types.workspace = true
 # TransactionRequest — the typed ArkivClient path only sends entity calls.
 alloy-network.workspace = true
 alloy-rpc-types.workspace = true
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 alloy-primitives.workspace = true

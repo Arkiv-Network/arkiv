@@ -46,6 +46,10 @@ pub const BLOCKS: &str = "blocks";
 pub const TRANSACTIONS: &str = "transactions";
 /// Receipts, named by their transaction's hash.
 pub const RECEIPTS: &str = "receipts";
+/// Every segment and how many columns its rows have, as the encoders below
+/// write them. A store that declares its segments up front, as GolemDB does,
+/// takes them from here.
+pub const ALL: [(&str, usize); 3] = [(BLOCKS, 2), (TRANSACTIONS, 3), (RECEIPTS, 1)];
 
 /// One row to append, with the segment it belongs to and the name it takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +294,23 @@ mod tests {
             success: true,
             cumulative_gas_used: 21_000,
             logs: vec![],
+        }
+    }
+
+    /// A store that declares column counts refuses a row of any other width.
+    #[test]
+    fn all_matches_what_the_encoders_write() {
+        let rows = [
+            (BLOCKS, encode_block(&Header::default(), &[])),
+            (
+                TRANSACTIONS,
+                encode_transaction(&a_transaction(), Address::ZERO, B256::ZERO),
+            ),
+            (RECEIPTS, encode_receipt(&a_receipt())),
+        ];
+        for (segment, row) in rows {
+            let declared = ALL.iter().find(|(name, _)| *name == segment);
+            assert_eq!(declared, Some(&(segment, row.len())));
         }
     }
 

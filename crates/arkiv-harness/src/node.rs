@@ -7,8 +7,9 @@
 //! datadir, so a test can prove crash recovery (state resumes after a restart).
 //!
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
-//! by default is in-process and so goes with the process — a test that wants to
-//! watch state survive a restart needs [`NodeBuilder::valkey_store`].
+//! by default is the in-process one (`memory://`) and so goes with the process —
+//! a test that wants to watch state survive a restart needs
+//! [`NodeBuilder::valkey_store`] or [`NodeBuilder::golemdb_store`].
 
 use std::fs::File;
 use std::net::TcpListener;
@@ -49,6 +50,8 @@ pub struct NodeBuilder {
     /// The Valkey server and namespace holding this node's Arkiv state, when it
     /// is not the default in-process store. Erased when the [`Node`] drops.
     store: Option<(String, String)>,
+    /// Whether this node's Arkiv state is in GolemDB, inside its datadir.
+    golemdb: bool,
 }
 
 impl NodeBuilder {
@@ -64,6 +67,7 @@ impl NodeBuilder {
             extra_args: Vec::new(),
             env: Vec::new(),
             store: None,
+            golemdb: false,
         }
     }
 
@@ -137,8 +141,21 @@ impl NodeBuilder {
             .env("ARKIV_STORE_NAMESPACE", namespace)
     }
 
+    /// Put the node's Arkiv state in GolemDB, in a directory inside its datadir.
+    ///
+    /// Like a Valkey store it survives a kill and a restart, but it needs no
+    /// server, and it goes with the datadir when the [`Node`] drops.
+    pub fn golemdb_store(mut self) -> Self {
+        self.golemdb = true;
+        self
+    }
+
     /// Launch the node.
     pub fn spawn(self) -> Node {
+        assert!(
+            !(self.golemdb && self.env.iter().any(|(key, _)| key == "ARKIV_STORE_URL")),
+            "golemdb_store() and another ARKIV_STORE_URL: a node has one store",
+        );
         Node::start(self)
     }
 }
@@ -226,7 +243,23 @@ impl Node {
             "--ipcdisable",
         ]);
         cmd.args(&self.config.extra_args);
+        // The node refuses to start without a store, and runs on anything but
+        // GolemDB only when allowed. Tests run on the in-process store unless
+        // the test process names another, as the suite pointed at a Valkey does.
+        if std::env::var_os("ARKIV_STORE_URL").is_none() {
+            cmd.env("ARKIV_STORE_URL", "memory://");
+        }
+        cmd.env("ALLOW_EXPERIMENTAL_BACKENDS", "true");
         cmd.envs(self.config.env.iter().map(|(k, v)| (k, v)));
+        if self.config.golemdb {
+            let directory = self.datadir.join("golemdb");
+            cmd.env(
+                "ARKIV_STORE_URL",
+                format!("golemdb://{}", directory.display()),
+            )
+            // GolemDB needs no permission, so run it as production does.
+            .env_remove("ALLOW_EXPERIMENTAL_BACKENDS");
+        }
         // An escape hatch for diagnosing a node under test: extra flags without
         // editing the test that spawns it. Used for raising the log filter when
         // a run's behaviour, not its assertions, is the thing in question.

@@ -941,11 +941,17 @@ pub trait StoreExt: Store {
     /// store-side rather than in a host map that could disagree after a crash.
     fn commit_tagged(&self, root: BranchId, tag: [u8; 32]) -> Result<CommitId, StoreError>;
 
-    /// **\[ext R1\]** Resolve a tag back to its commit, if still retained.
+    /// **\[ext R1\]** Resolve a tag back to its commit.
+    ///
+    /// A store may keep tags longer than state, as it keeps a commit's segment
+    /// rows: GolemDB answers for every commit but holds only the head's state.
+    /// A host that reads state at the commit checks [`retention`](Self::retention)
+    /// first.
     fn commit_by_tag(&self, tag: [u8; 32]) -> Result<Option<CommitId>, StoreError>;
 
-    /// **\[ext R1\]** The tag a commit was committed under, if it had one and
-    /// is still retained.
+    /// **\[ext R1\]** The tag a commit was committed under, if it had one. Like
+    /// [`commit_by_tag`](Self::commit_by_tag), it may answer for a commit whose
+    /// state is gone.
     ///
     /// The inverse of [`commit_by_tag`](Self::commit_by_tag). reth asks the
     /// other way round too — `block_hash(number)` is a `BlockHashReader`
@@ -981,7 +987,8 @@ pub trait StoreExt: Store {
     /// validate a peer's block and to re-derive a historical root.
     fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError>;
 
-    /// **\[ext\]** The retention window, oldest first.
+    /// **\[ext\]** The retention window, oldest first: the commits whose state
+    /// can still be read.
     ///
     /// A host must choose between a latest-state and a historical-state
     /// provider per request; without this it discovers unavailability by

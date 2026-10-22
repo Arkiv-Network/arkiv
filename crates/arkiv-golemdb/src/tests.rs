@@ -191,9 +191,18 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
     assert!(read(&store, ReadTarget::Commit(head), 1).is_ok());
     drop(store);
 
-    let mut other = config();
-    other.cell_limits.max_str_len += 1;
-    assert!(GolemDbStore::open(dir.path(), &other).is_err());
+    let mut limits = config();
+    limits.cell_limits.max_str_len += 1;
+    let mut segments = config();
+    segments.segments[0].columns += 1;
+    let mut hash = config();
+    hash.hash_function = HashAlgorithm::Blake3;
+    for other in [limits, segments, hash] {
+        assert!(matches!(
+            GolemDbStore::open(dir.path(), &other),
+            Err(OpenError::GenesisMismatch)
+        ));
+    }
 }
 
 /// Create record `n`, patch record `n - 1` and commit, as a block would.
