@@ -58,7 +58,6 @@ fn cell_name(key: &AnnotKey) -> CellName {
                 BuiltIn::Creator => annotations::CREATOR,
                 BuiltIn::Key => annotations::KEY,
                 BuiltIn::ExpiresAt => annotations::EXPIRES_AT,
-                BuiltIn::CreatedAt => annotations::CREATED_AT,
             };
             // The constants are ASCII literals in this crate's own source; a
             // non-UTF-8 one would be a compile-time typo, not a runtime input.

@@ -21,7 +21,7 @@
 //! | `$key`                | attribute | `KEY`    | `key`            |
 //! | `$creator`            | attribute | `ADDR`   | `creator`        |
 //! | `$owner`              | attribute | `ADDR`   | `owner`          |
-//! | `$createdAt`          | attribute | `U64`    | `created_at`     |
+//! | `$createdAt`          | **field** | `U64`    | `created_at`     |
 //! | `$expiresAt`          | attribute | `U64`    | `expires_at`     |
 //! | `$updatedAt`          | **field** | `U64`    | `updated_at`     |
 //! | `$creationFlags`      | **field** | `BYTES`* | `creation_flags` |
@@ -109,7 +109,7 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         ),
         (
             system(annotations::CREATED_AT),
-            Cell::attribute(TypeId::U64, entity.created_at.to_be_bytes().to_vec()),
+            Cell::field(TypeId::U64, entity.created_at.to_be_bytes().to_vec()),
         ),
         (
             system(annotations::EXPIRES_AT),
@@ -310,7 +310,6 @@ mod tests {
             annotations::KEY,
             annotations::CREATOR,
             annotations::OWNER,
-            annotations::CREATED_AT,
             annotations::EXPIRES_AT,
         ] {
             let name = core::str::from_utf8(name).unwrap();
@@ -318,6 +317,24 @@ mod tests {
                 .cell(name)
                 .unwrap_or_else(|| panic!("{name} missing"));
             assert_eq!(cell.kind, CellKind::Attribute, "{name} must be queryable");
+        }
+    }
+
+    #[test]
+    fn every_projection_only_system_cell_is_a_field() {
+        // The API spec returns these but does not query them; an attribute would
+        // pay for an index nothing can use.
+        let record = as_record(&sample());
+        for name in [
+            annotations::CREATED_AT,
+            annotations::UPDATED_AT,
+            annotations::CREATION_FLAGS,
+        ] {
+            let name = core::str::from_utf8(name).unwrap();
+            let cell = record
+                .cell(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(cell.kind, CellKind::Field, "{name} must not be indexed");
         }
     }
 

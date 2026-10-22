@@ -70,8 +70,6 @@ pub enum BuiltIn {
     Key,
     /// `$expiresAt` — the expiry block.
     ExpiresAt,
-    /// `$createdAt` — the creation block.
-    CreatedAt,
 }
 
 /// A value a predicate compares against.
