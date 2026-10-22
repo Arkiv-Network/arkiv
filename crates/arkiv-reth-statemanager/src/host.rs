@@ -665,6 +665,7 @@ impl BlockSeals {
                     let _ = store.discard(branch);
                     return Err(error.into());
                 }
+                slow_commit_for_repro(height);
                 // Tagged with the block hash, which is how a historical read
                 // finds the commit for a past block.
                 Ok(Some(store.commit_tagged(branch, block_hash)?))
@@ -677,6 +678,21 @@ impl BlockSeals {
     pub fn abandon(store: &HostStore, branch: BranchId) {
         let _ = store.discard(branch);
     }
+}
+
+/// REPRO: hold up the commit of block `ARKIV_DEBUG_SLOW_COMMIT_HEIGHT` for
+/// `ARKIV_DEBUG_SLOW_COMMIT_MS` (default 2000), standing in for a GolemDB
+/// commit that outlasts the block time, as a slow fsync does on real disks.
+/// Does nothing unless the variable is set. `scripts/repro/golemdb_slow_commit.py`
+/// drives it.
+fn slow_commit_for_repro(height: u64) {
+    let number = |name| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    if number("ARKIV_DEBUG_SLOW_COMMIT_HEIGHT") != Some(height) {
+        return;
+    }
+    let ms = number("ARKIV_DEBUG_SLOW_COMMIT_MS").unwrap_or(2000);
+    tracing::warn!(target: "arkiv-reth", height, ms, "slow commit for repro: delaying this block's commit");
+    std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
 #[cfg(test)]
