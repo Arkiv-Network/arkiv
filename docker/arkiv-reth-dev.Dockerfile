@@ -10,8 +10,14 @@
 # across the arkiv-reth, arkiv-committer and arkiv-reth-dev Dockerfiles, so all
 # builds resolve to the same layer digests and share one dependency
 # compilation. Edit them in lockstep.
-FROM rust:1.97-slim-bookworm AS chef
+FROM rust:1.97-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS chef
 WORKDIR /build
+
+# Crates are fetched over TLS, so the trust store comes from the current
+# Debian security release rather than the one baked into the base image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Native deps for the reth/alloy stack: libclang for bindgen (reth-mdbx-sys),
 # plus clang/cmake/git/build-essential (also covers zstd-sys' bundled libzstd).
@@ -48,7 +54,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi
     cargo build --release --locked --bin arkiv-reth --bin arkiv-cli
 
 # ---- runtime ----
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
