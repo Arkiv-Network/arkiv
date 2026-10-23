@@ -352,10 +352,6 @@ fn bare_str_value(
     position: usize,
 ) -> Result<AnnotVal, ParseError> {
     match key {
-        AnnotKey::BuiltIn(BuiltIn::ContentType) => {
-            literal::validate_str_len(&content, position)?;
-            Ok(AttributeValue::Str(content))
-        }
         AnnotKey::BuiltIn(BuiltIn::Owner | BuiltIn::Creator) => {
             literal::parse_addr(&content, position).map(AttributeValue::EthereumAddress)
         }
@@ -384,7 +380,6 @@ fn builtin_type(field: BuiltIn) -> AttributeType {
         BuiltIn::Owner | BuiltIn::Creator => AttributeType::EthereumAddress,
         BuiltIn::Key => AttributeType::EntityKey,
         BuiltIn::ExpiresAt | BuiltIn::CreatedAt => AttributeType::U64,
-        BuiltIn::ContentType => AttributeType::Str,
     }
 }
 
@@ -473,7 +468,6 @@ fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError>
         "key" => Ok(BuiltIn::Key),
         "expiresAt" => Ok(BuiltIn::ExpiresAt),
         "createdAt" => Ok(BuiltIn::CreatedAt),
-        "contentType" => Ok(BuiltIn::ContentType),
 
         "updatedAt" => Err(ParseError::type_error(
             position,
@@ -483,9 +477,12 @@ fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError>
             position,
             "$creationFlags is not queryable — it is returned by projections only",
         )),
-        "payload" => Err(ParseError::type_error(
+        "payload" | "contentType" => Err(ParseError::type_error(
             position,
-            "$payload is not queryable — bytes values carry no index",
+            alloc::format!(
+                "${name} is no longer a system attribute — content type and payload are \
+                 ordinary user attributes now; query yours by its own name, unprefixed"
+            ),
         )),
 
         // The pre-spec spellings, named so an old query says what to change.
@@ -502,7 +499,7 @@ fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError>
             position,
             alloc::format!(
                 "unknown system attribute ${name} — expected $key, $owner, $creator, \
-                 $expiresAt, $createdAt or $contentType"
+                 $expiresAt or $createdAt"
             ),
         )),
     }
@@ -737,13 +734,6 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            parse("$contentType = str('text/plain')").unwrap(),
-            Query::Eq {
-                key: built_in(BuiltIn::ContentType),
-                value: AttributeValue::Str("text/plain".into()),
-            }
-        );
     }
 
     /// The block heights are `u64`, so they must be tagged — the one place the
@@ -801,10 +791,6 @@ mod tests {
             parse(&format!("$key = '{}'", word_hex("ab"))).unwrap(),
             parse(&format!("$key = key({})", word_hex("ab"))).unwrap(),
         );
-        assert_eq!(
-            parse("$contentType = 'text/plain'").unwrap(),
-            parse("$contentType = str('text/plain')").unwrap(),
-        );
     }
 
     #[test]
@@ -814,7 +800,6 @@ mod tests {
             kind_of("$expiresAt = str('soon')"),
             ParseErrorKind::TypeError
         );
-        assert_eq!(kind_of("$contentType = i32(1)"), ParseErrorKind::TypeError);
         assert_eq!(kind_of("$key = true"), ParseErrorKind::TypeError);
     }
 
@@ -823,7 +808,8 @@ mod tests {
         for (query, hint) in [
             ("$updatedAt > 1", "projections only"),
             ("$creationFlags = true", "projections only"),
-            ("$payload = str('x')", "no index"),
+            ("$payload = str('x')", "user attributes now"),
+            ("$contentType = str('x')", "user attributes now"),
             ("$expiration > 1", "$expiresAt"),
             ("$createdAtBlock > 1", "$createdAt"),
             ("$nope = true", "unknown system attribute"),

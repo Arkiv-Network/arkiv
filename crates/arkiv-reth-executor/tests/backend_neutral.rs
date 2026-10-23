@@ -41,12 +41,16 @@ fn create(key: u8) -> Op {
         key: [key; 32],
         expires_at: 100,
         creation_flags: CreationFlags::NONE,
-        content_type: b"text/plain".to_vec(),
-        payload: vec![key],
-        attributes: vec![arkiv_interfaces::entity::Attribute::new(
-            b"level".to_vec(),
-            AttributeValue::Int(i32::from(key)),
-        )],
+        attributes: vec![
+            arkiv_interfaces::entity::Attribute::unindexed(
+                b"body".to_vec(),
+                arkiv_interfaces::entity::AttributeValue::Bytes(vec![key]),
+            ),
+            arkiv_interfaces::entity::Attribute::new(
+                b"level".to_vec(),
+                AttributeValue::Int(i32::from(key)),
+            ),
+        ],
     }
 }
 
@@ -72,14 +76,14 @@ fn a_batch_runs_against_golemdb_and_lands_in_the_store() {
     assert_eq!(deltas.len(), 2, "one net delta per created entity");
 
     // Every created entity is readable back through the overlay, with the
-    // payload the op carried.
+    // attributes the op carried — the unindexed blob and the indexed level.
     for delta in &deltas {
         let entity = view
             .get_entity(delta.entity, ReadMode::ViewWithOverlay)
             .expect("read")
             .expect("the entity exists");
         assert_eq!(entity.owner, ALICE);
-        assert_eq!(entity.attributes.len(), 1);
+        assert_eq!(entity.attributes.len(), 2);
     }
 
     // And the view still commits and graduates, so the batch left it usable.

@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use std::collections::BTreeMap;
 
 use arkiv_interfaces::constants::ENTITY_MAX_ATTRIBUTES;
-use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity, annotations};
+use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity};
 use arkiv_interfaces::execution::{
     AttributeMutation, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
     TransactionExecutor,
@@ -171,8 +171,6 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                 key,
                 expires_at,
                 creation_flags,
-                content_type,
-                payload,
                 attributes,
             } => {
                 if self.current(state, overlay, *key)?.is_some() {
@@ -186,8 +184,6 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     last_modified_at_block: env.block_number,
                     expires_at: *expires_at,
                     creation_flags: *creation_flags,
-                    content_type: content_type.clone(),
-                    payload: payload.clone(),
                     attributes: attributes.clone(),
                 };
                 overlay.insert(*key, Some(entity));
@@ -405,8 +401,6 @@ fn updates_between(
                     .then_some(a.last_modified_at_block),
                 expires_at: (b.expires_at != a.expires_at).then_some(a.expires_at),
                 creation_flags: (b.creation_flags != a.creation_flags).then_some(a.creation_flags),
-                content_type: (b.content_type != a.content_type).then(|| a.content_type.clone()),
-                payload: (b.payload != a.payload).then(|| a.payload.clone()),
                 attributes: (b.attributes != a.attributes).then(|| a.attributes.clone()),
             };
             (updates
@@ -438,30 +432,26 @@ impl Auth {
     }
 }
 
-/// Set some attributes, unset others, leave the rest untouched. `$payload` and
-/// `$contentType` route to the entity's own fields; every other `$` name was
-/// rejected at decode.
+/// Set some attributes, unset others, leave the rest untouched. Every `$` name
+/// was rejected at decode.
 fn apply_mutations(entity: &mut Entity, mutations: &[AttributeMutation]) {
     for m in mutations {
-        match m.key.as_slice() {
-            annotations::PAYLOAD => {
-                entity.payload = m.value.as_ref().map(|v| v.encode()).unwrap_or_default()
+        let name = m.key.as_slice();
+        match &m.value {
+            Some(value) => {
+                let set = Attribute {
+                    key: name.to_vec(),
+                    value: value.clone(),
+                    indexed: m.indexed,
+                };
+                match entity.attributes.iter_mut().find(|a| a.key == name) {
+                    // A set replaces the attribute whole: value, type and indexed flag.
+                    Some(existing) => *existing = set,
+                    None => entity.attributes.push(set),
+                }
             }
-            annotations::CONTENT_TYPE => {
-                entity.content_type = m.value.as_ref().map(|v| v.encode()).unwrap_or_default()
-            }
-            name => match &m.value {
-                Some(value) => match entity.attributes.iter_mut().find(|a| a.key == name) {
-                    // A set replaces the value *and* its type.
-                    Some(existing) => existing.value = value.clone(),
-                    None => entity.attributes.push(Attribute {
-                        key: name.to_vec(),
-                        value: value.clone(),
-                    }),
-                },
-                // Unsetting an unset attribute is a no-op, not an error.
-                None => entity.attributes.retain(|a| a.key != name),
-            },
+            // Unsetting an unset attribute is a no-op, not an error.
+            None => entity.attributes.retain(|a| a.key != name),
         }
     }
     // The stored order is canonical, and a push above may have broken it.
@@ -578,8 +568,6 @@ mod tests {
             last_modified_at_block: 4,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
-            content_type: b"text/plain".to_vec(),
-            payload: b"hello".to_vec(),
             attributes: vec![
                 Attribute::new(b"color".to_vec(), AttributeValue::Str("blue".into())),
                 Attribute::new(b"size".to_vec(), AttributeValue::u256_from_u64(1)),
@@ -603,8 +591,6 @@ mod tests {
                     key: [1u8; 32],
                     expires_at: 50,
                     creation_flags: CreationFlags::NONE,
-                    content_type: b"x".to_vec(),
-                    payload: b"y".to_vec(),
                     attributes: Vec::new(),
                 }],
             )
@@ -640,8 +626,6 @@ mod tests {
                     key: [1u8; 32],
                     expires_at: 50,
                     creation_flags: CreationFlags::NONE,
-                    content_type: Vec::new(),
-                    payload: Vec::new(),
                     attributes: Vec::new(),
                 }],
             )
@@ -689,7 +673,6 @@ mod tests {
         let deltas = view.get_uncommitted_deltas().unwrap();
         assert_eq!(deltas.len(), 1);
         assert!(deltas[0].owner.is_some());
-        assert!(deltas[0].payload.is_none());
         assert!(deltas[0].attributes.is_none());
     }
 
@@ -787,8 +770,6 @@ mod tests {
                         key: [3u8; 32],
                         expires_at: 50,
                         creation_flags: CreationFlags::NONE,
-                        content_type: Vec::new(),
-                        payload: Vec::new(),
                         attributes: Vec::new(),
                     },
                     Op::Delete { key: [3u8; 32] },
@@ -836,13 +817,13 @@ mod tests {
                 &[Op::Patch {
                     key: [7u8; 32],
                     mutations: vec![
-                        AttributeMutation::set(
-                            annotations::CONTENT_TYPE,
-                            AttributeValue::Str("application/json".into()),
-                        ),
-                        AttributeMutation::set(
-                            annotations::PAYLOAD,
+                        AttributeMutation::set_unindexed(
+                            b"body".to_vec(),
                             AttributeValue::Bytes(b"world".to_vec()),
+                        ),
+                        AttributeMutation::set_unindexed(
+                            b"mimeType".to_vec(),
+                            AttributeValue::Str("application/json".into()),
                         ),
                     ],
                 }],
@@ -851,9 +832,19 @@ mod tests {
 
         assert_eq!(out.status, ExecStatus::Ok);
         let e = staged(&view, [7u8; 32]).unwrap();
-        assert_eq!(e.content_type, b"application/json");
-        assert_eq!(e.payload, b"world");
-        assert_eq!(e.attributes.len(), 2, "unmentioned attributes survive");
+        assert_eq!(
+            e.attributes,
+            vec![
+                Attribute::unindexed(b"body".to_vec(), AttributeValue::Bytes(b"world".to_vec())),
+                Attribute::new(b"color".to_vec(), AttributeValue::Str("blue".into())),
+                Attribute::unindexed(
+                    b"mimeType".to_vec(),
+                    AttributeValue::Str("application/json".into())
+                ),
+                Attribute::new(b"size".to_vec(), AttributeValue::u256_from_u64(1)),
+            ],
+            "unmentioned attributes survive, the new ones land sorted"
+        );
         assert_eq!(e.last_modified_at_block, 20);
         assert_eq!(e.creator, [1u8; 20]);
         assert_eq!(e.owner, [2u8; 20]);
@@ -861,8 +852,7 @@ mod tests {
         assert_eq!(e.expires_at, 100);
 
         let deltas = view.get_uncommitted_deltas().unwrap();
-        assert!(deltas[0].content_type.is_some());
-        assert!(deltas[0].payload.is_some());
+        assert!(deltas[0].attributes.is_some());
         assert!(deltas[0].owner.is_none());
         assert!(deltas[0].expires_at.is_none());
     }
@@ -888,6 +878,33 @@ mod tests {
         assert_eq!(e.attributes[0].key, b"size");
     }
 
+    /// A set replaces the attribute whole, indexed flag included — so the same
+    /// value can be moved out of (and back into) the index.
+    #[test]
+    fn patch_can_flip_the_indexed_flag() {
+        let exec = ArkivExecutor::<View>::new();
+        let mut view = seeded_view(&[sample_entity()]);
+        let blue = AttributeValue::Str("blue".into());
+
+        exec.apply(
+            &env([2u8; 20], 20),
+            &mut view,
+            &[Op::Patch {
+                key: [7u8; 32],
+                mutations: vec![AttributeMutation::set_unindexed(
+                    b"color".to_vec(),
+                    blue.clone(),
+                )],
+            }],
+        )
+        .unwrap();
+        let e = staged(&view, [7u8; 32]).unwrap();
+        assert_eq!(
+            e.attributes[0],
+            Attribute::unindexed(b"color".to_vec(), blue)
+        );
+    }
+
     #[test]
     fn patches_cannot_exceed_the_entity_attribute_limit() {
         let exec = ArkivExecutor::<View>::new();
@@ -910,8 +927,6 @@ mod tests {
             key,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
-            content_type: Vec::new(),
-            payload: Vec::new(),
             attributes: Vec::new(),
         }];
         for start in (0..ENTITY_MAX_ATTRIBUTES).step_by(OP_MAX_ATTRIBUTES) {
@@ -1004,8 +1019,6 @@ mod tests {
             key: [1u8; 32],
             expires_at: 50,
             creation_flags: CreationFlags::NONE,
-            content_type: Vec::new(),
-            payload: Vec::new(),
             attributes: Vec::new(),
         };
         let cost = PlaceholderCost.op_cost(&create);
@@ -1033,8 +1046,6 @@ mod tests {
             key: [1u8; 32],
             expires_at: 50,
             creation_flags: CreationFlags::NONE,
-            content_type: Vec::new(),
-            payload: Vec::new(),
             attributes: Vec::new(),
         };
         let cost = PlaceholderCost.op_cost(&create);

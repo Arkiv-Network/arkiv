@@ -41,7 +41,7 @@ pub enum LowerError {
     /// Disjunctive normal form would exceed [`MAX_GROUPS`] groups.
     TooManyGroups,
     /// The value's type is never indexed, so no predicate can match it. Today that
-    /// is only `$payload`, which the language does not expose as a filter key.
+    /// is only `bytes`, which has no literal in the language.
     NotIndexable,
 }
 
@@ -60,7 +60,6 @@ fn cell_name(key: &AnnotKey) -> CellName {
                 BuiltIn::Key => annotations::KEY,
                 BuiltIn::ExpiresAt => annotations::EXPIRATION,
                 BuiltIn::CreatedAt => annotations::CREATED_AT_BLOCK,
-                BuiltIn::ContentType => annotations::CONTENT_TYPE,
             };
             // The constants are ASCII literals in this crate's own source; a
             // non-UTF-8 one would be a compile-time typo, not a runtime input.
@@ -82,7 +81,7 @@ const fn type_id(value: &AttributeValue) -> Result<TypeId, LowerError> {
         AttributeValue::EthereumAddress(_) => TypeId::ADDR,
         AttributeValue::EntityKey(_) => TypeId::KEY,
         // `bytes` is field-only: it has no index, so a predicate over it can never
-        // be answered. The language does not expose `$payload` as a filter key, so
+        // be answered. The language has no `bytes` literal, so
         // this is unreachable today -- but it is a type error, not a panic.
         AttributeValue::Bytes(_) => return Err(LowerError::NotIndexable),
     })

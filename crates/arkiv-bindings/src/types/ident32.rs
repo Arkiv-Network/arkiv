@@ -60,10 +60,10 @@ pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> 
     Ok(())
 }
 
-/// Validate a **system** attribute name (`$payload`, `$contentType`).
+/// Validate a **system** attribute name (`$owner`, `$expiration`, …).
 ///
-/// System names use a separate namespace with a leading `$`.
-/// The caller checks writable names against `annotations::USER_MANAGED`.
+/// System names use a separate namespace with a leading `$`, and the engine
+/// owns all of them: a client triple naming one reverts.
 ///
 /// So this enforces only what the encoding itself needs: a leading `$`, a
 /// non-empty remainder, and contiguous null padding (no bytes after the
@@ -107,9 +107,10 @@ impl Ident32 {
         Self(word)
     }
 
-    /// Encode a **system** attribute name (leading `$`), for callers building
-    /// `$payload` / `$contentType` triples. [`Ident32::encode`] rejects these
-    /// by design — its leading-byte charset is `A-Z a-z`.
+    /// Encode a **system** attribute name (leading `$`). No client may write
+    /// one — this exists to build the triples the engine must reject.
+    /// [`Ident32::encode`] refuses these by design — its leading-byte charset
+    /// is `A-Z a-z`.
     pub fn system(s: &str) -> Result<Self> {
         let bytes = s.as_bytes();
         if bytes.len() > 32 {
