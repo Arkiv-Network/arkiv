@@ -95,10 +95,9 @@ fn matching<S: Store>(
 ) -> Result<Vec<EntityAddress>, IndexError> {
     let query = Query {
         filter: Filter(vec![group]),
+        // No sort: GolemDB cannot sort yet, so the addresses are put in order
+        // below instead.
         sort: None,
-        // No sort: the store's documented tie-break is ascending record key, and an
-        // entity's record key *is* its address, so that is already the order the
-        // index traits promise.
         page: Page {
             offset: 0,
             limit: MAX_RESULTS + 1,
@@ -110,7 +109,7 @@ fn matching<S: Store>(
     if records.len() as u64 > MAX_RESULTS {
         return Err(IndexError::ResultTruncated);
     }
-    records
+    let mut addresses = records
         .into_iter()
         .map(|record| {
             record
@@ -118,7 +117,12 @@ fn matching<S: Store>(
                 .and_then(|cell| cell.value.as_slice().try_into().ok())
                 .ok_or(IndexError::MissingKey)
         })
-        .collect()
+        .collect::<Result<Vec<EntityAddress>, _>>()?;
+    // The store's own order need not be key order: GolemDB's is the order the
+    // entities were created in. An entity's record key is its address, so
+    // sorting the addresses is what gives the order the index traits promise.
+    addresses.sort_unstable();
+    Ok(addresses)
 }
 
 /// The cell holding an entity's own address.
@@ -411,9 +415,9 @@ mod tests {
 
     #[test]
     fn results_come_back_in_ascending_entity_order() {
-        // The index traits promise ascending entity order, and this relies on the
-        // store's tie-break being ascending record key plus an entity's record key
-        // being its address. Assert it rather than assume the chain holds.
+        // The index traits promise ascending entity order, which the lookup sorts
+        // into rather than taking the store's own order: written out of order,
+        // so a store answering in creation order would show it.
         let (store, at) = stored(&[entity(3, 1, "c"), entity(1, 1, "a"), entity(2, 1, "b")]);
         let indices = StoreIndices::new(&store, at);
         let hits = indices

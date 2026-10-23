@@ -36,7 +36,7 @@ pub use golemdb_api::{CellLimits, HashAlgorithm, OpenError};
 use convert::{
     arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
     golemdb_commit, immutable_data_address, immutable_data_key, immutable_data_row, metered,
-    query_op, record_key, segment_row, store_error,
+    metered_result, query_op, record_key, segment_row, store_error,
 };
 use tags::TagRow;
 
@@ -289,11 +289,8 @@ impl Store for GolemDbStore {
                 CellKind::Field => operation.field(name, value),
             };
         }
-        self.database
-            .create(branch_id(branch), operation)
-            .into_result()
+        metered_result(self.database.create(branch_id(branch), operation))
             .map(|key| metered(RecordKey(key.0)))
-            .map_err(store_error)
     }
 
     fn get(
@@ -311,10 +308,10 @@ impl Store for GolemDbStore {
         if let Some(names) = projection {
             operation = operation.only(names.iter().map(String::as_bytes));
         }
-        match self.database.get(target, operation).into_result() {
+        match metered_result(self.database.get(target, operation)) {
             Ok(record) => Ok(metered(Some(arkiv_record(&record)?))),
-            Err(ApiError::NotFound) => Ok(metered(None)),
-            Err(error) => Err(store_error(error)),
+            Err(StoreError::NotFound) => Ok(metered(None)),
+            Err(error) => Err(error),
         }
     }
 
@@ -333,15 +330,23 @@ impl Store for GolemDbStore {
         let mut operation = golemdb::RecordOp::patch(record_key(key), golemdb_budget(budget));
         for (name, change) in &changes {
             operation = match change {
-                CellChange::Set(cell) => operation.set(name, golemdb_cell(cell)?),
+                // A write, as in `create`, not GolemDB's `set`: `set` only
+                // replaces a cell the record already holds, and keeps its
+                // stored kind. Arkiv's `Set` adds a missing cell, which the
+                // account and entity paths rely on, and gives it the kind it
+                // names, which is how an attribute becomes indexed.
+                CellChange::Set(cell) => {
+                    let value = golemdb_cell(cell)?;
+                    match cell.kind {
+                        CellKind::Attribute => operation.attribute(name, value),
+                        CellKind::Field => operation.field(name, value),
+                    }
+                }
                 CellChange::Remove => operation.remove(name),
             };
         }
-        self.database
-            .patch(branch_id(branch), operation)
-            .into_result()
+        metered_result(self.database.patch(branch_id(branch), operation))
             .map(|()| metered(RecordVersion(0)))
-            .map_err(store_error)
     }
 
     fn delete(
@@ -354,30 +359,28 @@ impl Store for GolemDbStore {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
         }
-        self.database
-            .delete(
-                branch_id(branch),
-                golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
-            )
-            .into_result()
-            .map(metered)
-            .map_err(store_error)
+        metered_result(self.database.delete(
+            branch_id(branch),
+            golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
+        ))
+        .map(metered)
     }
 
     /// The query runs as converted, so what GolemDB cannot run yet is
-    /// `NotImplemented`: a negated predicate, and a sort. Paging runs, within
-    /// GolemDB's own query limit, over which a page is `LimitExceeded`.
+    /// `NotImplemented`: a negated predicate, a presence test for `key`, and a
+    /// sort. Matches come in GolemDB's own order, the order the records were
+    /// created in, and paging runs over that order within GolemDB's own query
+    /// limit, over which a page is `LimitExceeded`.
     fn query(
         &self,
         at: Option<CommitId>,
         query: &Query,
         budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
-        let page = self
-            .database
-            .query(at.map(golemdb_commit), query_op(query, budget)?)
-            .into_result()
-            .map_err(store_error)?;
+        let page = metered_result(
+            self.database
+                .query(at.map(golemdb_commit), query_op(query, budget)?),
+        )?;
         arkiv_query_result(&page).map(metered)
     }
 
@@ -389,11 +392,11 @@ impl Store for GolemDbStore {
         filter: &Filter,
         budget: Option<Budget>,
     ) -> Result<Metered<u64>, StoreError> {
-        self.database
-            .count(at.map(golemdb_commit), count_op(filter, budget)?)
-            .into_result()
-            .map(metered)
-            .map_err(store_error)
+        metered_result(
+            self.database
+                .count(at.map(golemdb_commit), count_op(filter, budget)?),
+        )
+        .map(metered)
     }
 
     /// A constant. The one production caller discards it, and GolemDB has no

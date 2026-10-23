@@ -2,8 +2,8 @@
 
 use arkiv_interfaces::entity::annotations;
 use arkiv_interfaces::store::{
-    BranchId, Cell, CellKind, CommitId, Metered, Receipt, Record, RecordKey, RecordVersion,
-    SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
+    BranchId, Cell, CellKind, CommitId, CostUnits, Metered, Receipt, Record, RecordKey,
+    RecordVersion, SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
 };
 use golemdb_api as golemdb;
 use golemdb_api::{ApiError, CellType, FloatWidth, Width};
@@ -24,11 +24,19 @@ pub(crate) fn metered<T>(value: T) -> Metered<T> {
 pub(crate) fn store_error(error: ApiError) -> StoreError {
     match error {
         ApiError::NotImplemented { .. } => StoreError::NotImplemented,
-        ApiError::NotFound => StoreError::NotFound,
+        // A missing cell comes only from GolemDB's `set`, which `patch` does
+        // not use: its writes create a cell that is missing.
+        ApiError::NotFound | ApiError::CellNotFound { .. } => StoreError::NotFound,
         ApiError::AlreadyExists => StoreError::AlreadyExists,
         ApiError::Reserved | ApiError::InvalidArgument { .. } => StoreError::InvalidArgument,
         ApiError::InvalidQuery { .. } => StoreError::InvalidQuery,
         ApiError::LimitExceeded { .. } => StoreError::LimitExceeded,
+        // A verdict on the call, not a machine failure. What it spent is on the
+        // receipt, which only a metered call has, and `metered_result` reads it
+        // there; with no receipt, nothing is reported spent.
+        ApiError::OutOfBudget { .. } => StoreError::OutOfBudget {
+            spent: CostUnits::default(),
+        },
         ApiError::HandleInvalid
         | ApiError::Conflict
         | ApiError::Sealed
@@ -39,6 +47,19 @@ pub(crate) fn store_error(error: ApiError) -> StoreError {
         // error GolemDB adds later is a machine failure until it is mapped.
         _ => StoreError::Internal,
     }
+}
+
+/// A metered call's result, its receipt dropped as GolemDB prices no work yet.
+/// Running out of budget is the exception: GolemDB reports what was spent by
+/// then on the receipt rather than in the error, so it is taken from there.
+pub(crate) fn metered_result<T>(metered: golemdb::Metered<T>) -> Result<T, StoreError> {
+    let golemdb::Metered { result, receipt } = metered;
+    result.map_err(|error| match error {
+        ApiError::OutOfBudget { .. } => StoreError::OutOfBudget {
+            spent: CostUnits(receipt.cost),
+        },
+        error => store_error(error),
+    })
 }
 
 pub(crate) fn branch_id(branch: BranchId) -> golemdb::BranchId {

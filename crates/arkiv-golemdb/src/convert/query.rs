@@ -7,9 +7,10 @@
 //! the adapter reports what GolemDB lacks:
 //!
 //! - a negated predicate: GolemDB has no NOT;
+//! - a presence test for `key`: GolemDB stores a `key` as the 32 fixed bytes
+//!   a `bytes32` is, so it cannot tell the two apart;
 //! - a sort on a cell the filter does not hold to one type: a GolemDB sort
 //!   names one.
-
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
@@ -172,8 +173,8 @@ fn equalities_on_one_cell(filter: &Filter) -> Result<Option<golemdb::Filter>, St
 type Equality<'a> = (&'a str, TypeId, &'a [u8]);
 
 /// One predicate as a leaf. GolemDB has no NOT, so a negated predicate has
-/// none. `KEY` and `BYTES32` are one GolemDB type, so a leaf of either matches
-/// both.
+/// none. `KEY` and `BYTES32` are one GolemDB type, so a comparison leaf of
+/// either matches both, and a presence test for `KEY` has none.
 fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
     if predicate.negated {
         return Err(StoreError::NotImplemented);
@@ -184,6 +185,11 @@ fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
         // type the same way: none for any, one for exactly that.
         Test::Exists { type_id } => {
             let ty = match type_id {
+                // `typeof(attr) = key` would also answer every `bytes32`
+                // holder. A `key` attribute reads back from GolemDB as a
+                // `bytes32` anyway, so `typeof(attr) = bytes32` is the one
+                // GolemDB answers, and it finds both.
+                Some(TypeId::KEY) => return Err(StoreError::NotImplemented),
                 // Two conversions, each with its own error: Arkiv's type to
                 // GolemDB's, then that to an indexable one.
                 Some(type_id) => {
@@ -292,7 +298,7 @@ mod tests {
     use super::*;
     use crate::{GolemDbConfig, GolemDbStore};
     use arkiv_interfaces::store::{Page, RecordKey, Store};
-    use golemdb_api::marker::{I32, Str, U64};
+    use golemdb_api::marker::{Bytes32, I32, Str, U64};
     use golemdb_api::{Api, CellLimits, CellType, HashAlgorithm, Width};
     use std::ops::Bound;
     use tempfile::TempDir;
@@ -436,6 +442,27 @@ mod tests {
                 Some(TypeId::BYTES)
             )])])),
             Err(StoreError::InvalidQuery)
+        );
+    }
+
+    /// GolemDB stores a `key` as the 32 fixed bytes a `bytes32` is, so a
+    /// presence test for `key` has no leaf, while one for `bytes32` is the
+    /// `Exists` leaf of those bytes, which a `key` holder matches too.
+    #[test]
+    fn a_presence_predicate_for_key_is_not_implemented() {
+        let typeof_is = |type_id| {
+            golemdb_filter(&Filter(vec![AndGroup(vec![presence(
+                "parent",
+                Some(type_id),
+            )])]))
+        };
+        assert_eq!(typeof_is(TypeId::KEY), Err(StoreError::NotImplemented));
+        assert_eq!(
+            typeof_is(TypeId::BYTES32),
+            Ok(golemdb::Filter::Exists {
+                field: cell_name("parent"),
+                ty: Some(ExistsType::of(Bytes32)),
+            })
         );
     }
 

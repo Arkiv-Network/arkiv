@@ -11,6 +11,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::store::{Filter, Page, Query, Store, StoreError};
 use arkiv_query::lower::{Lowered, lower};
+use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
 
 /// Arkiv's limits, as the node opens GolemDB with them.
@@ -148,24 +149,26 @@ fn a_simple_count_counts_the_entities_it_matches() {
     assert_eq!(count("team = str('green')"), 0);
 }
 
-/// A page is `offset` matches in, `limit` long. The matches are in key order,
-/// so the pages partition them: walking a limit at a time yields every match
-/// once, in order, and an offset past the last one is an empty page, not an
-/// error. `total_matched` is the whole match set, independent of the page.
+/// A page is `offset` matches in, `limit` long, over GolemDB's own order: the
+/// order the entities were created in, not their keys' order, and they are
+/// written out of key order here so the two differ. The pages partition the
+/// matches: walking a limit at a time yields every match once, in that order,
+/// and an offset past the last one is an empty page, not an error.
+/// `total_matched` is the whole match set, independent of the page.
 ///
 /// GolemDB caps a page at its own query limit; over that, a page is
 /// `LimitExceeded` rather than a silent trim.
 #[test]
 fn a_query_pages_by_limit_and_offset() {
     let dir = TempDir::new().unwrap();
-    let all = [
-        entity(1, "red"),
-        entity(2, "red"),
+    let created = [
         entity(3, "red"),
-        entity(4, "red"),
+        entity(1, "red"),
         entity(5, "red"),
+        entity(2, "red"),
+        entity(4, "red"),
     ];
-    let store = store_with(&dir, &all);
+    let store = store_with(&dir, &created);
 
     let page = |offset, limit, total_matched| {
         let query = Query {
@@ -187,21 +190,22 @@ fn a_query_pages_by_limit_and_offset() {
             .collect::<Vec<u8>>()
     };
 
-    // A limit that holds everything, and one that holds nothing left to hold.
-    assert_eq!(keys(0, 10), [1, 2, 3, 4, 5]);
+    // A limit that holds everything, in creation order, and one that holds
+    // nothing left to hold.
+    assert_eq!(keys(0, 10), [3, 1, 5, 2, 4]);
     assert!(keys(5, 10).is_empty());
     assert!(keys(9, 10).is_empty());
 
-    // Successive pages partition the matches, in key order.
-    assert_eq!(keys(0, 2), [1, 2]);
-    assert_eq!(keys(2, 2), [3, 4]);
-    assert_eq!(keys(4, 2), [5]);
+    // Successive pages partition the matches, in creation order.
+    assert_eq!(keys(0, 2), [3, 1]);
+    assert_eq!(keys(2, 2), [5, 2]);
+    assert_eq!(keys(4, 2), [4]);
     assert!(keys(6, 2).is_empty());
 
     // An offset with no limit left over, and a limit of one.
-    assert_eq!(keys(1, 3), [2, 3, 4]);
-    assert_eq!(keys(0, 1), [1]);
-    assert_eq!(keys(4, 1), [5]);
+    assert_eq!(keys(1, 3), [1, 5, 2]);
+    assert_eq!(keys(0, 1), [3]);
+    assert_eq!(keys(4, 1), [4]);
 
     // The count is the whole match set, not the page.
     assert_eq!(page(0, 2, true).total_matched, Some(5));
@@ -223,6 +227,28 @@ fn a_query_pages_by_limit_and_offset() {
             .query(None, &query, None)
             .map(|page| page.into_value()),
         Err(StoreError::LimitExceeded)
+    );
+}
+
+/// The largest page `arkiv_query` serves is one GolemDB runs: the RPC's
+/// ceiling is GolemDB's own query limit, so a full page is never refused.
+#[test]
+fn the_largest_page_arkiv_query_serves_runs() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, &[entity(1, "red")]);
+    let query = Query {
+        filter: filter("team = str('red')"),
+        page: Page {
+            offset: 0,
+            limit: MAX_PAGE_SIZE,
+        },
+        ..Query::default()
+    };
+    assert_eq!(
+        store
+            .query(None, &query, None)
+            .map(|page| page.into_value().records.len()),
+        Ok(1)
     );
 }
 
@@ -289,6 +315,56 @@ fn a_query_with_the_typeof_operator_matches_the_records_whose_attribute_has_that
         matched(&store, filter("typeof(team) = str AND team = str('red')")),
         [1]
     );
+}
+
+/// GolemDB stores a `key` as the 32 fixed bytes a `bytes32` is, so it cannot
+/// tell the two apart. `typeof(attr) = key` is not implemented rather than
+/// also answering the `bytes32` holders; `typeof(attr) = bytes32` finds both,
+/// as a `key` attribute reads back from GolemDB as a `bytes32` anyway.
+#[test]
+fn typeof_key_is_not_implemented_and_typeof_bytes32_finds_both() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with(
+        &dir,
+        &[
+            entity_with(
+                1,
+                vec![Attribute::new(
+                    "parent",
+                    AttributeValue::EntityKey([0xaa; 32]),
+                )],
+            ),
+            entity_with(
+                2,
+                vec![Attribute::new(
+                    "parent",
+                    AttributeValue::Bytes32([0xbb; 32]),
+                )],
+            ),
+        ],
+    );
+
+    let typeof_key = Query {
+        filter: filter("typeof(parent) = key"),
+        page: Page {
+            offset: 0,
+            limit: 10,
+        },
+        ..Query::default()
+    };
+    assert_eq!(
+        store
+            .query(None, &typeof_key, None)
+            .map(|page| page.into_value()),
+        Err(StoreError::NotImplemented)
+    );
+    assert_eq!(
+        store
+            .count(None, &typeof_key.filter, None)
+            .map(|count| count.into_value()),
+        Err(StoreError::NotImplemented)
+    );
+    assert_eq!(matched(&store, filter("typeof(parent) = bytes32")), [1, 2]);
 }
 
 /// The shapes `arkiv_query` sends: bounded to live entities by an AND, and

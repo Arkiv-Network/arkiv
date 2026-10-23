@@ -259,7 +259,7 @@ impl Parser {
                 }
             },
         )?;
-        let key = self.parse_presence_name()?;
+        let name = self.parse_presence_name()?;
         self.expect(
             &Token::RParen,
             self.next_position(),
@@ -277,18 +277,18 @@ impl Parser {
                 Some(self.parse_type_tag()?)
             }
         };
-        Ok(Query::Exists { key, attr_type })
+        Ok(Query::Exists { name, attr_type })
     }
 
     /// The `name` inside `exists(…)` / `typeof(…)`: a user attribute only.
-    fn parse_presence_name(&mut self) -> Result<AnnotKey, ParseError> {
+    fn parse_presence_name(&mut self) -> Result<String, ParseError> {
         let Some(spanned) = self.advance() else {
             return Err(ParseError::syntax(self.end, "expected an attribute name"));
         };
         match spanned.token {
             Token::Name(name) => {
                 validate_user_name(&name, spanned.start)?;
-                Ok(AnnotKey::User(name))
+                Ok(name)
             }
             Token::SysName(name) => Err(ParseError::type_error(
                 spanned.start,
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(
             parse("exists(reviewedBy)").unwrap(),
             Query::Exists {
-                key: user("reviewedBy"),
+                name: "reviewedBy".into(),
                 attr_type: None,
             }
         );
@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(
             parse("typeof(level) = i32").unwrap(),
             Query::Exists {
-                key: user("level"),
+                name: "level".into(),
                 attr_type: Some(AttributeType::Int),
             }
         );
@@ -1008,7 +1008,7 @@ mod tests {
             assert_eq!(
                 parse(&format!("typeof(a) = {tag}")).unwrap(),
                 Query::Exists {
-                    key: user("a"),
+                    name: "a".into(),
                     attr_type: Some(attr_type),
                 },
                 "{tag}"
@@ -1032,7 +1032,7 @@ mod tests {
             parse("exists(a) AND level > i32(3)").unwrap(),
             Query::And(
                 Box::new(Query::Exists {
-                    key: user("a"),
+                    name: "a".into(),
                     attr_type: None,
                 }),
                 Box::new(Query::Gt {
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(
             parse("NOT exists(a)").unwrap(),
             Query::Not(Box::new(Query::Exists {
-                key: user("a"),
+                name: "a".into(),
                 attr_type: None,
             }))
         );

@@ -57,6 +57,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     patch_version_guard_rejects_patch_on_state_view(store_generator);
     recordversion_zero_version_guard_always_fails(store_generator);
     patch_may_not_remove_last_cell(store_generator); // I do not understand this
+    patch_set_adds_cells_and_takes_their_kind(store_generator);
     delete_removes_record(store_generator);
     reserved_cell_name_rejected(store_generator);
     field_only_type_cannot_be_attribute(store_generator); // I do not understand this
@@ -65,7 +66,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     branch_hash_tracks_content(store_generator);
     query_sees_committed_state(store_generator);
     query_dnf_unions_and_dedups(store_generator);
-    query_defaults_to_key_order(store_generator);
+    query_without_a_sort_pages_in_a_fixed_order(store_generator);
     query_range_on_eq_only_type_is_invalid(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
@@ -733,6 +734,50 @@ fn patch_may_not_remove_last_cell<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
+/// `Set` writes the cell whether or not the record holds it yet, with the kind
+/// it names, and queries follow that kind. Arkiv's account and entity writes
+/// patch in cells a record lacks, and an update can make an attribute indexed:
+/// a store whose `Set` only replaced existing cells, or kept their old kind,
+/// would fail both.
+fn patch_set_adds_cells_and_takes_their_kind<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("tag", Cell::field(TypeId::STR, b"x".to_vec()))],
+    );
+    store
+        .patch(
+            branch,
+            record_key(1),
+            None,
+            vec![
+                ("tag".to_string(), CellChange::Set(str_attribute("y"))),
+                ("n".to_string(), CellChange::Set(u64_attribute(7))),
+            ],
+            None,
+        )
+        .unwrap();
+
+    let found = read_record(&store, ReadTarget::Branch(branch), record_key(1)).unwrap();
+    assert_eq!(
+        found.cell("tag"),
+        Some(&str_attribute("y")),
+        "the kind it names"
+    );
+    assert_eq!(found.cell("n"), Some(&u64_attribute(7)), "a cell it lacked");
+
+    let at = store.commit(branch).unwrap();
+    let tagged = paged_query(equals_filter("tag", TypeId::STR, b"y".to_vec()), 0, 10);
+    assert_eq!(
+        matched_keys(&store, at, &tagged),
+        vec![record_key(1)],
+        "an attribute now, so a query finds it"
+    );
+}
+
 /// Deleting removes the record; deleting again is `NotFound`, not a silent
 /// success.
 fn delete_removes_record<S: Store>(store_generator: &dyn Fn() -> S) {
@@ -985,9 +1030,12 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
-/// With no sort, results come back in ascending key order regardless of the
-/// order they were written in.
-fn query_defaults_to_key_order<S: Store>(store_generator: &dyn Fn() -> S) {
+/// With no sort, results follow the store's own order, which need not be key
+/// order — GolemDB's is the order records were created in — but is fixed for
+/// a commit: the same query lists the same records in the same order, so pages
+/// taken by offset partition the matches. Written out of key order, so a store
+/// that lists in one of those orders and pages in the other would show it.
+fn query_without_a_sort_pages_in_a_fixed_order<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     for ordinal in [3u8, 1, 2] {
@@ -999,22 +1047,22 @@ fn query_defaults_to_key_order<S: Store>(store_generator: &dyn Fn() -> S) {
         );
     }
     let committed = store.commit(branch).unwrap();
-
-    let query = Query {
-        filter: equals_filter("kind", TypeId::STR, b"a".to_vec()),
-        page: Page {
-            offset: 0,
-            limit: 10,
-        },
-        ..Query::default()
+    let page = |offset, limit| {
+        let filter = equals_filter("kind", TypeId::STR, b"a".to_vec());
+        matched_keys(&store, committed, &paged_query(filter, offset, limit))
     };
 
-    let found = store
-        .query(Some(committed), &query, None)
-        .unwrap()
-        .into_value();
-    let keys: Vec<RecordKey> = found.records.iter().map(|record| record.key).collect();
-    assert_eq!(keys, vec![record_key(1), record_key(2), record_key(3)]);
+    let all = page(0, 10);
+    let mut every_match = all.clone();
+    every_match.sort_unstable();
+    assert_eq!(
+        every_match,
+        vec![record_key(1), record_key(2), record_key(3)],
+        "every match, once"
+    );
+    assert_eq!(page(0, 10), all, "the same query lists the same order");
+    let walked: Vec<RecordKey> = (0..3).flat_map(|offset| page(offset, 1)).collect();
+    assert_eq!(walked, all, "pages partition the matches, in that order");
 }
 
 /// A range predicate against an equality-only type is refused, rather than

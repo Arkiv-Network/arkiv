@@ -657,8 +657,9 @@ async fn query_operator_classes_over_a_live_node() {
         "non-latest tags must error",
     );
 
-    // `limit` is bounded rather than silently trimmed, in both directions.
-    for bad_limit in [serde_json::json!(0), serde_json::json!(201)] {
+    // `limit` is bounded rather than silently trimmed, in both directions: 101
+    // is one past the node maximum.
+    for bad_limit in [serde_json::json!(0), serde_json::json!(101)] {
         assert!(
             client
                 .query_raw("*", serde_json::json!({ "limit": bad_limit }))

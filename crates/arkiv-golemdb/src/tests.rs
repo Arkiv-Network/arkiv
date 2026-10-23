@@ -1,5 +1,7 @@
 use super::*;
-use arkiv_interfaces::store::{AndGroup, CellKind, CompareOp, Page, Predicate, Test, TypeId};
+use arkiv_interfaces::store::{
+    AndGroup, CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId,
+};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -625,6 +627,70 @@ fn rolling_back_past_the_first_frame_is_handle_invalid() {
     assert_eq!(store.rollback(branch), Err(StoreError::HandleInvalid));
 }
 
+/// Arkiv's `Set` writes the cell whether or not the record holds it yet, and
+/// with the kind it names. The state layer relies on both: an account record
+/// is created with one of its cells and patched with the others, an entity
+/// update can add an attribute, and one can make an attribute indexed or not.
+#[test]
+fn a_patch_adds_missing_cells_and_gives_them_their_kind() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    let seven = 7u64.to_be_bytes();
+    store
+        .create(
+            branch,
+            RecordKey([1; 32]),
+            vec![
+                ("n".into(), attribute(TypeId::U64, &seven)),
+                ("tag".into(), cell(CellKind::Field, TypeId::STR, b"x")),
+            ],
+            None,
+        )
+        .unwrap();
+    // Indexed, then not; not, then indexed; and a cell the record lacks.
+    let changes = vec![
+        (
+            "n".into(),
+            CellChange::Set(cell(CellKind::Field, TypeId::U64, &seven)),
+        ),
+        ("tag".into(), CellChange::Set(attribute(TypeId::STR, b"y"))),
+        (
+            "added".into(),
+            CellChange::Set(cell(CellKind::Field, TypeId::STR, b"z")),
+        ),
+    ];
+    store
+        .patch(branch, RecordKey([1; 32]), None, changes, None)
+        .unwrap();
+
+    let record = read(&store, ReadTarget::Branch(branch), 1).unwrap();
+    assert_eq!(
+        record.cell("n"),
+        Some(&cell(CellKind::Field, TypeId::U64, &seven))
+    );
+    assert_eq!(record.cell("tag"), Some(&attribute(TypeId::STR, b"y")));
+    assert_eq!(
+        record.cell("added"),
+        Some(&cell(CellKind::Field, TypeId::STR, b"z"))
+    );
+
+    // The index follows the kinds: `tag` is found now, and `n` no longer is.
+    store.commit(branch).unwrap();
+    let tag_is_y = Filter(vec![AndGroup(vec![Predicate {
+        cell: "tag".into(),
+        test: Test::Compare {
+            op: CompareOp::Eq,
+            type_id: TypeId::STR,
+            value: b"y".to_vec(),
+        },
+        negated: false,
+    }])]);
+    let count = |filter: &Filter| store.count(None, filter, None).map(|n| n.into_value());
+    assert_eq!(count(&tag_is_y), Ok(1));
+    assert_eq!(count(&n_at_least(7)), Ok(0));
+}
+
 /// The filter `n >= at_least`, on [`commit_record`]'s cell.
 fn n_at_least(at_least: u64) -> Filter {
     Filter(vec![AndGroup(vec![Predicate {
@@ -684,8 +750,8 @@ fn a_query_pages_at_the_head() {
     assert_eq!(keys(2, 10), Ok(vec![]));
 }
 
-/// GolemDB caps a page at its own query limit, which is below the one
-/// `arkiv_query` admits, so an over-cap page is a structural limit.
+/// GolemDB caps a page at its own query limit, which `arkiv_query`'s largest
+/// page matches, so an over-cap page is a structural limit.
 #[test]
 fn a_page_over_golemdbs_query_limit_is_limit_exceeded() {
     let dir = TempDir::new().unwrap();
@@ -716,4 +782,22 @@ fn a_query_over_a_cap_is_limit_exceeded() {
         max: 64,
     };
     assert_eq!(convert::store_error(error), StoreError::LimitExceeded);
+}
+
+/// Running out of budget is a verdict on the call, not a store failure, and
+/// what was spent by then is on GolemDB's receipt, not in its error.
+#[test]
+fn running_out_of_budget_reports_what_the_receipt_spent() {
+    let mut receipt = golemdb::Receipt::default();
+    receipt.cost = 7;
+    let outcome = golemdb::Metered::<()>::new(
+        Err(golemdb::ApiError::OutOfBudget { required: Some(9) }),
+        receipt,
+    );
+    assert_eq!(
+        convert::metered_result(outcome),
+        Err(StoreError::OutOfBudget {
+            spent: CostUnits(7)
+        })
+    );
 }

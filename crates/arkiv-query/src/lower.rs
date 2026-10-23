@@ -127,14 +127,15 @@ fn predicate(
     })
 }
 
-/// One presence test, with negation already resolved.
+/// One presence test, with negation already resolved. It is only asked of a
+/// user attribute, whose cell is its name.
 fn presence(
-    key: &AnnotKey,
+    name: &str,
     attr_type: Option<AttributeType>,
     negated: bool,
 ) -> Result<Predicate, LowerError> {
     Ok(Predicate {
-        cell: cell_name(key),
+        cell: CellName::from(name),
         test: Test::Exists {
             type_id: attr_type.map(type_id_of).transpose()?,
         },
@@ -166,8 +167,8 @@ fn lower_inner(query: &Query, negate: bool) -> Result<Vec<AndGroup>, LowerError>
         Query::Lte { key, value } => leaf(key, value, CompareOp::Lte),
         Query::StartsWith { key, value } => leaf(key, value, CompareOp::Prefix),
 
-        Query::Exists { key, attr_type } => {
-            Ok(vec![AndGroup(vec![presence(key, *attr_type, negate)?])])
+        Query::Exists { name, attr_type } => {
+            Ok(vec![AndGroup(vec![presence(name, *attr_type, negate)?])])
         }
 
         // De Morgan: under negation, And becomes Or and vice versa.

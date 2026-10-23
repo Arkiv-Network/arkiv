@@ -40,11 +40,14 @@ pub enum Query {
     /// Matches entities whose `key` starts with `value` — the `STARTSWITH`
     /// operator, a raw UTF-8 byte prefix with no normalization.
     StartsWith { key: AnnotKey, value: AnnotVal },
-    /// Matches entities that carry `key` as an **indexed** attribute, without
-    /// comparing its value — the `exists(name)` and `typeof(name) = tag`
-    /// operators.
+    /// Matches entities that carry the user attribute `name` as an **indexed**
+    /// attribute, without comparing its value — the `exists(name)` and
+    /// `typeof(name) = tag` operators.
+    ///
+    /// A name rather than an [`AnnotKey`]: every entity carries the system
+    /// attributes, so the language asks this of user attributes only.
     Exists {
-        key: AnnotKey,
+        name: String,
         attr_type: Option<AttributeType>,
     },
     /// Matches entities satisfying both subqueries.

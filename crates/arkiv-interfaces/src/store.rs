@@ -516,8 +516,13 @@ pub enum SortDirection {
     Descending,
 }
 
-/// One sort key. Absent, and as the tie-break under a sort, results are in
-/// ascending [`RecordKey`] order.
+/// One sort key. Under a sort, ties break on ascending [`RecordKey`].
+///
+/// Absent, results follow the store's own order over its records at the
+/// commit: fixed for that commit, so the same query lists the same records in
+/// the same order and pages taken by offset partition the matches, but not
+/// necessarily key order. GolemDB's is the order the records were created in;
+/// the reference store's is key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sort {
     pub cell: CellName,
@@ -801,7 +806,8 @@ pub trait Store: core::fmt::Debug {
     // -- query (metered, commit-targeted) ----------------------------------
 
     /// Filtered, sorted, paged read against committed state. `at` defaults to
-    /// head and must lie within retention.
+    /// head and must lie within retention. Unsorted, results come in the
+    /// store's own order, which need not be key order: see [`Sort`].
     fn query(
         &self,
         at: Option<CommitId>,
