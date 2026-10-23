@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn a_query_error_carries_its_position() {
         //                                  0123456789012345
-        let error = arkiv_query::parse("$createdAt >= 1").unwrap_err();
+        let error = arkiv_query::parse("$expiresAt >= 1").unwrap_err();
         let rpc = query_error(&error);
         let data: serde_json::Value =
             serde_json::from_str(rpc.data().unwrap().get()).expect("data is json");

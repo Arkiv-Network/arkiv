@@ -119,7 +119,8 @@ fn other_key_cells_read_back_as_bytes32() {
     assert_eq!(record.cell("ref").unwrap().type_id, TypeId::BYTES32);
 }
 
-/// Arkiv's `$creationFlags` is a `BOOL` holding up to 3; GolemDB takes 0 or 1.
+/// GolemDB takes a `BOOL` of 0 or 1 only, which is why Arkiv stores
+/// `$creationFlags`, a byte holding up to 3, as `BYTES`.
 #[test]
 fn a_bool_above_one_is_refused() {
     let dir = TempDir::new().unwrap();

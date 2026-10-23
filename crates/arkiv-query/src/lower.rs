@@ -47,9 +47,8 @@ pub enum LowerError {
 
 /// The store cell an Arkiv attribute is stored under.
 ///
-/// Built-ins go to their [`annotations`] byte strings rather than the language's
-/// `$name`, because those constants are the on-chain identity of the attribute; the
-/// language name is just how it is spelled in a query.
+/// Built-ins go to their [`annotations`] constants, the one definition of each
+/// system name, which the record mapping writes under too.
 fn cell_name(key: &AnnotKey) -> CellName {
     match key {
         AnnotKey::User(name) => CellName::from(name.as_str()),
@@ -58,8 +57,7 @@ fn cell_name(key: &AnnotKey) -> CellName {
                 BuiltIn::Owner => annotations::OWNER,
                 BuiltIn::Creator => annotations::CREATOR,
                 BuiltIn::Key => annotations::KEY,
-                BuiltIn::ExpiresAt => annotations::EXPIRATION,
-                BuiltIn::CreatedAt => annotations::CREATED_AT_BLOCK,
+                BuiltIn::ExpiresAt => annotations::EXPIRES_AT,
             };
             // The constants are ASCII literals in this crate's own source; a
             // non-UTF-8 one would be a compile-time typo, not a runtime input.

@@ -180,8 +180,8 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     key: *key,
                     creator: env.caller,
                     owner: env.caller,
-                    created_at_block: env.block_number,
-                    last_modified_at_block: env.block_number,
+                    created_at: env.block_number,
+                    updated_at: env.block_number,
                     expires_at: *expires_at,
                     creation_flags: *creation_flags,
                     attributes: attributes.clone(),
@@ -357,7 +357,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         if let Err(reason) = edit(&mut entity) {
             return Ok(Err(reason));
         }
-        entity.last_modified_at_block = env.block_number;
+        entity.updated_at = env.block_number;
         let post_op = (entity.owner, entity.expires_at);
         overlay.insert(key, Some(entity));
         Ok(Ok(post_op))
@@ -395,10 +395,8 @@ fn updates_between(
                 delete: false,
                 creator: (b.creator != a.creator).then_some(a.creator),
                 owner: (b.owner != a.owner).then_some(a.owner),
-                created_at_block: (b.created_at_block != a.created_at_block)
-                    .then_some(a.created_at_block),
-                last_modified_at_block: (b.last_modified_at_block != a.last_modified_at_block)
-                    .then_some(a.last_modified_at_block),
+                created_at: (b.created_at != a.created_at).then_some(a.created_at),
+                updated_at: (b.updated_at != a.updated_at).then_some(a.updated_at),
                 expires_at: (b.expires_at != a.expires_at).then_some(a.expires_at),
                 creation_flags: (b.creation_flags != a.creation_flags).then_some(a.creation_flags),
                 attributes: (b.attributes != a.attributes).then(|| a.attributes.clone()),
@@ -564,8 +562,8 @@ mod tests {
             key: [7u8; 32],
             creator: [1u8; 20],
             owner: [2u8; 20],
-            created_at_block: 3,
-            last_modified_at_block: 4,
+            created_at: 3,
+            updated_at: 4,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
             attributes: vec![
@@ -600,7 +598,7 @@ mod tests {
         let e = staged(&view, [1u8; 32]).expect("staged in the view overlay");
         assert_eq!(e.owner, alice);
         assert_eq!(e.creator, alice);
-        assert_eq!(e.created_at_block, 10);
+        assert_eq!(e.created_at, 10);
         // Not on the base until commit.
         assert!(
             view.get_entity([1u8; 32], ReadMode::ViewOnBase)
@@ -668,7 +666,7 @@ mod tests {
         assert_eq!(out.status, ExecStatus::Ok);
         let e = staged(&view, [7u8; 32]).unwrap();
         assert_eq!(e.owner, [9u8; 20]);
-        assert_eq!(e.last_modified_at_block, 20);
+        assert_eq!(e.updated_at, 20);
         // The staged delta is partial: only what the transfer changed.
         let deltas = view.get_uncommitted_deltas().unwrap();
         assert_eq!(deltas.len(), 1);
@@ -802,7 +800,7 @@ mod tests {
         assert!(staged(&view, [7u8; 32]).is_none());
     }
 
-    /// A patch replaces contents, stamps `last_modified_at_block`, and leaves
+    /// A patch replaces contents, stamps `updated_at`, and leaves
     /// identity and lifecycle untouched — and the staged delta carries only the
     /// changed fields.
     #[test]
@@ -845,10 +843,10 @@ mod tests {
             ],
             "unmentioned attributes survive, the new ones land sorted"
         );
-        assert_eq!(e.last_modified_at_block, 20);
+        assert_eq!(e.updated_at, 20);
         assert_eq!(e.creator, [1u8; 20]);
         assert_eq!(e.owner, [2u8; 20]);
-        assert_eq!(e.created_at_block, 3);
+        assert_eq!(e.created_at, 3);
         assert_eq!(e.expires_at, 100);
 
         let deltas = view.get_uncommitted_deltas().unwrap();

@@ -80,8 +80,8 @@ fn parse_i32(body: &str, position: usize) -> Result<i32, ParseError> {
 
 /// `u64(n)` — decimal digits, or `0x` hex, range-checked.
 ///
-/// This is the tag the system block heights take (`$expiresAt`, `$createdAt`,
-/// `$updatedAt`), so it is the one most likely to be reached for by hand.
+/// This is the tag the queryable system block height takes (`$expiresAt`), so
+/// it is the one most likely to be reached for by hand.
 fn parse_u64(body: &str, position: usize) -> Result<u64, ParseError> {
     let text = body.trim();
     if text.starts_with('-') || text.starts_with('+') {
