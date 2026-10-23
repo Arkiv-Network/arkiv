@@ -17,6 +17,8 @@
 //! head, and before this there was nothing at head on a fresh store: block 1
 //! was the first commit, so the store's commit numbers started one short.
 
+use std::collections::BTreeMap;
+
 use alloy_primitives::{Address, B256, U256};
 use arkiv_golemdb_state::accounts::{CELL_BALANCE, CELL_NONCE, record_key};
 use arkiv_interfaces::store::{Cell, CellName, CommitId, Store, StoreError, TypeId};
@@ -32,6 +34,19 @@ pub struct GenesisAccount {
     pub balance: U256,
     /// Its starting transaction nonce — almost always zero.
     pub nonce: u64,
+}
+
+impl GenesisAccount {
+    /// The accounts of a genesis file's `alloc`, in address order.
+    pub fn from_alloc(
+        alloc: &BTreeMap<Address, alloy_genesis::GenesisAccount>,
+    ) -> impl Iterator<Item = Self> + '_ {
+        alloc.iter().map(|(address, account)| Self {
+            address: *address,
+            balance: account.balance,
+            nonce: account.nonce.unwrap_or_default(),
+        })
+    }
 }
 
 /// Write `alloc` as the store's genesis commit, tagged `genesis_hash`.
@@ -106,6 +121,34 @@ pub fn check_chain(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<()
     Ok(())
 }
 
+/// Check that `store`'s genesis commit, the one tagged `genesis_hash`, has
+/// `state_root`, the root block 0's header carries.
+pub fn check_genesis_root(
+    store: &HostStore,
+    genesis_hash: [u8; 32],
+    state_root: [u8; 32],
+) -> eyre::Result<()> {
+    let read = |e| eyre::eyre!("read the Arkiv store's genesis: {e:?}");
+    let commit = store
+        .commit_by_tag(genesis_hash)
+        .map_err(read)?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "the Arkiv store has no genesis commit for block {}",
+                B256::from(genesis_hash)
+            )
+        })?;
+    let root = store.commit_hash(commit).map_err(read)?;
+    eyre::ensure!(
+        root == state_root,
+        "the Arkiv store's genesis has state root {}, but block 0's header has {}: the store \
+         does not hold this genesis",
+        B256::from(root),
+        B256::from(state_root)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +170,44 @@ mod tests {
             balance: U256::from(balance),
             nonce: 0,
         }]
+    }
+
+    #[test]
+    fn genesis_accounts_come_from_alloc_in_address_order() {
+        let mut funded = alloy_genesis::GenesisAccount::default();
+        funded.balance = U256::from(2);
+        let mut used = alloy_genesis::GenesisAccount::default();
+        used.nonce = Some(3);
+        let alloc = BTreeMap::from([
+            (Address::repeat_byte(2), funded),
+            (Address::repeat_byte(1), used),
+        ]);
+        let account = |byte, balance: u64, nonce| GenesisAccount {
+            address: Address::repeat_byte(byte),
+            balance: U256::from(balance),
+            nonce,
+        };
+        assert_eq!(
+            GenesisAccount::from_alloc(&alloc).collect::<Vec<_>>(),
+            vec![account(1, 0, 3), account(2, 2, 0)]
+        );
+    }
+
+    /// Block 0 must carry the genesis commit's root; any other root is
+    /// refused, as is a store without this genesis.
+    #[test]
+    fn the_genesis_root_must_be_block_0s() {
+        let store = store();
+        let commit = seed_genesis(&store, HASH, alice(5)).unwrap().unwrap();
+        let root = store.commit_hash(commit).unwrap();
+        check_genesis_root(&store, HASH, root).unwrap();
+        let error = check_genesis_root(&store, HASH, [1; 32]).unwrap_err();
+        assert!(
+            error.to_string().contains("does not hold this genesis"),
+            "{error}"
+        );
+        let error = check_genesis_root(&store, [8; 32], root).unwrap_err();
+        assert!(error.to_string().contains("no genesis commit"), "{error}");
     }
 
     #[test]

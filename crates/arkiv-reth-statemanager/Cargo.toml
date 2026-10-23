@@ -19,6 +19,8 @@ arkiv-golemdb-state.workspace = true
 # The uncommitted lane(s): the pruning map.
 arkiv-reth-uncommitted-store.workspace = true
 
+# `alloc`, the genesis file's accounts.
+alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 # The append-only tier stores consensus encodings: RLP headers, EIP-2718
 # transactions and receipts.

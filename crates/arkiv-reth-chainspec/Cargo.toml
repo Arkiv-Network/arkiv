@@ -6,18 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 
 # The Arkiv chain specification: reth's `ChainSpec` with one protocol rule on
-# top — the EIP-1559 base fee never drops below the genesis block's base fee.
-# Also the `--chain` parser that produces it, so the node, the pool, the payload
-# builder and consensus all see the same rule.
+# top — the EIP-1559 base fee never drops below the genesis block's base fee —
+# and GolemDB's settings from the genesis file. Also the `--chain` parser that
+# produces it, so the node, the pool, the payload builder and consensus all see
+# the same rule.
 
 [dependencies]
 # reth's stock `ChainSpec` and the traits (`EthChainSpec`, `Hardforks`,
 # `EthereumHardforks`) the wrapper delegates to.
 reth-ethereum.workspace = true
-# The `ChainSpecParser` trait the `--chain` value parser implements.
+# The `ChainSpecParser` trait the `--chain` value parser implements, and
+# `parse_genesis`, reth's reader for a genesis file or inline JSON.
 reth-cli.workspace = true
-# reth's own `--chain` parser (named chains, genesis file, inline JSON), wrapped.
-reth-ethereum-cli.workspace = true
 # `NodeRecord`, the bootnode type in `EthChainSpec::bootnodes`.
 reth-network-peers.workspace = true
 # `EthExecutorSpec` (deposit contract address), required of a node's chain spec.
@@ -27,8 +27,12 @@ alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 eyre.workspace = true
-# The `--chain` parser reads the genesis JSON itself.
+# `config.arkiv` is read with serde.
+serde.workspace = true
+# Reads the built-in `dev` genesis.
 serde_json.workspace = true
+# GolemDB's genesis format, which `config.arkiv.golemdb` is in.
+golemdb-api.workspace = true
 
 [dev-dependencies]
 alloy-rlp.workspace = true
