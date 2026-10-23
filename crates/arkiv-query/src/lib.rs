@@ -41,11 +41,14 @@
 //!
 //! ## What this version leaves out
 //!
-//! `exists(…)`, `typeof(…)` and `!=` are **reserved but not implemented**. All
-//! three need a per-`(attribute, type)` presence index the host does not
-//! maintain, and answering them from what exists would silently return the wider
-//! `NOT` complement instead. They parse to a directive error naming the
+//! `!=` is **reserved but not implemented**: typed value-negation is
+//! `exists(attr)` minus `attr = value`, which no single store predicate
+//! expresses, and answering it from what exists would silently return the
+//! wider `NOT` complement instead. It parses to a directive error naming the
 //! alternative; `NOT (attr = value)` gives the complement explicitly.
+//!
+//! `exists(…)` and `typeof(…)` **are** implemented — see the presence
+//! operators above.
 //!
 //! ```
 //! use arkiv_query::parse;
@@ -67,7 +70,6 @@ mod error;
 mod lexer;
 pub mod limits;
 mod literal;
-pub mod lower;
 pub mod parse;
 
 pub use error::{ParseError, ParseErrorKind};

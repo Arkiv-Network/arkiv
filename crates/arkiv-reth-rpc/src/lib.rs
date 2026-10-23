@@ -238,16 +238,16 @@ fn is_live(expires_at: BlockNumber, block: BlockNumber) -> bool {
 /// than after the fact: pages come back full instead of pocked with holes, and
 /// the match-set cardinality behind `arkiv_getEntityCount` excludes dead rows.
 fn live_at(query: Query, block: BlockNumber) -> Query {
-    Query::And(
-        Box::new(query),
-        Box::new(Query::Gt {
+    Query::And(vec![
+        query,
+        Query::Gt {
             key: AnnotKey::BuiltIn(BuiltIn::ExpiresAt),
             // U64, not U256: `entity_records` stores `$expiresAt` as a
             // U64 cell, and a predicate never crosses types — a U256 bound
             // would silently match nothing.
             value: AnnotVal::U64(block),
-        }),
-    )
+        },
+    ])
 }
 
 /// Read one entity by key, at the tip or as of `block`. A past-BTL entity reads

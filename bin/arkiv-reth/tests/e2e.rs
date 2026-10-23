@@ -24,6 +24,7 @@ use arkiv_harness::{
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
+use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -495,6 +496,39 @@ async fn query_operator_classes_over_a_live_node() {
         expect(&[0, 1, 2, 3, 4])
     );
 
+    // Presence, without comparing a value: `exists` spans every type the
+    // attribute is carried under, `typeof` narrows it to one. All five
+    // entities carry both attributes.
+    assert_eq!(
+        result_keys(&client.query("exists(rank)", 100, None).await),
+        expect(&[0, 1, 2, 3, 4])
+    );
+    assert_eq!(
+        result_keys(&client.query("typeof(rank) = u256", 100, None).await),
+        expect(&[0, 1, 2, 3, 4])
+    );
+    assert_eq!(
+        result_keys(&client.query("typeof(team) = str", 100, None).await),
+        expect(&[0, 1, 2, 3, 4])
+    );
+    assert!(
+        result_keys(&client.query("exists(absent)", 100, None).await).is_empty(),
+        "no entity carries an attribute nothing wrote",
+    );
+    // `typeof` is as type-exact as a value predicate: `rank` is a u256.
+    assert!(
+        result_keys(&client.query("typeof(rank) = i32", 100, None).await).is_empty(),
+        "typeof must not match an attribute of another type",
+    );
+    assert_eq!(
+        result_keys(
+            &client
+                .query("exists(rank) AND team = str('blue')", 100, None)
+                .await
+        ),
+        expect(&[2, 3]),
+    );
+
     // A predicate asserts the attribute's *type*: `rank` is a u256, so the same
     // number tagged i32 addresses a different bucket and matches nothing.
     assert!(
@@ -590,13 +624,14 @@ async fn query_operator_classes_over_a_live_node() {
         ("$createdAt >= u64(1)", "-32002"),                   // returned, never queried
         ("rank != u256(30)", "-32002"),                       // != is not in the language
         ("team >= str('blue')", "-32002"),                    // range on an unordered type
-        ("exists(rank)", "-32002"),                           // reserved, unimplemented
-        ("rank = i32(2147483648)", "-32003"),                 // literal out of range
+        ("exists($owner)", "-32002"),                         // presence takes a user attribute
+        ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
+        ("rank = i32(2147483648)", "-32003"), // literal out of range
         (
             "who = addr(0x5aAeb6053f3E94C9b9A09f33669435E7Ef1BeAed)",
             "-32003",
         ), // bad EIP-55 checksum
-        (&"(".repeat(200), "-32004"),                         // nested too deeply
+        (&"(".repeat(200), "-32004"),       // nested too deeply
     ] {
         let err = client
             .query_raw(rejected, serde_json::json!({}))
@@ -625,8 +660,9 @@ async fn query_operator_classes_over_a_live_node() {
         "non-latest tags must error",
     );
 
-    // `limit` is bounded rather than silently trimmed, in both directions.
-    for bad_limit in [serde_json::json!(0), serde_json::json!(201)] {
+    // `limit` is bounded rather than silently trimmed, in both directions: 101
+    // is one past the node maximum.
+    for bad_limit in [serde_json::json!(0), serde_json::json!(101)] {
         assert!(
             client
                 .query_raw("*", serde_json::json!({ "limit": bad_limit }))
@@ -1542,6 +1578,10 @@ fn arkiv_section(hash_function: &str) -> serde_json::Value {
             "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
             "max_str_len": MAX_STR_BYTES,
             "max_bytes_len": MAX_BYTES_VALUE_LEN
+        },
+        "record_limits": {
+            "max_cells": MAX_RECORD_CELLS,
+            "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
         }
     } })
 }

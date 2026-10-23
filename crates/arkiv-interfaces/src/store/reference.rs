@@ -1068,9 +1068,10 @@ impl StoreExt for MemStore {
 /// The matching itself is [`Filter::matches`] — shared with every other
 /// implementation, because filter semantics are spec and must not be able to
 /// diverge between backends. All this adds is the scan and the ordering:
-/// ascending key order falls out of the ordered map, and is both the default
-/// result order and the tie-break under a sort. A record matching several
-/// groups is visited once, so it appears once.
+/// ascending key order falls out of the ordered map, and is both this store's
+/// own order, which unsorted results follow, and the tie-break the contract
+/// fixes under a sort. A record matching several groups is visited once, so it
+/// appears once.
 fn evaluate_filter(
     state: &BTreeMap<RecordKey, RecordData>,
     filter: &Filter,

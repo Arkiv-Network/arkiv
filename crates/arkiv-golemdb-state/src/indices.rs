@@ -8,7 +8,7 @@
 //! be built on top of it.
 //!
 //! A GolemDB store indexes every attribute cell itself. So the two index traits
-//! reduce to lowering a lookup into a [`Filter`] and asking the store, and
+//! reduce to writing a lookup as a [`Filter`] and asking the store, and
 //! `apply_deltas` — the whole write-side maintenance path — becomes **nothing at
 //! all**: writing the entity record already moved its index entries.
 //!
@@ -27,8 +27,8 @@ use arkiv_interfaces::statemanager::{
     EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode,
 };
 use arkiv_interfaces::store::{
-    AndGroup, CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store,
-    StoreError, TypeId,
+    CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store, StoreError,
+    Test,
 };
 
 use crate::view::{GolemStateView, ViewError};
@@ -73,30 +73,30 @@ fn predicate(
     attribute: &[u8],
     value: &AttributeValue,
     op: CompareOp,
-) -> Result<Predicate, IndexError> {
-    Ok(Predicate {
+) -> Result<Filter, IndexError> {
+    Ok(Filter::Predicate(Predicate {
         cell: cell_name(attribute)?,
-        op,
-        type_id: type_id_of(value),
-        // Canonical bytes, not `index_bytes`: the store sign-biases for itself when
-        // ordering, and biasing here too would invert negatives.
-        value: value.encode(),
-        negated: false,
-    })
+        test: Test::Compare {
+            op,
+            type_id: type_id_of(value),
+            // Canonical bytes, not `index_bytes`: the store sign-biases for itself
+            // when ordering, and biasing here too would invert negatives.
+            value: value.encode(),
+        },
+    }))
 }
 
 /// Run a filter and return the matching entity addresses, ascending.
 fn matching<S: Store>(
     store: &S,
     at: CommitId,
-    group: AndGroup,
+    filter: Filter,
 ) -> Result<Vec<EntityAddress>, IndexError> {
     let query = Query {
-        filter: Filter(vec![group]),
+        filter,
+        // No sort: GolemDB cannot sort yet, so the addresses are put in order
+        // below instead.
         sort: None,
-        // No sort: the store's documented tie-break is ascending record key, and an
-        // entity's record key *is* its address, so that is already the order the
-        // index traits promise.
         page: Page {
             offset: 0,
             limit: MAX_RESULTS + 1,
@@ -108,7 +108,7 @@ fn matching<S: Store>(
     if records.len() as u64 > MAX_RESULTS {
         return Err(IndexError::ResultTruncated);
     }
-    records
+    let mut addresses = records
         .into_iter()
         .map(|record| {
             record
@@ -116,7 +116,12 @@ fn matching<S: Store>(
                 .and_then(|cell| cell.value.as_slice().try_into().ok())
                 .ok_or(IndexError::MissingKey)
         })
-        .collect()
+        .collect::<Result<Vec<EntityAddress>, _>>()?;
+    // The store's own order need not be key order: GolemDB's is the order the
+    // entities were created in. An entity's record key is its address, so
+    // sorting the addresses is what gives the order the index traits promise.
+    addresses.sort_unstable();
+    Ok(addresses)
 }
 
 /// The cell holding an entity's own address.
@@ -148,8 +153,11 @@ impl<'s, S: Store> StoreIndices<'s, S> {
         attribute: &[u8],
         value: &AttributeValue,
     ) -> Result<Vec<EntityAddress>, IndexError> {
-        let group = AndGroup(vec![predicate(attribute, value, CompareOp::Eq)?]);
-        matching(self.store, self.at, group)
+        matching(
+            self.store,
+            self.at,
+            predicate(attribute, value, CompareOp::Eq)?,
+        )
     }
 
     /// Entities whose string `attribute` starts with `prefix`.
@@ -158,13 +166,14 @@ impl<'s, S: Store> StoreIndices<'s, S> {
         attribute: &[u8],
         prefix: &str,
     ) -> Result<Vec<EntityAddress>, IndexError> {
-        let mut term = predicate(
+        // `type_id_of` already gives `STR` for a `Str` operand, so the type
+        // needs no override here.
+        let term = predicate(
             attribute,
             &AttributeValue::Str(alloc::string::String::from(prefix)),
             CompareOp::Prefix,
         )?;
-        term.type_id = TypeId::STR;
-        matching(self.store, self.at, AndGroup(vec![term]))
+        matching(self.store, self.at, term)
     }
 
     /// Entities whose `attribute` falls within the bounds.
@@ -188,7 +197,7 @@ impl<'s, S: Store> StoreIndices<'s, S> {
             Bound::Excluded(value) => terms.push(predicate(attribute, value, CompareOp::Lt)?),
             Bound::Unbounded => {}
         }
-        matching(self.store, self.at, AndGroup(terms))
+        matching(self.store, self.at, Filter::And(terms))
     }
 }
 
@@ -408,9 +417,9 @@ mod tests {
 
     #[test]
     fn results_come_back_in_ascending_entity_order() {
-        // The index traits promise ascending entity order, and this relies on the
-        // store's tie-break being ascending record key plus an entity's record key
-        // being its address. Assert it rather than assume the chain holds.
+        // The index traits promise ascending entity order, which the lookup sorts
+        // into rather than taking the store's own order: written out of order,
+        // so a store answering in creation order would show it.
         let (store, at) = stored(&[entity(3, 1, "c"), entity(1, 1, "a"), entity(2, 1, "b")]);
         let indices = StoreIndices::new(&store, at);
         let hits = indices

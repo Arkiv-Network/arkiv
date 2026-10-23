@@ -14,7 +14,10 @@ pub const DEFAULT_PAGE_SIZE: u64 = 100;
 
 /// The largest `limit` a node will serve. Part of the client contract, so an SDK
 /// can bound its own paging instead of discovering the ceiling by being rejected.
-pub const MAX_PAGE_SIZE: u64 = 200;
+///
+/// GolemDB, the store a node answers from, returns at most 100 records per
+/// query and refuses a larger limit, so a larger page here could not be served.
+pub const MAX_PAGE_SIZE: u64 = 100;
 
 /// The `arkiv_query` options — the second positional param. The full call is
 /// `["<query>", { "atBlock": …, "select": …, "limit": …, "cursor": … }]`; the
@@ -36,7 +39,7 @@ pub struct QueryOptions {
 }
 
 /// The page size to serve. Over the ceiling is an error rather than a trim —
-/// silently serving 200 of a requested 500 reads as a short page, so a caller
+/// silently serving 100 of a requested 500 reads as a short page, so a caller
 /// would stop early. `Err` carries the node's invalid-params message.
 pub fn resolve_limit(requested: Option<u64>) -> Result<u64, String> {
     match requested {

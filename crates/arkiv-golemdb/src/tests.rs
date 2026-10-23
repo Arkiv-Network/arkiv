@@ -1,5 +1,6 @@
 use super::*;
-use arkiv_interfaces::store::{CellKind, TypeId};
+use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
+use arkiv_interfaces::store::{CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -12,8 +13,12 @@ fn config() -> GolemDbConfig {
         max_str_len: 128,
         max_bytes_len: 128 * 1024,
     };
+    let record_limits = RecordLimits {
+        max_cells: MAX_RECORD_CELLS as u64,
+        max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
+    };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, None),
+        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
         segments: vec![SegmentSpec {
             name: SEGMENT.into(),
             columns: 2,
@@ -227,11 +232,13 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
 
     let mut limits = config();
     limits.genesis.cell_limits.max_str_len += 1;
+    let mut record_limits = config();
+    record_limits.genesis.record_limits.max_cells += 1;
     let mut segments = config();
     segments.segments[0].columns += 1;
     let mut hash = config();
     hash.genesis.hash_function = HashAlgorithm::Blake3;
-    for other in [limits, segments, hash] {
+    for other in [limits, record_limits, segments, hash] {
         assert!(matches!(
             GolemDbStore::open(dir.path(), &other),
             Err(OpenError::GenesisMismatch)
@@ -655,4 +662,177 @@ fn rolling_back_past_the_first_frame_is_handle_invalid() {
     let branch = store.begin(None).unwrap();
     store.rollback(branch).unwrap();
     assert_eq!(store.rollback(branch), Err(StoreError::HandleInvalid));
+}
+
+/// Arkiv's `Set` writes the cell whether or not the record holds it yet, and
+/// with the kind it names. The state layer relies on both: an account record
+/// is created with one of its cells and patched with the others, an entity
+/// update can add an attribute, and one can make an attribute indexed or not.
+#[test]
+fn a_patch_adds_missing_cells_and_gives_them_their_kind() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    let seven = 7u64.to_be_bytes();
+    store
+        .create(
+            branch,
+            RecordKey([1; 32]),
+            vec![
+                ("n".into(), attribute(TypeId::U64, &seven)),
+                ("tag".into(), cell(CellKind::Field, TypeId::STR, b"x")),
+            ],
+            None,
+        )
+        .unwrap();
+    // Indexed, then not; not, then indexed; and a cell the record lacks.
+    let changes = vec![
+        (
+            "n".into(),
+            CellChange::Set(cell(CellKind::Field, TypeId::U64, &seven)),
+        ),
+        ("tag".into(), CellChange::Set(attribute(TypeId::STR, b"y"))),
+        (
+            "added".into(),
+            CellChange::Set(cell(CellKind::Field, TypeId::STR, b"z")),
+        ),
+    ];
+    store
+        .patch(branch, RecordKey([1; 32]), None, changes, None)
+        .unwrap();
+
+    let record = read(&store, ReadTarget::Branch(branch), 1).unwrap();
+    assert_eq!(
+        record.cell("n"),
+        Some(&cell(CellKind::Field, TypeId::U64, &seven))
+    );
+    assert_eq!(record.cell("tag"), Some(&attribute(TypeId::STR, b"y")));
+    assert_eq!(
+        record.cell("added"),
+        Some(&cell(CellKind::Field, TypeId::STR, b"z"))
+    );
+
+    // The index follows the kinds: `tag` is found now, and `n` no longer is.
+    store.commit(branch).unwrap();
+    let tag_is_y = Filter::Predicate(Predicate {
+        cell: "tag".into(),
+        test: Test::Compare {
+            op: CompareOp::Eq,
+            type_id: TypeId::STR,
+            value: b"y".to_vec(),
+        },
+    });
+    let count = |filter: &Filter| store.count(None, filter, None).map(|n| n.into_value());
+    assert_eq!(count(&tag_is_y), Ok(1));
+    assert_eq!(count(&n_at_least(7)), Ok(0));
+}
+
+/// The filter `n >= at_least`, on [`commit_record`]'s cell.
+fn n_at_least(at_least: u64) -> Filter {
+    Filter::Predicate(Predicate {
+        cell: "n".into(),
+        test: Test::Compare {
+            op: CompareOp::Gte,
+            type_id: TypeId::U64,
+            value: at_least.to_be_bytes().to_vec(),
+        },
+    })
+}
+
+/// A count does not page, so GolemDB runs it, at the head only.
+#[test]
+fn a_count_runs_at_the_head() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let first = commit_record(&store, 1);
+    let head = commit_record(&store, 2);
+    let count = |at| {
+        store
+            .count(at, &n_at_least(2), None)
+            .map(|n| n.into_value())
+    };
+    assert_eq!(count(None), Ok(1));
+    assert_eq!(count(Some(head)), Ok(1));
+    assert_eq!(count(Some(first)), Err(StoreError::HandleInvalid));
+}
+
+/// GolemDB pages now, so an Arkiv query runs: the page skips its offset and
+/// holds the matches its limit admits. An offset past the last match is an
+/// empty page, not an error.
+#[test]
+fn a_query_pages_at_the_head() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 1);
+    commit_record(&store, 2);
+    let keys = |offset, limit| {
+        let query = Query {
+            filter: n_at_least(1),
+            page: Page { offset, limit },
+            ..Query::default()
+        };
+        store.query(None, &query, None).map(|page| {
+            page.into_value()
+                .records
+                .iter()
+                .map(|record| record.key.0[0])
+                .collect::<Vec<u8>>()
+        })
+    };
+    assert_eq!(keys(0, 10), Ok(vec![1, 2]));
+    assert_eq!(keys(0, 1), Ok(vec![1]));
+    assert_eq!(keys(1, 10), Ok(vec![2]));
+    assert_eq!(keys(2, 10), Ok(vec![]));
+}
+
+/// GolemDB caps a page at its own query limit, which `arkiv_query`'s largest
+/// page matches, so an over-cap page is a structural limit.
+#[test]
+fn a_page_over_golemdbs_query_limit_is_limit_exceeded() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 1);
+    let query = Query {
+        filter: n_at_least(1),
+        page: Page {
+            offset: 0,
+            limit: 1_000,
+        },
+        ..Query::default()
+    };
+    assert_eq!(
+        store
+            .query(None, &query, None)
+            .map(|page| page.into_value()),
+        Err(StoreError::LimitExceeded)
+    );
+}
+
+/// A filter over GolemDB's caps is a structural limit, not a fatal store
+/// failure.
+#[test]
+fn a_query_over_a_cap_is_limit_exceeded() {
+    let error = golemdb::ApiError::LimitExceeded {
+        limit: "filter depth",
+        max: 64,
+    };
+    assert_eq!(convert::store_error(error), StoreError::LimitExceeded);
+}
+
+/// Running out of budget is a verdict on the call, not a store failure, and
+/// what was spent by then is on GolemDB's receipt, not in its error.
+#[test]
+fn running_out_of_budget_reports_what_the_receipt_spent() {
+    let mut receipt = golemdb::Receipt::default();
+    receipt.cost = 7;
+    let outcome = golemdb::Metered::<()>::new(
+        Err(golemdb::ApiError::OutOfBudget { required: Some(9) }),
+        receipt,
+    );
+    assert_eq!(
+        convert::metered_result(outcome),
+        Err(StoreError::OutOfBudget {
+            spent: CostUnits(7)
+        })
+    );
 }

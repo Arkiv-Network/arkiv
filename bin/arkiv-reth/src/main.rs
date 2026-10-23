@@ -156,11 +156,17 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
     use arkiv_interfaces::constants::{
         MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
     };
+    use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     let limit = |bytes: usize| u32::try_from(bytes).expect("Arkiv's limits fit in u32");
     let limits = arkiv_golemdb::CellLimits {
         max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
         max_str_len: limit(MAX_STR_BYTES),
         max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
+    };
+    let count = |cells: usize| u64::try_from(cells).expect("Arkiv's limits fit in u64");
+    let record_limits = arkiv_golemdb::RecordLimits {
+        max_cells: count(MAX_RECORD_CELLS),
+        max_indexed_cells: count(MAX_RECORD_INDEXED_CELLS),
     };
     let genesis = spec.golemdb().ok_or_else(|| {
         eyre::eyre!(
@@ -175,6 +181,15 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
         "genesis config.arkiv.golemdb.cell_limits must be Arkiv's limits, {limits:?}; the file \
          has {:?}",
         genesis.cell_limits
+    );
+    // And an entity's attributes against its cap, so the record caps must be
+    // the ones an entity with every attribute it may have fills: lower, and
+    // GolemDB would refuse a write Arkiv accepted.
+    eyre::ensure!(
+        genesis.record_limits == record_limits,
+        "genesis config.arkiv.golemdb.record_limits must be Arkiv's limits, {record_limits:?}; \
+         the file has {:?}",
+        genesis.record_limits
     );
     Ok(arkiv_golemdb::GolemDbConfig {
         genesis: genesis.clone(),
@@ -295,6 +310,7 @@ mod tests {
     use arkiv_interfaces::constants::{
         MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
     };
+    use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use serde_json::{Value, json};
 
     fn set(value: impl Into<OsString>) -> Option<OsString> {
@@ -344,6 +360,10 @@ mod tests {
                 "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
                 "max_str_len": MAX_STR_BYTES,
                 "max_bytes_len": MAX_BYTES_VALUE_LEN
+            },
+            "record_limits": {
+                "max_cells": MAX_RECORD_CELLS,
+                "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
             }
         })
     }
@@ -383,14 +403,23 @@ mod tests {
     }
 
     #[test]
-    fn cell_limits_other_than_arkivs_are_refused() {
-        for name in ["max_cell_name_len", "max_str_len", "max_bytes_len"] {
+    fn limits_other_than_arkivs_are_refused() {
+        for (section, name) in [
+            ("cell_limits", "max_cell_name_len"),
+            ("cell_limits", "max_str_len"),
+            ("cell_limits", "max_bytes_len"),
+            ("record_limits", "max_cells"),
+            ("record_limits", "max_indexed_cells"),
+        ] {
             for delta in [-1, 1] {
                 let mut other = golemdb("keccak-256");
-                let limit = &mut other["cell_limits"][name];
+                let limit = &mut other[section][name];
                 *limit = json!(limit.as_i64().unwrap() + delta);
                 let error = settings(Some(other)).unwrap_err().to_string();
-                assert!(error.contains("must be Arkiv's limits"), "{name}: {error}");
+                assert!(
+                    error.contains(&format!("{section} must be Arkiv's limits")),
+                    "{section}.{name}: {error}"
+                );
             }
         }
     }

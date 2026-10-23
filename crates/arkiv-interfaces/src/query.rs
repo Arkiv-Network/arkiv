@@ -1,10 +1,12 @@
 //! Queries: the query language, and the trait that answers it.
 
+mod filter;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::entity::{AttributeValue, Entity};
+use crate::entity::{AttributeType, AttributeValue, Entity};
 use crate::primitives::{EntityAddress, Gas};
 use crate::statemanager::{BlockRef, StateView};
 
@@ -19,9 +21,10 @@ use crate::statemanager::{BlockRef, StateView};
 /// the language's rule, not an implementation detail.
 ///
 /// There is deliberately **no `!=` variant**. Value-negation restricted to
-/// "attribute is set with this type, and differs" needs a per-`(attribute, type)`
-/// presence index the host does not maintain, so the language omits the operator
-/// rather than silently answering the wider [`Not`](Self::Not) complement.
+/// "attribute is set with this type, and differs" is
+/// [`Exists`](Self::Exists) minus an [`Eq`](Self::Eq), which the language has
+/// no single operator for; `NOT (attr = value)` gives the wider complement
+/// explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     /// Matches every live entity (`*`).
@@ -39,10 +42,23 @@ pub enum Query {
     /// Matches entities whose `key` starts with `value` — the `STARTSWITH`
     /// operator, a raw UTF-8 byte prefix with no normalization.
     StartsWith { key: AnnotKey, value: AnnotVal },
-    /// Matches entities satisfying both subqueries.
-    And(Box<Query>, Box<Query>),
-    /// Matches entities satisfying either subquery.
-    Or(Box<Query>, Box<Query>),
+    /// Matches entities that carry the user attribute `name` as an **indexed**
+    /// attribute, without comparing its value — the `exists(name)` and
+    /// `typeof(name) = tag` operators.
+    ///
+    /// A name rather than an [`AnnotKey`]: every entity carries the system
+    /// attributes, so the language asks this of user attributes only.
+    Exists {
+        name: String,
+        attr_type: Option<AttributeType>,
+    },
+    /// Matches entities satisfying every subquery. A chain of one connective
+    /// is one node, `a AND b AND c` an `And` of three, so a node is only as
+    /// deep as the query nests; the parser builds it with two or more.
+    And(Vec<Query>),
+    /// Matches entities satisfying some subquery. One node per chain, as
+    /// [`And`](Self::And).
+    Or(Vec<Query>),
     /// Matches entities not satisfying the subquery — the full complement,
     /// evaluated against the live-entity set.
     Not(Box<Query>),

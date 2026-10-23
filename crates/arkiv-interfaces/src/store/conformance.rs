@@ -57,6 +57,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     patch_version_guard_rejects_patch_on_state_view(store_generator);
     recordversion_zero_version_guard_always_fails(store_generator);
     patch_may_not_remove_last_cell(store_generator); // I do not understand this
+    patch_set_adds_cells_and_takes_their_kind(store_generator);
     delete_removes_record(store_generator);
     reserved_cell_name_rejected(store_generator);
     field_only_type_cannot_be_attribute(store_generator); // I do not understand this
@@ -64,8 +65,8 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     branch_hash_doesnt_include_record_version(store_generator);
     branch_hash_tracks_content(store_generator);
     query_sees_committed_state(store_generator);
-    query_dnf_unions_and_dedups(store_generator);
-    query_defaults_to_key_order(store_generator);
+    query_or_unions_and_dedups(store_generator);
+    query_without_a_sort_pages_in_a_fixed_order(store_generator);
     query_range_on_eq_only_type_is_invalid(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
@@ -74,8 +75,9 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     block_lifecycle_in_frames(store_generator);
     branch_reads_its_origin_not_the_head(store_generator);
     projection_limits_returned_cells(store_generator);
-    query_and_group_intersects_predicates(store_generator);
-    query_negated_predicate_excludes_matches(store_generator);
+    query_and_intersects_its_children(store_generator);
+    query_not_excludes_matches(store_generator);
+    query_presence_matches_records_carrying_the_attribute(store_generator);
     query_pages_with_offset_and_limit(store_generator);
     query_reports_total_matched_beyond_the_page(store_generator);
     query_sorts_ascending_and_descending(store_generator);
@@ -182,15 +184,16 @@ fn read_record<S: Store>(store: &S, target: ReadTarget, key: RecordKey) -> Optio
         .into_value()
 }
 
-/// A one-group, one-predicate DNF: `cell == value`.
+/// One predicate: `cell == value`.
 fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
-    Filter(vec![AndGroup(vec![Predicate {
+    Filter::Predicate(Predicate {
         cell: cell.to_string(),
-        op: CompareOp::Eq,
-        type_id,
-        value,
-        negated: false,
-    }])])
+        test: Test::Compare {
+            op: CompareOp::Eq,
+            type_id,
+            value,
+        },
+    })
 }
 
 /// The digest of committed state, using only [`Store`].
@@ -730,6 +733,50 @@ fn patch_may_not_remove_last_cell<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
+/// `Set` writes the cell whether or not the record holds it yet, with the kind
+/// it names, and queries follow that kind. Arkiv's account and entity writes
+/// patch in cells a record lacks, and an update can make an attribute indexed:
+/// a store whose `Set` only replaced existing cells, or kept their old kind,
+/// would fail both.
+fn patch_set_adds_cells_and_takes_their_kind<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("tag", Cell::field(TypeId::STR, b"x".to_vec()))],
+    );
+    store
+        .patch(
+            branch,
+            record_key(1),
+            None,
+            vec![
+                ("tag".to_string(), CellChange::Set(str_attribute("y"))),
+                ("n".to_string(), CellChange::Set(u64_attribute(7))),
+            ],
+            None,
+        )
+        .unwrap();
+
+    let found = read_record(&store, ReadTarget::Branch(branch), record_key(1)).unwrap();
+    assert_eq!(
+        found.cell("tag"),
+        Some(&str_attribute("y")),
+        "the kind it names"
+    );
+    assert_eq!(found.cell("n"), Some(&u64_attribute(7)), "a cell it lacked");
+
+    let at = store.commit(branch).unwrap();
+    let tagged = paged_query(equals_filter("tag", TypeId::STR, b"y".to_vec()), 0, 10);
+    assert_eq!(
+        matched_keys(&store, at, &tagged),
+        vec![record_key(1)],
+        "an attribute now, so a query finds it"
+    );
+}
+
 /// Deleting removes the record; deleting again is `NotFound`, not a silent
 /// success.
 fn delete_removes_record<S: Store>(store_generator: &dyn Fn() -> S) {
@@ -924,8 +971,9 @@ fn query_sees_committed_state<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
-/// OR-groups union, and a record matching several groups comes back once.
-fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
+/// An `Or` unions its children, and a record several of them match comes back
+/// once.
+fn query_or_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     create_record(
@@ -942,21 +990,9 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     );
     let committed = store.commit(branch).unwrap();
 
-    let filter = Filter(vec![
-        AndGroup(vec![Predicate {
-            cell: "kind".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::STR,
-            value: b"a".to_vec(),
-            negated: false,
-        }]),
-        AndGroup(vec![Predicate {
-            cell: "n".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::U64,
-            value: 1u64.to_be_bytes().to_vec(),
-            negated: false,
-        }]),
+    let filter = Filter::Or(vec![
+        equals_filter("kind", TypeId::STR, b"a".to_vec()),
+        equals_filter("n", TypeId::U64, 1u64.to_be_bytes().to_vec()),
     ]);
     let query = Query {
         filter,
@@ -974,13 +1010,16 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     assert_eq!(
         found.records.len(),
         1,
-        "a record matching both groups is returned once"
+        "a record matching both children is returned once"
     );
 }
 
-/// With no sort, results come back in ascending key order regardless of the
-/// order they were written in.
-fn query_defaults_to_key_order<S: Store>(store_generator: &dyn Fn() -> S) {
+/// With no sort, results follow the store's own order, which need not be key
+/// order — GolemDB's is the order records were created in — but is fixed for
+/// a commit: the same query lists the same records in the same order, so pages
+/// taken by offset partition the matches. Written out of key order, so a store
+/// that lists in one of those orders and pages in the other would show it.
+fn query_without_a_sort_pages_in_a_fixed_order<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     for ordinal in [3u8, 1, 2] {
@@ -992,22 +1031,22 @@ fn query_defaults_to_key_order<S: Store>(store_generator: &dyn Fn() -> S) {
         );
     }
     let committed = store.commit(branch).unwrap();
-
-    let query = Query {
-        filter: equals_filter("kind", TypeId::STR, b"a".to_vec()),
-        page: Page {
-            offset: 0,
-            limit: 10,
-        },
-        ..Query::default()
+    let page = |offset, limit| {
+        let filter = equals_filter("kind", TypeId::STR, b"a".to_vec());
+        matched_keys(&store, committed, &paged_query(filter, offset, limit))
     };
 
-    let found = store
-        .query(Some(committed), &query, None)
-        .unwrap()
-        .into_value();
-    let keys: Vec<RecordKey> = found.records.iter().map(|record| record.key).collect();
-    assert_eq!(keys, vec![record_key(1), record_key(2), record_key(3)]);
+    let all = page(0, 10);
+    let mut every_match = all.clone();
+    every_match.sort_unstable();
+    assert_eq!(
+        every_match,
+        vec![record_key(1), record_key(2), record_key(3)],
+        "every match, once"
+    );
+    assert_eq!(page(0, 10), all, "the same query lists the same order");
+    let walked: Vec<RecordKey> = (0..3).flat_map(|offset| page(offset, 1)).collect();
+    assert_eq!(walked, all, "pages partition the matches, in that order");
 }
 
 /// A range predicate against an equality-only type is refused, rather than
@@ -1023,13 +1062,14 @@ fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -
     );
     let committed = store.commit(branch).unwrap();
 
-    let filter = Filter(vec![AndGroup(vec![Predicate {
+    let filter = Filter::Predicate(Predicate {
         cell: "h".to_string(),
-        op: CompareOp::Gt,
-        type_id: TypeId::BYTES32,
-        value: vec![0u8; 32],
-        negated: false,
-    }])]);
+        test: Test::Compare {
+            op: CompareOp::Gt,
+            type_id: TypeId::BYTES32,
+            value: vec![0u8; 32],
+        },
+    });
 
     assert_eq!(
         store.count(Some(committed), &filter, None).unwrap_err(),
@@ -1284,28 +1324,16 @@ fn matched_keys<S: Store>(store: &S, at: CommitId, query: &Query) -> Vec<RecordK
         .collect()
 }
 
-/// Predicates inside one AND-group intersect: a record must satisfy all of
-/// them, not merely one.
-fn query_and_group_intersects_predicates<S: Store>(store_generator: &dyn Fn() -> S) {
+/// An `And` intersects its children: a record must satisfy all of them, not
+/// merely one.
+fn query_and_intersects_its_children<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let at = committed_fixture(&mut store);
 
-    let both = Filter(vec![AndGroup(vec![
-        Predicate {
-            cell: "kind".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::STR,
-            value: b"a".to_vec(),
-            negated: false,
-        },
-        Predicate {
-            cell: "n".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::U64,
-            value: 2u64.to_be_bytes().to_vec(),
-            negated: false,
-        },
-    ])]);
+    let both = Filter::And(vec![
+        equals_filter("kind", TypeId::STR, b"a".to_vec()),
+        equals_filter("n", TypeId::U64, 2u64.to_be_bytes().to_vec()),
+    ]);
 
     assert_eq!(
         matched_keys(&store, at, &paged_query(both, 0, 10)),
@@ -1314,18 +1342,90 @@ fn query_and_group_intersects_predicates<S: Store>(store_generator: &dyn Fn() ->
     );
 }
 
-/// A negated predicate matches the records the predicate does not.
-fn query_negated_predicate_excludes_matches<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A presence test matches the records carrying the attribute, with no
+/// comparison: under any type when it names none, under exactly one when it
+/// does. The query language's `exists(name)` and `typeof(name) = tag`.
+fn query_presence_matches_records_carrying_the_attribute<S: Store>(
+    store_generator: &dyn Fn() -> S,
+) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    // One record carries `tag` as a str, one as a u64, one not at all.
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("tag", str_attribute("x"))],
+    );
+    create_record(
+        &mut store,
+        branch,
+        record_key(2),
+        &[("tag", u64_attribute(7))],
+    );
+    create_record(
+        &mut store,
+        branch,
+        record_key(3),
+        &[("other", str_attribute("x"))],
+    );
+    let at = store.commit(branch).unwrap();
+
+    let presence = |type_id| {
+        Filter::Predicate(Predicate {
+            cell: "tag".to_string(),
+            test: Test::Exists { type_id },
+        })
+    };
+    let keys = |filter| matched_keys(&store, at, &paged_query(filter, 0, 10));
+
+    assert_eq!(
+        keys(presence(None)),
+        vec![record_key(1), record_key(2)],
+        "any type: both carriers, and not the record without the attribute"
+    );
+    assert_eq!(
+        keys(presence(Some(TypeId::STR))),
+        vec![record_key(1)],
+        "one type: only the carrier of that type"
+    );
+    assert_eq!(
+        keys(presence(Some(TypeId::U64))),
+        vec![record_key(2)],
+        "the same attribute under another type is a different test"
+    );
+    assert_eq!(
+        keys(presence(Some(TypeId::BOOL))),
+        Vec::<RecordKey>::new(),
+        "a type nothing carries it under matches nothing, rather than failing"
+    );
+    assert_eq!(
+        keys(Filter::Not(Box::new(presence(None)))),
+        vec![record_key(3)],
+        "negated: the records not carrying it at all"
+    );
+
+    // A type that is never indexed cannot be asked for, as a range on an
+    // equality-only type cannot: invalid, not empty.
+    assert_eq!(
+        store
+            .query(
+                Some(at),
+                &paged_query(presence(Some(TypeId::BYTES)), 0, 10),
+                None
+            )
+            .unwrap_err(),
+        StoreError::InvalidQuery,
+        "a presence test over a field-only type is invalid"
+    );
+}
+
+/// A `Not` matches the records its child does not.
+fn query_not_excludes_matches<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let at = committed_fixture(&mut store);
 
-    let not_a = Filter(vec![AndGroup(vec![Predicate {
-        cell: "kind".to_string(),
-        op: CompareOp::Eq,
-        type_id: TypeId::STR,
-        value: b"a".to_vec(),
-        negated: true,
-    }])]);
+    let not_a = Filter::Not(Box::new(equals_filter("kind", TypeId::STR, b"a".to_vec())));
 
     assert_eq!(
         matched_keys(&store, at, &paged_query(not_a, 0, 10)),

@@ -40,14 +40,31 @@
 //!
 //! [`AttributeType`] and [`TypeId`] both number types, and they **disagree** —
 //! `AttributeType::U64` is 3 where [`TypeId::U64`] is 8. Conversion goes through
-//! [`type_id_of`], which matches on the value, never on a discriminant.
+//! [`type_id_for`], which matches on the variant, never on a discriminant.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::entity::{Attribute, AttributeValue, CreationFlags, Entity, annotations};
+use crate::constants::ENTITY_MAX_ATTRIBUTES;
+use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
 use crate::store::{Cell, CellKind, CellName, Record, RecordKey, TypeId};
+
+/// The system cells of the layout above, which every entity record holds.
+const SYSTEM_CELLS: usize = 7;
+
+/// Of the [`SYSTEM_CELLS`], the attributes: `$key`, `$creator`, `$owner` and
+/// `$expiresAt`.
+const SYSTEM_ATTRIBUTES: usize = 4;
+
+/// The most cells an entity record holds: its system cells and one per
+/// attribute. An account record holds a few fields, so this caps every record,
+/// and GolemDB's genesis states it as `record_limits.max_cells`.
+pub const MAX_RECORD_CELLS: usize = SYSTEM_CELLS + ENTITY_MAX_ATTRIBUTES;
+
+/// The most of a record's cells that are attributes, every user attribute
+/// indexed: GolemDB's `record_limits.max_indexed_cells`.
+pub const MAX_RECORD_INDEXED_CELLS: usize = SYSTEM_ATTRIBUTES + ENTITY_MAX_ATTRIBUTES;
 
 /// Why an entity could not be mapped, in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,21 +78,26 @@ pub enum RecordError {
 }
 
 /// The [`TypeId`] a value is stored under.
-///
-/// Matches on the variant, never on [`AttributeType`](crate::entity::AttributeType)'s
-/// discriminant — the two numbering schemes differ. See the module docs.
 pub const fn type_id_of(value: &AttributeValue) -> TypeId {
-    match value {
-        AttributeValue::Bool(_) => TypeId::BOOL,
-        AttributeValue::Int(_) => TypeId::I32,
-        AttributeValue::U64(_) => TypeId::U64,
-        AttributeValue::U256(_) => TypeId::U256,
-        AttributeValue::Decimal(_) => TypeId::DEC,
-        AttributeValue::Bytes32(_) => TypeId::BYTES32,
-        AttributeValue::Bytes(_) => TypeId::BYTES,
-        AttributeValue::Str(_) => TypeId::STR,
-        AttributeValue::EthereumAddress(_) => TypeId::ADDR,
-        AttributeValue::EntityKey(_) => TypeId::KEY,
+    type_id_for(value.attr_type())
+}
+
+/// The [`TypeId`] an attribute type is stored under.
+///
+/// Matches on the variant, never on [`AttributeType`]'s discriminant — the two
+/// numbering schemes differ. See the module docs.
+pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
+    match attr_type {
+        AttributeType::Bool => TypeId::BOOL,
+        AttributeType::Int => TypeId::I32,
+        AttributeType::U64 => TypeId::U64,
+        AttributeType::U256 => TypeId::U256,
+        AttributeType::Decimal => TypeId::DEC,
+        AttributeType::Bytes32 => TypeId::BYTES32,
+        AttributeType::Bytes => TypeId::BYTES,
+        AttributeType::Str => TypeId::STR,
+        AttributeType::EthereumAddress => TypeId::ADDR,
+        AttributeType::EntityKey => TypeId::KEY,
     }
 }
 
@@ -88,7 +110,7 @@ pub const fn record_key(key: EntityAddress) -> RecordKey {
 ///
 /// The [`annotations`] constants are ASCII byte literals in this crate's own source,
 /// so a failure here is a typo in a constant, not untrusted input.
-fn system(name: &[u8]) -> CellName {
+pub(crate) fn system(name: &[u8]) -> CellName {
     CellName::from(core::str::from_utf8(name).expect("annotation names are ASCII"))
 }
 
@@ -288,6 +310,27 @@ mod tests {
             version: RecordVersion(1),
             cells: to_cells(entity).expect("maps"),
         }
+    }
+
+    /// An entity with every attribute it may have, all indexed, fills the
+    /// record caps exactly, so the system cell counts are `to_cells`'s own.
+    #[test]
+    fn a_full_entity_fills_the_record_caps() {
+        let entity = Entity {
+            attributes: (0..ENTITY_MAX_ATTRIBUTES)
+                .map(|i| {
+                    Attribute::new(alloc::format!("a{i}").into_bytes(), AttributeValue::U64(0))
+                })
+                .collect(),
+            ..sample()
+        };
+        let cells = to_cells(&entity).expect("maps");
+        let indexed = cells
+            .iter()
+            .filter(|(_, cell)| matches!(cell.kind, CellKind::Attribute))
+            .count();
+        assert_eq!(cells.len(), MAX_RECORD_CELLS);
+        assert_eq!(indexed, MAX_RECORD_INDEXED_CELLS);
     }
 
     #[test]

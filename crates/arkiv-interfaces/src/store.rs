@@ -43,6 +43,7 @@
 //!   meta entries). See [`validate_cell_name`]. The full grammar is still open
 //!   upstream; when it lands it belongs in that function and nowhere else.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Debug;
@@ -447,31 +448,75 @@ impl CompareOp {
     }
 }
 
-/// One comparison against one attribute.
+/// One test against one attribute. Its complement is a [`Filter::Not`] over it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Predicate {
     pub cell: CellName,
-    pub op: CompareOp,
-    pub type_id: TypeId,
-    pub value: Vec<u8>,
-    /// Complement: matches records the predicate does *not*.
-    pub negated: bool,
+    pub test: Test,
 }
 
-/// An AND-group: predicates intersect **in submitted order**.
+/// What a [`Predicate`] asks of the attribute it names.
 ///
-/// Order is significant and never rearranged. Intersection cost tracks operand
-/// sizes, so putting the most selective predicate first is the caller's main
-/// optimization lever — and since [`Budget`] thresholds cost, it can decide
-/// whether a query completes at all.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AndGroup(pub Vec<Predicate>);
+/// An enum rather than fields on `Predicate`, because a presence test has no
+/// value to compare and no operator to compare it with: one shape covering
+/// both would be able to hold a value-less comparison, or a presence test
+/// carrying an operand that nothing reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Test {
+    /// Compare the attribute's value, which must be of `type_id`: an
+    /// attribute of any other type is a miss, never a coercion.
+    Compare {
+        op: CompareOp,
+        type_id: TypeId,
+        value: Vec<u8>,
+    },
+    /// The attribute is present and indexed, with no comparison: under any
+    /// type when `type_id` is `None`, under exactly that type when it is
+    /// `Some`. The query language's `exists(name)` and `typeof(name) = tag`.
+    Exists { type_id: Option<TypeId> },
+}
 
-/// An ordered DNF: OR of AND-groups. The store evaluates groups in submitted
-/// order and unions the results; a record matching several groups is returned
-/// **once**.
+impl Test {
+    /// Whether a store can answer this test at all, independent of any
+    /// record. A test over a type whose index does not support it is
+    /// [`StoreError::InvalidQuery`]; a presence test needs only *an* index,
+    /// which every type but the field-only ones has.
+    pub const fn is_answerable(&self) -> bool {
+        match self {
+            Self::Compare { op, type_id, .. } => op.permitted_by(type_id.index_class()),
+            // `None` spans the indexed types, so only a named field-only type
+            // is unanswerable.
+            Self::Exists { type_id: None } => true,
+            Self::Exists {
+                type_id: Some(type_id),
+            } => !matches!(type_id.index_class(), IndexClass::None),
+        }
+    }
+}
+
+/// Which records a query or a count selects: predicates under `And`, `Or` and
+/// `Not`, in the shape the caller wrote them.
+///
+/// The store never rearranges the tree. Children are evaluated **in the
+/// written order**, and intersection cost tracks operand sizes, so putting the
+/// most selective test first is the caller's main optimization lever — and
+/// since [`Budget`] thresholds cost, it can decide whether a query completes
+/// at all. A record several `Or` children match is returned **once**.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Filter(pub Vec<AndGroup>);
+pub enum Filter {
+    /// Every record.
+    #[default]
+    All,
+    /// The records the predicate holds for.
+    Predicate(Predicate),
+    /// The records every child matches; with no child, every record.
+    And(Vec<Filter>),
+    /// The records some child matches; with no child, none.
+    Or(Vec<Filter>),
+    /// The records the child does not match: the full complement, so it also
+    /// takes the records lacking the attribute a predicate under it tests.
+    Not(Box<Filter>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
@@ -479,8 +524,13 @@ pub enum SortDirection {
     Descending,
 }
 
-/// One sort key. Absent, and as the tie-break under a sort, results are in
-/// ascending [`RecordKey`] order.
+/// One sort key. Under a sort, ties break on ascending [`RecordKey`].
+///
+/// Absent, results follow the store's own order over its records at the
+/// commit: fixed for that commit, so the same query lists the same records in
+/// the same order and pages taken by offset partition the matches, but not
+/// necessarily key order. GolemDB's is the order the records were created in;
+/// the reference store's is key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sort {
     pub cell: CellName,
@@ -501,8 +551,8 @@ pub struct Query {
     pub page: Page,
     /// Cell names to return; absent = the full record.
     pub projection: Option<Vec<CellName>>,
-    /// Ask for the full match count. Suppresses page early-exit: every group
-    /// runs to completion.
+    /// Ask for the full match count. Suppresses page early-exit: the whole
+    /// filter runs to completion.
     pub total_matched: bool,
 }
 
@@ -764,7 +814,8 @@ pub trait Store: core::fmt::Debug {
     // -- query (metered, commit-targeted) ----------------------------------
 
     /// Filtered, sorted, paged read against committed state. `at` defaults to
-    /// head and must lie within retention.
+    /// head and must lie within retention. Unsorted, results come in the
+    /// store's own order, which need not be key order: see [`Sort`].
     fn query(
         &self,
         at: Option<CommitId>,
@@ -1303,77 +1354,85 @@ impl Predicate {
     /// invisible to queries, and the type is part of the index bucket, so an
     /// attribute of some other type is a miss rather than a coercion.
     ///
-    /// Returns [`StoreError::InvalidQuery`] if the operation is not one the
-    /// type can be indexed for — checked before the record is consulted, so
-    /// an invalid query fails the same way against any state.
+    /// Returns [`StoreError::InvalidQuery`] if the test is not one the type
+    /// can be indexed for — checked before the record is consulted, so an
+    /// invalid query fails the same way against any state.
     pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
-        if !self.op.permitted_by(self.type_id.index_class()) {
+        if !self.test.is_answerable() {
             return Err(StoreError::InvalidQuery);
         }
 
+        // Fields are invisible to queries whichever test is asked, so the
+        // attribute kind is checked once, before the test is applied.
         let hit = match record.cell(&self.cell) {
-            Some(cell)
-                if matches!(cell.kind, CellKind::Attribute) && cell.type_id == self.type_id =>
-            {
-                self.compare(&cell.value)
-            }
+            Some(cell) if matches!(cell.kind, CellKind::Attribute) => match &self.test {
+                Test::Compare { op, type_id, value } => {
+                    cell.type_id == *type_id && compare(*op, &cell.value, value, *type_id)
+                }
+                // Presence of an indexed attribute: any type, or exactly one.
+                Test::Exists { type_id: None } => {
+                    !matches!(cell.type_id.index_class(), IndexClass::None)
+                }
+                Test::Exists {
+                    type_id: Some(type_id),
+                } => cell.type_id == *type_id,
+            },
             _ => false,
         };
-        Ok(hit != self.negated)
-    }
-
-    /// Compare a stored value against this predicate's operand.
-    ///
-    /// Equality and prefix work on the canonical bytes directly; ordering
-    /// works on [`order_encoding`], which for signed types is not the same.
-    fn compare(&self, stored: &[u8]) -> bool {
-        match self.op {
-            CompareOp::Prefix => stored.starts_with(&self.value),
-            CompareOp::Eq => stored == self.value.as_slice(),
-            CompareOp::Lt | CompareOp::Lte | CompareOp::Gt | CompareOp::Gte => {
-                let left = order_encoding(stored, self.type_id);
-                let right = order_encoding(&self.value, self.type_id);
-                match self.op {
-                    CompareOp::Lt => left < right,
-                    CompareOp::Lte => left <= right,
-                    CompareOp::Gt => left > right,
-                    CompareOp::Gte => left >= right,
-                    CompareOp::Eq | CompareOp::Prefix => unreachable!("handled above"),
-                }
-            }
-        }
+        Ok(hit)
     }
 }
 
-impl AndGroup {
-    /// Whether every predicate in the group holds for `record`.
-    ///
-    /// Predicates are intersected in submitted order and the group stops at
-    /// the first miss — the early exit the spec makes the caller's cost lever.
-    pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
-        for predicate in &self.0 {
-            if !predicate.matches(record)? {
-                return Ok(false);
+/// Compare a stored value against a predicate's operand.
+///
+/// Equality and prefix work on the canonical bytes directly; ordering works on
+/// [`order_encoding`], which for signed types is not the same.
+fn compare(op: CompareOp, stored: &[u8], operand: &[u8], type_id: TypeId) -> bool {
+    match op {
+        CompareOp::Prefix => stored.starts_with(operand),
+        CompareOp::Eq => stored == operand,
+        CompareOp::Lt | CompareOp::Lte | CompareOp::Gt | CompareOp::Gte => {
+            let left = order_encoding(stored, type_id);
+            let right = order_encoding(operand, type_id);
+            match op {
+                CompareOp::Lt => left < right,
+                CompareOp::Lte => left <= right,
+                CompareOp::Gt => left > right,
+                CompareOp::Gte => left >= right,
+                CompareOp::Eq | CompareOp::Prefix => unreachable!("handled above"),
             }
         }
-        Ok(true)
     }
 }
 
 impl Filter {
-    /// Whether any group matches `record` — the OR half of the DNF.
+    /// Whether the filter selects `record`.
     ///
-    /// An empty filter matches every record.
+    /// Children are evaluated in the written order, an `And` stopping at its
+    /// first miss and an `Or` at its first hit — the early exit the spec makes
+    /// the caller's cost lever.
     pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
-        if self.0.is_empty() {
-            return Ok(true);
-        }
-        for group in &self.0 {
-            if group.matches(record)? {
-                return Ok(true);
+        match self {
+            Self::All => Ok(true),
+            Self::Predicate(predicate) => predicate.matches(record),
+            Self::And(children) => {
+                for child in children {
+                    if !child.matches(record)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
+            Self::Or(children) => {
+                for child in children {
+                    if child.matches(record)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Not(child) => child.matches(record).map(|hit| !hit),
         }
-        Ok(false)
     }
 }
 

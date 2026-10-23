@@ -13,4 +13,7 @@ arkiv-interfaces.workspace = true
 golemdb-api.workspace = true
 
 [dev-dependencies]
+arkiv-query.workspace = true
+# `MAX_PAGE_SIZE`, the largest page `arkiv_query` asks GolemDB for.
+arkiv-rpc-types.workspace = true
 tempfile.workspace = true

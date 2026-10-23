@@ -2,11 +2,15 @@
 
 use arkiv_interfaces::entity::annotations;
 use arkiv_interfaces::store::{
-    BranchId, Cell, CellKind, CommitId, Metered, Receipt, Record, RecordKey, RecordVersion,
-    SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
+    BranchId, Cell, CellKind, CommitId, CostUnits, Metered, Receipt, Record, RecordKey,
+    RecordVersion, SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
 };
 use golemdb_api as golemdb;
-use golemdb_api::{ApiError, CellType, Width};
+use golemdb_api::{ApiError, CellType, FloatWidth, Width};
+
+mod query;
+
+pub(crate) use query::{arkiv_query_result, count_op, golemdb_budget, query_op};
 
 /// GolemDB reports no cost yet, so every receipt is empty.
 pub(crate) fn metered<T>(value: T) -> Metered<T> {
@@ -20,17 +24,42 @@ pub(crate) fn metered<T>(value: T) -> Metered<T> {
 pub(crate) fn store_error(error: ApiError) -> StoreError {
     match error {
         ApiError::NotImplemented { .. } => StoreError::NotImplemented,
-        ApiError::NotFound => StoreError::NotFound,
+        // A missing cell comes only from GolemDB's `set`, which `patch` does
+        // not use: its writes create a cell that is missing.
+        ApiError::NotFound | ApiError::CellNotFound { .. } => StoreError::NotFound,
         ApiError::AlreadyExists => StoreError::AlreadyExists,
         ApiError::Reserved | ApiError::InvalidArgument { .. } => StoreError::InvalidArgument,
         ApiError::InvalidQuery { .. } => StoreError::InvalidQuery,
+        ApiError::LimitExceeded { .. } => StoreError::LimitExceeded,
+        // A verdict on the call, not a machine failure. What it spent is on the
+        // receipt, which only a metered call has, and `metered_result` reads it
+        // there; with no receipt, nothing is reported spent.
+        ApiError::OutOfBudget { .. } => StoreError::OutOfBudget {
+            spent: CostUnits::default(),
+        },
         ApiError::HandleInvalid
         | ApiError::Conflict
         | ApiError::Sealed
         | ApiError::CommitUnavailable { .. }
         | ApiError::NoFrameToRollback => StoreError::HandleInvalid,
+        ApiError::StoreFull | ApiError::Internal { .. } => StoreError::Internal,
+        // `ApiError` is non-exhaustive, so the compiler requires this arm: an
+        // error GolemDB adds later is a machine failure until it is mapped.
         _ => StoreError::Internal,
     }
+}
+
+/// A metered call's result, its receipt dropped as GolemDB prices no work yet.
+/// Running out of budget is the exception: GolemDB reports what was spent by
+/// then on the receipt rather than in the error, so it is taken from there.
+pub(crate) fn metered_result<T>(metered: golemdb::Metered<T>) -> Result<T, StoreError> {
+    let golemdb::Metered { result, receipt } = metered;
+    result.map_err(|error| match error {
+        ApiError::OutOfBudget { .. } => StoreError::OutOfBudget {
+            spent: CostUnits(receipt.cost),
+        },
+        error => store_error(error),
+    })
 }
 
 pub(crate) fn branch_id(branch: BranchId) -> golemdb::BranchId {
@@ -102,7 +131,14 @@ fn type_id(name: &[u8], cell_type: CellType) -> Result<TypeId, StoreError> {
         CellType::Str => TypeId::STR,
         CellType::Uint(Width::W8) => TypeId::U64,
         CellType::Bytes20 => TypeId::ADDR,
-        _ => return Err(StoreError::Internal),
+        // Types Arkiv never writes.
+        CellType::Int(Width::W8 | Width::W16 | Width::W32)
+        | CellType::Uint(Width::W4 | Width::W16)
+        | CellType::Decimal(Width::W4 | Width::W8 | Width::W16)
+        | CellType::FixedBytes(Width::W4 | Width::W8 | Width::W16)
+        | CellType::Float(FloatWidth::F32 | FloatWidth::F64)
+        | CellType::Date32
+        | CellType::Timestamp64 => return Err(StoreError::Internal),
     })
 }
 

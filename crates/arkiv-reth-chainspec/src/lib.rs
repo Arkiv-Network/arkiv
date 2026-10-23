@@ -203,7 +203,7 @@ impl EthChainSpec for ArkivChainSpec {
 mod tests {
     use super::*;
     use alloy_eips::eip1559::{INITIAL_BASE_FEE, MIN_PROTOCOL_BASE_FEE};
-    use golemdb_api::{CellLimits, HashAlgorithm};
+    use golemdb_api::{CellLimits, HashAlgorithm, RecordLimits};
     use reth_ethereum::chainspec::DEV;
     use serde_json::{Value, json};
 
@@ -353,7 +353,8 @@ mod tests {
     fn arkiv(edit: impl FnOnce(&mut Value)) -> Value {
         let mut golemdb = json!({
             "hash_function": "blake3",
-            "cell_limits": { "max_cell_name_len": 32, "max_str_len": 128, "max_bytes_len": 131072 }
+            "cell_limits": { "max_cell_name_len": 32, "max_str_len": 128, "max_bytes_len": 131072 },
+            "record_limits": { "max_cells": 39, "max_indexed_cells": 36 }
         });
         edit(&mut golemdb);
         json!({ "golemdb": golemdb })
@@ -383,11 +384,16 @@ mod tests {
             max_str_len: 128,
             max_bytes_len: 131072,
         };
+        let record_limits = RecordLimits {
+            max_cells: 39,
+            max_indexed_cells: 36,
+        };
         assert_eq!(
             with_arkiv(arkiv(|_| {})).unwrap().golemdb(),
             Some(&golemdb_api::Genesis::new(
                 HashAlgorithm::Blake3,
                 limits,
+                record_limits,
                 None
             ))
         );
@@ -417,6 +423,12 @@ mod tests {
                     g.as_object_mut().unwrap().remove("cell_limits");
                 }),
                 "missing field `cell_limits`",
+            ),
+            (
+                arkiv(|g| {
+                    g.as_object_mut().unwrap().remove("record_limits");
+                }),
+                "missing field `record_limits`",
             ),
             (
                 arkiv(|g| g["cell_limits"]["max_str_len"] = json!(-1)),

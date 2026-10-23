@@ -11,9 +11,11 @@ license.workspace = true
 
 [dependencies]
 arkiv-interfaces.workspace = true
-alloy-primitives.workspace = true
+# `serde` because the wire types derive it over alloy's. Built alone, nothing
+# else in the graph turns it on.
+alloy-primitives = { workspace = true, features = ["serde"] }
 # `BlockNumberOrTag` for the `atBlock` query option.
-alloy-eips.workspace = true
+alloy-eips = { workspace = true, features = ["serde"] }
 serde.workspace = true
 # Attribute values are rendered per type, so the wire value is a JSON value.
 serde_json.workspace = true

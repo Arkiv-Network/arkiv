@@ -23,19 +23,20 @@ mod tags;
 use std::path::Path;
 
 use arkiv_interfaces::store::{
-    BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, Filter,
-    Metered, Origin, Query, QueryResult, ReadTarget, Record, RecordChange, RecordKey,
+    BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellKind, CellName, CommitId,
+    Filter, Metered, Origin, Query, QueryResult, ReadTarget, Record, RecordChange, RecordKey,
     RecordVersion, SealedCommit, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
     StoreError, StoreExt, WriteOp, WriteOutcome,
 };
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError};
+pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, RecordLimits};
 
 use convert::{
-    arkiv_record, branch_id, commit_id, golemdb_cell, golemdb_commit, immutable_data_address,
-    immutable_data_key, immutable_data_row, metered, record_key, segment_row, store_error,
+    arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
+    golemdb_commit, immutable_data_address, immutable_data_key, immutable_data_row, metered,
+    metered_result, query_op, record_key, segment_row, store_error,
 };
 use tags::TagRow;
 
@@ -293,18 +294,18 @@ impl Store for GolemDbStore {
         branch: BranchId,
         key: RecordKey,
         cells: Vec<(CellName, Cell)>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<RecordKey>, StoreError> {
-        let mut operation = golemdb::RecordOp::create(record_key(key));
+        let mut operation = golemdb::RecordOp::create(record_key(key), golemdb_budget(budget));
         for (name, cell) in &cells {
-            operation = operation
-                .insert(name, golemdb_cell(cell)?)
-                .map_err(store_error)?;
+            let value = golemdb_cell(cell)?;
+            operation = match cell.kind {
+                CellKind::Attribute => operation.attribute(name, value),
+                CellKind::Field => operation.field(name, value),
+            };
         }
-        self.database
-            .create(branch_id(branch), operation)
+        metered_result(self.database.create(branch_id(branch), operation))
             .map(|key| metered(RecordKey(key.0)))
-            .map_err(store_error)
     }
 
     fn get(
@@ -312,20 +313,20 @@ impl Store for GolemDbStore {
         target: ReadTarget,
         key: RecordKey,
         projection: Option<&[CellName]>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<Option<Record>>, StoreError> {
         let target = match target {
             ReadTarget::Branch(branch) => golemdb::ReadTarget::Branch(branch_id(branch)),
             ReadTarget::Commit(commit) => golemdb::ReadTarget::Commit(golemdb_commit(commit)),
         };
-        let mut operation = golemdb::RecordOp::get(record_key(key));
+        let mut operation = golemdb::RecordOp::get(record_key(key), golemdb_budget(budget));
         if let Some(names) = projection {
             operation = operation.only(names.iter().map(String::as_bytes));
         }
-        match self.database.get(target, operation) {
+        match metered_result(self.database.get(target, operation)) {
             Ok(record) => Ok(metered(Some(arkiv_record(&record)?))),
-            Err(ApiError::NotFound) => Ok(metered(None)),
-            Err(error) => Err(store_error(error)),
+            Err(StoreError::NotFound) => Ok(metered(None)),
+            Err(error) => Err(error),
         }
     }
 
@@ -336,23 +337,31 @@ impl Store for GolemDbStore {
         key: RecordKey,
         expected_version: Option<RecordVersion>,
         changes: Vec<(CellName, CellChange)>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<RecordVersion>, StoreError> {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
         }
-        let mut operation = golemdb::RecordOp::patch(record_key(key));
+        let mut operation = golemdb::RecordOp::patch(record_key(key), golemdb_budget(budget));
         for (name, change) in &changes {
             operation = match change {
-                CellChange::Set(cell) => operation.set(name, golemdb_cell(cell)?),
+                // A write, as in `create`, not GolemDB's `set`: `set` only
+                // replaces a cell the record already holds, and keeps its
+                // stored kind. Arkiv's `Set` adds a missing cell, which the
+                // account and entity paths rely on, and gives it the kind it
+                // names, which is how an attribute becomes indexed.
+                CellChange::Set(cell) => {
+                    let value = golemdb_cell(cell)?;
+                    match cell.kind {
+                        CellKind::Attribute => operation.attribute(name, value),
+                        CellKind::Field => operation.field(name, value),
+                    }
+                }
                 CellChange::Remove => operation.remove(name),
-            }
-            .map_err(store_error)?;
+            };
         }
-        self.database
-            .patch(branch_id(branch), operation)
+        metered_result(self.database.patch(branch_id(branch), operation))
             .map(|()| metered(RecordVersion(0)))
-            .map_err(store_error)
     }
 
     fn delete(
@@ -360,38 +369,49 @@ impl Store for GolemDbStore {
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
-        _budget: Option<Budget>,
+        budget: Option<Budget>,
     ) -> Result<Metered<()>, StoreError> {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
         }
-        self.database
-            .delete(
-                branch_id(branch),
-                golemdb::RecordOp::delete(record_key(key)),
-            )
-            .map(metered)
-            .map_err(store_error)
+        metered_result(self.database.delete(
+            branch_id(branch),
+            golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
+        ))
+        .map(metered)
     }
 
-    /// Out of scope here, and GolemDB cannot yet run Arkiv's queries, which
-    /// always combine predicates.
+    /// The query runs as written, so what GolemDB cannot run yet is
+    /// `NotImplemented`: a `Not`, a presence test for `key`, and a sort.
+    /// Matches come in GolemDB's own order, the order the records were
+    /// created in, and paging runs over that order within GolemDB's own query
+    /// limit, over which a page is `LimitExceeded`.
     fn query(
         &self,
-        _at: Option<CommitId>,
-        _query: &Query,
-        _budget: Option<Budget>,
+        at: Option<CommitId>,
+        query: &Query,
+        budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
-        Err(StoreError::NotImplemented)
+        let page = metered_result(
+            self.database
+                .query(at.map(golemdb_commit), query_op(query, budget)?),
+        )?;
+        arkiv_query_result(&page).map(metered)
     }
 
+    /// A count does not page, so it runs whenever GolemDB can express the
+    /// filter.
     fn count(
         &self,
-        _at: Option<CommitId>,
-        _filter: &Filter,
-        _budget: Option<Budget>,
+        at: Option<CommitId>,
+        filter: &Filter,
+        budget: Option<Budget>,
     ) -> Result<Metered<u64>, StoreError> {
-        Err(StoreError::NotImplemented)
+        metered_result(
+            self.database
+                .count(at.map(golemdb_commit), count_op(filter, budget)?),
+        )
+        .map(metered)
     }
 
     /// A constant. The one production caller discards it, and GolemDB has no

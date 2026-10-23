@@ -353,7 +353,7 @@ JSON-RPC 2.0, positional params `[queryString, options?]`. Chain quantities are
 |---|---|---|---|
 | `atBlock` | hex quantity | head | must be within the node's retained range |
 | `select` | object | `{ "key": true }` | everything except `key` defaults **off** |
-| `limit` | hex quantity | node default | node max 200 |
+| `limit` | hex quantity | node default | node max 100 |
 | `cursor` | string | — | opaque, from a previous response; bound to query/block/select |
 
 **Projections** (`select`) — flat, per-field booleans:
