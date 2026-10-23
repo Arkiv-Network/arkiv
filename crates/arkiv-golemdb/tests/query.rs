@@ -405,7 +405,7 @@ fn star_matches_every_entity() {
     );
     let live_at = |block: u64| {
         let bound = arkiv_query::parse(&format!("$expiresAt > u64({block})")).unwrap();
-        Filter::from(&ArkivQuery::And(Box::new(ArkivQuery::All), Box::new(bound)))
+        Filter::from(&ArkivQuery::And(vec![ArkivQuery::All, bound]))
     };
     let count = |filter: &Filter| store.count(None, filter, None).map(|n| n.into_value());
 

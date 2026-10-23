@@ -16,10 +16,10 @@
 //! - a sort on a cell the filter does not hold to one type: a GolemDB sort
 //!   names one.
 //!
-//! A query keeps within GolemDB's cap of 64 nested `And`/`Or` levels without
-//! being flattened: each node joins two subtrees, so a path through the tree
-//! holds fewer nodes than the query has predicates, which the parser caps at
-//! 64, and the RPC's live-entity bound adds one.
+//! A query keeps well within GolemDB's cap of 64 nested `And`/`Or` levels: the
+//! parser builds a chain of one connective as one node and refuses a query
+//! nesting `AND`/`OR` more than four levels, and the RPC's live-entity bound
+//! adds one.
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 

@@ -52,10 +52,13 @@ pub enum Query {
         name: String,
         attr_type: Option<AttributeType>,
     },
-    /// Matches entities satisfying both subqueries.
-    And(Box<Query>, Box<Query>),
-    /// Matches entities satisfying either subquery.
-    Or(Box<Query>, Box<Query>),
+    /// Matches entities satisfying every subquery. A chain of one connective
+    /// is one node, `a AND b AND c` an `And` of three, so a node is only as
+    /// deep as the query nests; the parser builds it with two or more.
+    And(Vec<Query>),
+    /// Matches entities satisfying some subquery. One node per chain, as
+    /// [`And`](Self::And).
+    Or(Vec<Query>),
     /// Matches entities not satisfying the subquery — the full complement,
     /// evaluated against the live-entity set.
     Not(Box<Query>),

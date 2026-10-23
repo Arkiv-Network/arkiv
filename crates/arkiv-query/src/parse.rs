@@ -17,11 +17,16 @@
 //! (`$owner` takes an address) and against its operator (only the numeric types
 //! are ordered). A range operator on an equality-only type is an error here, not
 //! an empty result later — the spec is explicit that the two must not be
-//! confused. Second, **limits**: length, predicate count and nesting depth are
-//! bounded, because `parse` runs on unauthenticated RPC input.
+//! confused. Second, **limits**: length, predicate count, nesting depth and
+//! `AND`/`OR` depth are bounded, because `parse` runs on unauthenticated RPC
+//! input.
+//!
+//! A chain of one connective is one node: `a AND b AND c` is an `And` of
+//! three, so the tree is only as deep as the query nests.
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use arkiv_interfaces::entity::{AttributeType, AttributeValue};
@@ -31,10 +36,6 @@ use crate::error::{ParseError, ParseErrorKind};
 use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
 use crate::limits;
 use crate::literal;
-
-/// Names reserved for possible future language features, so they cannot be
-/// used as attribute names.
-const RESERVED_NAMES: [&str; 1] = ["set"];
 
 /// Parse a query string into a [`Query`] AST. See the [module docs](self).
 pub fn parse(input: &str) -> Result<Query, ParseError> {
@@ -115,23 +116,52 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Query, ParseError> {
-        let mut query = self.parse_and()?;
-        while matches!(self.peek_token(), Some(Token::Or)) {
-            self.advance();
-            let right = self.parse_and()?;
-            query = Query::Or(Box::new(query), Box::new(right));
-        }
-        Ok(query)
+        let first = self.parse_and()?;
+        self.chain(first, &Token::Or, Self::parse_and, Query::Or)
     }
 
     fn parse_and(&mut self) -> Result<Query, ParseError> {
-        let mut query = self.parse_unary()?;
-        while matches!(self.peek_token(), Some(Token::And)) {
+        let first = self.parse_unary()?;
+        self.chain(first, &Token::And, Self::parse_unary, Query::And)
+    }
+
+    /// `first` and every operand joined to it by `connective`, as one node of
+    /// them all: `a AND b AND c` is one `And` of three, not nested pairs. A
+    /// lone operand is returned as it is.
+    ///
+    /// Each operand is held to [`limits::MAX_AND_OR_DEPTH`] as soon as it is
+    /// parsed, so a query nesting deeper stops here, before anything deeper
+    /// than the limit is built.
+    fn chain(
+        &mut self,
+        first: Query,
+        connective: &Token,
+        operand: fn(&mut Self) -> Result<Query, ParseError>,
+        node: fn(Vec<Query>) -> Query,
+    ) -> Result<Query, ParseError> {
+        let Some(mut position) = self.connective_at(connective) else {
+            return Ok(first);
+        };
+        // A node is coming, so `first` is one of its operands.
+        within_and_or_depth(&first, position)?;
+        let mut operands = vec![first];
+        loop {
             self.advance();
-            let right = self.parse_unary()?;
-            query = Query::And(Box::new(query), Box::new(right));
+            let next = operand(self)?;
+            within_and_or_depth(&next, position)?;
+            operands.push(next);
+            let Some(next_position) = self.connective_at(connective) else {
+                return Ok(node(operands));
+            };
+            position = next_position;
         }
-        Ok(query)
+    }
+
+    /// Where the next token starts, when it is `connective`.
+    fn connective_at(&self, connective: &Token) -> Option<usize> {
+        self.peek()
+            .filter(|spanned| spanned.token == *connective)
+            .map(|spanned| spanned.start)
     }
 
     fn parse_unary(&mut self) -> Result<Query, ParseError> {
@@ -568,26 +598,55 @@ fn check_operator(operator: &Token, value: &AnnotVal, position: usize) -> Result
     Ok(())
 }
 
-/// User attribute names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, and never
-/// one of the language's own words.
+/// Refuse `operand` when the `AND`/`OR` node at `position` joining it would
+/// nest more than [`limits::MAX_AND_OR_DEPTH`] levels: the node is one level
+/// above its deepest operand.
+fn within_and_or_depth(operand: &Query, position: usize) -> Result<(), ParseError> {
+    if and_or_depth(operand) < limits::MAX_AND_OR_DEPTH {
+        return Ok(());
+    }
+    Err(ParseError::at(
+        position,
+        ParseErrorKind::QueryLimitError,
+        alloc::format!(
+            "query nests AND/OR more than {} levels deep",
+            limits::MAX_AND_OR_DEPTH
+        ),
+    ))
+}
+
+/// How many `AND`/`OR` levels `query` nests: none for a predicate, and one
+/// more than its deepest operand for an `AND` or `OR`. A `NOT` adds none; its
+/// nesting is held to [`limits::MAX_NESTING_DEPTH`] instead.
+fn and_or_depth(query: &Query) -> usize {
+    match query {
+        Query::And(operands) | Query::Or(operands) => {
+            1 + operands.iter().map(and_or_depth).max().unwrap_or(0)
+        }
+        Query::Not(inner) => and_or_depth(inner),
+        Query::All
+        | Query::Eq { .. }
+        | Query::Gt { .. }
+        | Query::Gte { .. }
+        | Query::Lt { .. }
+        | Query::Lte { .. }
+        | Query::StartsWith { .. }
+        | Query::Exists { .. } => 0,
+    }
+}
+
+/// User attribute names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, and
+/// never a type name.
 ///
-/// The charset is the lexer's business; what is left is the length cap and the
-/// reserved names. Type tags are only tags in front of a `(`, so a bare `str`
-/// arrives here as an ordinary name and has to be rejected by hand.
+/// The charset is the lexer's business, and so are the keywords, which arrive
+/// as tokens of their own; what is left is the length cap and the type names.
+/// Type tags are only tags in front of a `(`, so a bare `str` arrives here as
+/// an ordinary name and has to be rejected by hand.
 fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
     if name.len() > limits::MAX_ATTRIBUTE_NAME_BYTES {
         return Err(ParseError::syntax(
             position,
             "attribute names are limited to 32 bytes",
-        ));
-    }
-    if RESERVED_NAMES
-        .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
-    {
-        return Err(ParseError::syntax(
-            position,
-            alloc::format!("{name} is reserved and cannot be an attribute name"),
         ));
     }
     if let Some(tag) = TypeTag::from_name(name) {
@@ -1030,16 +1089,16 @@ mod tests {
     fn presence_operators_combine_and_negate() {
         assert_eq!(
             parse("exists(a) AND level > i32(3)").unwrap(),
-            Query::And(
-                Box::new(Query::Exists {
+            Query::And(vec![
+                Query::Exists {
                     name: "a".into(),
                     attr_type: None,
-                }),
-                Box::new(Query::Gt {
+                },
+                Query::Gt {
                     key: user("level"),
                     value: AttributeValue::Int(3),
-                })
-            )
+                },
+            ])
         );
         assert_eq!(
             parse("NOT exists(a)").unwrap(),
@@ -1115,35 +1174,109 @@ mod tests {
 
     // ── boolean structure ───────────────────────────────────────────────
 
-    #[test]
-    fn precedence_is_not_then_and_then_or() {
-        // AND binds tighter than OR.
-        assert!(matches!(
-            parse("a = true OR b = true AND c = true").unwrap(),
-            Query::Or(_, right) if matches!(*right, Query::And(_, _))
-        ));
-        // NOT binds tighter than AND, and needs no parentheses.
-        assert!(matches!(
-            parse("NOT a = true AND b = true").unwrap(),
-            Query::And(left, _) if matches!(*left, Query::Not(_))
-        ));
-        // Parentheses override.
-        assert!(matches!(
-            parse("(a = true OR b = true) AND c = true").unwrap(),
-            Query::And(left, _) if matches!(*left, Query::Or(_, _))
-        ));
+    /// `name = true`, the predicate the structure tests are built from.
+    fn is_true(name: &str) -> Query {
+        Query::Eq {
+            key: user(name),
+            value: AttributeValue::Bool(true),
+        }
     }
 
     #[test]
-    fn connectives_are_left_associative() {
-        assert!(matches!(
+    fn precedence_is_not_then_and_then_or() {
+        // AND binds tighter than OR.
+        assert_eq!(
+            parse("a = true OR b = true AND c = true").unwrap(),
+            Query::Or(vec![
+                is_true("a"),
+                Query::And(vec![is_true("b"), is_true("c")])
+            ])
+        );
+        // NOT binds tighter than AND, and needs no parentheses.
+        assert_eq!(
+            parse("NOT a = true AND b = true").unwrap(),
+            Query::And(vec![Query::Not(Box::new(is_true("a"))), is_true("b")])
+        );
+        // Parentheses override.
+        assert_eq!(
+            parse("(a = true OR b = true) AND c = true").unwrap(),
+            Query::And(vec![
+                Query::Or(vec![is_true("a"), is_true("b")]),
+                is_true("c")
+            ])
+        );
+    }
+
+    /// A chain of one connective is one node, its operands in the written
+    /// order.
+    #[test]
+    fn a_chain_of_one_connective_is_one_node() {
+        assert_eq!(
             parse("a = true AND b = true AND c = true").unwrap(),
-            Query::And(left, _) if matches!(*left, Query::And(_, _))
-        ));
-        assert!(matches!(
+            Query::And(vec![is_true("a"), is_true("b"), is_true("c")])
+        );
+        assert_eq!(
             parse("a = true OR b = true OR c = true").unwrap(),
-            Query::Or(left, _) if matches!(*left, Query::Or(_, _))
-        ));
+            Query::Or(vec![is_true("a"), is_true("b"), is_true("c")])
+        );
+        // A parenthesized chain is a group of its own, not merged into the
+        // chain around it.
+        assert_eq!(
+            parse("a = true AND (b = true AND c = true)").unwrap(),
+            Query::And(vec![
+                is_true("a"),
+                Query::And(vec![is_true("b"), is_true("c")])
+            ])
+        );
+    }
+
+    /// `levels` AND/OR levels, alternating and each nesting the next:
+    /// `a = true OR (a = true AND (a = true))` is two.
+    fn nested_and_or(levels: usize) -> String {
+        (0..levels).fold(String::from("a = true"), |inner, level| {
+            let connective = if level % 2 == 0 { "AND" } else { "OR" };
+            format!("a = true {connective} ({inner})")
+        })
+    }
+
+    /// AND/OR nest at most `MAX_AND_OR_DEPTH` levels. One more is a limit
+    /// error at the connective that would add it, raised before the parser
+    /// builds anything deeper.
+    #[test]
+    fn and_or_nest_at_most_the_depth_limit() {
+        let deepest = nested_and_or(limits::MAX_AND_OR_DEPTH);
+        assert!(parse(&deepest).is_ok(), "{deepest}");
+
+        let too_deep = nested_and_or(limits::MAX_AND_OR_DEPTH + 1);
+        let err = parse(&too_deep).unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::QueryLimitError, "{too_deep}");
+        assert!(err.message.contains("AND/OR"), "{err}");
+        assert_eq!(
+            err.failure_position,
+            Some("a = true ".len()),
+            "at the outermost connective, which would add the level"
+        );
+
+        // A NOT between levels adds none, and hides none.
+        let negated = format!("a = true AND NOT ({deepest})");
+        assert_eq!(
+            parse(&negated).unwrap_err().kind,
+            ParseErrorKind::QueryLimitError,
+            "{negated}"
+        );
+    }
+
+    /// However long, a chain of one connective is a single level.
+    #[test]
+    fn a_long_chain_is_one_level() {
+        let chain = (0..limits::MAX_PREDICATES)
+            .map(|i| format!("a{i} = true"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let Query::And(operands) = parse(&chain).unwrap() else {
+            panic!("one And");
+        };
+        assert_eq!(operands.len(), limits::MAX_PREDICATES);
     }
 
     #[test]
@@ -1187,17 +1320,15 @@ mod tests {
     }
 
     #[test]
-    fn reserved_and_type_names_cannot_be_attributes() {
+    fn keywords_and_type_names_cannot_be_attributes() {
         // Keywords lex as keywords, so they never reach an attribute position.
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
-        assert_eq!(kind_of("set = true"), ParseErrorKind::MalformedInputError);
-        assert_eq!(kind_of("Set = true"), ParseErrorKind::MalformedInputError);
-        assert_eq!(kind_of("SET = true"), ParseErrorKind::MalformedInputError);
-        assert_eq!(kind_of("seT = true"), ParseErrorKind::MalformedInputError);
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");
+        // Any other word is a name, `set` included.
+        assert_eq!(parse("set = true").unwrap(), is_true("set"));
     }
 
     #[test]

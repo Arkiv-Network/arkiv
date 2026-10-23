@@ -7,7 +7,6 @@
 //! can run. Each leaf becomes one [`Predicate`] on its attribute's cell.
 
 use alloc::boxed::Box;
-use alloc::vec;
 
 use super::{AnnotKey, AnnotVal, BuiltIn, Query};
 use crate::entity::annotations;
@@ -68,8 +67,8 @@ impl From<&Query> for Filter {
                     type_id: attr_type.map(type_id_for),
                 },
             }),
-            Query::And(left, right) => Self::And(vec![Self::from(&**left), Self::from(&**right)]),
-            Query::Or(left, right) => Self::Or(vec![Self::from(&**left), Self::from(&**right)]),
+            Query::And(children) => Self::And(children.iter().map(Self::from).collect()),
+            Query::Or(children) => Self::Or(children.iter().map(Self::from).collect()),
             Query::Not(inner) => Self::Not(Box::new(Self::from(&**inner))),
         }
     }
@@ -81,6 +80,7 @@ mod tests {
     use crate::entity::{AttributeType, AttributeValue};
     use crate::store::{Cell, Record, RecordKey, RecordVersion, StoreError, TypeId};
     use alloc::string::String;
+    use alloc::vec;
 
     fn user(name: &str) -> AnnotKey {
         AnnotKey::User(String::from(name))
@@ -132,19 +132,19 @@ mod tests {
 
     #[test]
     fn the_filter_has_the_shape_of_the_query() {
-        // NOT (a = 1 OR b = 2) AND c = 3: no De Morgan, no distribution.
-        let query = Query::And(
-            Box::new(Query::Not(Box::new(Query::Or(
-                Box::new(eq("a", 1)),
-                Box::new(eq("b", 2)),
-            )))),
-            Box::new(eq("c", 3)),
-        );
+        // NOT (a = 1 OR b = 2) AND c = 3 AND d = 4: no De Morgan, no
+        // distribution, and the chain stays one node of three.
+        let query = Query::And(vec![
+            Query::Not(Box::new(Query::Or(vec![eq("a", 1), eq("b", 2)]))),
+            eq("c", 3),
+            eq("d", 4),
+        ]);
         assert_eq!(
             Filter::from(&query),
             Filter::And(vec![
                 Filter::Not(Box::new(Filter::Or(vec![int_eq("a", 1), int_eq("b", 2)]))),
                 int_eq("c", 3),
+                int_eq("d", 4),
             ])
         );
     }
@@ -230,10 +230,7 @@ mod tests {
     #[test]
     fn not_is_the_full_complement() {
         // NOT (a = 1 AND b = 2), over records that may not carry the attribute.
-        let query = Query::Not(Box::new(Query::And(
-            Box::new(eq("a", 1)),
-            Box::new(eq("b", 2)),
-        )));
+        let query = Query::Not(Box::new(Query::And(vec![eq("a", 1), eq("b", 2)])));
         assert!(
             !matches(&query, &record(&[("a", 1), ("b", 2)])),
             "both hold, so NOT is false"

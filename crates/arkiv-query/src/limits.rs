@@ -24,5 +24,12 @@ pub const MAX_PREDICATES: usize = 64;
 /// recursion together, since the evaluator walks the tree the parser builds.
 pub const MAX_NESTING_DEPTH: usize = 32;
 
+/// Most `AND`/`OR` levels a query may nest. A chain of one connective is one
+/// level however long it is, `a AND b AND c` being a single `And`, and each
+/// `AND` or `OR` that holds another adds one: `(a OR b) AND c` is two. A
+/// deeper query is refused while it is parsed, before anything deeper than
+/// this is built, since dropping a query recurses once per level.
+pub const MAX_AND_OR_DEPTH: usize = 4;
+
 /// Longest attribute name, in bytes — the width the ABI's `Ident32` carries.
 pub use arkiv_interfaces::constants::MAX_ATTRIBUTE_NAME_BYTES;
