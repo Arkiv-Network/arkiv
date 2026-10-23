@@ -2,7 +2,7 @@
 //!
 //! Replaces `arkiv-reth-mpt-committed-store`. Most of that crate is index machinery
 //! built because Ethereum's account trie has none; a GolemDB store indexes attribute
-//! cells itself, so [`indices`] is a lowering into store queries and nothing more.
+//! cells itself, so [`indices`] writes lookups as store queries and nothing more.
 #![no_std]
 
 extern crate alloc;

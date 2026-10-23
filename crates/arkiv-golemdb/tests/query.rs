@@ -1,6 +1,6 @@
 //! A query in Arkiv's query language, run against GolemDB on disk the way
-//! `arkiv_query` runs it: parsed, lowered to a store filter, answered by
-//! `Store::query` or `Store::count`, and read back as entities.
+//! `arkiv_query` runs it: parsed, taken node for node as a store filter,
+//! answered by `Store::query` or `Store::count`, and read back as entities.
 //!
 //! The RPC also bounds every query to live entities, `AND $expiresAt >
 //! block`: `a_count_combines_predicates` counts in that shape.
@@ -9,8 +9,8 @@ use arkiv_golemdb::{CellLimits, GolemDbConfig, GolemDbStore, HashAlgorithm};
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
+use arkiv_interfaces::query::Query as ArkivQuery;
 use arkiv_interfaces::store::{Filter, Page, Query, Store, StoreError};
-use arkiv_query::lower::{Lowered, lower};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
 
@@ -64,12 +64,9 @@ fn store_with(dir: &TempDir, entities: &[Entity]) -> GolemDbStore {
     store
 }
 
-/// `text` as the store filter `arkiv_query` would lower it to.
+/// `text` as the store filter `arkiv_query` runs it as.
 fn filter(text: &str) -> Filter {
-    match lower(&arkiv_query::parse(text).unwrap()).unwrap() {
-        Lowered::Filter(filter) => filter,
-        Lowered::Nothing => panic!("`{text}` matches nothing"),
-    }
+    Filter::from(&arkiv_query::parse(text).unwrap())
 }
 
 /// The entities that tell the reserved operators apart: two carrying `team` as
@@ -387,7 +384,33 @@ fn a_count_combines_predicates() {
     assert_eq!(count("team = str('red') OR team = str('blue')"), Ok(3));
     assert_eq!(count("team = str('blue') OR $expiresAt > u64(1000)"), Ok(1));
     assert_eq!(
+        count("(team = str('red') OR team = str('blue')) AND $expiresAt > u64(500)"),
+        Ok(3),
+        "an AND of an OR, answered as written"
+    );
+    assert_eq!(
         count("NOT (team = str('red'))"),
         Err(StoreError::NotImplemented)
     );
+}
+
+/// `*` is every entity, which GolemDB answers as the records carrying `$key`:
+/// alone, and bounded to live entities the way `arkiv_query` bounds it.
+#[test]
+fn star_matches_every_entity() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with(
+        &dir,
+        &[entity(1, "red"), entity(2, "blue"), entity(3, "red")],
+    );
+    let live_at = |block: u64| {
+        let bound = arkiv_query::parse(&format!("$expiresAt > u64({block})")).unwrap();
+        Filter::from(&ArkivQuery::And(Box::new(ArkivQuery::All), Box::new(bound)))
+    };
+    let count = |filter: &Filter| store.count(None, filter, None).map(|n| n.into_value());
+
+    assert_eq!(count(&filter("*")), Ok(3));
+    assert_eq!(count(&live_at(500)), Ok(3));
+    assert_eq!(count(&live_at(1_000)), Ok(0), "every entity has expired");
+    assert_eq!(matched(&store, live_at(500)), [1, 2, 3]);
 }

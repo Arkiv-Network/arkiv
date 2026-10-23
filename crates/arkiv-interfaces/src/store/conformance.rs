@@ -65,7 +65,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     branch_hash_doesnt_include_record_version(store_generator);
     branch_hash_tracks_content(store_generator);
     query_sees_committed_state(store_generator);
-    query_dnf_unions_and_dedups(store_generator);
+    query_or_unions_and_dedups(store_generator);
     query_without_a_sort_pages_in_a_fixed_order(store_generator);
     query_range_on_eq_only_type_is_invalid(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
@@ -75,8 +75,8 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     block_lifecycle_in_frames(store_generator);
     branch_reads_its_origin_not_the_head(store_generator);
     projection_limits_returned_cells(store_generator);
-    query_and_group_intersects_predicates(store_generator);
-    query_negated_predicate_excludes_matches(store_generator);
+    query_and_intersects_its_children(store_generator);
+    query_not_excludes_matches(store_generator);
     query_presence_matches_records_carrying_the_attribute(store_generator);
     query_pages_with_offset_and_limit(store_generator);
     query_reports_total_matched_beyond_the_page(store_generator);
@@ -184,17 +184,16 @@ fn read_record<S: Store>(store: &S, target: ReadTarget, key: RecordKey) -> Optio
         .into_value()
 }
 
-/// A one-group, one-predicate DNF: `cell == value`.
+/// One predicate: `cell == value`.
 fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
-    Filter(vec![AndGroup(vec![Predicate {
+    Filter::Predicate(Predicate {
         cell: cell.to_string(),
         test: Test::Compare {
             op: CompareOp::Eq,
             type_id,
             value,
         },
-        negated: false,
-    }])])
+    })
 }
 
 /// The digest of committed state, using only [`Store`].
@@ -972,8 +971,9 @@ fn query_sees_committed_state<S: Store>(store_generator: &dyn Fn() -> S) {
     );
 }
 
-/// OR-groups union, and a record matching several groups comes back once.
-fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
+/// An `Or` unions its children, and a record several of them match comes back
+/// once.
+fn query_or_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     create_record(
@@ -990,25 +990,9 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     );
     let committed = store.commit(branch).unwrap();
 
-    let filter = Filter(vec![
-        AndGroup(vec![Predicate {
-            cell: "kind".to_string(),
-            test: Test::Compare {
-                op: CompareOp::Eq,
-                type_id: TypeId::STR,
-                value: b"a".to_vec(),
-            },
-            negated: false,
-        }]),
-        AndGroup(vec![Predicate {
-            cell: "n".to_string(),
-            test: Test::Compare {
-                op: CompareOp::Eq,
-                type_id: TypeId::U64,
-                value: 1u64.to_be_bytes().to_vec(),
-            },
-            negated: false,
-        }]),
+    let filter = Filter::Or(vec![
+        equals_filter("kind", TypeId::STR, b"a".to_vec()),
+        equals_filter("n", TypeId::U64, 1u64.to_be_bytes().to_vec()),
     ]);
     let query = Query {
         filter,
@@ -1026,7 +1010,7 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     assert_eq!(
         found.records.len(),
         1,
-        "a record matching both groups is returned once"
+        "a record matching both children is returned once"
     );
 }
 
@@ -1078,15 +1062,14 @@ fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -
     );
     let committed = store.commit(branch).unwrap();
 
-    let filter = Filter(vec![AndGroup(vec![Predicate {
+    let filter = Filter::Predicate(Predicate {
         cell: "h".to_string(),
         test: Test::Compare {
             op: CompareOp::Gt,
             type_id: TypeId::BYTES32,
             value: vec![0u8; 32],
         },
-        negated: false,
-    }])]);
+    });
 
     assert_eq!(
         store.count(Some(committed), &filter, None).unwrap_err(),
@@ -1341,32 +1324,16 @@ fn matched_keys<S: Store>(store: &S, at: CommitId, query: &Query) -> Vec<RecordK
         .collect()
 }
 
-/// Predicates inside one AND-group intersect: a record must satisfy all of
-/// them, not merely one.
-fn query_and_group_intersects_predicates<S: Store>(store_generator: &dyn Fn() -> S) {
+/// An `And` intersects its children: a record must satisfy all of them, not
+/// merely one.
+fn query_and_intersects_its_children<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let at = committed_fixture(&mut store);
 
-    let both = Filter(vec![AndGroup(vec![
-        Predicate {
-            cell: "kind".to_string(),
-            test: Test::Compare {
-                op: CompareOp::Eq,
-                type_id: TypeId::STR,
-                value: b"a".to_vec(),
-            },
-            negated: false,
-        },
-        Predicate {
-            cell: "n".to_string(),
-            test: Test::Compare {
-                op: CompareOp::Eq,
-                type_id: TypeId::U64,
-                value: 2u64.to_be_bytes().to_vec(),
-            },
-            negated: false,
-        },
-    ])]);
+    let both = Filter::And(vec![
+        equals_filter("kind", TypeId::STR, b"a".to_vec()),
+        equals_filter("n", TypeId::U64, 2u64.to_be_bytes().to_vec()),
+    ]);
 
     assert_eq!(
         matched_keys(&store, at, &paged_query(both, 0, 10)),
@@ -1404,37 +1371,36 @@ fn query_presence_matches_records_carrying_the_attribute<S: Store>(
     );
     let at = store.commit(branch).unwrap();
 
-    let presence = |type_id, negated| {
-        Filter(vec![AndGroup(vec![Predicate {
+    let presence = |type_id| {
+        Filter::Predicate(Predicate {
             cell: "tag".to_string(),
             test: Test::Exists { type_id },
-            negated,
-        }])])
+        })
     };
     let keys = |filter| matched_keys(&store, at, &paged_query(filter, 0, 10));
 
     assert_eq!(
-        keys(presence(None, false)),
+        keys(presence(None)),
         vec![record_key(1), record_key(2)],
         "any type: both carriers, and not the record without the attribute"
     );
     assert_eq!(
-        keys(presence(Some(TypeId::STR), false)),
+        keys(presence(Some(TypeId::STR))),
         vec![record_key(1)],
         "one type: only the carrier of that type"
     );
     assert_eq!(
-        keys(presence(Some(TypeId::U64), false)),
+        keys(presence(Some(TypeId::U64))),
         vec![record_key(2)],
         "the same attribute under another type is a different test"
     );
     assert_eq!(
-        keys(presence(Some(TypeId::BOOL), false)),
+        keys(presence(Some(TypeId::BOOL))),
         Vec::<RecordKey>::new(),
         "a type nothing carries it under matches nothing, rather than failing"
     );
     assert_eq!(
-        keys(presence(None, true)),
+        keys(Filter::Not(Box::new(presence(None)))),
         vec![record_key(3)],
         "negated: the records not carrying it at all"
     );
@@ -1445,7 +1411,7 @@ fn query_presence_matches_records_carrying_the_attribute<S: Store>(
         store
             .query(
                 Some(at),
-                &paged_query(presence(Some(TypeId::BYTES), false), 0, 10),
+                &paged_query(presence(Some(TypeId::BYTES)), 0, 10),
                 None
             )
             .unwrap_err(),
@@ -1454,20 +1420,12 @@ fn query_presence_matches_records_carrying_the_attribute<S: Store>(
     );
 }
 
-/// A negated predicate matches the records the predicate does not.
-fn query_negated_predicate_excludes_matches<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A `Not` matches the records its child does not.
+fn query_not_excludes_matches<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let at = committed_fixture(&mut store);
 
-    let not_a = Filter(vec![AndGroup(vec![Predicate {
-        cell: "kind".to_string(),
-        test: Test::Compare {
-            op: CompareOp::Eq,
-            type_id: TypeId::STR,
-            value: b"a".to_vec(),
-        },
-        negated: true,
-    }])]);
+    let not_a = Filter::Not(Box::new(equals_filter("kind", TypeId::STR, b"a".to_vec())));
 
     assert_eq!(
         matched_keys(&store, at, &paged_query(not_a, 0, 10)),

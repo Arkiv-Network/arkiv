@@ -42,7 +42,7 @@
 //! ## What this version leaves out
 //!
 //! `!=` is **reserved but not implemented**: typed value-negation is
-//! `exists(attr)` minus `attr = value`, which no single store filter
+//! `exists(attr)` minus `attr = value`, which no single store predicate
 //! expresses, and answering it from what exists would silently return the
 //! wider `NOT` complement instead. It parses to a directive error naming the
 //! alternative; `NOT (attr = value)` gives the complement explicitly.
@@ -70,7 +70,6 @@ mod error;
 mod lexer;
 pub mod limits;
 mod literal;
-pub mod lower;
 pub mod parse;
 
 pub use error::{ParseError, ParseErrorKind};

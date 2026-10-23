@@ -2,8 +2,8 @@
 //!
 //! Replaces the MPT read path (`SnapshotAccountCode` over a reth state
 //! snapshot, entities decoded out of account code, the index walked as storage
-//! slots). An entity is a record, so a read is a point `get`; a query is
-//! [`arkiv_query::lower`] into a store [`Filter`] and one `query` call.
+//! slots). An entity is a record, so a read is a point `get`; a query is the
+//! store [`Filter`] of the parsed query, node for node, and one `query` call.
 //!
 //! # Paging
 //!
@@ -16,15 +16,12 @@ use arkiv_interfaces::entity_records;
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::query::Query as ArkivQuery;
 use arkiv_interfaces::store::{CommitId, Filter, Page, Query, ReadTarget, Store, StoreError};
-use arkiv_query::lower::{self, Lowered};
 
 /// Why a store read failed.
 #[derive(Debug)]
 pub enum ReadError {
     Store(StoreError),
     Record(arkiv_interfaces::entity_records::RecordError),
-    /// The query cannot be answered by the store's index.
-    NotIndexable(lower::LowerError),
 }
 
 impl core::fmt::Display for ReadError {
@@ -32,7 +29,6 @@ impl core::fmt::Display for ReadError {
         match self {
             Self::Store(e) => write!(f, "store: {e:?}"),
             Self::Record(e) => write!(f, "record: {e:?}"),
-            Self::NotIndexable(e) => write!(f, "query not answerable: {e:?}"),
         }
     }
 }
@@ -64,15 +60,6 @@ pub fn entity<S: Store + ?Sized>(
         .map_err(ReadError::Record)
 }
 
-/// Lower an Arkiv query to a store filter. `None` means "matches nothing",
-/// which an empty store `Filter` cannot express — it means *everything*.
-fn filter_of(query: &ArkivQuery) -> Result<Option<Filter>, ReadError> {
-    match lower::lower(query).map_err(ReadError::NotIndexable)? {
-        Lowered::Nothing => Ok(None),
-        Lowered::Filter(filter) => Ok(Some(filter)),
-    }
-}
-
 /// Entities matching `query`, as of `at`, one page at a time.
 pub fn query<S: Store + ?Sized>(
     store: &S,
@@ -81,14 +68,11 @@ pub fn query<S: Store + ?Sized>(
     offset: u64,
     limit: u64,
 ) -> Result<Vec<Entity>, ReadError> {
-    let Some(filter) = filter_of(query)? else {
-        return Ok(Vec::new());
-    };
     let result = store
         .query(
             Some(at),
             &Query {
-                filter,
+                filter: Filter::from(query),
                 sort: None,
                 page: Page { offset, limit },
                 // The whole record: an entity is reconstructed from all of it.
@@ -112,8 +96,7 @@ pub fn count<S: Store + ?Sized>(
     at: CommitId,
     query: &ArkivQuery,
 ) -> Result<u64, ReadError> {
-    let Some(filter) = filter_of(query)? else {
-        return Ok(0);
-    };
-    Ok(store.count(Some(at), &filter, None)?.into_value())
+    Ok(store
+        .count(Some(at), &Filter::from(query), None)?
+        .into_value())
 }

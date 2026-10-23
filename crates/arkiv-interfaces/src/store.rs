@@ -43,6 +43,7 @@
 //!   meta entries). See [`validate_cell_name`]. The full grammar is still open
 //!   upstream; when it lands it belongs in that function and nowhere else.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Debug;
@@ -447,13 +448,11 @@ impl CompareOp {
     }
 }
 
-/// One test against one attribute.
+/// One test against one attribute. Its complement is a [`Filter::Not`] over it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Predicate {
     pub cell: CellName,
     pub test: Test,
-    /// Complement: matches records the predicate does *not*.
-    pub negated: bool,
 }
 
 /// What a [`Predicate`] asks of the attribute it names.
@@ -495,20 +494,29 @@ impl Test {
     }
 }
 
-/// An AND-group: predicates intersect **in submitted order**.
+/// Which records a query or a count selects: predicates under `And`, `Or` and
+/// `Not`, in the shape the caller wrote them.
 ///
-/// Order is significant and never rearranged. Intersection cost tracks operand
-/// sizes, so putting the most selective predicate first is the caller's main
-/// optimization lever — and since [`Budget`] thresholds cost, it can decide
-/// whether a query completes at all.
+/// The store never rearranges the tree. Children are evaluated **in the
+/// written order**, and intersection cost tracks operand sizes, so putting the
+/// most selective test first is the caller's main optimization lever — and
+/// since [`Budget`] thresholds cost, it can decide whether a query completes
+/// at all. A record several `Or` children match is returned **once**.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AndGroup(pub Vec<Predicate>);
-
-/// An ordered DNF: OR of AND-groups. The store evaluates groups in submitted
-/// order and unions the results; a record matching several groups is returned
-/// **once**.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Filter(pub Vec<AndGroup>);
+pub enum Filter {
+    /// Every record.
+    #[default]
+    All,
+    /// The records the predicate holds for.
+    Predicate(Predicate),
+    /// The records every child matches; with no child, every record.
+    And(Vec<Filter>),
+    /// The records some child matches; with no child, none.
+    Or(Vec<Filter>),
+    /// The records the child does not match: the full complement, so it also
+    /// takes the records lacking the attribute a predicate under it tests.
+    Not(Box<Filter>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
@@ -543,8 +551,8 @@ pub struct Query {
     pub page: Page,
     /// Cell names to return; absent = the full record.
     pub projection: Option<Vec<CellName>>,
-    /// Ask for the full match count. Suppresses page early-exit: every group
-    /// runs to completion.
+    /// Ask for the full match count. Suppresses page early-exit: the whole
+    /// filter runs to completion.
     pub total_matched: bool,
 }
 
@@ -1371,7 +1379,7 @@ impl Predicate {
             },
             _ => false,
         };
-        Ok(hit != self.negated)
+        Ok(hit)
     }
 }
 
@@ -1397,35 +1405,34 @@ fn compare(op: CompareOp, stored: &[u8], operand: &[u8], type_id: TypeId) -> boo
     }
 }
 
-impl AndGroup {
-    /// Whether every predicate in the group holds for `record`.
-    ///
-    /// Predicates are intersected in submitted order and the group stops at
-    /// the first miss — the early exit the spec makes the caller's cost lever.
-    pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
-        for predicate in &self.0 {
-            if !predicate.matches(record)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-}
-
 impl Filter {
-    /// Whether any group matches `record` — the OR half of the DNF.
+    /// Whether the filter selects `record`.
     ///
-    /// An empty filter matches every record.
+    /// Children are evaluated in the written order, an `And` stopping at its
+    /// first miss and an `Or` at its first hit — the early exit the spec makes
+    /// the caller's cost lever.
     pub fn matches(&self, record: &Record) -> Result<bool, StoreError> {
-        if self.0.is_empty() {
-            return Ok(true);
-        }
-        for group in &self.0 {
-            if group.matches(record)? {
-                return Ok(true);
+        match self {
+            Self::All => Ok(true),
+            Self::Predicate(predicate) => predicate.matches(record),
+            Self::And(children) => {
+                for child in children {
+                    if !child.matches(record)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
+            Self::Or(children) => {
+                for child in children {
+                    if child.matches(record)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Not(child) => child.matches(record).map(|hit| !hit),
         }
-        Ok(false)
     }
 }
 

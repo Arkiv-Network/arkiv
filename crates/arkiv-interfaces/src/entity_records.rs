@@ -40,12 +40,12 @@
 //!
 //! [`AttributeType`] and [`TypeId`] both number types, and they **disagree** —
 //! `AttributeType::U64` is 3 where [`TypeId::U64`] is 8. Conversion goes through
-//! [`type_id_of`], which matches on the value, never on a discriminant.
+//! [`type_id_for`], which matches on the variant, never on a discriminant.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::entity::{Attribute, AttributeValue, CreationFlags, Entity, annotations};
+use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
 use crate::store::{Cell, CellKind, CellName, Record, RecordKey, TypeId};
 
@@ -61,21 +61,26 @@ pub enum RecordError {
 }
 
 /// The [`TypeId`] a value is stored under.
-///
-/// Matches on the variant, never on [`AttributeType`](crate::entity::AttributeType)'s
-/// discriminant — the two numbering schemes differ. See the module docs.
 pub const fn type_id_of(value: &AttributeValue) -> TypeId {
-    match value {
-        AttributeValue::Bool(_) => TypeId::BOOL,
-        AttributeValue::Int(_) => TypeId::I32,
-        AttributeValue::U64(_) => TypeId::U64,
-        AttributeValue::U256(_) => TypeId::U256,
-        AttributeValue::Decimal(_) => TypeId::DEC,
-        AttributeValue::Bytes32(_) => TypeId::BYTES32,
-        AttributeValue::Bytes(_) => TypeId::BYTES,
-        AttributeValue::Str(_) => TypeId::STR,
-        AttributeValue::EthereumAddress(_) => TypeId::ADDR,
-        AttributeValue::EntityKey(_) => TypeId::KEY,
+    type_id_for(value.attr_type())
+}
+
+/// The [`TypeId`] an attribute type is stored under.
+///
+/// Matches on the variant, never on [`AttributeType`]'s discriminant — the two
+/// numbering schemes differ. See the module docs.
+pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
+    match attr_type {
+        AttributeType::Bool => TypeId::BOOL,
+        AttributeType::Int => TypeId::I32,
+        AttributeType::U64 => TypeId::U64,
+        AttributeType::U256 => TypeId::U256,
+        AttributeType::Decimal => TypeId::DEC,
+        AttributeType::Bytes32 => TypeId::BYTES32,
+        AttributeType::Bytes => TypeId::BYTES,
+        AttributeType::Str => TypeId::STR,
+        AttributeType::EthereumAddress => TypeId::ADDR,
+        AttributeType::EntityKey => TypeId::KEY,
     }
 }
 
@@ -88,7 +93,7 @@ pub const fn record_key(key: EntityAddress) -> RecordKey {
 ///
 /// The [`annotations`] constants are ASCII byte literals in this crate's own source,
 /// so a failure here is a typo in a constant, not untrusted input.
-fn system(name: &[u8]) -> CellName {
+pub(crate) fn system(name: &[u8]) -> CellName {
     CellName::from(core::str::from_utf8(name).expect("annotation names are ASCII"))
 }
 

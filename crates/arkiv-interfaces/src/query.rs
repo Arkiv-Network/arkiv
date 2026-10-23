@@ -1,5 +1,7 @@
 //! Queries: the query language, and the trait that answers it.
 
+mod filter;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;

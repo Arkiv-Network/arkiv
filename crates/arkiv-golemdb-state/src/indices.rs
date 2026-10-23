@@ -8,7 +8,7 @@
 //! be built on top of it.
 //!
 //! A GolemDB store indexes every attribute cell itself. So the two index traits
-//! reduce to lowering a lookup into a [`Filter`] and asking the store, and
+//! reduce to writing a lookup as a [`Filter`] and asking the store, and
 //! `apply_deltas` — the whole write-side maintenance path — becomes **nothing at
 //! all**: writing the entity record already moved its index entries.
 //!
@@ -27,8 +27,8 @@ use arkiv_interfaces::statemanager::{
     EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode,
 };
 use arkiv_interfaces::store::{
-    AndGroup, CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store,
-    StoreError, Test,
+    CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store, StoreError,
+    Test,
 };
 
 use crate::view::{GolemStateView, ViewError};
@@ -73,8 +73,8 @@ fn predicate(
     attribute: &[u8],
     value: &AttributeValue,
     op: CompareOp,
-) -> Result<Predicate, IndexError> {
-    Ok(Predicate {
+) -> Result<Filter, IndexError> {
+    Ok(Filter::Predicate(Predicate {
         cell: cell_name(attribute)?,
         test: Test::Compare {
             op,
@@ -83,18 +83,17 @@ fn predicate(
             // when ordering, and biasing here too would invert negatives.
             value: value.encode(),
         },
-        negated: false,
-    })
+    }))
 }
 
 /// Run a filter and return the matching entity addresses, ascending.
 fn matching<S: Store>(
     store: &S,
     at: CommitId,
-    group: AndGroup,
+    filter: Filter,
 ) -> Result<Vec<EntityAddress>, IndexError> {
     let query = Query {
-        filter: Filter(vec![group]),
+        filter,
         // No sort: GolemDB cannot sort yet, so the addresses are put in order
         // below instead.
         sort: None,
@@ -154,8 +153,11 @@ impl<'s, S: Store> StoreIndices<'s, S> {
         attribute: &[u8],
         value: &AttributeValue,
     ) -> Result<Vec<EntityAddress>, IndexError> {
-        let group = AndGroup(vec![predicate(attribute, value, CompareOp::Eq)?]);
-        matching(self.store, self.at, group)
+        matching(
+            self.store,
+            self.at,
+            predicate(attribute, value, CompareOp::Eq)?,
+        )
     }
 
     /// Entities whose string `attribute` starts with `prefix`.
@@ -171,7 +173,7 @@ impl<'s, S: Store> StoreIndices<'s, S> {
             &AttributeValue::Str(alloc::string::String::from(prefix)),
             CompareOp::Prefix,
         )?;
-        matching(self.store, self.at, AndGroup(vec![term]))
+        matching(self.store, self.at, term)
     }
 
     /// Entities whose `attribute` falls within the bounds.
@@ -195,7 +197,7 @@ impl<'s, S: Store> StoreIndices<'s, S> {
             Bound::Excluded(value) => terms.push(predicate(attribute, value, CompareOp::Lt)?),
             Bound::Unbounded => {}
         }
-        matching(self.store, self.at, AndGroup(terms))
+        matching(self.store, self.at, Filter::And(terms))
     }
 }
 

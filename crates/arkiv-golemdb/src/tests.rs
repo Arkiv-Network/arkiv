@@ -1,7 +1,5 @@
 use super::*;
-use arkiv_interfaces::store::{
-    AndGroup, CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId,
-};
+use arkiv_interfaces::store::{CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -677,15 +675,14 @@ fn a_patch_adds_missing_cells_and_gives_them_their_kind() {
 
     // The index follows the kinds: `tag` is found now, and `n` no longer is.
     store.commit(branch).unwrap();
-    let tag_is_y = Filter(vec![AndGroup(vec![Predicate {
+    let tag_is_y = Filter::Predicate(Predicate {
         cell: "tag".into(),
         test: Test::Compare {
             op: CompareOp::Eq,
             type_id: TypeId::STR,
             value: b"y".to_vec(),
         },
-        negated: false,
-    }])]);
+    });
     let count = |filter: &Filter| store.count(None, filter, None).map(|n| n.into_value());
     assert_eq!(count(&tag_is_y), Ok(1));
     assert_eq!(count(&n_at_least(7)), Ok(0));
@@ -693,15 +690,14 @@ fn a_patch_adds_missing_cells_and_gives_them_their_kind() {
 
 /// The filter `n >= at_least`, on [`commit_record`]'s cell.
 fn n_at_least(at_least: u64) -> Filter {
-    Filter(vec![AndGroup(vec![Predicate {
+    Filter::Predicate(Predicate {
         cell: "n".into(),
         test: Test::Compare {
             op: CompareOp::Gte,
             type_id: TypeId::U64,
             value: at_least.to_be_bytes().to_vec(),
         },
-        negated: false,
-    }])])
+    })
 }
 
 /// A count does not page, so GolemDB runs it, at the head only.
