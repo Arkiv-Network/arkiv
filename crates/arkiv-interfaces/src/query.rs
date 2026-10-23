@@ -65,10 +65,9 @@ pub enum AnnotKey {
 
 /// The built-in (`$`-prefixed) fields you can query by name.
 ///
-/// These are the *language's* names. The byte strings they are indexed under are
-/// the [`annotations`](crate::entity::annotations) constants, which a host maps
-/// them to — the two are deliberately decoupled, because the annotation bytes are
-/// mixed into index-bucket addresses and renaming one relocates on-chain state.
+/// Each is stored under its [`annotations`](crate::entity::annotations) constant,
+/// which carries the same name: the language and the store spell every system
+/// attribute alike. What this enum adds is which of them are queryable at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltIn {
     /// `$owner` — the current owner's address.
@@ -79,8 +78,6 @@ pub enum BuiltIn {
     Key,
     /// `$expiresAt` — the expiry block.
     ExpiresAt,
-    /// `$createdAt` — the creation block.
-    CreatedAt,
 }
 
 /// A value a predicate compares against.

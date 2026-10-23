@@ -61,11 +61,11 @@ fn merge(base: &mut EntityUpdates, next: EntityUpdates) {
     if next.owner.is_some() {
         base.owner = next.owner;
     }
-    if next.created_at_block.is_some() {
-        base.created_at_block = next.created_at_block;
+    if next.created_at.is_some() {
+        base.created_at = next.created_at;
     }
-    if next.last_modified_at_block.is_some() {
-        base.last_modified_at_block = next.last_modified_at_block;
+    if next.updated_at.is_some() {
+        base.updated_at = next.updated_at;
     }
     if next.expires_at.is_some() {
         base.expires_at = next.expires_at;
@@ -197,8 +197,8 @@ mod tests {
             key: [key; 32],
             creator: [1; 20],
             owner: [2; 20],
-            created_at_block: 1,
-            last_modified_at_block: 1,
+            created_at: 1,
+            updated_at: 1,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
             attributes: vec![

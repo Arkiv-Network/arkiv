@@ -574,7 +574,7 @@ async fn query_operator_classes_over_a_live_node() {
     );
     // Block heights are u64 and must say so — an untagged number means i32.
     assert_eq!(
-        result_keys(&client.query("$createdAt >= u64(1)", 100, None).await),
+        result_keys(&client.query("$expiresAt >= u64(1)", 100, None).await),
         expect(&[0, 1, 2, 3, 4]),
     );
 
@@ -617,7 +617,8 @@ async fn query_operator_classes_over_a_live_node() {
     for (rejected, code) in [
         ("rank = = u256(30)", "-32001"),                      // malformed
         ("rank >= u256(20) && team = str('blue')", "-32001"), // removed operator
-        ("$createdAt >= 1", "-32002"),                        // system u64 needs its tag
+        ("$expiresAt >= 1", "-32002"),                        // system u64 needs its tag
+        ("$createdAt >= u64(1)", "-32002"),                   // returned, never queried
         ("rank != u256(30)", "-32002"),                       // != is not in the language
         ("team >= str('blue')", "-32002"),                    // range on an unordered type
         ("exists($owner)", "-32002"),                         // presence takes a user attribute

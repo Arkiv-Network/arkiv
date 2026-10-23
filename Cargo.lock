@@ -1584,9 +1584,9 @@ dependencies = [
  "reth-storage-overlay",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]

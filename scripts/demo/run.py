@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run arkiv-reth against a throwaway Valkey for a few seconds, then tidy up.
+"""Run arkiv-reth against a throwaway store for a few seconds, then tidy up.
 
-Everything this starts is its own: a Valkey server on a free port with its own
-data directory, and a dev chain with its own datadir. Nothing touches a Valkey
-you already run, and the namespace is unique per run, so two of these can
-overlap without colliding.
+The store is GolemDB, in-process in the node (the default), or a Valkey
+server. Everything this starts is its own: a Valkey server on a free port with
+its own data directory, or a GolemDB directory, and a dev chain with its own
+datadir. Nothing touches a Valkey you already run, and the namespace is unique
+per run, so two of these can overlap without colliding.
 
 The point is the evidence, not the uptime. Every run leaves one directory
 holding both logs, the chain's progress, and what actually landed in the store
@@ -14,15 +15,19 @@ cells carry the `$` prefix the GolemDB spec reserves for a host.
 Processes and the scratch data are removed on the way out, including after a
 failure or a Ctrl-C. The log directory is what survives.
 
-Usage: scripts/demo/run.py [seconds] [--keep] [--restart] [--out DIR]
+Usage: scripts/demo/run.py [seconds] [--store S] [--keep] [--restart] [--out DIR]
 
   seconds     how long to let the chain run (default 30)
-  --keep      leave Valkey and the chain running, and say how to reach them
+  --store S   golemdb (default) or valkey
+  --keep      leave the store and the chain running, and say how to reach them
   --restart   stop the node and start it again, against the same store, and
               check it comes back where the store says the chain is -- the
               store outlives the node, which is the point of keeping the
               chain outside reth's database
   --out DIR   where to write the bundle (default target/demo/<timestamp>)
+
+The run creates and patches one entity with arkiv-cli and sends one transfer
+with cast, when they are there, so the store has something to keep.
 """
 
 import argparse
@@ -109,23 +114,90 @@ def valkey(port, *args):
     return out.stdout.strip()
 
 
-def binary():
-    """The arkiv-reth to run: ARKIV_RETH_BINARY, else whichever profile built."""
-    override = os.environ.get("ARKIV_RETH_BINARY")
+def find_binary(name, variable):
+    """The `name` to run: `variable` if set, else whichever profile built it."""
+    override = os.environ.get(variable)
     if override:
         path = Path(override)
         if not path.exists():
-            raise SystemExit(f"ARKIV_RETH_BINARY is set but {path} does not exist")
+            raise SystemExit(f"{variable} is set but {path} does not exist")
         return path
     for profile in ("dev-fast", "debug", "release"):
-        path = ROOT / "target" / profile / "arkiv-reth"
+        path = ROOT / "target" / profile / name
         if path.exists():
             return path
-    raise SystemExit(
-        "no arkiv-reth binary found -- build one first:\n"
-        "  cargo build --bin arkiv-reth --profile dev-fast\n"
-        "or point ARKIV_RETH_BINARY at one."
+    return None
+
+
+def binary():
+    """The arkiv-reth to run: ARKIV_RETH_BINARY, else whichever profile built."""
+    path = find_binary("arkiv-reth", "ARKIV_RETH_BINARY")
+    if path is None:
+        raise SystemExit(
+            "no arkiv-reth binary found -- build one first:\n"
+            "  cargo build --bin arkiv-reth --profile dev-fast\n"
+            "or point ARKIV_RETH_BINARY at one."
+        )
+    return path
+
+
+def wait_for_next_block(rpc_port):
+    """Wait until the chain is past the current block.
+
+    The store saves a block just after reth makes it canonical, so a read
+    straight after a receipt can still see the block before. One block later
+    the write is in the store.
+    """
+    current = int(rpc(rpc_port, "eth_blockNumber"), 16)
+    wait_for(
+        f"block {current + 1}",
+        lambda: int(rpc(rpc_port, "eth_blockNumber") or "0x0", 16) > current,
+        timeout=30,
     )
+
+
+def write_entity(rpc_port, out):
+    """Create one entity and patch it with arkiv-cli, and return its key.
+
+    The entity is what the store is for: an idle chain, or one that only moves
+    money, never writes an entity record. Returns the key and a note on what
+    happened; the key is None when nothing was written.
+    """
+    cli = find_binary("arkiv-cli", "ARKIV_CLI_BINARY")
+    if cli is None:
+        return None, "skipped: no arkiv-cli binary, so no entity was written"
+    rpc_url = f"http://127.0.0.1:{rpc_port}"
+    log_file = out / "entity.log"
+
+    def run_cli(*args):
+        result = subprocess.run(
+            [str(cli), "--rpc-url", rpc_url, "--private-key", DEV_KEY, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        with log_file.open("a") as log_out:
+            log_out.write(f"$ arkiv-cli {' '.join(args)}\n{result.stdout}{result.stderr}\n")
+        return result
+
+    created = run_cli("create", "--payload", "hello from the demo", "--min-lifetime", "100000")
+    keys = [
+        line.split()[-1]
+        for line in created.stdout.splitlines()
+        if line.strip().startswith("entity_key:")
+    ]
+    if created.returncode != 0 or not keys:
+        return None, "failed (see entity.log): create"
+    key = keys[0]
+    # Known gap: the store can still be a block behind when the receipt comes
+    # back, so a patch sent straight away is refused as EntityNotFound while
+    # its gas is estimated.
+    wait_for_next_block(rpc_port)
+    patched = run_cli("patch", "--key", key, "--payload", "patched by the demo")
+    if patched.returncode != 0:
+        return key, "created, but the patch failed (see entity.log)"
+    wait_for_next_block(rpc_port)
+    return key, "created and patched one entity"
 
 
 def spend_something(rpc_port, out):
@@ -209,9 +281,27 @@ def dump_store(port, namespace, out, spend):
     return keys
 
 
+def dump_golemdb(directory, out, spend, entity_key, entity):
+    """Write what the run left in GolemDB: its files, and the entity it holds.
+
+    GolemDB is in-process, so there is nothing to scan from outside the node:
+    the files show it was written to, and the entity, read back over the
+    node's RPC, shows what it holds.
+    """
+    files = sorted(path for path in directory.rglob("*") if path.is_file())
+    lines = [f"GolemDB directory: {directory}", f"transfer: {spend}", ""]
+    lines += [f"{len(files)} files:"] + [
+        f"  {path.stat().st_size:>12}  {path.relative_to(directory)}" for path in files
+    ]
+    lines += ["", f"entity {entity_key}:", json.dumps(entity, indent=2)]
+    (out / "store-summary.txt").write_text("\n".join(lines) + "\n")
+    return len(files)
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("seconds", nargs="?", type=int, default=30)
+    parser.add_argument("--store", choices=["golemdb", "valkey"], default="golemdb")
     parser.add_argument("--keep", action="store_true")
     parser.add_argument(
         "--restart",
@@ -226,10 +316,20 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     node_bin = binary()
+    golemdb = args.store == "golemdb"
     valkey_port, rpc_port = free_port(), free_port()
     namespace = f"demo{stamp}"
     scratch = out / "scratch"
+    golemdb_dir = scratch / "golemdb"
     (scratch / "valkey").mkdir(parents=True, exist_ok=True)
+    if golemdb:
+        # The node takes an absolute path, which `out` already is.
+        store_env = {"ARKIV_STORE_PATH": str(golemdb_dir)}
+    else:
+        store_env = {
+            "ARKIV_EXPERIMENTAL_STORE": f"redis://127.0.0.1:{valkey_port}",
+            "ARKIV_STORE_NAMESPACE": namespace,
+        }
 
     processes = []
 
@@ -252,7 +352,7 @@ def main():
     def start_node(log_name):
         """Launch the node against this run's store, and wait for its RPC.
 
-        Same datadir, store URL and namespace every time, which is what makes
+        Same datadir, store and namespace every time, which is what makes
         a restart a restart rather than a second chain.
         """
         handle = subprocess.Popen(
@@ -274,13 +374,7 @@ def main():
                 str(rpc_port),
                 *shlex.split(os.environ.get("ARKIV_DEMO_NODE_ARGS", "")),
             ],
-            env={
-                **os.environ,
-                "ARKIV_STORE_URL": f"redis://127.0.0.1:{valkey_port}",
-                "ARKIV_STORE_NAMESPACE": namespace,
-                # Valkey is not GolemDB, so the node runs on it only when allowed.
-                "ALLOW_EXPERIMENTAL_BACKENDS": "true",
-            },
+            env={**os.environ, **store_env},
             stdout=(out / log_name).open("w"),
             stderr=subprocess.STDOUT,
         )
@@ -315,41 +409,49 @@ def main():
     try:
         log(f"logs will be in {out}")
 
-        valkey_log = (out / "valkey.log").open("w")
-        processes.append(
-            (
-                "valkey",
-                subprocess.Popen(
-                    [
-                        "valkey-server",
-                        "--port",
-                        str(valkey_port),
-                        "--dir",
-                        str(scratch / "valkey"),
-                        # No snapshotting: this data is scrap and a stray
-                        # dump.rdb in the repo would be worse than useless.
-                        "--save",
-                        "",
-                        "--appendonly",
-                        "no",
-                    ],
-                    stdout=valkey_log,
-                    stderr=subprocess.STDOUT,
-                ),
+        if golemdb:
+            log(f"store: GolemDB in {golemdb_dir}")
+        else:
+            valkey_log = (out / "valkey.log").open("w")
+            processes.append(
+                (
+                    "valkey",
+                    subprocess.Popen(
+                        [
+                            "valkey-server",
+                            "--port",
+                            str(valkey_port),
+                            "--dir",
+                            str(scratch / "valkey"),
+                            # No snapshotting: this data is scrap and a stray
+                            # dump.rdb in the repo would be worse than useless.
+                            "--save",
+                            "",
+                            "--appendonly",
+                            "no",
+                        ],
+                        stdout=valkey_log,
+                        stderr=subprocess.STDOUT,
+                    ),
+                )
             )
-        )
-        wait_for(
-            f"valkey on {valkey_port}",
-            lambda: valkey(valkey_port, "ping") == "PONG",
-            timeout=20,
-        )
-        log(f"valkey up on {valkey_port}, namespace {namespace}")
+            wait_for(
+                f"valkey on {valkey_port}",
+                lambda: valkey(valkey_port, "ping") == "PONG",
+                timeout=20,
+            )
+            log(f"valkey up on {valkey_port}, namespace {namespace}")
 
         start_node("node.log")
         log(f"node up on {rpc_port}, running for {args.seconds}s")
 
         spend = spend_something(rpc_port, out)
         log(f"transfer: {spend}")
+        entity_key, entity_note = write_entity(rpc_port, out)
+        log(f"entity: {entity_note}" + (f", key {entity_key}" if entity_key else ""))
+
+        def read_entity():
+            return rpc(rpc_port, "arkiv_getEntity", [entity_key]) if entity_key else None
 
         # Sample while it runs, so the bundle shows the chain moving rather
         # than just a first and last number.
@@ -357,16 +459,17 @@ def main():
         started = time.monotonic()
         while time.monotonic() - started < args.seconds:
             block = rpc(rpc_port, "eth_blockNumber")
-            samples.append(
-                {
-                    "elapsed": round(time.monotonic() - started, 1),
-                    "block": int(block, 16) if block else None,
-                    "entities": rpc(rpc_port, "arkiv_getEntityCount"),
-                    "keys": len(
-                        valkey(valkey_port, "--scan", "--pattern", f"{namespace}:*").splitlines()
-                    ),
-                }
-            )
+            sample = {
+                "elapsed": round(time.monotonic() - started, 1),
+                "block": int(block, 16) if block else None,
+            }
+            if not golemdb:
+                # GolemDB does not count entities yet, and has no keys to scan.
+                sample["entities"] = rpc(rpc_port, "arkiv_getEntityCount")
+                sample["keys"] = len(
+                    valkey(valkey_port, "--scan", "--pattern", f"{namespace}:*").splitlines()
+                )
+            samples.append(sample)
             time.sleep(max(1, args.seconds // 10))
         (out / "progress.json").write_text(json.dumps(samples, indent=2) + "\n")
 
@@ -381,14 +484,16 @@ def main():
             # recipient of the transfer is the thing worth re-reading: if the
             # store did not carry the chain across, this comes back zero.
             paid_before = rpc(rpc_port, "eth_getBalance", [SPEND_RECIPIENT, "latest"])
+            entity_before = read_entity()
             log(f"stopping the node at block {before}")
             stop_node()
-            log("node stopped; the store is still up and still holds the chain")
+            log("node stopped; the store still holds the chain")
 
             start_node("node-after-restart.log")
             resumed = int(rpc(rpc_port, "eth_blockNumber"), 16)
             entities_after = rpc(rpc_port, "arkiv_getEntityCount")
             paid_after = rpc(rpc_port, "eth_getBalance", [SPEND_RECIPIENT, "latest"])
+            entity_after = read_entity()
             log(f"node back up, resumed at block {resumed}")
 
             # Let it make new blocks, because resuming is only half of it: a
@@ -409,6 +514,8 @@ def main():
                         "entities_after_restart": entities_after,
                         "recipient_balance_before_shutdown": paid_before,
                         "recipient_balance_after_restart": paid_after,
+                        "entity_before_shutdown": entity_before,
+                        "entity_after_restart": entity_after,
                     },
                     indent=2,
                 )
@@ -429,6 +536,11 @@ def main():
                     "the restart lost account state: recipient held "
                     f"{paid_before} before, {paid_after} after"
                 )
+            if entity_after != entity_before:
+                raise SystemExit(
+                    f"the restart changed entity {entity_key}: "
+                    f"{entity_before} before, {entity_after} after"
+                )
             if paid_before in (None, "0x0"):
                 # Without `cast` nothing was ever spent, so the balance check
                 # above compared zero with zero. Say so rather than let the
@@ -441,17 +553,28 @@ def main():
                 f"recipient still holds {paid_after}"
             )
 
-        keys = dump_store(valkey_port, namespace, out, spend)
+        entity = read_entity()
+        if golemdb:
+            stored = dump_golemdb(golemdb_dir, out, spend, entity_key, entity)
+            store_note = f"{stored} files in the GolemDB directory"
+        else:
+            stored = len(dump_store(valkey_port, namespace, out, spend))
+            store_note = f"{stored} keys in the store"
         first, last = samples[0]["block"], samples[-1]["block"]
-        log(f"blocks {first} -> {last}, {len(keys)} keys in the store")
+        log(f"blocks {first} -> {last}, {store_note}")
 
         if first is None or last is None or last <= first:
             raise SystemExit(f"the chain did not advance: {first} -> {last}")
-        if not keys:
+        if not stored:
             raise SystemExit("the chain advanced but the store is empty")
+        if entity_key and entity is None:
+            raise SystemExit(f"entity {entity_key} was written but does not read back")
+        if entity_key:
+            log(f"entity {entity_key} reads back: {json.dumps(entity)}")
 
         if args.keep:
-            log(f"--keep: valkey on {valkey_port}, rpc on {rpc_port}, namespace {namespace}")
+            where = f"GolemDB in {golemdb_dir}" if golemdb else f"valkey on {valkey_port}"
+            log(f"--keep: {where}, rpc on {rpc_port}, namespace {namespace}")
             log("stop them yourself; scratch data is in " + str(scratch))
             processes.clear()
             return 0

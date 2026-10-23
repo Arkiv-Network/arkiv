@@ -20,7 +20,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
-use arkiv_interfaces::entity::AttributeValue;
+use arkiv_interfaces::entity::{AttributeValue, annotations};
 use arkiv_interfaces::entity_records::type_id_of;
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::statemanager::{
@@ -122,7 +122,10 @@ fn matching<S: Store>(
 }
 
 /// The cell holding an entity's own address.
-const KEY_CELL: &str = "$key";
+const KEY_CELL: &str = match core::str::from_utf8(annotations::KEY) {
+    Ok(name) => name,
+    Err(_) => panic!("annotation names are ASCII"),
+};
 
 /// Arkiv's equality and range indices over a [`Store`].
 ///
@@ -284,8 +287,8 @@ mod tests {
             key: [key; 32],
             creator: [1; 20],
             owner: [2; 20],
-            created_at_block: 1,
-            last_modified_at_block: 1,
+            created_at: 1,
+            updated_at: 1,
             expires_at: 100,
             creation_flags: CreationFlags::NONE,
             attributes: vec![

@@ -69,8 +69,8 @@ pub struct EntityUpdates {
     pub delete: bool,
     pub creator: Option<UserAddress>,
     pub owner: Option<UserAddress>,
-    pub created_at_block: Option<BlockNumber>,
-    pub last_modified_at_block: Option<BlockNumber>,
+    pub created_at: Option<BlockNumber>,
+    pub updated_at: Option<BlockNumber>,
     pub expires_at: Option<BlockNumber>,
     pub creation_flags: Option<CreationFlags>,
     pub attributes: Option<Vec<Attribute>>,
@@ -83,8 +83,8 @@ impl EntityUpdates {
             delete: false,
             creator: Some(entity.creator),
             owner: Some(entity.owner),
-            created_at_block: Some(entity.created_at_block),
-            last_modified_at_block: Some(entity.last_modified_at_block),
+            created_at: Some(entity.created_at),
+            updated_at: Some(entity.updated_at),
             expires_at: Some(entity.expires_at),
             creation_flags: Some(entity.creation_flags),
             attributes: Some(entity.attributes),
@@ -107,11 +107,11 @@ impl EntityUpdates {
         if let Some(v) = self.owner {
             entity.owner = v;
         }
-        if let Some(v) = self.created_at_block {
-            entity.created_at_block = v;
+        if let Some(v) = self.created_at {
+            entity.created_at = v;
         }
-        if let Some(v) = self.last_modified_at_block {
-            entity.last_modified_at_block = v;
+        if let Some(v) = self.updated_at {
+            entity.updated_at = v;
         }
         if let Some(v) = self.expires_at {
             entity.expires_at = v;
@@ -531,7 +531,7 @@ mod tests {
             key: [1; 32],
             owner: [2; 20],
             expires_at: 50,
-            created_at_block: 7,
+            created_at: 7,
             ..Entity::default()
         };
         let updates = EntityUpdates {
@@ -543,7 +543,7 @@ mod tests {
         updates.apply_to(&mut entity);
         assert_eq!(entity.owner, [9; 20]);
         assert_eq!(entity.expires_at, 80);
-        assert_eq!(entity.created_at_block, 7, "untouched field survives");
+        assert_eq!(entity.created_at, 7, "untouched field survives");
     }
 
     #[test]
@@ -552,8 +552,8 @@ mod tests {
             key: [7; 32],
             creator: [3; 20],
             owner: [4; 20],
-            created_at_block: 10,
-            last_modified_at_block: 10,
+            created_at: 10,
+            updated_at: 10,
             expires_at: 99,
             attributes: vec![Attribute::unindexed(
                 b"body".to_vec(),

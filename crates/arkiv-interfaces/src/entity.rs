@@ -20,9 +20,9 @@ pub struct Entity {
     /// Who owns it now. Changes on transfer.
     pub owner: UserAddress,
     /// The block it was created in.
-    pub created_at_block: BlockNumber,
+    pub created_at: BlockNumber,
     /// The block of its last change (create, update, extend, or transfer).
-    pub last_modified_at_block: BlockNumber,
+    pub updated_at: BlockNumber,
     /// The block it expires in.
     pub expires_at: BlockNumber,
     /// Entity properties fixed at creation. Set from the create op's
@@ -48,8 +48,8 @@ pub struct EntityMeta {
     pub key: EntityAddress,
     pub creator: UserAddress,
     pub owner: UserAddress,
-    pub created_at_block: BlockNumber,
-    pub last_modified_at_block: BlockNumber,
+    pub created_at: BlockNumber,
+    pub updated_at: BlockNumber,
     pub expires_at: BlockNumber,
 }
 
@@ -466,21 +466,27 @@ impl fmt::Display for AttributeValueError {
 
 /// The attribute names the protocol sets on every entity.
 ///
-/// Some never change (`$creator`, `$createdAtBlock`, `$key`); `$owner` changes on
-/// transfer, `$expiration` on extend. `$all` matches every live entity.
+/// The names of the API spec, `$`-prefixed: the same names a client reads
+/// (`createdAt`) and a Rust field carries (`created_at`). Some never change
+/// (`$creator`, `$createdAt`, `$key`); `$owner` changes on transfer, `$expiresAt`
+/// on extend, `$updatedAt` on every change. `$all` matches every live entity.
 pub mod annotations {
     /// Matches every live entity.
     pub const ALL: &[u8] = b"$all";
     /// The creator's address (never changes).
     pub const CREATOR: &[u8] = b"$creator";
     /// The creation block, as a big-endian `u64` (never changes).
-    pub const CREATED_AT_BLOCK: &[u8] = b"$createdAtBlock";
+    pub const CREATED_AT: &[u8] = b"$createdAt";
+    /// The block of the last change, as a big-endian `u64`.
+    pub const UPDATED_AT: &[u8] = b"$updatedAt";
     /// The current owner (changes on transfer).
     pub const OWNER: &[u8] = b"$owner";
     /// The full entity key, 32 raw bytes (never changes).
     pub const KEY: &[u8] = b"$key";
     /// The expiry block, as a big-endian `u64` (changes on extend).
-    pub const EXPIRATION: &[u8] = b"$expiration";
+    pub const EXPIRES_AT: &[u8] = b"$expiresAt";
+    /// The creation flags, one byte.
+    pub const CREATION_FLAGS: &[u8] = b"$creationFlags";
 
     /// The `$` prefix marking a system attribute. Reserved: a user attribute
     /// name may never start with it.
@@ -489,8 +495,8 @@ pub mod annotations {
     /// Whether `name` is reserved for the engine.
     ///
     /// Every `$` attribute is **engine-controlled** — filled from the
-    /// transaction context at creation (`$creator`, `$createdAtBlock`) or
-    /// maintained by the protocol (`$owner`, `$expiration`) — and naming one in
+    /// transaction context at creation (`$creator`, `$createdAt`) or
+    /// maintained by the protocol (`$owner`, `$expiresAt`) — and naming one in
     /// a triple list is a revert, set or tombstone alike. That is what keeps
     /// "the engine owns these cells" true by construction rather than by
     /// convention.

@@ -713,8 +713,10 @@ mod tests {
         for name in [
             "$owner",
             "$creator",
-            "$createdAtBlock",
-            "$expiration",
+            "$createdAt",
+            "$updatedAt",
+            "$expiresAt",
+            "$creationFlags",
             "$key",
             // No longer special: the engine owns every `$` name now.
             "$payload",

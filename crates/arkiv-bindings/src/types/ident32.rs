@@ -60,7 +60,7 @@ pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> 
     Ok(())
 }
 
-/// Validate a **system** attribute name (`$owner`, `$expiration`, …).
+/// Validate a **system** attribute name (`$owner`, `$expiresAt`, …).
 ///
 /// System names use a separate namespace with a leading `$`, and the engine
 /// owns all of them: a client triple naming one reverts.

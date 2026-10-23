@@ -10,11 +10,9 @@ participants:
   # Participant 1 is the sole sequencer: its validator client proposes blocks.
   - el_type: reth
     el_image: arkiv-reth:dev
-    # The node needs a store named. This devnet runs on the in-process one,
-    # which only runs when allowed.
+    # The node needs a store named. This devnet runs on the in-process one.
     el_extra_env_vars:
-      ARKIV_STORE_URL: memory://
-      ALLOW_EXPERIMENTAL_BACKENDS: "true"
+      ARKIV_EXPERIMENTAL_STORE: memory
     cl_type: lighthouse
     validator_count: 1
 
@@ -23,8 +21,7 @@ participants:
   - el_type: reth
     el_image: arkiv-reth:dev
     el_extra_env_vars:
-      ARKIV_STORE_URL: memory://
-      ALLOW_EXPERIMENTAL_BACKENDS: "true"
+      ARKIV_EXPERIMENTAL_STORE: memory
     cl_type: lighthouse
     validator_count: 0
     # ethereum-package currently emits an ENR as Reth's --bootnodes value,

@@ -13,16 +13,19 @@
 //!
 //! One entity is one record, keyed by the entity address.
 //!
-//! | cell                    | kind      | type    | from                       |
-//! |-------------------------|-----------|---------|----------------------------|
-//! | `$key`                  | attribute | `KEY`   | `key`                      |
-//! | `$creator`              | attribute | `ADDR`  | `creator`                  |
-//! | `$owner`                | attribute | `ADDR`  | `owner`                    |
-//! | `$createdAtBlock`       | attribute | `U64`   | `created_at_block`         |
-//! | `$expiration`           | attribute | `U64`   | `expires_at`               |
-//! | [`CELL_LAST_MODIFIED`]  | **field** | `U64`   | `last_modified_at_block`   |
-//! | [`CELL_CREATION_FLAGS`] | **field** | `BYTES`* | `creation_flags`          |
-//! | *user attribute name*   | attribute if `indexed`, else field | per value | `attributes` |
+//! Every system cell is named by its [`annotations`] constant: the API spec's name,
+//! `$`-prefixed.
+//!
+//! | cell                  | kind      | type     | from             |
+//! |-----------------------|-----------|----------|------------------|
+//! | `$key`                | attribute | `KEY`    | `key`            |
+//! | `$creator`            | attribute | `ADDR`   | `creator`        |
+//! | `$owner`              | attribute | `ADDR`   | `owner`          |
+//! | `$createdAt`          | **field** | `U64`    | `created_at`     |
+//! | `$expiresAt`          | attribute | `U64`    | `expires_at`     |
+//! | `$updatedAt`          | **field** | `U64`    | `updated_at`     |
+//! | `$creationFlags`      | **field** | `BYTES`* | `creation_flags` |
+//! | *user attribute name* | attribute if `indexed`, else field | per value | `attributes` |
 //!
 //! Attributes are indexed and queryable; fields are not. The split follows the
 //! language exactly: the [`BuiltIn`](crate::query::BuiltIn) keys are attributes, a
@@ -45,11 +48,6 @@ use alloc::vec::Vec;
 use crate::entity::{Attribute, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
 use crate::store::{Cell, CellKind, CellName, Record, RecordKey, TypeId};
-
-/// The block of the entity's last change. A field: the language cannot query it.
-pub const CELL_LAST_MODIFIED: &str = "$lastModifiedAtBlock";
-/// The entity's creation flags. A field, for the same reason.
-pub const CELL_CREATION_FLAGS: &str = "$creationFlags";
 
 /// Why an entity could not be mapped, in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,22 +108,19 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
             Cell::attribute(TypeId::ADDR, entity.owner.to_vec())
         ),
         (
-            system(annotations::CREATED_AT_BLOCK),
-            Cell::attribute(TypeId::U64, entity.created_at_block.to_be_bytes().to_vec()),
+            system(annotations::CREATED_AT),
+            Cell::field(TypeId::U64, entity.created_at.to_be_bytes().to_vec()),
         ),
         (
-            system(annotations::EXPIRATION),
+            system(annotations::EXPIRES_AT),
             Cell::attribute(TypeId::U64, entity.expires_at.to_be_bytes().to_vec()),
         ),
         (
-            CellName::from(CELL_LAST_MODIFIED),
-            Cell::field(
-                TypeId::U64,
-                entity.last_modified_at_block.to_be_bytes().to_vec()
-            ),
+            system(annotations::UPDATED_AT),
+            Cell::field(TypeId::U64, entity.updated_at.to_be_bytes().to_vec()),
         ),
         (
-            CellName::from(CELL_CREATION_FLAGS),
+            system(annotations::CREATION_FLAGS),
             Cell::field(TypeId::BYTES, alloc::vec![entity.creation_flags.bits()]),
         ),
     ];
@@ -175,26 +170,30 @@ pub fn from_record(record: &Record) -> Result<Entity, RecordError> {
     let key_bytes = cell(record, &system(annotations::KEY), TypeId::KEY, "$key")?;
     let created = cell(
         record,
-        &system(annotations::CREATED_AT_BLOCK),
+        &system(annotations::CREATED_AT),
         TypeId::U64,
-        "$createdAtBlock",
+        "$createdAt",
     )?;
     let expires = cell(
         record,
-        &system(annotations::EXPIRATION),
+        &system(annotations::EXPIRES_AT),
         TypeId::U64,
-        "$expiration",
+        "$expiresAt",
     )?;
-    let modified = cell(record, CELL_LAST_MODIFIED, TypeId::U64, CELL_LAST_MODIFIED)?;
+    let updated = cell(
+        record,
+        &system(annotations::UPDATED_AT),
+        TypeId::U64,
+        "$updatedAt",
+    )?;
     let flags_raw = cell(
         record,
-        CELL_CREATION_FLAGS,
+        &system(annotations::CREATION_FLAGS),
         TypeId::BYTES,
-        CELL_CREATION_FLAGS,
+        "$creationFlags",
     )?;
-    let [bits] = fixed::<1>(flags_raw, CELL_CREATION_FLAGS)?;
-    let flags =
-        CreationFlags::from_bits(bits).ok_or(RecordError::Malformed(CELL_CREATION_FLAGS))?;
+    let [bits] = fixed::<1>(flags_raw, "$creationFlags")?;
+    let flags = CreationFlags::from_bits(bits).ok_or(RecordError::Malformed("$creationFlags"))?;
 
     let mut entity = Entity {
         key: fixed(key_bytes, "$key")?,
@@ -211,9 +210,9 @@ pub fn from_record(record: &Record) -> Result<Entity, RecordError> {
             cell(record, &system(annotations::OWNER), TypeId::ADDR, "$owner")?,
             "$owner",
         )?,
-        created_at_block: u64::from_be_bytes(fixed(created, "$createdAtBlock")?),
-        last_modified_at_block: u64::from_be_bytes(fixed(modified, CELL_LAST_MODIFIED)?),
-        expires_at: u64::from_be_bytes(fixed(expires, "$expiration")?),
+        created_at: u64::from_be_bytes(fixed(created, "$createdAt")?),
+        updated_at: u64::from_be_bytes(fixed(updated, "$updatedAt")?),
+        expires_at: u64::from_be_bytes(fixed(expires, "$expiresAt")?),
         creation_flags: flags,
         attributes: Vec::new(),
     };
@@ -265,8 +264,8 @@ mod tests {
             key: [0x11; 32],
             creator: [0x22; 20],
             owner: [0x33; 20],
-            created_at_block: 100,
-            last_modified_at_block: 150,
+            created_at: 100,
+            updated_at: 150,
             expires_at: 200,
             creation_flags: CreationFlags::NONE,
             attributes: alloc::vec![
@@ -311,14 +310,31 @@ mod tests {
             annotations::KEY,
             annotations::CREATOR,
             annotations::OWNER,
-            annotations::CREATED_AT_BLOCK,
-            annotations::EXPIRATION,
+            annotations::EXPIRES_AT,
         ] {
             let name = core::str::from_utf8(name).unwrap();
             let cell = record
                 .cell(name)
                 .unwrap_or_else(|| panic!("{name} missing"));
             assert_eq!(cell.kind, CellKind::Attribute, "{name} must be queryable");
+        }
+    }
+
+    #[test]
+    fn every_projection_only_system_cell_is_a_field() {
+        // The API spec returns these but does not query them; an attribute would
+        // pay for an index nothing can use.
+        let record = as_record(&sample());
+        for name in [
+            annotations::CREATED_AT,
+            annotations::UPDATED_AT,
+            annotations::CREATION_FLAGS,
+        ] {
+            let name = core::str::from_utf8(name).unwrap();
+            let cell = record
+                .cell(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(cell.kind, CellKind::Field, "{name} must not be indexed");
         }
     }
 

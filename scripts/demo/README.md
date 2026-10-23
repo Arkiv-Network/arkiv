@@ -1,24 +1,26 @@
 # Demo: a chain on GolemDB, from nothing, in one command
 
-`run.py` starts a throwaway Valkey, runs `arkiv-reth --dev` against it for a few seconds, sends one transaction, collects the evidence, and removes everything it started.
+`run.py` runs `arkiv-reth --dev` on GolemDB for a few seconds, creates and patches one entity and sends one transfer, collects the evidence, and removes everything it started. GolemDB runs inside the node, so there is nothing else to start.
 
 ```sh
-cargo build --bin arkiv-reth --profile dev-fast
-scripts/demo/run.py            # 30 seconds
-scripts/demo/run.py 10         # or however long
+cargo build --bin arkiv-reth --bin arkiv-cli --profile dev-fast
+scripts/demo/run.py --restart  # 30 seconds, then a stop and a start
+scripts/demo/run.py 10         # or however long, without the restart
 ```
 
-Nothing it starts is shared. Valkey gets a free port and its own data directory, snapshotting off; the chain gets its own datadir; the store namespace carries the run's timestamp. A Valkey you already run on 6379 is untouched, and two runs can overlap.
+Nothing it starts is shared: the chain and GolemDB get their own directories, so two runs can overlap. `--store valkey` runs on a throwaway Valkey server instead, on a free port with its own data directory and a namespace carrying the run's timestamp; a Valkey you already run on 6379 is untouched.
 
 | Flag / variable | Meaning |
 | --- | --- |
 | `seconds` | How long to let the chain run (default 30) |
+| `--store S` | `golemdb` (default) or `valkey` |
 | `--out DIR` | Where to write the bundle (default `target/demo/<timestamp>`) |
-| `--keep` | Leave Valkey and the chain up, and print how to reach them |
+| `--keep` | Leave the store and the chain up, and print how to reach them |
 | `--restart` | Stop the node and start it again against the same store, and check it comes back where the store says the chain is |
 | `ARKIV_RETH_BINARY` | Use this binary instead of looking in `target/{dev-fast,debug,release}` |
+| `ARKIV_CLI_BINARY` | The same for `arkiv-cli`, which creates and patches the entity |
 
-Foundry is optional. With `cast` on PATH the run sends one transfer so the chain has something to execute; without it the chain just idles and the summary says so.
+Foundry is optional. With `cast` on PATH the run sends one transfer so the chain has something to execute; without it the summary says so. The entity needs an `arkiv-cli` binary, built like `arkiv-reth`.
 
 ## What you get
 
@@ -27,13 +29,17 @@ One directory, named in the last line of output:
 | File | What it holds |
 | --- | --- |
 | `node.log` | Everything arkiv-reth wrote, stdout and stderr |
-| `valkey.log` | The same for the Valkey server |
-| `progress.json` | Block height, entity count and key count, sampled ten times while running |
-| `valkey-keys.txt` | Every key the run left in the store |
-| `store-summary.txt` | Key totals by kind, and the cells of a record if there is one |
+| `valkey.log` | Valkey only: the same for the Valkey server |
+| `progress.json` | Block height, sampled ten times while running (Valkey: also entity and key counts) |
+| `valkey-keys.txt` | Valkey only: every key the run left in the store |
+| `store-summary.txt` | Valkey: key totals by kind, and the cells of a record. GolemDB: its files, and the entity read back |
+| `entity.log` | The `arkiv-cli` create and patch output |
+| `restart.json` | With `--restart`: block, balance and entity before and after |
 | `transfer.log` | `cast send` output, when foundry is installed |
 
-## What the store actually holds
+## What Valkey holds
+
+This section is about `--store valkey`, where the store's keys can be read from outside the node.
 
 A plain transfer leaves **no entity records**, which is the design rather than a fault: entity records are written by Arkiv operations, and a transfer is not one. It does leave an account record, because balances and nonces are GolemDB's too since the accounts cutover. So an idle or transfer-only run holds commit bookkeeping and accounts, and no entities:
 
@@ -53,7 +59,7 @@ One `commit:N:hash` and one `tag:` per block — the commit lineage, one commit 
 `rec:` keys appear once something **creates an entity**. The quickest way to see them, and the cell names with them, is the e2e suite pointed at a Valkey:
 
 ```sh
-ARKIV_STORE_URL=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=scratch \
+ARKIV_EXPERIMENTAL_STORE=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=scratch \
   cargo test -p arkiv-reth --test e2e query_operator_classes_over_a_live_node
 ```
 
@@ -61,10 +67,11 @@ When a record is present the summary prints its cell names, which is where the p
 
 ## Restart
 
-`--restart` is the one that shows why any of this exists. The run stops the node with SIGTERM, leaves Valkey up, starts the node again on the same datadir and namespace, and then checks three things:
+`--restart` is the one that shows why any of this exists. The run stops the node with SIGTERM, leaves the store in place, starts the node again on the same datadir and store, and then checks three things:
 
 - it resumes at the height it stopped at, rather than at whatever reth last flushed to its own database;
 - the transfer recipient still holds its ether, which is GolemDB's record and not reth's;
+- the entity reads back unchanged, patched payload included;
 - it goes on building new blocks, because coming back up and then stalling is not recovery.
 
 `restart.json` in the bundle has the before and after numbers. A typical run:
@@ -81,11 +88,11 @@ When a record is present the summary prints its cell names, which is where the p
 
 Without `cast` on PATH nothing is ever spent, so the balance check compares zero with zero; the run says so rather than letting it read as though it proved something.
 
-This is the graceful stop, the one an operator performs. The abrupt one — SIGKILL — is covered by `arkiv-reth::recovery`, which needs a Valkey of its own.
+This is the graceful stop, the one an operator performs. The abrupt one — SIGKILL — is covered by `arkiv-reth::recovery`.
 
 ## Exit status
 
-Zero when the chain advanced and the store is non-empty. Non-zero, with the reason, when the chain never moved, when the store came back empty, or when Valkey or the RPC never came up. The logs are written either way, which is the point on a failure.
+Zero when the chain advanced and the store is non-empty. Non-zero, with the reason, when the chain never moved, when the store came back empty, when the entity does not read back, or when the store or the RPC never came up. The logs are written either way, which is the point on a failure.
 
 Ctrl-C is handled: the processes and scratch data still go, the log directory still stays.
 

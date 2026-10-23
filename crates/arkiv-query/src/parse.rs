@@ -525,7 +525,7 @@ fn builtin_type(field: BuiltIn) -> AttributeType {
     match field {
         BuiltIn::Owner | BuiltIn::Creator => AttributeType::EthereumAddress,
         BuiltIn::Key => AttributeType::EntityKey,
-        BuiltIn::ExpiresAt | BuiltIn::CreatedAt => AttributeType::U64,
+        BuiltIn::ExpiresAt => AttributeType::U64,
     }
 }
 
@@ -613,8 +613,11 @@ fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError>
         "creator" => Ok(BuiltIn::Creator),
         "key" => Ok(BuiltIn::Key),
         "expiresAt" => Ok(BuiltIn::ExpiresAt),
-        "createdAt" => Ok(BuiltIn::CreatedAt),
 
+        "createdAt" => Err(ParseError::type_error(
+            position,
+            "$createdAt is not queryable — it is returned by projections only",
+        )),
         "updatedAt" => Err(ParseError::type_error(
             position,
             "$updatedAt is not queryable — it is returned by projections only",
@@ -638,14 +641,15 @@ fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError>
         )),
         "createdAtBlock" => Err(ParseError::type_error(
             position,
-            "unknown system attribute $createdAtBlock — it is now $createdAt",
+            "unknown system attribute $createdAtBlock — it is now $createdAt, which is \
+             returned by projections only",
         )),
 
         _ => Err(ParseError::type_error(
             position,
             alloc::format!(
-                "unknown system attribute ${name} — expected $key, $owner, $creator, \
-                 $expiresAt or $createdAt"
+                "unknown system attribute ${name} — expected $key, $owner, $creator or \
+                 $expiresAt"
             ),
         )),
     }
@@ -896,13 +900,6 @@ mod tests {
                 value: AttributeValue::U64(1_200_000),
             }
         );
-        assert!(matches!(
-            parse("$createdAt >= u64(7)").unwrap(),
-            Query::Gte {
-                key: AnnotKey::BuiltIn(BuiltIn::CreatedAt),
-                ..
-            }
-        ));
 
         // Untagged is a type error that names the fix, rather than silently
         // comparing an i32 against a u64 attribute and matching nothing.
@@ -952,6 +949,7 @@ mod tests {
     #[test]
     fn unqueryable_and_renamed_system_attributes_say_so() {
         for (query, hint) in [
+            ("$createdAt > u64(1)", "projections only"),
             ("$updatedAt > 1", "projections only"),
             ("$creationFlags = true", "projections only"),
             ("$payload = str('x')", "user attributes now"),
