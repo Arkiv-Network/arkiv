@@ -216,6 +216,20 @@ def check_single_node(args):
     log(f"OK: block {latest} is retrievable", "green")
 
 
+def wait_for_chain_start(url, wait):
+    """Wait, up to `wait` seconds, for a chain still at genesis to make block 1.
+
+    A Kurtosis network starts producing blocks some seconds after the enclave
+    is up (ethereum-package's genesis delay), so a window that opens on arrival
+    can close before the first block is due.
+    """
+    deadline = time.monotonic() + wait
+    while block_number(url) == 0:
+        if time.monotonic() >= deadline:
+            fail(f"no block produced in {wait:g}s")
+        time.sleep(POLL_INTERVAL)
+
+
 def check_network(args):
     # Capture both starting heights before polling. This lets us distinguish
     # a live-but-idle sequencer from a network that is producing blocks.
@@ -235,6 +249,8 @@ def check_network(args):
         fail(f"nodes disagree at initial common height {common_start}")
     log(f"OK: initial block hash matches at height {common_start}", "green")
 
+    if sequencer_start == 0:
+        wait_for_chain_start(args.sequencer_rpc, args.wait)
     deadline = time.monotonic() + args.wait
     sequencer_latest = sequencer_start
     follower_latest = follower_start

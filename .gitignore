@@ -19,3 +19,6 @@ jwt.hex
 .claude/scheduled_tasks.lock
 
 .DS_Store
+
+# Python bytecode, from running the scripts.
+__pycache__/
