@@ -1,4 +1,5 @@
 use super::*;
+use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::store::{CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -12,8 +13,12 @@ fn config() -> GolemDbConfig {
         max_str_len: 128,
         max_bytes_len: 128 * 1024,
     };
+    let record_limits = RecordLimits {
+        max_cells: MAX_RECORD_CELLS as u64,
+        max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
+    };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, None),
+        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
         segments: vec![SegmentSpec {
             name: SEGMENT.into(),
             columns: 2,
@@ -227,11 +232,13 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
 
     let mut limits = config();
     limits.genesis.cell_limits.max_str_len += 1;
+    let mut record_limits = config();
+    record_limits.genesis.record_limits.max_cells += 1;
     let mut segments = config();
     segments.segments[0].columns += 1;
     let mut hash = config();
     hash.genesis.hash_function = HashAlgorithm::Blake3;
-    for other in [limits, segments, hash] {
+    for other in [limits, record_limits, segments, hash] {
         assert!(matches!(
             GolemDbStore::open(dir.path(), &other),
             Err(OpenError::GenesisMismatch)

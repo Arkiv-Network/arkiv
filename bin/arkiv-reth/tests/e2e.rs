@@ -24,6 +24,7 @@ use arkiv_harness::{
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
+use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -1577,6 +1578,10 @@ fn arkiv_section(hash_function: &str) -> serde_json::Value {
             "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
             "max_str_len": MAX_STR_BYTES,
             "max_bytes_len": MAX_BYTES_VALUE_LEN
+        },
+        "record_limits": {
+            "max_cells": MAX_RECORD_CELLS,
+            "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
         }
     } })
 }

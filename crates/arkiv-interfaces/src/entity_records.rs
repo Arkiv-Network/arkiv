@@ -45,9 +45,26 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::constants::ENTITY_MAX_ATTRIBUTES;
 use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
 use crate::store::{Cell, CellKind, CellName, Record, RecordKey, TypeId};
+
+/// The system cells of the layout above, which every entity record holds.
+const SYSTEM_CELLS: usize = 7;
+
+/// Of the [`SYSTEM_CELLS`], the attributes: `$key`, `$creator`, `$owner` and
+/// `$expiresAt`.
+const SYSTEM_ATTRIBUTES: usize = 4;
+
+/// The most cells an entity record holds: its system cells and one per
+/// attribute. An account record holds a few fields, so this caps every record,
+/// and GolemDB's genesis states it as `record_limits.max_cells`.
+pub const MAX_RECORD_CELLS: usize = SYSTEM_CELLS + ENTITY_MAX_ATTRIBUTES;
+
+/// The most of a record's cells that are attributes, every user attribute
+/// indexed: GolemDB's `record_limits.max_indexed_cells`.
+pub const MAX_RECORD_INDEXED_CELLS: usize = SYSTEM_ATTRIBUTES + ENTITY_MAX_ATTRIBUTES;
 
 /// Why an entity could not be mapped, in either direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +310,27 @@ mod tests {
             version: RecordVersion(1),
             cells: to_cells(entity).expect("maps"),
         }
+    }
+
+    /// An entity with every attribute it may have, all indexed, fills the
+    /// record caps exactly, so the system cell counts are `to_cells`'s own.
+    #[test]
+    fn a_full_entity_fills_the_record_caps() {
+        let entity = Entity {
+            attributes: (0..ENTITY_MAX_ATTRIBUTES)
+                .map(|i| {
+                    Attribute::new(alloc::format!("a{i}").into_bytes(), AttributeValue::U64(0))
+                })
+                .collect(),
+            ..sample()
+        };
+        let cells = to_cells(&entity).expect("maps");
+        let indexed = cells
+            .iter()
+            .filter(|(_, cell)| matches!(cell.kind, CellKind::Attribute))
+            .count();
+        assert_eq!(cells.len(), MAX_RECORD_CELLS);
+        assert_eq!(indexed, MAX_RECORD_INDEXED_CELLS);
     }
 
     #[test]

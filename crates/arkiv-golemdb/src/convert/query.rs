@@ -254,9 +254,10 @@ fn invalid_query(_: golemdb::ValuesError) -> StoreError {
 mod tests {
     use super::*;
     use crate::{GolemDbConfig, GolemDbStore};
+    use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use arkiv_interfaces::store::{Page, RecordKey, Store};
     use golemdb_api::marker::{Bytes32, I32, Str, U64};
-    use golemdb_api::{Api, CellLimits, CellType, Genesis, HashAlgorithm, Width};
+    use golemdb_api::{Api, CellLimits, CellType, Genesis, HashAlgorithm, RecordLimits, Width};
     use std::ops::Bound;
     use tempfile::TempDir;
 
@@ -654,8 +655,12 @@ mod tests {
             max_str_len: 128,
             max_bytes_len: 1024,
         };
+        let record_limits = RecordLimits {
+            max_cells: MAX_RECORD_CELLS as u64,
+            max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
+        };
         let config = GolemDbConfig {
-            genesis: Genesis::new(HashAlgorithm::Keccak256, limits, None),
+            genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
             segments: vec![],
         };
         let store = GolemDbStore::open(dir.path(), &config).unwrap();

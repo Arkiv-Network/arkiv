@@ -26,6 +26,10 @@
           "max_cell_name_len": 32,
           "max_str_len": 128,
           "max_bytes_len": 131072
+        },
+        "record_limits": {
+          "max_cells": 39,
+          "max_indexed_cells": 36
         }
       }
     }

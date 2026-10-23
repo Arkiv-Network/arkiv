@@ -31,7 +31,7 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError};
+pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, RecordLimits};
 
 use convert::{
     arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
