@@ -256,7 +256,7 @@ mod tests {
     use crate::{GolemDbConfig, GolemDbStore};
     use arkiv_interfaces::store::{Page, RecordKey, Store};
     use golemdb_api::marker::{Bytes32, I32, Str, U64};
-    use golemdb_api::{Api, CellLimits, CellType, HashAlgorithm, Width};
+    use golemdb_api::{Api, CellLimits, CellType, Genesis, HashAlgorithm, Width};
     use std::ops::Bound;
     use tempfile::TempDir;
 
@@ -649,13 +649,13 @@ mod tests {
     #[test]
     fn a_converted_filter_finds_what_was_written() {
         let dir = TempDir::new().unwrap();
+        let limits = CellLimits {
+            max_cell_name_len: 32,
+            max_str_len: 128,
+            max_bytes_len: 1024,
+        };
         let config = GolemDbConfig {
-            hash_function: HashAlgorithm::Keccak256,
-            cell_limits: CellLimits {
-                max_cell_name_len: 32,
-                max_str_len: 128,
-                max_bytes_len: 1024,
-            },
+            genesis: Genesis::new(HashAlgorithm::Keccak256, limits, None),
             segments: vec![],
         };
         let store = GolemDbStore::open(dir.path(), &config).unwrap();

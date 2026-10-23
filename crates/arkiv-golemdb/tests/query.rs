@@ -5,7 +5,7 @@
 //! The RPC also bounds every query to live entities, `AND $expiresAt >
 //! block`: `a_count_combines_predicates` counts in that shape.
 
-use arkiv_golemdb::{CellLimits, GolemDbConfig, GolemDbStore, HashAlgorithm};
+use arkiv_golemdb::{CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm};
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
@@ -17,13 +17,13 @@ use tempfile::TempDir;
 /// Arkiv's limits, as the node opens GolemDB with them.
 fn config() -> GolemDbConfig {
     let limit = |bytes: usize| u32::try_from(bytes).unwrap();
+    let limits = CellLimits {
+        max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
+        max_str_len: limit(MAX_STR_BYTES),
+        max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
+    };
     GolemDbConfig {
-        hash_function: HashAlgorithm::Keccak256,
-        cell_limits: CellLimits {
-            max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
-            max_str_len: limit(MAX_STR_BYTES),
-            max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
-        },
+        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, None),
         segments: vec![],
     }
 }
