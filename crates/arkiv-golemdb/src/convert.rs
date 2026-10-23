@@ -3,7 +3,8 @@
 use arkiv_interfaces::entity::annotations;
 use arkiv_interfaces::store::{
     BranchId, Cell, CellKind, CommitId, CostUnits, Metered, Receipt, Record, RecordKey,
-    RecordVersion, SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
+    RecordVersion, ScheduleVersion, SegmentAddress, SegmentKey, SegmentRow, StoreError, TypeId,
+    WriteDetails,
 };
 use golemdb_api as golemdb;
 use golemdb_api::{ApiError, CellType, FloatWidth, Width};
@@ -11,11 +12,6 @@ use golemdb_api::{ApiError, CellType, FloatWidth, Width};
 mod query;
 
 pub(crate) use query::{arkiv_query_result, count_op, golemdb_budget, query_op};
-
-/// GolemDB reports no cost yet, so every receipt is empty.
-pub(crate) fn metered<T>(value: T) -> Metered<T> {
-    Metered::new(value, Receipt::default())
-}
 
 /// Every form of "this branch or commit is stale" becomes `HandleInvalid`: the
 /// caller re-opens over the new head and executes again. Rolling back past the
@@ -49,17 +45,42 @@ pub(crate) fn store_error(error: ApiError) -> StoreError {
     }
 }
 
-/// A metered call's result, its receipt dropped as GolemDB prices no work yet.
-/// Running out of budget is the exception: GolemDB reports what was spent by
-/// then on the receipt rather than in the error, so it is taken from there.
-pub(crate) fn metered_result<T>(metered: golemdb::Metered<T>) -> Result<T, StoreError> {
+/// A metered call's result, with GolemDB's receipt in Arkiv's terms.
+///
+/// Running out of budget reports what was spent by then, which GolemDB puts on
+/// the receipt rather than in the error. Other failures carry no receipt:
+/// Arkiv's errors have no room for one.
+pub(crate) fn metered_result<T>(metered: golemdb::Metered<T>) -> Result<Metered<T>, StoreError> {
     let golemdb::Metered { result, receipt } = metered;
-    result.map_err(|error| match error {
-        ApiError::OutOfBudget { .. } => StoreError::OutOfBudget {
+    match result {
+        Ok(value) => Ok(Metered::new(value, arkiv_receipt(&receipt))),
+        Err(ApiError::OutOfBudget { .. }) => Err(StoreError::OutOfBudget {
             spent: CostUnits(receipt.cost),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// GolemDB's receipt as Arkiv's. GolemDB names no schedule version, so
+/// `schedule` stays 0; its per-weight ledger is not carried yet.
+pub(crate) fn arkiv_receipt(receipt: &golemdb::Receipt) -> Receipt {
+    let details = &receipt.details;
+    Receipt {
+        cost: CostUnits(receipt.cost),
+        schedule: ScheduleVersion::default(),
+        priced_at: receipt.priced_at.map(commit_id),
+        details: WriteDetails {
+            cells_created: details.cells_created,
+            cells_updated: details.cells_updated,
+            cells_deleted: details.cells_deleted,
+            index_joins: details.index_joins,
+            index_leaves: details.index_leaves,
+            cell_bytes_written: details.cell_bytes_written,
+            cell_bytes_deleted: details.cell_bytes_deleted,
+            index_bytes_written: details.index_bytes_written,
+            index_bytes_deleted: details.index_bytes_deleted,
         },
-        error => store_error(error),
-    })
+    }
 }
 
 pub(crate) fn branch_id(branch: BranchId) -> golemdb::BranchId {

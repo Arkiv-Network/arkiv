@@ -1,6 +1,8 @@
 use super::*;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
-use arkiv_interfaces::store::{CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId};
+use arkiv_interfaces::store::{
+    CellKind, CompareOp, CostUnits, Page, Predicate, Test, TypeId, WriteDetails,
+};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -62,6 +64,31 @@ fn attribute(type_id: TypeId, value: &[u8]) -> Cell {
     cell(CellKind::Attribute, type_id, value)
 }
 
+fn field(type_id: TypeId, value: &[u8]) -> Cell {
+    cell(CellKind::Field, type_id, value)
+}
+
+/// Print a record's `#meta` counts, read straight from GolemDB: Arkiv's store
+/// interface does not carry `#meta` yet. A deleted record has none.
+fn print_meta(step: &str, store: &GolemDbStore, branch: BranchId, key: RecordKey) {
+    let read = store.database.get(
+        golemdb::ReadTarget::Branch(branch_id(branch)),
+        golemdb::RecordOp::get(record_key(key), golemdb::Budget::Unlimited)
+            .only(["#meta".as_bytes()]),
+    );
+    match read.into_result() {
+        Ok(record) => match record.meta() {
+            Some(meta) => println!(
+                "{step} #meta: {} cells, {} cell bytes, {} indexed cells, {} index bytes",
+                meta.cells, meta.cell_bytes, meta.indexed_cells, meta.index_bytes
+            ),
+            None => println!("{step} #meta: missing or malformed"),
+        },
+        Err(ApiError::NotFound) => println!("{step} #meta: none, the record is gone"),
+        Err(error) => panic!("reading #meta after {step}: {error:?}"),
+    }
+}
+
 fn read(store: &GolemDbStore, target: ReadTarget, key: u8) -> Result<Record, StoreError> {
     Ok(store
         .get(target, RecordKey([key; 32]), None, None)?
@@ -93,7 +120,7 @@ fn every_type_round_trips() {
         ("u".into(), attribute(TypeId::U256, &[0xab; 32])),
         ("d".into(), attribute(TypeId::DEC, &[0xff; 32])),
         ("h".into(), attribute(TypeId::BYTES32, &[9; 32])),
-        ("p".into(), cell(CellKind::Field, TypeId::BYTES, b"payload")),
+        ("p".into(), field(TypeId::BYTES, b"payload")),
         ("s".into(), attribute(TypeId::STR, b"hello")),
         ("n".into(), attribute(TypeId::U64, &42u64.to_be_bytes())),
         ("a".into(), attribute(TypeId::ADDR, &[3; 20])),
@@ -131,7 +158,7 @@ fn a_bool_above_one_is_refused() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
     let branch = store.begin(None).unwrap();
-    let cells = vec![("f".into(), cell(CellKind::Field, TypeId::BOOL, &[2]))];
+    let cells = vec![("f".into(), field(TypeId::BOOL, &[2]))];
     assert_eq!(
         store.create(branch, RecordKey([1; 32]), cells, None),
         Err(StoreError::InvalidArgument)
@@ -613,7 +640,7 @@ fn a_failed_commit_leaves_no_tag_row() {
     let branch = store.begin(None).unwrap();
     for n in 0..10 {
         let payload = vec![n; 128 * 1024];
-        let cells = vec![("p".into(), cell(CellKind::Field, TypeId::BYTES, &payload))];
+        let cells = vec![("p".into(), field(TypeId::BYTES, &payload))];
         store
             .create(branch, RecordKey([n; 32]), cells, None)
             .unwrap();
@@ -680,37 +707,25 @@ fn a_patch_adds_missing_cells_and_gives_them_their_kind() {
             RecordKey([1; 32]),
             vec![
                 ("n".into(), attribute(TypeId::U64, &seven)),
-                ("tag".into(), cell(CellKind::Field, TypeId::STR, b"x")),
+                ("tag".into(), field(TypeId::STR, b"x")),
             ],
             None,
         )
         .unwrap();
     // Indexed, then not; not, then indexed; and a cell the record lacks.
     let changes = vec![
-        (
-            "n".into(),
-            CellChange::Set(cell(CellKind::Field, TypeId::U64, &seven)),
-        ),
+        ("n".into(), CellChange::Set(field(TypeId::U64, &seven))),
         ("tag".into(), CellChange::Set(attribute(TypeId::STR, b"y"))),
-        (
-            "added".into(),
-            CellChange::Set(cell(CellKind::Field, TypeId::STR, b"z")),
-        ),
+        ("added".into(), CellChange::Set(field(TypeId::STR, b"z"))),
     ];
     store
         .patch(branch, RecordKey([1; 32]), None, changes, None)
         .unwrap();
 
     let record = read(&store, ReadTarget::Branch(branch), 1).unwrap();
-    assert_eq!(
-        record.cell("n"),
-        Some(&cell(CellKind::Field, TypeId::U64, &seven))
-    );
+    assert_eq!(record.cell("n"), Some(&field(TypeId::U64, &seven)));
     assert_eq!(record.cell("tag"), Some(&attribute(TypeId::STR, b"y")));
-    assert_eq!(
-        record.cell("added"),
-        Some(&cell(CellKind::Field, TypeId::STR, b"z"))
-    );
+    assert_eq!(record.cell("added"), Some(&field(TypeId::STR, b"z")));
 
     // The index follows the kinds: `tag` is found now, and `n` no longer is.
     store.commit(branch).unwrap();
@@ -817,6 +832,139 @@ fn a_query_over_a_cap_is_limit_exceeded() {
         max: 64,
     };
     assert_eq!(convert::store_error(error), StoreError::LimitExceeded);
+}
+
+/// GolemDB's receipt reaches Arkiv: each write reports what it did to the
+/// record's user cells, sized by GolemDB's rule, `(8 + name) + (1 + value)`
+/// per cell and `name + 2 + value` per index entry.
+#[test]
+fn writes_report_golemdbs_details() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    let key = RecordKey([1; 32]);
+
+    // Cell bytes: record ID (8) + name, then type tag (1) + value.
+    // Index bytes: name + 0x00 separator (1) + type tag (1) + value.
+    //
+    // `n`, a u64 attribute:
+    //   cell bytes  key:(8 + 1) + value:(1 + 8) = 18
+    let cell_bytes_n = 18;
+    //   index bytes  1 + 2 + 8 = 11
+    let index_bytes_n = 11;
+
+    // `note`, a str field holding "hi":
+    //   cell bytes  (8 + 4) + (1 + 2) = 15
+    let cell_bytes_note = 15;
+    //   no index entry: a field is not indexed
+    let index_bytes_note = 0;
+
+    let created = store
+        .create(
+            branch,
+            key,
+            vec![
+                ("n".into(), attribute(TypeId::U64, &7u64.to_be_bytes())),
+                ("note".into(), field(TypeId::STR, b"hi")),
+            ],
+            None,
+        )
+        .unwrap()
+        .receipt;
+    // For inspection: `cargo test -p arkiv-golemdb writes_report -- --nocapture`.
+    print_meta("create", &store, branch, key);
+    println!("create receipt: {created:#?}");
+
+    assert_eq!(created.priced_at, Some(store.head()));
+    assert_eq!(created.details.cells_created, 2);
+    assert_eq!(created.details.cells_updated, 0);
+    assert_eq!(created.details.cells_deleted, 0);
+    assert_eq!(created.details.index_joins, 1);
+    assert_eq!(created.details.index_leaves, 0);
+    assert_eq!(
+        created.details.cell_bytes_written,
+        cell_bytes_n + cell_bytes_note
+    );
+    assert_eq!(created.details.cell_bytes_deleted, 0);
+    assert_eq!(
+        created.details.index_bytes_written,
+        index_bytes_n + index_bytes_note
+    );
+    assert_eq!(created.details.index_bytes_deleted, 0);
+
+    // A new value for `n` leaves its old index term and joins the new one.
+    let patched = store
+        .patch(
+            branch,
+            key,
+            None,
+            vec![
+                (
+                    "n".into(),
+                    CellChange::Set(attribute(TypeId::U64, &8u64.to_be_bytes())),
+                ),
+                ("note".into(), CellChange::Remove),
+            ],
+            None,
+        )
+        .unwrap()
+        .receipt;
+    print_meta("patch", &store, branch, key);
+    println!("patch receipt: {patched:#?}");
+
+    // The new `n` has the same size as the old one: both are u64 values.
+    assert_eq!(patched.priced_at, Some(store.head()));
+    assert_eq!(patched.details.cells_created, 0);
+    assert_eq!(patched.details.cells_updated, 1); // `n` was updated.
+    assert_eq!(patched.details.cells_deleted, 1); // `note` was removed.
+    assert_eq!(patched.details.index_leaves, 1); // the old `n` leaves its index.
+    assert_eq!(patched.details.index_joins, 1); // The new `n` joins its index.
+    assert_eq!(patched.details.cell_bytes_written, cell_bytes_n); // only the new `n` was written (same size as old value)
+    assert_eq!(
+        patched.details.cell_bytes_deleted,
+        cell_bytes_n + cell_bytes_note
+    );
+    assert_eq!(patched.details.index_bytes_written, index_bytes_n);
+    assert_eq!(
+        patched.details.index_bytes_deleted,
+        index_bytes_n + index_bytes_note
+    );
+
+    // Only `n` is left, and it goes with the record.
+    let deleted = store.delete(branch, key, None, None).unwrap().receipt;
+    print_meta("delete", &store, branch, key);
+    println!("delete receipt: {deleted:#?}");
+
+    assert_eq!(deleted.priced_at, Some(store.head()));
+    assert_eq!(deleted.details.cells_created, 0);
+    assert_eq!(deleted.details.cells_updated, 0);
+    assert_eq!(deleted.details.cells_deleted, 1);
+    assert_eq!(deleted.details.index_joins, 0);
+    assert_eq!(deleted.details.index_leaves, 1);
+    assert_eq!(deleted.details.cell_bytes_written, 0);
+    assert_eq!(deleted.details.cell_bytes_deleted, cell_bytes_n);
+    assert_eq!(deleted.details.index_bytes_written, 0);
+    assert_eq!(deleted.details.index_bytes_deleted, index_bytes_n);
+}
+
+/// A read of a missing record is an answer, and it still carries its receipt.
+#[test]
+fn a_missing_record_still_has_a_receipt() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let branch = store.begin(None).unwrap();
+    let read = store
+        .get(ReadTarget::Branch(branch), RecordKey([9; 32]), None, None)
+        .unwrap();
+    // For inspection: `cargo test -p arkiv-golemdb a_missing_record -- --nocapture`.
+    println!("get receipt (missing record): {:#?}", read.receipt);
+    assert_eq!(read.value, None);
+    assert_eq!(read.receipt.priced_at, Some(store.head()));
+    assert_eq!(
+        read.receipt.details,
+        WriteDetails::ZERO,
+        "a read writes nothing"
+    );
 }
 
 /// Running out of budget is a verdict on the call, not a store failure, and
