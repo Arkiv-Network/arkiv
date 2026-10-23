@@ -31,7 +31,7 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, HashAlgorithm, OpenError};
+pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError};
 
 use convert::{
     arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
@@ -43,8 +43,9 @@ use tags::TagRow;
 /// Fixed when the database is created; reopening with anything else fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GolemDbConfig {
-    pub hash_function: HashAlgorithm,
-    pub cell_limits: CellLimits,
+    /// GolemDB's settings, as the chain's genesis file gives them. They declare
+    /// no segments; those are [`segments`](Self::segments).
+    pub genesis: Genesis,
     /// The segments rows may be appended to.
     pub segments: Vec<SegmentSpec>,
 }
@@ -60,8 +61,14 @@ pub struct SegmentSpec {
 const SHARD_SPAN: u64 = 500_000;
 
 impl GolemDbConfig {
-    /// The host's segments are LZ4-compressed byte columns.
-    fn genesis(&self) -> golemdb::Genesis {
+    /// [`genesis`](Self::genesis) with the host's segments, as LZ4-compressed
+    /// byte columns, and the adapter's own.
+    fn full_genesis(&self) -> Result<Genesis, OpenError> {
+        if self.genesis.immutable_data.is_some() {
+            return Err(OpenError::InvalidConfig(
+                "the genesis sets `immutable_data`, but the node declares its own segments".into(),
+            ));
+        }
         let segments = self
             .segments
             .iter()
@@ -74,11 +81,12 @@ impl GolemDbConfig {
             })
             .chain([tags::segment()])
             .collect();
-        let immutable_data = golemdb::ImmutableDataConfig {
+        let mut genesis = self.genesis.clone();
+        genesis.immutable_data = Some(golemdb::ImmutableDataConfig {
             shard_span: SHARD_SPAN,
             segments,
-        };
-        golemdb::Genesis::new(self.hash_function, self.cell_limits, Some(immutable_data))
+        });
+        Ok(genesis)
     }
 }
 
@@ -98,7 +106,14 @@ impl GolemDbStore {
     /// process may open a directory.
     pub fn open(directory: &Path, config: &GolemDbConfig) -> Result<Self, OpenError> {
         let database =
-            golemdb::Database::open(directory, &golemdb::OpenConfig::new(config.genesis()))?;
+            golemdb::Database::open(directory, &golemdb::OpenConfig::new(config.full_genesis()?))?;
+        Ok(Self { database })
+    }
+
+    /// A new database in memory, created with `config`; gone when the last
+    /// clone drops. It computes the same roots as one on disk.
+    pub fn open_memory(config: &GolemDbConfig) -> Result<Self, OpenError> {
+        let database = golemdb::Database::open_memory(&config.full_genesis()?)?;
         Ok(Self { database })
     }
 

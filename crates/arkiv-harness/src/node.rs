@@ -14,7 +14,7 @@
 use std::fs::File;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -357,6 +357,25 @@ impl Node {
                     tokio::time::sleep(READY_POLL_INTERVAL).await;
                 }
             }
+        }
+    }
+
+    /// Block until the process exits and return its status, or panic after
+    /// `timeout`. For a node that is meant to refuse to start; its reason is in
+    /// [`log_path`](Node::log_path).
+    pub async fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let child = self.child.as_mut().expect("node is running");
+            if let Some(status) = child.try_wait().expect("check the node process") {
+                self.child = None;
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node still running after {timeout:?}"
+            );
+            tokio::time::sleep(READY_POLL_INTERVAL).await;
         }
     }
 

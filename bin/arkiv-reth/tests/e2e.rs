@@ -6,6 +6,7 @@
 //! historical reads — all against real reth state over JSON-RPC.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use alloy_network::TransactionBuilder;
@@ -22,6 +23,7 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
+use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -1545,13 +1547,15 @@ async fn idle_dev_chain_holds_the_genesis_base_fee() {
         .await;
 }
 
-/// The floor follows the genesis file: `baseFeePerGas` of 10 wei floors the chain
-/// at 10 wei. Without the rule the run would read 10, 9, 8, 7, 7, 7, 7.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn base_fee_floor_follows_the_genesis_file() {
-    let genesis = serde_json::json!({
+/// The chain ID of [`genesis_json`].
+const FILE_CHAIN_ID: u64 = 424242;
+
+/// A genesis file's contents: every fork from block 0, and [`DEV_KEY_0`] funded.
+fn genesis_json() -> serde_json::Value {
+    let funded = DEV_KEY_0.parse::<PrivateKeySigner>().unwrap().address();
+    serde_json::json!({
         "config": {
-            "chainId": 424242,
+            "chainId": FILE_CHAIN_ID,
             "homesteadBlock": 0, "eip150Block": 0, "eip155Block": 0, "eip158Block": 0,
             "byzantiumBlock": 0, "constantinopleBlock": 0, "petersburgBlock": 0,
             "istanbulBlock": 0, "berlinBlock": 0, "londonBlock": 0,
@@ -1559,12 +1563,27 @@ async fn base_fee_floor_follows_the_genesis_file() {
             "terminalTotalDifficultyPassed": true,
             "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0
         },
-        "baseFeePerGas": "0xa",
         "gasLimit": "0x3938700",
         "difficulty": "0x0",
-        "alloc": {}
-    });
-    let genesis_path = std::env::temp_dir().join(format!(
+        "alloc": { format!("{funded:#x}"): { "balance": "0xd3c21bcecceda1000000" } }
+    })
+}
+
+/// `config.arkiv` giving GolemDB `hash_function` and Arkiv's limits.
+fn arkiv_section(hash_function: &str) -> serde_json::Value {
+    serde_json::json!({ "golemdb": {
+        "hash_function": hash_function,
+        "cell_limits": {
+            "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
+            "max_str_len": MAX_STR_BYTES,
+            "max_bytes_len": MAX_BYTES_VALUE_LEN
+        }
+    } })
+}
+
+/// Write `genesis` to a file of this test's own and return its path.
+fn genesis_file(genesis: &serde_json::Value) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
         "arkiv-e2e-genesis-{}-{}.json",
         std::process::id(),
         std::time::SystemTime::now()
@@ -1572,20 +1591,178 @@ async fn base_fee_floor_follows_the_genesis_file() {
             .unwrap()
             .as_nanos()
     ));
-    std::fs::write(&genesis_path, genesis.to_string()).expect("write genesis");
+    std::fs::write(&path, genesis.to_string()).expect("write genesis");
+    path
+}
+
+/// Wait for `node` to stop at startup, and return its log.
+async fn refusal(node: &mut arkiv_harness::Node) -> String {
+    let status = node.wait_exit(READY).await;
+    assert!(!status.success(), "the node exits with an error ({status})");
+    std::fs::read_to_string(node.log_path()).expect("read the node log")
+}
+
+/// The chain's base fee never drops below the genesis file's `baseFeePerGas`.
+/// Here that is 10 wei, so the first 7 blocks all have a base fee of 10.
+/// Without this rule, empty blocks would lower it to 7.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn base_fee_floor_follows_the_genesis_file() {
+    let mut genesis = genesis_json();
+    genesis["baseFeePerGas"] = "0xa".into();
+    let genesis_path = genesis_file(&genesis);
 
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
-        .arg("--chain")
-        .arg(genesis_path.to_str().unwrap())
+        .chain(&genesis_path)
         .spawn();
     let client = arkiv_harness::connect_reader(&node.http_url());
     node.wait_ready(&client, READY).await;
-    assert_eq!(client.chain_id().await, 424242);
+    assert_eq!(client.chain_id().await, FILE_CHAIN_ID);
     client.wait_for_block(6, READY).await;
 
     let fees = base_fees(&client, 6).await;
     let _ = std::fs::remove_file(&genesis_path);
     assert_eq!(fees, vec![10; 7], "the floor is the genesis baseFeePerGas");
+}
+
+/// GolemDB's settings follow the genesis file: a chain on Blake3 runs and takes
+/// writes. Its store then refuses the same file on Keccak-256, and opens again
+/// for the right file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn golemdb_settings_follow_the_genesis_file() {
+    let mut genesis = genesis_json();
+    genesis["config"]["arkiv"] = arkiv_section("blake3");
+    let genesis_path = genesis_file(&genesis);
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .chain(&genesis_path)
+        .golemdb_store()
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    let log = std::fs::read_to_string(node.log_path()).unwrap();
+    assert!(
+        log.contains("Blake3"),
+        "the node logs the settings in use: {log}"
+    );
+
+    let receipt = client
+        .execute(vec![create_op(1000, Bytes::from_static(b"blake3"), vec![])])
+        .await;
+    // Past reth's persistence threshold of 50 blocks, as the restart tests
+    // wait, so a restart resumes the chain. The store has the write by then.
+    let mined = receipt.block_number.expect("mined");
+    client.wait_for_block(mined + 60, READY).await;
+    let key = B256::from(derive_entity_address(
+        FILE_CHAIN_ID,
+        &caller.into_array(),
+        EntityCreationNonce::new(0),
+        0,
+    ));
+    let entity = client.get_entity(key).await;
+    assert_eq!(attr_value(&entity, "payload"), "0x626c616b6533"); // "blake3"
+    node.terminate();
+
+    let mut keccak = genesis.clone();
+    keccak["config"]["arkiv"] = arkiv_section("keccak-256");
+    std::fs::write(&genesis_path, keccak.to_string()).unwrap();
+    node.restart();
+    let log = refusal(&mut node).await;
+    assert!(
+        log.contains("it was created with other GolemDB settings"),
+        "{log}"
+    );
+
+    std::fs::write(&genesis_path, genesis.to_string()).unwrap();
+    node.restart();
+    node.wait_ready(&client, READY).await;
+    let _ = std::fs::remove_file(&genesis_path);
+    assert_eq!(client.get_entity(key).await, entity, "the entity survives");
+}
+
+/// A GolemDB chain whose genesis file lacks a usable `config.arkiv.golemdb`
+/// stops at startup, with the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_arkiv_section_stops_the_node() {
+    let mut top_level = genesis_json();
+    top_level["arkiv"] = arkiv_section("keccak-256");
+    let mut misnamed = genesis_json();
+    misnamed["config"]["arkiv"] = serde_json::json!({ "golemdb": { "hash_fn": "keccak-256" } });
+    let mut limits = genesis_json();
+    limits["config"]["arkiv"] = arkiv_section("keccak-256");
+    limits["config"]["arkiv"]["golemdb"]["cell_limits"]["max_str_len"] = (MAX_STR_BYTES / 2).into();
+    let mut segments = genesis_json();
+    segments["config"]["arkiv"] = arkiv_section("keccak-256");
+    segments["config"]["arkiv"]["golemdb"]["immutable_data"] =
+        serde_json::json!({ "shard_span": 1, "segments": [] });
+    for (genesis, expected) in [
+        (genesis_json(), "no config.arkiv.golemdb"),
+        (top_level, "no config.arkiv.golemdb"),
+        (misnamed, "unknown field `hash_fn`"),
+        (limits, "must be Arkiv's limits"),
+        (segments, "the node declares its own segments"),
+    ] {
+        let genesis_path = genesis_file(&genesis);
+        let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+            .chain(&genesis_path)
+            .golemdb_store()
+            .spawn();
+        let log = refusal(&mut node).await;
+        let _ = std::fs::remove_file(&genesis_path);
+        assert!(log.contains(expected), "{expected}: {log}");
+    }
+}
+
+/// On GolemDB, the store's genesis must have block 0's `stateRoot`. A store
+/// with this chain's settings and genesis tag, but other accounts, has another
+/// root and is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_golemdb_store_with_another_genesis_root_is_refused() {
+    use arkiv_reth_statemanager::{GenesisAccount, HostStore, seed_genesis, segments};
+    let example = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/example.json");
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .chain(example)
+        .golemdb_store()
+        .spawn();
+    let client = arkiv_harness::connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    let genesis_hash = client
+        .provider()
+        .get_block_by_number(0.into())
+        .await
+        .expect("eth_getBlockByNumber")
+        .expect("block 0")
+        .header
+        .hash;
+    node.terminate();
+
+    let directory = node.datadir().join("golemdb");
+    std::fs::remove_dir_all(&directory).unwrap();
+    let genesis: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(example).unwrap()).unwrap();
+    let config = arkiv_golemdb::GolemDbConfig {
+        genesis: serde_json::from_value(genesis["config"]["arkiv"]["golemdb"].clone()).unwrap(),
+        segments: segments::ALL
+            .iter()
+            .map(|&(name, columns)| arkiv_golemdb::SegmentSpec {
+                name: name.into(),
+                columns,
+            })
+            .collect(),
+    };
+    let store: HostStore =
+        std::sync::Arc::new(arkiv_golemdb::GolemDbStore::open(&directory, &config).unwrap());
+    let other = GenesisAccount {
+        address: Address::repeat_byte(0x33),
+        balance: U256::from(1),
+        nonce: 0,
+    };
+    seed_genesis(&store, genesis_hash.0, [other]).unwrap();
+    drop(store);
+
+    node.restart();
+    let log = refusal(&mut node).await;
+    assert!(log.contains("does not hold this genesis"), "{log}");
 }
 
 /// EIP-1559 accounting end to end: the sender's balance drops by

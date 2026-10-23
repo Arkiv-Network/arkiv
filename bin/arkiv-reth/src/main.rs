@@ -17,6 +17,7 @@
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
+mod genesis;
 mod node;
 
 // jemalloc, as reth's own binary does it. reth fragments badly under the stock
@@ -30,7 +31,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 #[cfg(unix)]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
-use arkiv_reth_chainspec::ArkivChainSpecParser;
+use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivEvmFactory;
 use arkiv_reth_golemdbprovider::{ArkivProvider, ArkivProviderBuilder};
 use arkiv_reth_statemanager::{BlockSeals, HostStore};
@@ -60,7 +61,14 @@ const PATH_EXAMPLE: &str = "ARKIV_STORE_PATH=/var/lib/arkiv/golemdb";
 /// - `ARKIV_EXPERIMENTAL_STORE` (`experimental`) is for tests and experiments:
 ///   `memory` is the in-process reference store, gone when the process is, and
 ///   a Valkey URL, such as `redis://127.0.0.1:6379`, is a Valkey server.
-fn open_store(path: Option<OsString>, experimental: Option<OsString>) -> eyre::Result<HostStore> {
+///   They do not use the genesis file's GolemDB settings.
+///
+/// GolemDB is created with the settings of the chain `spec` describes.
+fn open_store(
+    spec: &ArkivChainSpec,
+    path: Option<OsString>,
+    experimental: Option<OsString>,
+) -> eyre::Result<HostStore> {
     match (path, experimental) {
         (Some(path), None) => {
             let path = expand_home(path.into())?;
@@ -70,7 +78,7 @@ fn open_store(path: Option<OsString>, experimental: Option<OsString>) -> eyre::R
                  {PATH_EXAMPLE} or ~/arkiv/golemdb",
                 path.display()
             );
-            open_golemdb(&path)
+            open_golemdb(&path, spec)
         }
         (None, Some(store)) => match store.to_str() {
             Some("memory") => {
@@ -110,18 +118,24 @@ fn expand_home(path: PathBuf) -> eyre::Result<PathBuf> {
     Ok(home.join(rest))
 }
 
-/// Open GolemDB in `directory`, creating it with Arkiv's settings if it is new.
-fn open_golemdb(directory: &Path) -> eyre::Result<HostStore> {
+/// Open GolemDB in `directory`, creating it with the chain's settings if it is
+/// new.
+fn open_golemdb(directory: &Path, spec: &ArkivChainSpec) -> eyre::Result<HostStore> {
     let at = directory.display();
-    let store =
-        arkiv_golemdb::GolemDbStore::open(directory, &golemdb_config()).map_err(|e| match e {
-            arkiv_golemdb::OpenError::GenesisMismatch => eyre::eyre!(
-                "open GolemDB at {at}: it was created with other GolemDB settings, such as by \
-                 another Arkiv version; use a new directory"
-            ),
-            e => eyre::eyre!("open GolemDB at {at}: {e}"),
-        })?;
-    info!(target: "arkiv-reth", directory = %at, "Arkiv state on GolemDB");
+    let config = golemdb_config(spec)?;
+    let store = arkiv_golemdb::GolemDbStore::open(directory, &config).map_err(|e| match e {
+        arkiv_golemdb::OpenError::GenesisMismatch => eyre::eyre!(
+            "open GolemDB at {at}: it was created with other GolemDB settings. Delete it if \
+             the node never ran on it; otherwise use a new directory"
+        ),
+        e => eyre::eyre!("open GolemDB at {at}: {e}"),
+    })?;
+    info!(
+        target: "arkiv-reth",
+        directory = %at,
+        hash_function = ?config.genesis.hash_function,
+        "Arkiv state on GolemDB"
+    );
     Ok(Arc::new(store))
 }
 
@@ -135,21 +149,35 @@ fn open_valkey(url: &str) -> eyre::Result<HostStore> {
     Ok(Arc::new(store))
 }
 
-/// GolemDB's settings for Arkiv, from Arkiv's own limits and segments. They are
-/// fixed when a database is created and part of its state root, so every node
-/// of a chain must use the same.
-fn golemdb_config() -> arkiv_golemdb::GolemDbConfig {
+/// GolemDB's settings for the chain, from its genesis file, with Arkiv's
+/// segments. They are fixed when a database is created and part of its state
+/// root, so every node of a chain must use the same.
+fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbConfig> {
     use arkiv_interfaces::constants::{
         MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
     };
     let limit = |bytes: usize| u32::try_from(bytes).expect("Arkiv's limits fit in u32");
-    arkiv_golemdb::GolemDbConfig {
-        hash_function: arkiv_golemdb::HashAlgorithm::Keccak256,
-        cell_limits: arkiv_golemdb::CellLimits {
-            max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
-            max_str_len: limit(MAX_STR_BYTES),
-            max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
-        },
+    let limits = arkiv_golemdb::CellLimits {
+        max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
+        max_str_len: limit(MAX_STR_BYTES),
+        max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
+    };
+    let genesis = spec.golemdb().ok_or_else(|| {
+        eyre::eyre!(
+            "the genesis file has no config.arkiv.golemdb, which a chain on GolemDB needs; \
+             `arkiv-reth dump-genesis --chain dev` prints a genesis that has one"
+        )
+    })?;
+    // Arkiv checks names and values against its own limits before GolemDB sees
+    // them, so the file must state those.
+    eyre::ensure!(
+        genesis.cell_limits == limits,
+        "genesis config.arkiv.golemdb.cell_limits must be Arkiv's limits, {limits:?}; the file \
+         has {:?}",
+        genesis.cell_limits
+    );
+    Ok(arkiv_golemdb::GolemDbConfig {
+        genesis: genesis.clone(),
         segments: arkiv_reth_statemanager::segments::ALL
             .iter()
             .map(|&(name, columns)| arkiv_golemdb::SegmentSpec {
@@ -157,7 +185,7 @@ fn golemdb_config() -> arkiv_golemdb::GolemDbConfig {
                 columns,
             })
             .collect(),
-    }
+    })
 }
 
 fn main() {
@@ -183,21 +211,20 @@ fn main() {
     // It opens in `block_in_place`, outside async code: a store may own a
     // runtime of its own, as Valkey's does, and tokio refuses to drop one from
     // async code, which a failed connect does.
+    let path = std::env::var_os("ARKIV_STORE_PATH");
+    let experimental = std::env::var_os("ARKIV_EXPERIMENTAL_STORE");
+    // GolemDB is the store whose genesis root block 0's header carries.
+    let on_golemdb = path.is_some();
     let store = Arc::new(OnceLock::<HostStore>::new());
-    let open = move || {
+    let open = move |spec: &ArkivChainSpec| {
         store
             .get_or_init(|| {
-                tokio::task::block_in_place(|| {
-                    open_store(
-                        std::env::var_os("ARKIV_STORE_PATH"),
-                        std::env::var_os("ARKIV_EXPERIMENTAL_STORE"),
-                    )
-                })
-                .unwrap_or_else(|err| {
-                    // A setup mistake, so the message alone: no backtrace.
-                    eprintln!("Error: {err:#}");
-                    std::process::exit(1);
-                })
+                tokio::task::block_in_place(|| open_store(spec, path.clone(), experimental.clone()))
+                    .unwrap_or_else(|err| {
+                        // A setup mistake, so the message alone: no backtrace.
+                        eprintln!("Error: {err:#}");
+                        std::process::exit(1);
+                    })
             })
             .clone()
     };
@@ -208,19 +235,19 @@ fn main() {
     // `ChainSpec`. The components closure gives the non-`node` subcommands
     // (`import`, `stage`, `re-execute`) the same executor and consensus the node
     // uses.
-    let result = Cli::<ArkivChainSpecParser>::parse().run_with_components::<ArkivNode>(
+    let result = Cli::<genesis::NodeChainSpecParser>::parse().run_with_components::<ArkivNode>(
         move |spec| {
             (
                 EthEvmConfig::new_with_evm_factory(
                     spec.clone(),
-                    ArkivEvmFactory::new(factory_open(), factory_seals.clone()),
+                    ArkivEvmFactory::new(factory_open(&spec), factory_seals.clone()),
                 ),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
         },
         async move |builder, _| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
-            let store = open();
+            let store = open(&builder.config().chain);
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone());
@@ -241,9 +268,10 @@ fn main() {
                     info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                     Ok(())
                 });
-            let launcher = builder
-                .engine_api_launcher()
-                .with_provider_builder(ArkivProviderBuilder::new(store.clone(), seals.clone()));
+            let launcher = builder.engine_api_launcher().with_provider_builder(
+                ArkivProviderBuilder::new(store.clone(), seals.clone())
+                    .check_genesis_root(on_golemdb),
+            );
             let handle = builder
                 .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
@@ -263,14 +291,29 @@ fn exit_with(err: &eyre::Report) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arkiv_golemdb::HashAlgorithm;
+    use arkiv_interfaces::constants::{
+        MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
+    };
+    use serde_json::{Value, json};
 
     fn set(value: impl Into<OsString>) -> Option<OsString> {
         Some(value.into())
     }
 
+    /// A chain spec whose genesis has `config.arkiv.golemdb` set to `golemdb`,
+    /// or no section.
+    fn spec(golemdb: Option<Value>) -> ArkivChainSpec {
+        let mut genesis = json!({ "config": { "chainId": 424242 } });
+        if let Some(golemdb) = golemdb {
+            genesis["config"]["arkiv"] = json!({ "golemdb": golemdb });
+        }
+        ArkivChainSpec::from_genesis(serde_json::from_value(genesis).unwrap()).unwrap()
+    }
+
     /// Why `open_store` refused, for a call that must not open anything.
     fn refusal(path: Option<OsString>, experimental: Option<OsString>) -> String {
-        match open_store(path, experimental) {
+        match open_store(&spec(None), path, experimental) {
             Ok(_) => panic!("a store opened"),
             Err(error) => error.to_string(),
         }
@@ -282,8 +325,73 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         for name in ["my dir", "run#1", "a%2Fb?x"] {
             let path = dir.path().join(name);
-            open_store(set(&path), None).expect(name);
+            open_store(&spec(Some(golemdb("keccak-256"))), set(&path), None).expect(name);
             assert!(path.is_dir(), "{name}");
+        }
+    }
+
+    /// [`golemdb_config`] for a genesis whose `config.arkiv.golemdb` is
+    /// `golemdb`, or that has none.
+    fn settings(golemdb: Option<Value>) -> eyre::Result<arkiv_golemdb::GolemDbConfig> {
+        golemdb_config(&spec(golemdb))
+    }
+
+    /// `config.arkiv.golemdb` with `hash_function` and Arkiv's limits.
+    fn golemdb(hash_function: &str) -> Value {
+        json!({
+            "hash_function": hash_function,
+            "cell_limits": {
+                "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
+                "max_str_len": MAX_STR_BYTES,
+                "max_bytes_len": MAX_BYTES_VALUE_LEN
+            }
+        })
+    }
+
+    /// GolemDB has no settings of its own: they come from the genesis file.
+    #[test]
+    fn golemdb_needs_the_genesis_settings() {
+        let error = settings(None).unwrap_err().to_string();
+        assert!(error.contains("no config.arkiv.golemdb"), "{error}");
+    }
+
+    #[test]
+    fn golemdb_settings_follow_the_genesis_file() {
+        for (name, hash) in [
+            ("keccak-256", HashAlgorithm::Keccak256),
+            ("blake3", HashAlgorithm::Blake3),
+        ] {
+            assert_eq!(
+                settings(Some(golemdb(name))).unwrap().genesis.hash_function,
+                hash
+            );
+        }
+    }
+
+    /// The repository's example genesis file, read as `--chain` reads a file,
+    /// passes the node's checks.
+    #[test]
+    fn the_example_genesis_file_is_accepted() {
+        use reth_cli::chainspec::ChainSpecParser;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/example.json");
+        let spec = genesis::NodeChainSpecParser::parse(path).unwrap();
+        assert!(spec.golemdb().is_some(), "it sets config.arkiv.golemdb");
+        assert_eq!(
+            golemdb_config(&spec).unwrap().genesis.hash_function,
+            HashAlgorithm::Keccak256
+        );
+    }
+
+    #[test]
+    fn cell_limits_other_than_arkivs_are_refused() {
+        for name in ["max_cell_name_len", "max_str_len", "max_bytes_len"] {
+            for delta in [-1, 1] {
+                let mut other = golemdb("keccak-256");
+                let limit = &mut other["cell_limits"][name];
+                *limit = json!(limit.as_i64().unwrap() + delta);
+                let error = settings(Some(other)).unwrap_err().to_string();
+                assert!(error.contains("must be Arkiv's limits"), "{name}: {error}");
+            }
         }
     }
 
@@ -316,7 +424,7 @@ mod tests {
 
     #[test]
     fn an_experimental_store_is_memory_or_valkey() {
-        assert!(open_store(None, set("memory")).is_ok());
+        assert!(open_store(&spec(None), None, set("memory")).is_ok());
         // Nothing listens on port 1, so this shows each was taken as Valkey.
         for valkey in [
             "redis://127.0.0.1:1",
