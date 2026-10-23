@@ -121,6 +121,75 @@ pub struct ScheduleVersion(pub u64);
 pub struct Receipt {
     pub cost: CostUnits,
     pub schedule: ScheduleVersion,
+    /// The commit whose pricing schedule the call was priced against. `None`
+    /// where a store prices nothing, or rejected the call before pricing it.
+    pub priced_at: Option<CommitId>,
+    /// What a write did to the record's user cells. Zero for reads.
+    pub details: WriteDetails,
+}
+
+impl Receipt {
+    /// Add `other`'s cost and details to this receipt, as the receipts of
+    /// several calls add up. The schedule and pricing commit are left alone:
+    /// summed receipts no longer name one call.
+    pub fn accumulate(&mut self, other: &Receipt) {
+        self.cost = CostUnits(self.cost.0.saturating_add(other.cost.0));
+        self.details.accumulate(&other.details);
+    }
+}
+
+/// A write's effects on a record's user cells, as the store reports them.
+///
+/// Bytes follow GolemDB's size rule: a cell counts `(8 + name) + (1 + value)`
+/// bytes, an index entry `name + 2 + value`. Deleted bytes are reported, never
+/// refunded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteDetails {
+    pub cells_created: u64,
+    pub cells_updated: u64,
+    pub cells_deleted: u64,
+    pub index_joins: u64,
+    pub index_leaves: u64,
+    pub cell_bytes_written: u64,
+    pub cell_bytes_deleted: u64,
+    pub index_bytes_written: u64,
+    pub index_bytes_deleted: u64,
+}
+
+impl WriteDetails {
+    /// No effects: a read, or a store that does not report them.
+    pub const ZERO: Self = Self {
+        cells_created: 0,
+        cells_updated: 0,
+        cells_deleted: 0,
+        index_joins: 0,
+        index_leaves: 0,
+        cell_bytes_written: 0,
+        cell_bytes_deleted: 0,
+        index_bytes_written: 0,
+        index_bytes_deleted: 0,
+    };
+
+    /// Add `other`'s counts to these.
+    pub fn accumulate(&mut self, other: &WriteDetails) {
+        self.cells_created = self.cells_created.saturating_add(other.cells_created);
+        self.cells_updated = self.cells_updated.saturating_add(other.cells_updated);
+        self.cells_deleted = self.cells_deleted.saturating_add(other.cells_deleted);
+        self.index_joins = self.index_joins.saturating_add(other.index_joins);
+        self.index_leaves = self.index_leaves.saturating_add(other.index_leaves);
+        self.cell_bytes_written = self
+            .cell_bytes_written
+            .saturating_add(other.cell_bytes_written);
+        self.cell_bytes_deleted = self
+            .cell_bytes_deleted
+            .saturating_add(other.cell_bytes_deleted);
+        self.index_bytes_written = self
+            .index_bytes_written
+            .saturating_add(other.index_bytes_written);
+        self.index_bytes_deleted = self
+            .index_bytes_deleted
+            .saturating_add(other.index_bytes_deleted);
+    }
 }
 
 /// A data-plane result: the value, plus what producing it cost.
@@ -140,6 +209,11 @@ impl<T> Metered<T> {
     /// and host paths where the cost is accounted elsewhere.
     pub fn into_value(self) -> T {
         self.value
+    }
+
+    /// Convert the value, keeping the receipt.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Metered<U> {
+        Metered::new(f(self.value), self.receipt)
     }
 }
 

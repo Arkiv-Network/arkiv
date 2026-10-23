@@ -44,7 +44,8 @@ use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange, RecordKey,
     RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey, SegmentOrdinal,
-    SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp, WriteOutcome,
+    SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteDetails, WriteOp,
+    WriteOutcome,
 };
 use core::ops::Range;
 use fred::prelude::*;
@@ -172,6 +173,8 @@ const fn free_receipt() -> Receipt {
     Receipt {
         cost: CostUnits(0),
         schedule: ScheduleVersion(0),
+        priced_at: None,
+        details: WriteDetails::ZERO,
     }
 }
 
