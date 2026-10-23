@@ -7,9 +7,8 @@
 #   VALKEY_URL=redis://127.0.0.1:6379 cargo test -p arkiv-valkey -- --ignored
 #   docker compose -f docker/compose.yml down -v
 #
-# The node does NOT talk to Valkey. Nothing wires arkiv-valkey into arkiv-reth
-# yet — that is the arkiv-statemanager work. These two share a compose file
-# because they share one `up`, not because they are connected.
+# The node does NOT talk to Valkey: it runs on GolemDB. These two share a
+# compose file because they share one `up`, not because they are connected.
 #
 # For a real two-node network with a consensus layer, use Kurtosis
 # (scripts/kurtosis/up.py). This is for a node you can poke at and a Valkey you
@@ -35,9 +34,10 @@ services:
     image: arkiv-reth:dev
     ports:
       - "8545:8545"
-    # The node needs a store named. This dev stack runs on the in-process one.
+    # The node needs a store named. This dev stack runs on GolemDB, kept in the
+    # node-data volume next to the datadir.
     environment:
-      ARKIV_EXPERIMENTAL_STORE: memory
+      ARKIV_STORE_PATH: /data/golemdb
     command:
       - node
       - --dev
