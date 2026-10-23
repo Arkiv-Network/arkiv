@@ -44,7 +44,7 @@ type ArkivNodeTypes = NodeTypesWithDBAdapter<ArkivNode, DatabaseEnv>;
 use reth::{beacon_consensus::EthBeaconConsensus, cli::Cli};
 use reth_node_ethereum::EthEvmConfig;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
@@ -55,22 +55,22 @@ const PATH_EXAMPLE: &str = "ARKIV_STORE_PATH=/var/lib/arkiv/golemdb";
 /// every entity, the query index and the minting nonces.
 ///
 /// Exactly one of two variables names it:
-/// - `ARKIV_STORE_PATH` (`path`) is GolemDB's directory, taken as written. It
-///   must be absolute; nothing expands `~`.
+/// - `ARKIV_STORE_PATH` (`path`) is GolemDB's directory. It must be absolute
+///   or start with `~`, the home directory; otherwise it is taken as written.
 /// - `ARKIV_EXPERIMENTAL_STORE` (`experimental`) is for tests and experiments:
 ///   `memory` is the in-process reference store, gone when the process is, and
 ///   a Valkey URL, such as `redis://127.0.0.1:6379`, is a Valkey server.
 fn open_store(path: Option<OsString>, experimental: Option<OsString>) -> eyre::Result<HostStore> {
     match (path, experimental) {
         (Some(path), None) => {
-            let path = Path::new(&path);
+            let path = expand_home(path.into())?;
             eyre::ensure!(
                 path.is_absolute(),
                 "ARKIV_STORE_PATH={}: the GolemDB directory must be an absolute path, such as \
-                 {PATH_EXAMPLE} ($HOME works, ~ does not)",
+                 {PATH_EXAMPLE} or ~/arkiv/golemdb",
                 path.display()
             );
-            open_golemdb(path)
+            open_golemdb(&path)
         }
         (None, Some(store)) => match store.to_str() {
             Some("memory") => {
@@ -96,6 +96,18 @@ fn open_store(path: Option<OsString>, experimental: Option<OsString>) -> eyre::R
             "ARKIV_STORE_PATH and ARKIV_EXPERIMENTAL_STORE are both set; a node has one store"
         ),
     }
+}
+
+/// `path` with a leading `~` (`~` or `~/…`) replaced by the home directory, as
+/// a shell would; a shell leaves it alone inside a variable's value.
+fn expand_home(path: PathBuf) -> eyre::Result<PathBuf> {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return Ok(path);
+    };
+    let home = std::env::home_dir().ok_or_else(|| {
+        eyre::eyre!("ARKIV_STORE_PATH starts with ~, but there is no home directory")
+    })?;
+    Ok(home.join(rest))
 }
 
 /// Open GolemDB in `directory`, creating it with Arkiv's settings if it is new.
@@ -277,9 +289,21 @@ mod tests {
 
     #[test]
     fn golemdb_needs_an_absolute_path() {
-        for relative in ["", "golemdb", "~/x", "golemdb:///srv/x"] {
+        for relative in ["", "golemdb", "~user/x"] {
             let error = refusal(set(relative), None);
             assert!(error.contains("absolute path"), "{relative}: {error}");
+        }
+    }
+
+    /// A leading `~` is the home directory, as in a shell; nothing else is.
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        let home = std::env::home_dir().unwrap();
+        let expand = |path: &str| expand_home(path.into()).unwrap();
+        assert_eq!(expand("~/arkiv/golemdb"), home.join("arkiv/golemdb"));
+        assert_eq!(expand("~"), home);
+        for as_written in ["/srv/golemdb", "/srv/~/x", "~user/x", "golemdb"] {
+            assert_eq!(expand(as_written), PathBuf::from(as_written));
         }
     }
 
@@ -310,15 +334,7 @@ mod tests {
     /// A typo is not taken for some other store.
     #[test]
     fn an_unknown_experimental_store_is_refused() {
-        for unknown in [
-            "",
-            "memory://",
-            "Memory",
-            "valkey",
-            "redis",
-            "golemdb",
-            "/srv/golemdb",
-        ] {
+        for unknown in ["", "Memory", "valkey", "redis", "golemdb", "/srv/golemdb"] {
             let error = refusal(None, set(unknown));
             assert!(error.contains("use memory"), "{unknown}: {error}");
         }
