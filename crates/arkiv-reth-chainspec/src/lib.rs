@@ -34,6 +34,7 @@ use reth_ethereum::chainspec::{
     Chain, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks, ForkCondition,
     ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
+use reth_ethereum::primitives::SealedHeader;
 use reth_network_peers::NodeRecord;
 use serde::Deserialize;
 
@@ -89,6 +90,15 @@ impl ArkivChainSpec {
     /// The base-fee floor: the genesis block's base fee (0 if it has none).
     pub fn min_base_fee(&self) -> u64 {
         self.min_base_fee
+    }
+
+    /// The same chain with block 0's `stateRoot` set to `root`, so that the
+    /// genesis hash covers it.
+    pub fn with_genesis_state_root(mut self, root: B256) -> Self {
+        let mut header = self.inner.genesis_header.header().clone();
+        header.state_root = root;
+        self.inner.genesis_header = SealedHeader::seal_slow(header);
+        self
     }
 
     /// GolemDB's settings from the genesis file's `config.arkiv.golemdb`, in
@@ -321,6 +331,22 @@ mod tests {
         let spec = ArkivChainSpec::from_genesis(genesis).unwrap();
         assert_eq!(spec.min_base_fee(), 0);
         assert_eq!(spec.genesis_header().base_fee_per_gas, None);
+    }
+
+    /// A new block 0 `stateRoot` is a new genesis header and hash; nothing
+    /// else changes.
+    #[test]
+    fn a_genesis_state_root_moves_the_genesis_hash() {
+        let spec = ArkivChainSpec::from_genesis(genesis(Some(10))).unwrap();
+        let root = B256::repeat_byte(7);
+        let moved = spec.clone().with_genesis_state_root(root);
+        assert_eq!(moved.genesis_header().state_root, root);
+        assert_eq!(moved.genesis_hash(), moved.genesis_header().hash_slow());
+        assert_ne!(moved.genesis_hash(), spec.genesis_hash());
+        let mut header = moved.genesis_header().clone();
+        header.state_root = spec.genesis_header().state_root;
+        assert_eq!(&header, spec.genesis_header());
+        assert_eq!(moved.min_base_fee(), spec.min_base_fee());
     }
 
     /// `config.arkiv` with GolemDB's settings, then `edit`ed.

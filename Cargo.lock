@@ -1718,6 +1718,7 @@ version = "0.5.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "arkiv-golemdb-state",

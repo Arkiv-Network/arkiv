@@ -32,7 +32,7 @@ use arkiv_interfaces::store::{
     CommitId, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
 };
 use arkiv_reth_statemanager::{
-    BlockSeals, GolemAccounts, HostStore, check_chain, seed_genesis, segments,
+    BlockSeals, GolemAccounts, HostStore, check_chain, check_genesis_root, seed_genesis, segments,
 };
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
@@ -1962,6 +1962,8 @@ const fn _satisfies_full_provider<N: ProviderNodeTypes>() {
 pub struct ArkivProviderBuilder {
     store: HostStore,
     seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
+    /// Whether the store's genesis commit must have block 0's `stateRoot`.
+    check_genesis_root: bool,
 }
 
 impl ArkivProviderBuilder {
@@ -1970,7 +1972,18 @@ impl ArkivProviderBuilder {
         store: HostStore,
         seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
     ) -> Self {
-        Self { store, seals }
+        Self {
+            store,
+            seals,
+            check_genesis_root: false,
+        }
+    }
+
+    /// Refuse to start unless the store's genesis commit has block 0's
+    /// `stateRoot`. For a store whose root block 0's header carries: GolemDB.
+    pub const fn check_genesis_root(mut self, check: bool) -> Self {
+        self.check_genesis_root = check;
+        self
     }
 }
 
@@ -2005,13 +2018,7 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         let spec = factory.chain_spec();
         let genesis_hash = spec.genesis_hash();
         check_chain(&self.store, genesis_hash.0)?;
-        let alloc = spec.genesis().alloc.iter().map(|(address, account)| {
-            arkiv_reth_statemanager::GenesisAccount {
-                address: *address,
-                balance: account.balance,
-                nonce: account.nonce.unwrap_or_default(),
-            }
-        });
+        let alloc = arkiv_reth_statemanager::GenesisAccount::from_alloc(&spec.genesis().alloc);
         if let Some(commit) = seed_genesis(&self.store, genesis_hash.0, alloc)
             .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}"))?
         {
@@ -2021,6 +2028,13 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
                 accounts = spec.genesis().alloc.len(),
                 "genesis allocation written to the Arkiv store",
             );
+        }
+        if self.check_genesis_root {
+            check_genesis_root(
+                &self.store,
+                genesis_hash.0,
+                spec.genesis_header().state_root().0,
+            )?;
         }
 
         // Anchor the overlays on the store's head, not on reth's stage

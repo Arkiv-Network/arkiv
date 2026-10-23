@@ -52,6 +52,9 @@ clap.workspace = true
 tracing.workspace = true
 # `block_in_place`, to open the store outside async code.
 tokio.workspace = true
+# `ChainSpecParser`, for the node's `--chain` parser.
+reth-cli.workspace = true
+alloy-primitives.workspace = true
 
 [dev-dependencies]
 # The black-box tests spawn this node binary and drive it through the harness:
@@ -68,8 +71,5 @@ alloy-network.workspace = true
 alloy-rpc-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-alloy-primitives.workspace = true
 # GolemDB directories for the store-opening unit tests.
 tempfile.workspace = true
-# `ChainSpecParser`, to read the example genesis file as `--chain` does.
-reth-cli.workspace = true

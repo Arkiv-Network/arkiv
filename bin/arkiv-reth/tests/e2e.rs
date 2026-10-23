@@ -1678,6 +1678,58 @@ async fn a_bad_arkiv_section_stops_the_node() {
     }
 }
 
+/// On GolemDB, the store's genesis must have block 0's `stateRoot`. A store
+/// with this chain's settings and genesis tag, but other accounts, has another
+/// root and is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_golemdb_store_with_another_genesis_root_is_refused() {
+    use arkiv_reth_statemanager::{GenesisAccount, HostStore, seed_genesis, segments};
+    let example = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/example.json");
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .chain(example)
+        .golemdb_store()
+        .spawn();
+    let client = arkiv_harness::connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    let genesis_hash = client
+        .provider()
+        .get_block_by_number(0.into())
+        .await
+        .expect("eth_getBlockByNumber")
+        .expect("block 0")
+        .header
+        .hash;
+    node.terminate();
+
+    let directory = node.datadir().join("golemdb");
+    std::fs::remove_dir_all(&directory).unwrap();
+    let genesis: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(example).unwrap()).unwrap();
+    let config = arkiv_golemdb::GolemDbConfig {
+        genesis: serde_json::from_value(genesis["config"]["arkiv"]["golemdb"].clone()).unwrap(),
+        segments: segments::ALL
+            .iter()
+            .map(|&(name, columns)| arkiv_golemdb::SegmentSpec {
+                name: name.into(),
+                columns,
+            })
+            .collect(),
+    };
+    let store: HostStore =
+        std::sync::Arc::new(arkiv_golemdb::GolemDbStore::open(&directory, &config).unwrap());
+    let other = GenesisAccount {
+        address: Address::repeat_byte(0x33),
+        balance: U256::from(1),
+        nonce: 0,
+    };
+    seed_genesis(&store, genesis_hash.0, [other]).unwrap();
+    drop(store);
+
+    node.restart();
+    let log = refusal(&mut node).await;
+    assert!(log.contains("does not hold this genesis"), "{log}");
+}
+
 /// EIP-1559 accounting end to end: the sender's balance drops by
 /// `gas_used × effectiveGasPrice` — the receipt's figure, not the fee cap — the
 /// block's beneficiary receives `gas_used × (effective − base_fee)`, and the

@@ -527,6 +527,23 @@ fn a_host_segment_may_not_be_named_commit_tags() {
     assert!(error.to_string().contains("duplicate"), "{error}");
 }
 
+/// The same writes give the same roots in memory as on disk.
+#[test]
+fn a_database_in_memory_has_the_roots_of_one_on_disk() {
+    let dir = TempDir::new().unwrap();
+    let on_disk = open(&dir);
+    let in_memory = GolemDbStore::open_memory(&config()).unwrap();
+    let roots: Vec<_> = [&on_disk, &in_memory]
+        .into_iter()
+        .map(|store| {
+            let branch = stage(store, 1);
+            let commit = store.commit_tagged(branch, [9; 32]).unwrap();
+            store.commit_hash(commit).unwrap()
+        })
+        .collect();
+    assert_eq!(roots[0], roots[1]);
+}
+
 /// Segments are the host's and the adapter's, so a genesis that declares its
 /// own is refused, and nothing is created.
 #[test]

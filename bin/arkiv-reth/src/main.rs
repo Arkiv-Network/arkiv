@@ -17,6 +17,7 @@
 //!
 //! The node still speaks the Ethereum interface a Lighthouse CL and the SDK expect.
 
+mod genesis;
 mod node;
 
 // jemalloc, as reth's own binary does it. reth fragments badly under the stock
@@ -30,7 +31,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 #[cfg(unix)]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
-use arkiv_reth_chainspec::{ArkivChainSpec, ArkivChainSpecParser};
+use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivEvmFactory;
 use arkiv_reth_golemdbprovider::{ArkivProvider, ArkivProviderBuilder};
 use arkiv_reth_statemanager::{BlockSeals, HostStore};
@@ -210,22 +211,20 @@ fn main() {
     // It opens in `block_in_place`, outside async code: a store may own a
     // runtime of its own, as Valkey's does, and tokio refuses to drop one from
     // async code, which a failed connect does.
+    let path = std::env::var_os("ARKIV_STORE_PATH");
+    let experimental = std::env::var_os("ARKIV_EXPERIMENTAL_STORE");
+    // GolemDB is the store whose genesis root block 0's header carries.
+    let on_golemdb = path.is_some();
     let store = Arc::new(OnceLock::<HostStore>::new());
     let open = move |spec: &ArkivChainSpec| {
         store
             .get_or_init(|| {
-                tokio::task::block_in_place(|| {
-                    open_store(
-                        spec,
-                        std::env::var_os("ARKIV_STORE_PATH"),
-                        std::env::var_os("ARKIV_EXPERIMENTAL_STORE"),
-                    )
-                })
-                .unwrap_or_else(|err| {
-                    // A setup mistake, so the message alone: no backtrace.
-                    eprintln!("Error: {err:#}");
-                    std::process::exit(1);
-                })
+                tokio::task::block_in_place(|| open_store(spec, path.clone(), experimental.clone()))
+                    .unwrap_or_else(|err| {
+                        // A setup mistake, so the message alone: no backtrace.
+                        eprintln!("Error: {err:#}");
+                        std::process::exit(1);
+                    })
             })
             .clone()
     };
@@ -236,7 +235,7 @@ fn main() {
     // `ChainSpec`. The components closure gives the non-`node` subcommands
     // (`import`, `stage`, `re-execute`) the same executor and consensus the node
     // uses.
-    let result = Cli::<ArkivChainSpecParser>::parse().run_with_components::<ArkivNode>(
+    let result = Cli::<genesis::NodeChainSpecParser>::parse().run_with_components::<ArkivNode>(
         move |spec| {
             (
                 EthEvmConfig::new_with_evm_factory(
@@ -269,9 +268,10 @@ fn main() {
                     info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                     Ok(())
                 });
-            let launcher = builder
-                .engine_api_launcher()
-                .with_provider_builder(ArkivProviderBuilder::new(store.clone(), seals.clone()));
+            let launcher = builder.engine_api_launcher().with_provider_builder(
+                ArkivProviderBuilder::new(store.clone(), seals.clone())
+                    .check_genesis_root(on_golemdb),
+            );
             let handle = builder
                 .launch_with(DebugNodeLauncher::new(launcher))
                 .await?;
@@ -374,7 +374,7 @@ mod tests {
     fn the_example_genesis_file_is_accepted() {
         use reth_cli::chainspec::ChainSpecParser;
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/example.json");
-        let spec = ArkivChainSpecParser::parse(path).unwrap();
+        let spec = genesis::NodeChainSpecParser::parse(path).unwrap();
         assert!(spec.golemdb().is_some(), "it sets config.arkiv.golemdb");
         assert_eq!(
             golemdb_config(&spec).unwrap().genesis.hash_function,

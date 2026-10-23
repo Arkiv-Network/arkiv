@@ -19,6 +19,11 @@ const DEV_GENESIS: &str = include_str!("../../../genesis/dev.json");
 /// Clap value parser for `--chain`: `dev` from `genesis/dev.json`, anything
 /// else through reth's genesis reader, wrapped in [`ArkivChainSpec`] so the
 /// minimum-base-fee rule applies to every chain the node can be pointed at.
+///
+/// Its block 0 is reth's, built from `alloc`. The node reads `--chain` with a
+/// parser on top of this one that sets block 0's `stateRoot` to GolemDB's
+/// genesis root (`bin/arkiv-reth/src/genesis.rs`), so that one gives the
+/// node's genesis hash.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ArkivChainSpecParser;
@@ -58,7 +63,8 @@ mod tests {
         }
     }
 
-    /// `dev` is reth's dev chain, block 0 included, with GolemDB's settings.
+    /// As this parser reads it, `dev` is reth's dev chain, block 0 included,
+    /// with GolemDB's settings.
     #[test]
     fn the_dev_chain_is_reths_with_golemdb_settings() {
         use reth_ethereum::chainspec::{DEV, ForkCondition, Hardfork, Hardforks};

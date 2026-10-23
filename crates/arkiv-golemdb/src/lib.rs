@@ -109,6 +109,13 @@ impl GolemDbStore {
         Ok(Self { database })
     }
 
+    /// A new database in memory, created with `config`; gone when the last
+    /// clone drops. It computes the same roots as one on disk.
+    pub fn open_memory(config: &GolemDbConfig) -> Result<Self, OpenError> {
+        let database = golemdb::Database::open_memory(&config.full_genesis()?)?;
+        Ok(Self { database })
+    }
+
     /// Seal `branch`, stage its commit's `commit_tags` row and commit. If the
     /// commit fails, the row comes off again, so a retry stages only one.
     fn commit_with_tag(
