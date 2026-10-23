@@ -28,7 +28,7 @@ use arkiv_interfaces::statemanager::{
 };
 use arkiv_interfaces::store::{
     AndGroup, CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store,
-    StoreError, TypeId,
+    StoreError, Test,
 };
 
 use crate::view::{GolemStateView, ViewError};
@@ -76,11 +76,13 @@ fn predicate(
 ) -> Result<Predicate, IndexError> {
     Ok(Predicate {
         cell: cell_name(attribute)?,
-        op,
-        type_id: type_id_of(value),
-        // Canonical bytes, not `index_bytes`: the store sign-biases for itself when
-        // ordering, and biasing here too would invert negatives.
-        value: value.encode(),
+        test: Test::Compare {
+            op,
+            type_id: type_id_of(value),
+            // Canonical bytes, not `index_bytes`: the store sign-biases for itself
+            // when ordering, and biasing here too would invert negatives.
+            value: value.encode(),
+        },
         negated: false,
     })
 }
@@ -155,12 +157,13 @@ impl<'s, S: Store> StoreIndices<'s, S> {
         attribute: &[u8],
         prefix: &str,
     ) -> Result<Vec<EntityAddress>, IndexError> {
-        let mut term = predicate(
+        // `type_id_of` already gives `STR` for a `Str` operand, so the type
+        // needs no override here.
+        let term = predicate(
             attribute,
             &AttributeValue::Str(alloc::string::String::from(prefix)),
             CompareOp::Prefix,
         )?;
-        term.type_id = TypeId::STR;
         matching(self.store, self.at, AndGroup(vec![term]))
     }
 

@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::entity::{AttributeValue, Entity};
+use crate::entity::{AttributeType, AttributeValue, Entity};
 use crate::primitives::{EntityAddress, Gas};
 use crate::statemanager::{BlockRef, StateView};
 
@@ -19,9 +19,10 @@ use crate::statemanager::{BlockRef, StateView};
 /// the language's rule, not an implementation detail.
 ///
 /// There is deliberately **no `!=` variant**. Value-negation restricted to
-/// "attribute is set with this type, and differs" needs a per-`(attribute, type)`
-/// presence index the host does not maintain, so the language omits the operator
-/// rather than silently answering the wider [`Not`](Self::Not) complement.
+/// "attribute is set with this type, and differs" is
+/// [`Exists`](Self::Exists) minus an [`Eq`](Self::Eq), which the language has
+/// no single operator for; `NOT (attr = value)` gives the wider complement
+/// explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     /// Matches every live entity (`*`).
@@ -39,6 +40,13 @@ pub enum Query {
     /// Matches entities whose `key` starts with `value` — the `STARTSWITH`
     /// operator, a raw UTF-8 byte prefix with no normalization.
     StartsWith { key: AnnotKey, value: AnnotVal },
+    /// Matches entities that carry `key` as an **indexed** attribute, without
+    /// comparing its value — the `exists(name)` and `typeof(name) = tag`
+    /// operators.
+    Exists {
+        key: AnnotKey,
+        attr_type: Option<AttributeType>,
+    },
     /// Matches entities satisfying both subqueries.
     And(Box<Query>, Box<Query>),
     /// Matches entities satisfying either subquery.

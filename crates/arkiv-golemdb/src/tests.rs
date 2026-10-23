@@ -1,5 +1,5 @@
 use super::*;
-use arkiv_interfaces::store::{AndGroup, CellKind, CompareOp, Page, Predicate, TypeId};
+use arkiv_interfaces::store::{AndGroup, CellKind, CompareOp, Page, Predicate, Test, TypeId};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
@@ -628,9 +628,11 @@ fn rolling_back_past_the_first_frame_is_handle_invalid() {
 fn n_at_least(at_least: u64) -> Filter {
     Filter(vec![AndGroup(vec![Predicate {
         cell: "n".into(),
-        op: CompareOp::Gte,
-        type_id: TypeId::U64,
-        value: at_least.to_be_bytes().to_vec(),
+        test: Test::Compare {
+            op: CompareOp::Gte,
+            type_id: TypeId::U64,
+            value: at_least.to_be_bytes().to_vec(),
+        },
         negated: false,
     }])])
 }

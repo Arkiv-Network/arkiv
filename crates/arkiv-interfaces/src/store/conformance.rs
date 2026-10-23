@@ -76,6 +76,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     projection_limits_returned_cells(store_generator);
     query_and_group_intersects_predicates(store_generator);
     query_negated_predicate_excludes_matches(store_generator);
+    query_presence_matches_records_carrying_the_attribute(store_generator);
     query_pages_with_offset_and_limit(store_generator);
     query_reports_total_matched_beyond_the_page(store_generator);
     query_sorts_ascending_and_descending(store_generator);
@@ -186,9 +187,11 @@ fn read_record<S: Store>(store: &S, target: ReadTarget, key: RecordKey) -> Optio
 fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
     Filter(vec![AndGroup(vec![Predicate {
         cell: cell.to_string(),
-        op: CompareOp::Eq,
-        type_id,
-        value,
+        test: Test::Compare {
+            op: CompareOp::Eq,
+            type_id,
+            value,
+        },
         negated: false,
     }])])
 }
@@ -945,16 +948,20 @@ fn query_dnf_unions_and_dedups<S: Store>(store_generator: &dyn Fn() -> S) {
     let filter = Filter(vec![
         AndGroup(vec![Predicate {
             cell: "kind".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::STR,
-            value: b"a".to_vec(),
+            test: Test::Compare {
+                op: CompareOp::Eq,
+                type_id: TypeId::STR,
+                value: b"a".to_vec(),
+            },
             negated: false,
         }]),
         AndGroup(vec![Predicate {
             cell: "n".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::U64,
-            value: 1u64.to_be_bytes().to_vec(),
+            test: Test::Compare {
+                op: CompareOp::Eq,
+                type_id: TypeId::U64,
+                value: 1u64.to_be_bytes().to_vec(),
+            },
             negated: false,
         }]),
     ]);
@@ -1025,9 +1032,11 @@ fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -
 
     let filter = Filter(vec![AndGroup(vec![Predicate {
         cell: "h".to_string(),
-        op: CompareOp::Gt,
-        type_id: TypeId::BYTES32,
-        value: vec![0u8; 32],
+        test: Test::Compare {
+            op: CompareOp::Gt,
+            type_id: TypeId::BYTES32,
+            value: vec![0u8; 32],
+        },
         negated: false,
     }])]);
 
@@ -1293,16 +1302,20 @@ fn query_and_group_intersects_predicates<S: Store>(store_generator: &dyn Fn() ->
     let both = Filter(vec![AndGroup(vec![
         Predicate {
             cell: "kind".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::STR,
-            value: b"a".to_vec(),
+            test: Test::Compare {
+                op: CompareOp::Eq,
+                type_id: TypeId::STR,
+                value: b"a".to_vec(),
+            },
             negated: false,
         },
         Predicate {
             cell: "n".to_string(),
-            op: CompareOp::Eq,
-            type_id: TypeId::U64,
-            value: 2u64.to_be_bytes().to_vec(),
+            test: Test::Compare {
+                op: CompareOp::Eq,
+                type_id: TypeId::U64,
+                value: 2u64.to_be_bytes().to_vec(),
+            },
             negated: false,
         },
     ])]);
@@ -1314,6 +1327,85 @@ fn query_and_group_intersects_predicates<S: Store>(store_generator: &dyn Fn() ->
     );
 }
 
+/// A presence test matches the records carrying the attribute, with no
+/// comparison: under any type when it names none, under exactly one when it
+/// does. The query language's `exists(name)` and `typeof(name) = tag`.
+fn query_presence_matches_records_carrying_the_attribute<S: Store>(
+    store_generator: &dyn Fn() -> S,
+) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    // One record carries `tag` as a str, one as a u64, one not at all.
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("tag", str_attribute("x"))],
+    );
+    create_record(
+        &mut store,
+        branch,
+        record_key(2),
+        &[("tag", u64_attribute(7))],
+    );
+    create_record(
+        &mut store,
+        branch,
+        record_key(3),
+        &[("other", str_attribute("x"))],
+    );
+    let at = store.commit(branch).unwrap();
+
+    let presence = |type_id, negated| {
+        Filter(vec![AndGroup(vec![Predicate {
+            cell: "tag".to_string(),
+            test: Test::Exists { type_id },
+            negated,
+        }])])
+    };
+    let keys = |filter| matched_keys(&store, at, &paged_query(filter, 0, 10));
+
+    assert_eq!(
+        keys(presence(None, false)),
+        vec![record_key(1), record_key(2)],
+        "any type: both carriers, and not the record without the attribute"
+    );
+    assert_eq!(
+        keys(presence(Some(TypeId::STR), false)),
+        vec![record_key(1)],
+        "one type: only the carrier of that type"
+    );
+    assert_eq!(
+        keys(presence(Some(TypeId::U64), false)),
+        vec![record_key(2)],
+        "the same attribute under another type is a different test"
+    );
+    assert_eq!(
+        keys(presence(Some(TypeId::BOOL), false)),
+        Vec::<RecordKey>::new(),
+        "a type nothing carries it under matches nothing, rather than failing"
+    );
+    assert_eq!(
+        keys(presence(None, true)),
+        vec![record_key(3)],
+        "negated: the records not carrying it at all"
+    );
+
+    // A type that is never indexed cannot be asked for, as a range on an
+    // equality-only type cannot: invalid, not empty.
+    assert_eq!(
+        store
+            .query(
+                Some(at),
+                &paged_query(presence(Some(TypeId::BYTES), false), 0, 10),
+                None
+            )
+            .unwrap_err(),
+        StoreError::InvalidQuery,
+        "a presence test over a field-only type is invalid"
+    );
+}
+
 /// A negated predicate matches the records the predicate does not.
 fn query_negated_predicate_excludes_matches<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
@@ -1321,9 +1413,11 @@ fn query_negated_predicate_excludes_matches<S: Store>(store_generator: &dyn Fn()
 
     let not_a = Filter(vec![AndGroup(vec![Predicate {
         cell: "kind".to_string(),
-        op: CompareOp::Eq,
-        type_id: TypeId::STR,
-        value: b"a".to_vec(),
+        test: Test::Compare {
+            op: CompareOp::Eq,
+            type_id: TypeId::STR,
+            value: b"a".to_vec(),
+        },
         negated: true,
     }])]);
 

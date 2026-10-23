@@ -28,9 +28,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use arkiv_interfaces::entity::{AttributeValue, annotations};
+use arkiv_interfaces::entity::{AttributeType, AttributeValue, annotations};
 use arkiv_interfaces::query::{AnnotKey, BuiltIn, Query};
-use arkiv_interfaces::store::{AndGroup, CellName, CompareOp, Filter, Predicate, TypeId};
+use arkiv_interfaces::store::{AndGroup, CellName, CompareOp, Filter, Predicate, Test, TypeId};
 
 /// The most AND-groups a lowered filter may contain. See the module docs.
 pub const MAX_GROUPS: usize = 256;
@@ -87,6 +87,26 @@ const fn type_id(value: &AttributeValue) -> Result<TypeId, LowerError> {
     })
 }
 
+/// The store type id for an attribute type, named without a value of it —
+/// what `typeof(name) = tag` lowers through.
+const fn type_id_of(attr_type: AttributeType) -> Result<TypeId, LowerError> {
+    Ok(match attr_type {
+        AttributeType::Bool => TypeId::BOOL,
+        AttributeType::Int => TypeId::I32,
+        AttributeType::U64 => TypeId::U64,
+        AttributeType::U256 => TypeId::U256,
+        AttributeType::Decimal => TypeId::DEC,
+        AttributeType::Bytes32 => TypeId::BYTES32,
+        AttributeType::Str => TypeId::STR,
+        AttributeType::EthereumAddress => TypeId::ADDR,
+        AttributeType::EntityKey => TypeId::KEY,
+        // As in `type_id`: never indexed, so no predicate over it can be
+        // answered. The language has no `bytes` tag, so `typeof(x) = bytes`
+        // is already a parse error -- this is the same rule one layer down.
+        AttributeType::Bytes => return Err(LowerError::NotIndexable),
+    })
+}
+
 /// One comparison, with negation already resolved.
 fn predicate(
     key: &AnnotKey,
@@ -96,12 +116,30 @@ fn predicate(
 ) -> Result<Predicate, LowerError> {
     Ok(Predicate {
         cell: cell_name(key),
-        op,
-        type_id: type_id(value)?,
-        // `encode`, never `index_bytes`. The store applies its own `order_encoding`
-        // when comparing, and `index_bytes` has already sign-biased `Int`/`Decimal`
-        // -- passing it would bias twice and invert the ordering for negatives.
-        value: value.encode(),
+        test: Test::Compare {
+            op,
+            type_id: type_id(value)?,
+            // `encode`, never `index_bytes`. The store applies its own
+            // `order_encoding` when comparing, and `index_bytes` has already
+            // sign-biased `Int`/`Decimal` -- passing it would bias twice and
+            // invert the ordering for negatives.
+            value: value.encode(),
+        },
+        negated,
+    })
+}
+
+/// One presence test, with negation already resolved.
+fn presence(
+    key: &AnnotKey,
+    attr_type: Option<AttributeType>,
+    negated: bool,
+) -> Result<Predicate, LowerError> {
+    Ok(Predicate {
+        cell: cell_name(key),
+        test: Test::Exists {
+            type_id: attr_type.map(type_id_of).transpose()?,
+        },
         negated,
     })
 }
@@ -129,6 +167,12 @@ fn lower_inner(query: &Query, negate: bool) -> Result<Vec<AndGroup>, LowerError>
         Query::Lt { key, value } => leaf(key, value, CompareOp::Lt),
         Query::Lte { key, value } => leaf(key, value, CompareOp::Lte),
         Query::StartsWith { key, value } => leaf(key, value, CompareOp::Prefix),
+
+        // `exists`/`typeof`: a leaf like any other, and a negated one is the
+        // complement over the live set, exactly as `Not` of it would be.
+        Query::Exists { key, attr_type } => {
+            Ok(vec![AndGroup(vec![presence(key, *attr_type, negate)?])])
+        }
 
         // De Morgan: under negation, And becomes Or and vice versa.
         Query::And(left, right) | Query::Or(left, right) => {
@@ -396,7 +440,14 @@ mod tests {
             filter.0[0].0[0].cell,
             CellName::from(core::str::from_utf8(annotations::OWNER).unwrap())
         );
-        assert_eq!(filter.0[0].0[0].type_id, TypeId::ADDR);
+        assert_eq!(
+            filter.0[0].0[0].test,
+            Test::Compare {
+                op: CompareOp::Eq,
+                type_id: TypeId::ADDR,
+                value: AttributeValue::EthereumAddress([0xab; 20]).encode(),
+            }
+        );
     }
 
     #[test]

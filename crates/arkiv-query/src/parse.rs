@@ -7,6 +7,7 @@
 //! unary      → NOT unary | primary
 //! primary    → '(' expr ')' | predicate
 //! predicate  → attrRef compOp value | attrRef STARTSWITH strValue
+//!            | EXISTS '(' name ')' | TYPEOF '(' name ')' '=' typeTag
 //! ```
 //!
 //! Precedence, tightest first: `NOT`, `AND`, `OR`.
@@ -197,6 +198,14 @@ impl Parser {
             ));
         }
 
+        // `exists(name)` and `typeof(name) = tag` lead with their keyword
+        // rather than an attribute reference, so they are dispatched first.
+        match self.peek_token() {
+            Some(Token::Exists) => return self.parse_presence(Presence::Exists),
+            Some(Token::TypeOf) => return self.parse_presence(Presence::TypeOf),
+            _ => {}
+        }
+
         let key = self.parse_attr_ref()?;
         let Some(operator) = self.advance() else {
             return Err(ParseError::syntax(
@@ -232,6 +241,121 @@ impl Parser {
         }
     }
 
+    /// `existsTest = EXISTS , "(" , name , ")"` and
+    /// `typeTest = TYPEOF , "(" , name , ")" , "=" , typeTag`, per the spec's
+    /// grammar (`docs/api-spec.md` §4).
+    ///
+    /// Both take `name`, not `attrRef`: a system attribute is carried by every
+    /// entity, so asking whether it is there would be a constant.
+    fn parse_presence(&mut self, which: Presence) -> Result<Query, ParseError> {
+        let keyword = self.advance().expect("the caller peeked EXISTS or TYPEOF");
+        self.expect(
+            &Token::LParen,
+            keyword.start,
+            match which {
+                Presence::Exists => "exists takes a parenthesized attribute name — exists(name)",
+                Presence::TypeOf => {
+                    "typeof takes a parenthesized attribute name — typeof(name) = tag"
+                }
+            },
+        )?;
+        let key = self.parse_presence_name()?;
+        self.expect(
+            &Token::RParen,
+            self.next_position(),
+            "expected ) after the attribute name",
+        )?;
+
+        let attr_type = match which {
+            Presence::Exists => None,
+            Presence::TypeOf => {
+                self.expect(
+                    &Token::Eq,
+                    self.next_position(),
+                    "typeof names the type it asks for — typeof(name) = tag",
+                )?;
+                Some(self.parse_type_tag()?)
+            }
+        };
+        Ok(Query::Exists { key, attr_type })
+    }
+
+    /// The `name` inside `exists(…)` / `typeof(…)`: a user attribute only.
+    fn parse_presence_name(&mut self) -> Result<AnnotKey, ParseError> {
+        let Some(spanned) = self.advance() else {
+            return Err(ParseError::syntax(self.end, "expected an attribute name"));
+        };
+        match spanned.token {
+            Token::Name(name) => {
+                validate_user_name(&name, spanned.start)?;
+                Ok(AnnotKey::User(name))
+            }
+            Token::SysName(name) => Err(ParseError::type_error(
+                spanned.start,
+                alloc::format!(
+                    "${name} is a system attribute, which every entity carries — \
+                     exists and typeof take a user attribute"
+                ),
+            )),
+            _ => Err(ParseError::syntax(
+                spanned.start,
+                "expected an attribute name",
+            )),
+        }
+    }
+
+    /// `typeof`'s right-hand side: a bare type tag, not a literal.
+    ///
+    /// Tags are positional rather than reserved, so one arrives as a plain
+    /// name; `bytes` is not among them, which is what keeps the one type that
+    /// is never indexed out of the operator.
+    fn parse_type_tag(&mut self) -> Result<AttributeType, ParseError> {
+        let Some(spanned) = self.advance() else {
+            return Err(ParseError::syntax(
+                self.end,
+                "expected a type tag, e.g. typeof(name) = i32",
+            ));
+        };
+        match spanned.token {
+            Token::Name(name) => match TypeTag::from_name(&name) {
+                Some(tag) => Ok(attr_type_of(tag)),
+                None => Err(ParseError::type_error(
+                    spanned.start,
+                    alloc::format!(
+                        "{name} is not a type tag — one of \
+                         i32 u64 u256 dec str addr key bytes32 bool"
+                    ),
+                )),
+            },
+            Token::Tagged { tag, .. } => Err(ParseError::type_error(
+                spanned.start,
+                alloc::format!(
+                    "typeof asks for a bare type tag, not a value — write \
+                     typeof(name) = {}",
+                    tag.name()
+                ),
+            )),
+            _ => Err(ParseError::syntax(
+                spanned.start,
+                "expected a type tag, e.g. typeof(name) = i32",
+            )),
+        }
+    }
+
+    /// Consume `expected`, or report `message` against `position`.
+    fn expect(
+        &mut self,
+        expected: &Token,
+        position: usize,
+        message: &str,
+    ) -> Result<(), ParseError> {
+        if self.peek_token() == Some(expected) {
+            self.advance();
+            return Ok(());
+        }
+        Err(ParseError::syntax(position, message))
+    }
+
     fn parse_attr_ref(&mut self) -> Result<AnnotKey, ParseError> {
         let Some(spanned) = self.advance() else {
             return Err(ParseError::syntax(self.end, "expected an attribute name"));
@@ -242,20 +366,14 @@ impl Parser {
                 Ok(AnnotKey::User(name))
             }
             Token::SysName(name) => builtin_from_name(&name, spanned.start).map(AnnotKey::BuiltIn),
-            Token::Exists => Err(ParseError::type_error(
-                spanned.start,
-                "exists(…) is not supported — the index has no per-attribute presence set in this version",
-            )),
-            Token::TypeOf => Err(ParseError::type_error(
-                spanned.start,
-                "typeof(…) is not supported — a value predicate already asserts the attribute's type",
-            )),
             Token::And
             | Token::Or
             | Token::Not
             | Token::True
             | Token::False
-            | Token::StartsWith => Err(ParseError::syntax(
+            | Token::StartsWith
+            | Token::Exists
+            | Token::TypeOf => Err(ParseError::syntax(
                 spanned.start,
                 "a reserved word cannot be used as an attribute name",
             )),
@@ -295,6 +413,34 @@ impl Parser {
         };
         check_value_type(key, &value, position)?;
         Ok((value, position))
+    }
+}
+
+/// Which presence operator a predicate opened with. The two share a parse —
+/// a parenthesized name — and differ only in whether a type follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    /// `exists(name)`: the attribute, under any type.
+    Exists,
+    /// `typeof(name) = tag`: the attribute, under exactly one type.
+    TypeOf,
+}
+
+/// The attribute type a type tag names.
+///
+/// Total: every tag in the language denotes an entity attribute type. `bytes`
+/// has no tag, which is how the one never-indexed type stays out of `typeof`.
+const fn attr_type_of(tag: TypeTag) -> AttributeType {
+    match tag {
+        TypeTag::Bool => AttributeType::Bool,
+        TypeTag::I32 => AttributeType::Int,
+        TypeTag::U64 => AttributeType::U64,
+        TypeTag::U256 => AttributeType::U256,
+        TypeTag::Dec => AttributeType::Decimal,
+        TypeTag::Bytes32 => AttributeType::Bytes32,
+        TypeTag::Str => AttributeType::Str,
+        TypeTag::Addr => AttributeType::EthereumAddress,
+        TypeTag::Key => AttributeType::EntityKey,
     }
 }
 
@@ -820,6 +966,132 @@ mod tests {
         }
     }
 
+    // ── the presence operators ──────────────────────────────────────────
+
+    /// `existsTest = EXISTS , "(" , name , ")"`.
+    #[test]
+    fn exists_takes_a_parenthesized_user_attribute() {
+        assert_eq!(
+            parse("exists(reviewedBy)").unwrap(),
+            Query::Exists {
+                key: user("reviewedBy"),
+                attr_type: None,
+            }
+        );
+        // Keywords are case-insensitive, like every other.
+        assert_eq!(
+            parse("EXISTS(reviewedBy)").unwrap(),
+            parse("exists(reviewedBy)").unwrap()
+        );
+    }
+
+    /// `typeTest = TYPEOF , "(" , name , ")" , "=" , typeTag`, and every tag
+    /// in the language denotes a type it can ask for.
+    #[test]
+    fn typeof_names_the_type_it_asks_for() {
+        assert_eq!(
+            parse("typeof(level) = i32").unwrap(),
+            Query::Exists {
+                key: user("level"),
+                attr_type: Some(AttributeType::Int),
+            }
+        );
+        for (tag, attr_type) in [
+            ("bool", AttributeType::Bool),
+            ("i32", AttributeType::Int),
+            ("u64", AttributeType::U64),
+            ("u256", AttributeType::U256),
+            ("dec", AttributeType::Decimal),
+            ("bytes32", AttributeType::Bytes32),
+            ("str", AttributeType::Str),
+            ("addr", AttributeType::EthereumAddress),
+            ("key", AttributeType::EntityKey),
+        ] {
+            assert_eq!(
+                parse(&format!("typeof(a) = {tag}")).unwrap(),
+                Query::Exists {
+                    key: user("a"),
+                    attr_type: Some(attr_type),
+                },
+                "{tag}"
+            );
+            // This parser is stricter than the spec's "tags are positional,
+            // not globally reserved": `validate_user_name` refuses a type
+            // name as an attribute name, so a tag cannot be the name either.
+            let err = parse(&format!("typeof({tag}) = i32")).unwrap_err();
+            assert!(err.message.contains("is a type name"), "{tag}: {err}");
+        }
+        assert_eq!(
+            parse("TYPEOF(level) = I32").unwrap(),
+            parse("typeof(level) = i32").unwrap()
+        );
+    }
+
+    /// Both combine like any other predicate.
+    #[test]
+    fn presence_operators_combine_and_negate() {
+        assert_eq!(
+            parse("exists(a) AND level > i32(3)").unwrap(),
+            Query::And(
+                Box::new(Query::Exists {
+                    key: user("a"),
+                    attr_type: None,
+                }),
+                Box::new(Query::Gt {
+                    key: user("level"),
+                    value: AttributeValue::Int(3),
+                })
+            )
+        );
+        assert_eq!(
+            parse("NOT exists(a)").unwrap(),
+            Query::Not(Box::new(Query::Exists {
+                key: user("a"),
+                attr_type: None,
+            }))
+        );
+        assert!(parse("exists(a) OR typeof(b) = str").is_ok());
+    }
+
+    /// The grammar gives both operators `name`, not `attrRef`: every entity
+    /// carries the system attributes, so asking would be a constant.
+    #[test]
+    fn presence_operators_refuse_a_system_attribute() {
+        for query in ["exists($owner)", "typeof($owner) = addr"] {
+            let err = parse(query).unwrap_err();
+            assert_eq!(err.kind, ParseErrorKind::TypeError, "{query}");
+            assert!(err.message.contains("system attribute"), "{query}: {err}");
+        }
+    }
+
+    /// `bytes` is the one type that is never indexed, and the only one with no
+    /// tag — so `typeof` cannot name it.
+    #[test]
+    fn typeof_refuses_a_non_tag_and_a_value() {
+        let err = parse("typeof(a) = bytes").unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::TypeError);
+        assert!(err.message.contains("not a type tag"), "{err}");
+
+        let err = parse("typeof(a) = str('x')").unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::TypeError);
+        assert!(err.message.contains("bare type tag"), "{err}");
+    }
+
+    #[test]
+    fn presence_operators_need_their_full_shape() {
+        for query in [
+            "exists",
+            "exists a",
+            "exists(a",
+            "exists()",
+            "typeof(a)",
+            "typeof(a) i32",
+            "typeof(a) = ",
+        ] {
+            assert!(parse(query).is_err(), "`{query}` should not parse");
+        }
+    }
+
     // ── what this version deliberately leaves out ───────────────────────
 
     #[test]
@@ -827,12 +1099,6 @@ mod tests {
         let err = parse("level != i32(10)").unwrap_err();
         assert_eq!(err.kind, ParseErrorKind::TypeError);
         assert!(err.message.contains("NOT (attr = value)"), "{err}");
-
-        let err = parse("exists(reviewedBy)").unwrap_err();
-        assert!(err.message.contains("presence"), "{err}");
-
-        let err = parse("typeof(level) = i32").unwrap_err();
-        assert!(err.message.contains("not supported"), "{err}");
     }
 
     #[test]

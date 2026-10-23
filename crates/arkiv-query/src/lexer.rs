@@ -84,9 +84,9 @@ pub(crate) enum Token {
     Or,
     Not,
     StartsWith,
-    /// Reserved, not implemented — the parser rejects it with a directive error.
+    /// `EXISTS` — opens `exists(name)`.
     Exists,
-    /// Reserved, not implemented — as [`Exists`](Self::Exists).
+    /// `TYPEOF` — opens `typeof(name) = tag`.
     TypeOf,
     Eq,
     /// Lexed only so the parser can explain why `!=` is not in the language.

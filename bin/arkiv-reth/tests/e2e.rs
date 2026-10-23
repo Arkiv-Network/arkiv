@@ -493,6 +493,39 @@ async fn query_operator_classes_over_a_live_node() {
         expect(&[0, 1, 2, 3, 4])
     );
 
+    // Presence, without comparing a value: `exists` spans every type the
+    // attribute is carried under, `typeof` narrows it to one. All five
+    // entities carry both attributes.
+    assert_eq!(
+        result_keys(&client.query("exists(rank)", 100, None).await),
+        expect(&[0, 1, 2, 3, 4])
+    );
+    assert_eq!(
+        result_keys(&client.query("typeof(rank) = u256", 100, None).await),
+        expect(&[0, 1, 2, 3, 4])
+    );
+    assert_eq!(
+        result_keys(&client.query("typeof(team) = str", 100, None).await),
+        expect(&[0, 1, 2, 3, 4])
+    );
+    assert!(
+        result_keys(&client.query("exists(absent)", 100, None).await).is_empty(),
+        "no entity carries an attribute nothing wrote",
+    );
+    // `typeof` is as type-exact as a value predicate: `rank` is a u256.
+    assert!(
+        result_keys(&client.query("typeof(rank) = i32", 100, None).await).is_empty(),
+        "typeof must not match an attribute of another type",
+    );
+    assert_eq!(
+        result_keys(
+            &client
+                .query("exists(rank) AND team = str('blue')", 100, None)
+                .await
+        ),
+        expect(&[2, 3]),
+    );
+
     // A predicate asserts the attribute's *type*: `rank` is a u256, so the same
     // number tagged i32 addresses a different bucket and matches nothing.
     assert!(
@@ -587,13 +620,14 @@ async fn query_operator_classes_over_a_live_node() {
         ("$createdAt >= 1", "-32002"),                        // system u64 needs its tag
         ("rank != u256(30)", "-32002"),                       // != is not in the language
         ("team >= str('blue')", "-32002"),                    // range on an unordered type
-        ("exists(rank)", "-32002"),                           // reserved, unimplemented
-        ("rank = i32(2147483648)", "-32003"),                 // literal out of range
+        ("exists($owner)", "-32002"),                         // presence takes a user attribute
+        ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
+        ("rank = i32(2147483648)", "-32003"), // literal out of range
         (
             "who = addr(0x5aAeb6053f3E94C9b9A09f33669435E7Ef1BeAed)",
             "-32003",
         ), // bad EIP-55 checksum
-        (&"(".repeat(200), "-32004"),                         // nested too deeply
+        (&"(".repeat(200), "-32004"),       // nested too deeply
     ] {
         let err = client
             .query_raw(rejected, serde_json::json!({}))

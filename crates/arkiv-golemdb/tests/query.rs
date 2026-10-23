@@ -71,30 +71,6 @@ fn filter(text: &str) -> Filter {
     }
 }
 
-/// `text` as a store filter, for a query whose operator the parser does not
-/// implement yet.
-///
-/// The two reserved operators, `exists(…)` and `typeof(…)`, are still refused
-/// while the query is a string, so the two tests using this are **red by
-/// design**: they state the semantics the operators are to have, and go green
-/// once the parser grows them. Nothing below them is blocked — GolemDB answers
-/// both natively through its `Exists` leaf
-/// (`Filter::Exists { field, ty: Option<ExistsType> }`, where `ty: None` is
-/// `exists` and `ty: Some(_)` is `typeof`), and the store filter needs a
-/// `CompareOp` for them to lower onto.
-fn pending_filter(text: &str) -> Filter {
-    match arkiv_query::parse(text) {
-        Ok(query) => match lower(&query).unwrap() {
-            Lowered::Filter(filter) => filter,
-            Lowered::Nothing => panic!("`{text}` matches nothing"),
-        },
-        Err(error) => panic!(
-            "`{text}` is still refused by the parser, so this test is red until \
-             exists/typeof are implemented: {error}"
-        ),
-    }
-}
-
 /// The entities that tell the reserved operators apart: two carrying `team` as
 /// a `str`, one not carrying it at all, and one carrying it as an `i32`.
 fn mixed_team_attribute() -> Vec<Entity> {
@@ -270,57 +246,47 @@ fn one_attribute_name_carries_two_types_at_once() {
 /// and only those: a record without the attribute does not match, and one
 /// carrying it under another type does.
 ///
-/// Red by design until the parser implements the operator — see
-/// [`pending_filter`].
+/// Lowers to a store presence test, which GolemDB answers with its own
+/// `Exists` leaf.
 #[test]
 fn a_query_with_the_exists_operator_matches_the_records_that_have_the_attribute() {
     let dir = TempDir::new().unwrap();
     let store = store_with(&dir, &mixed_team_attribute());
 
     // Type-blind: both `str` holders and the `i32` holder match.
-    assert_eq!(matched(&store, pending_filter("exists(team)")), [1, 2, 4]);
+    assert_eq!(matched(&store, filter("exists(team)")), [1, 2, 4]);
     // The entity that carries `level` instead is the only one `exists(level)`
     // matches.
-    assert_eq!(matched(&store, pending_filter("exists(level)")), [3]);
+    assert_eq!(matched(&store, filter("exists(level)")), [3]);
     // As one half of an AND whose other half is answerable today.
     assert_eq!(
-        matched(
-            &store,
-            pending_filter("exists(team) AND $expiresAt > u64(500)")
-        ),
+        matched(&store, filter("exists(team) AND $expiresAt > u64(500)")),
         [1, 2, 4]
     );
     // No record carries both attributes.
-    assert!(matched(&store, pending_filter("exists(team) AND exists(level)")).is_empty());
+    assert!(matched(&store, filter("exists(team) AND exists(level)")).is_empty());
 }
 
 /// `typeof(attr) = type` narrows presence to one type: it matches the records
 /// carrying `attr` under exactly that type, so it splits the records that
 /// `exists(attr)` matches together.
 ///
-/// Red by design until the parser implements the operator — see
-/// [`pending_filter`].
+/// The same leaf as `exists`, narrowed to one type.
 #[test]
 fn a_query_with_the_typeof_operator_matches_the_records_whose_attribute_has_that_type() {
     let dir = TempDir::new().unwrap();
     let store = store_with(&dir, &mixed_team_attribute());
 
-    assert_eq!(
-        matched(&store, pending_filter("typeof(team) = str")),
-        [1, 2]
-    );
-    assert_eq!(matched(&store, pending_filter("typeof(team) = i32")), [4]);
-    assert_eq!(matched(&store, pending_filter("typeof(level) = i32")), [3]);
+    assert_eq!(matched(&store, filter("typeof(team) = str")), [1, 2]);
+    assert_eq!(matched(&store, filter("typeof(team) = i32")), [4]);
+    assert_eq!(matched(&store, filter("typeof(level) = i32")), [3]);
     // A type no record carries the attribute under matches nothing, rather
     // than failing.
-    assert!(matched(&store, pending_filter("typeof(team) = u64")).is_empty());
+    assert!(matched(&store, filter("typeof(team) = u64")).is_empty());
     // Narrower than a value predicate on the same attribute, and wider than
     // one on a single value.
     assert_eq!(
-        matched(
-            &store,
-            pending_filter("typeof(team) = str AND team = str('red')")
-        ),
+        matched(&store, filter("typeof(team) = str AND team = str('red')")),
         [1]
     );
 }

@@ -23,10 +23,10 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use arkiv_interfaces::store::{
     AndGroup, Budget, Cell, CellKind, CompareOp, Filter, Predicate, Query, QueryResult, Sort,
-    SortDirection, StoreError, TypeId,
+    SortDirection, StoreError, Test, TypeId,
 };
 use golemdb_api as golemdb;
-use golemdb_api::{Bounds, EqValue, InValues};
+use golemdb_api::{Bounds, EqValue, ExistsType, InValues};
 
 use super::{arkiv_record, cell_type, golemdb_cell};
 
@@ -99,7 +99,7 @@ pub(crate) fn arkiv_query_result(page: &golemdb::QueryPage) -> Result<QueryResul
 /// it: a range on a `str` is invalid even though GolemDB could run it.
 fn golemdb_filter(filter: &Filter) -> Result<golemdb::Filter, StoreError> {
     for predicate in filter.0.iter().flat_map(|group| &group.0) {
-        if !predicate.op.permitted_by(predicate.type_id.index_class()) {
+        if !predicate.test.is_answerable() {
             return Err(StoreError::InvalidQuery);
         }
     }
@@ -134,35 +134,50 @@ fn node(
 /// An OR of equalities on one cell, of one type, is GolemDB's `In`: one leaf
 /// rather than an `Or` of several. `None` for any other filter.
 fn equalities_on_one_cell(filter: &Filter) -> Result<Option<golemdb::Filter>, StoreError> {
-    let equalities: Option<Vec<&Predicate>> = filter
+    /// One group's predicate as an equality: its cell, type and operand.
+    /// `None` for anything else, including a presence test, which names no
+    /// value for `In` to hold.
+    fn equality(predicate: &Predicate) -> Option<Equality<'_>> {
+        match &predicate.test {
+            Test::Compare {
+                op: CompareOp::Eq,
+                type_id,
+                value,
+            } if !predicate.negated => Some((&predicate.cell, *type_id, value)),
+            Test::Compare { .. } | Test::Exists { .. } => None,
+        }
+    }
+
+    let equalities: Option<Vec<Equality<'_>>> = filter
         .0
         .iter()
         .map(|AndGroup(predicates)| match predicates.as_slice() {
-            [predicate] => {
-                (predicate.op == CompareOp::Eq && !predicate.negated).then_some(predicate)
-            }
+            [predicate] => equality(predicate),
             [] | [_, _, ..] => None,
         })
         .collect();
-    let (first, equalities) = match equalities.as_deref() {
-        Some(equalities @ [first, _, ..]) => (*first, equalities),
+    let (&(first_cell, first_type, _), equalities) = match equalities.as_deref() {
+        Some(equalities @ [first, _, ..]) => (first, equalities),
         // A group that is not one equality, or fewer than two groups.
         None | Some([] | [_]) => return Ok(None),
     };
-    let alike =
-        |predicate: &&Predicate| predicate.cell == first.cell && predicate.type_id == first.type_id;
+    let alike = |(cell, type_id, _): &Equality<'_>| *cell == first_cell && *type_id == first_type;
     if !equalities.iter().all(alike) {
         return Ok(None);
     }
     let values = equalities
         .iter()
-        .map(|predicate| operand(predicate))
+        .map(|(_, type_id, value)| operand(*type_id, value))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(golemdb::Filter::In {
-        field: cell_name(&first.cell),
+        field: cell_name(first_cell),
         values: InValues::try_from(values).map_err(invalid_query)?,
     }))
 }
+
+/// An un-negated equality, decomposed: the cell it is on, the type it holds it
+/// to, and the operand bytes.
+type Equality<'a> = (&'a str, TypeId, &'a [u8]);
 
 /// One predicate as a leaf. GolemDB has no NOT, so a negated predicate has
 /// none. `KEY` and `BYTES32` are one GolemDB type, so a leaf of either matches
@@ -172,36 +187,50 @@ fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
         return Err(StoreError::NotImplemented);
     }
     let field = cell_name(&predicate.cell);
-    let bounds = |lower, upper| {
-        Bounds::try_new(cell_type(predicate.type_id)?, lower, upper).map_err(invalid_query)
+    let (op, type_id, value) = match &predicate.test {
+        // `exists`/`typeof` are GolemDB's own `Exists` leaf, which takes the
+        // type the same way: none for any, one for exactly that.
+        Test::Exists { type_id } => {
+            let ty = match type_id {
+                // Two conversions, each with its own error: Arkiv's type to
+                // GolemDB's, then that to an indexable one.
+                Some(type_id) => {
+                    Some(ExistsType::try_from(cell_type(*type_id)?).map_err(invalid_query)?)
+                }
+                None => None,
+            };
+            return Ok(golemdb::Filter::Exists { field, ty });
+        }
+        Test::Compare { op, type_id, value } => (*op, *type_id, value),
     };
-    Ok(match predicate.op {
+    let bounds =
+        |lower, upper| Bounds::try_new(cell_type(type_id)?, lower, upper).map_err(invalid_query);
+    Ok(match op {
         CompareOp::Eq => golemdb::Filter::Eq {
             field,
-            value: EqValue::try_from(operand(predicate)?).map_err(invalid_query)?,
+            value: EqValue::try_from(operand(type_id, value)?).map_err(invalid_query)?,
         },
         CompareOp::Lt => golemdb::Filter::Range {
             field,
-            bounds: bounds(Unbounded, Excluded(operand(predicate)?))?,
+            bounds: bounds(Unbounded, Excluded(operand(type_id, value)?))?,
         },
         CompareOp::Lte => golemdb::Filter::Range {
             field,
-            bounds: bounds(Unbounded, Included(operand(predicate)?))?,
+            bounds: bounds(Unbounded, Included(operand(type_id, value)?))?,
         },
         CompareOp::Gt => golemdb::Filter::Range {
             field,
-            bounds: bounds(Excluded(operand(predicate)?), Unbounded)?,
+            bounds: bounds(Excluded(operand(type_id, value)?), Unbounded)?,
         },
         CompareOp::Gte => golemdb::Filter::Range {
             field,
-            bounds: bounds(Included(operand(predicate)?), Unbounded)?,
+            bounds: bounds(Included(operand(type_id, value)?), Unbounded)?,
         },
         CompareOp::Prefix => golemdb::Filter::Prefix {
             field,
             // GolemDB's prefix is text, so a prefix that ends inside a
             // character cannot be asked.
-            prefix: String::from_utf8(predicate.value.clone())
-                .map_err(|_| StoreError::NotImplemented)?,
+            prefix: String::from_utf8(value.clone()).map_err(|_| StoreError::NotImplemented)?,
         },
     })
 }
@@ -222,11 +251,23 @@ fn sort_key(sort: &Sort, filter: &Filter) -> Result<golemdb::SortKey, StoreError
 /// does when any of its predicates is on that cell, unless negated, and the
 /// filter when every group does, to the same type.
 fn held_type(filter: &Filter, name: &str) -> Option<TypeId> {
+    /// The type a test holds its cell to, if it holds it to one. A bare
+    /// `exists` spans every indexed type, so it holds the cell to none.
+    const fn type_of(test: &Test) -> Option<TypeId> {
+        match test {
+            Test::Compare { type_id, .. }
+            | Test::Exists {
+                type_id: Some(type_id),
+            } => Some(*type_id),
+            Test::Exists { type_id: None } => None,
+        }
+    }
+
     let mut groups = filter.0.iter().map(|AndGroup(predicates)| {
         predicates
             .iter()
-            .find(|predicate| predicate.cell == name && !predicate.negated)
-            .map(|predicate| predicate.type_id)
+            .filter(|predicate| predicate.cell == name && !predicate.negated)
+            .find_map(|predicate| type_of(&predicate.test))
     });
     let first = groups.next()??;
     groups
@@ -234,13 +275,13 @@ fn held_type(filter: &Filter, name: &str) -> Option<TypeId> {
         .then_some(first)
 }
 
-/// A predicate's value encoded as [`golemdb_cell`] writes a cell, so a leaf
+/// A predicate's operand encoded as [`golemdb_cell`] writes a cell, so a leaf
 /// finds what was stored. A field, which is what a leaf's values are.
-fn operand(predicate: &Predicate) -> Result<golemdb::CellValue, StoreError> {
+fn operand(type_id: TypeId, value: &[u8]) -> Result<golemdb::CellValue, StoreError> {
     golemdb_cell(&Cell {
         kind: CellKind::Field,
-        type_id: predicate.type_id,
-        value: predicate.value.clone(),
+        type_id,
+        value: value.to_vec(),
     })
 }
 
@@ -267,9 +308,20 @@ mod tests {
     fn predicate(cell: &str, op: CompareOp, type_id: TypeId, value: &[u8]) -> Predicate {
         Predicate {
             cell: cell.into(),
-            op,
-            type_id,
-            value: value.to_vec(),
+            test: Test::Compare {
+                op,
+                type_id,
+                value: value.to_vec(),
+            },
+            negated: false,
+        }
+    }
+
+    /// A presence predicate: `exists` with no type, `typeof` with one.
+    fn presence(cell: &str, type_id: Option<TypeId>) -> Predicate {
+        Predicate {
+            cell: cell.into(),
+            test: Test::Exists { type_id },
             negated: false,
         }
     }
@@ -345,6 +397,54 @@ mod tests {
         .offset(20)
         .with_total();
         assert_eq!(query_op(&arkiv, Some(Budget(1_000))), Ok(expected));
+    }
+
+    /// A presence predicate is GolemDB's own `Exists` leaf, which takes the
+    /// type the same way: absent for any, present for exactly one.
+    #[test]
+    fn a_presence_predicate_is_an_exists_leaf() {
+        assert_eq!(
+            golemdb_filter(&Filter(vec![AndGroup(vec![presence("team", None)])])),
+            Ok(golemdb::Filter::Exists {
+                field: cell_name("team"),
+                ty: None,
+            })
+        );
+        assert_eq!(
+            golemdb_filter(&Filter(vec![AndGroup(vec![presence(
+                "team",
+                Some(TypeId::STR)
+            )])])),
+            Ok(golemdb::Filter::Exists {
+                field: cell_name("team"),
+                ty: Some(ExistsType::of(Str)),
+            })
+        );
+    }
+
+    /// GolemDB has no NOT, so a negated presence test has no leaf — as a
+    /// negated comparison has none.
+    #[test]
+    fn a_negated_presence_predicate_is_not_implemented() {
+        let mut negated = presence("team", None);
+        negated.negated = true;
+        assert_eq!(
+            golemdb_filter(&Filter(vec![AndGroup(vec![negated])])),
+            Err(StoreError::NotImplemented)
+        );
+    }
+
+    /// A type that is never indexed cannot be asked for, the same way a range
+    /// on an equality-only type cannot.
+    #[test]
+    fn a_presence_predicate_over_a_field_only_type_is_invalid() {
+        assert_eq!(
+            golemdb_filter(&Filter(vec![AndGroup(vec![presence(
+                "payload",
+                Some(TypeId::BYTES)
+            )])])),
+            Err(StoreError::InvalidQuery)
+        );
     }
 
     #[test]
