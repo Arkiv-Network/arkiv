@@ -323,15 +323,12 @@ def main():
     golemdb_dir = scratch / "golemdb"
     (scratch / "valkey").mkdir(parents=True, exist_ok=True)
     if golemdb:
-        # GolemDB runs inside the node and needs no permission to; the URL
-        # takes an absolute path, which `out` already is.
-        store_env = {"ARKIV_STORE_URL": f"golemdb://{golemdb_dir}"}
+        # The node takes an absolute path, which `out` already is.
+        store_env = {"ARKIV_STORE_PATH": str(golemdb_dir)}
     else:
         store_env = {
-            "ARKIV_STORE_URL": f"redis://127.0.0.1:{valkey_port}",
+            "ARKIV_EXPERIMENTAL_STORE": f"redis://127.0.0.1:{valkey_port}",
             "ARKIV_STORE_NAMESPACE": namespace,
-            # Valkey is not GolemDB, so the node runs on it only when allowed.
-            "ALLOW_EXPERIMENTAL_BACKENDS": "true",
         }
 
     processes = []
@@ -355,7 +352,7 @@ def main():
     def start_node(log_name):
         """Launch the node against this run's store, and wait for its RPC.
 
-        Same datadir, store URL and namespace every time, which is what makes
+        Same datadir, store and namespace every time, which is what makes
         a restart a restart rather than a second chain.
         """
         handle = subprocess.Popen(

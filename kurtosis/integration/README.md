@@ -20,7 +20,7 @@ bun test
 | `ARKIV_FUNDED_KEY`       | ethereum-package's first prefunded account | Pays for the transfers the tests need                   |
 
 The chain id is read from the RPC, so the same tests run against a bare
-`ARKIV_STORE_URL=memory:// ALLOW_EXPERIMENTAL_BACKENDS=true arkiv-reth node --dev`:
+`ARKIV_EXPERIMENTAL_STORE=memory arkiv-reth node --dev`:
 
 ```sh
 ARKIV_RPC_URL=http://127.0.0.1:8545 \

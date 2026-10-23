@@ -59,7 +59,7 @@ One `commit:N:hash` and one `tag:` per block — the commit lineage, one commit 
 `rec:` keys appear once something **creates an entity**. The quickest way to see them, and the cell names with them, is the e2e suite pointed at a Valkey:
 
 ```sh
-ARKIV_STORE_URL=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=scratch \
+ARKIV_EXPERIMENTAL_STORE=redis://127.0.0.1:6379 ARKIV_STORE_NAMESPACE=scratch \
   cargo test -p arkiv-reth --test e2e query_operator_classes_over_a_live_node
 ```
 
