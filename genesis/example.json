@@ -1,0 +1,38 @@
+{
+  "config": {
+    "chainId": 424242,
+    "homesteadBlock": 0,
+    "eip150Block": 0,
+    "eip155Block": 0,
+    "eip158Block": 0,
+    "byzantiumBlock": 0,
+    "constantinopleBlock": 0,
+    "petersburgBlock": 0,
+    "istanbulBlock": 0,
+    "berlinBlock": 0,
+    "londonBlock": 0,
+    "mergeNetsplitBlock": 0,
+    "terminalTotalDifficulty": 0,
+    "terminalTotalDifficultyPassed": true,
+    "shanghaiTime": 0,
+    "cancunTime": 0,
+    "pragueTime": 0,
+    "arkiv": {
+      "golemdb": {
+        "hash_function": "keccak-256",
+        "cell_limits": {
+          "max_cell_name_len": 32,
+          "max_str_len": 128,
+          "max_bytes_len": 131072
+        }
+      }
+    }
+  },
+  "baseFeePerGas": "0x3b9aca00",
+  "gasLimit": "0x3938700",
+  "difficulty": "0x0",
+  "alloc": {
+    "0x1111111111111111111111111111111111111111": { "balance": "0x3635c9adc5dea00000" },
+    "0x2222222222222222222222222222222222222222": { "balance": "0xde0b6b3a7640000" }
+  }
+}

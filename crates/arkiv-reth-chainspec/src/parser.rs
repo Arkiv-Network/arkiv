@@ -1,11 +1,7 @@
 //! The `--chain` value parser producing an [`ArkivChainSpec`].
 
 use crate::ArkivChainSpec;
-use alloy_genesis::Genesis;
-use reth_cli::chainspec::ChainSpecParser;
-use reth_ethereum::chainspec::ChainSpec;
-use reth_ethereum_cli::chainspec::chain_value_parser;
-use std::path::PathBuf;
+use reth_cli::chainspec::{ChainSpecParser, parse_genesis};
 use std::sync::Arc;
 
 /// `--chain` values an Arkiv node accepts by name. Anything else is read as a
@@ -16,9 +12,13 @@ use std::sync::Arc;
 /// rejects every block. `dev` is also the default when nothing is given.
 pub const SUPPORTED_CHAINS: &[&str] = &["dev"];
 
-/// Clap value parser for `--chain`: reth's own parser, wrapped in
-/// [`ArkivChainSpec`] so the minimum-base-fee rule applies to every chain the
-/// node can be pointed at.
+/// The `dev` chain: reth's dev chain (chain ID 1337, every fork from block 0,
+/// its funded dev accounts) with GolemDB's settings.
+const DEV_GENESIS: &str = include_str!("../../../genesis/dev.json");
+
+/// Clap value parser for `--chain`: `dev` from `genesis/dev.json`, anything
+/// else through reth's genesis reader, wrapped in [`ArkivChainSpec`] so the
+/// minimum-base-fee rule applies to every chain the node can be pointed at.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ArkivChainSpecParser;
@@ -29,32 +29,13 @@ impl ChainSpecParser for ArkivChainSpecParser {
     const SUPPORTED_CHAINS: &'static [&'static str] = SUPPORTED_CHAINS;
 
     fn parse(s: &str) -> eyre::Result<Arc<ArkivChainSpec>> {
-        if SUPPORTED_CHAINS.contains(&s) {
-            let inner = chain_value_parser(s)?;
-            return Ok(Arc::new(ArkivChainSpec::new(
-                Arc::try_unwrap(inner).unwrap_or_else(|arc| (*arc).clone()),
-            )));
-        }
-        Ok(Arc::new(ArkivChainSpec::new(parse_genesis_spec(s)?)))
+        let genesis = if s == "dev" {
+            serde_json::from_str(DEV_GENESIS)?
+        } else {
+            parse_genesis(s)?
+        };
+        Ok(Arc::new(ArkivChainSpec::from_genesis(genesis)?))
     }
-}
-
-/// A genesis file path or inline genesis JSON, as reth reads it.
-fn parse_genesis_spec(s: &str) -> eyre::Result<ChainSpec> {
-    // reth's rule: a readable path first, else the text itself if it looks
-    // like JSON.
-    let raw = match std::fs::read_to_string(PathBuf::from(s)) {
-        Ok(raw) => raw,
-        Err(io_err) => {
-            if s.contains('{') {
-                s.to_string()
-            } else {
-                return Err(io_err.into());
-            }
-        }
-    };
-    let genesis: Genesis = serde_json::from_str(&raw)?;
-    Ok(ChainSpec::from_genesis(genesis))
 }
 
 #[cfg(test)]
@@ -75,6 +56,33 @@ mod tests {
             let spec = ArkivChainSpecParser::parse(chain).expect("named chain parses");
             assert_eq!(spec.min_base_fee(), INITIAL_BASE_FEE);
         }
+    }
+
+    /// `dev` is reth's dev chain, block 0 included, with GolemDB's settings.
+    #[test]
+    fn the_dev_chain_is_reths_with_golemdb_settings() {
+        use reth_ethereum::chainspec::{DEV, ForkCondition, Hardfork, Hardforks};
+        let spec = ArkivChainSpecParser::parse("dev").unwrap();
+        assert_eq!(spec.chain(), DEV.chain());
+        assert_eq!(spec.genesis_hash(), DEV.genesis_hash());
+        assert_eq!(
+            spec.final_paris_total_difficulty(),
+            DEV.final_paris_total_difficulty()
+        );
+        // The same forks, each active at genesis or not as on reth's.
+        let active = |forks: Vec<(&dyn Hardfork, ForkCondition)>| {
+            forks
+                .into_iter()
+                .map(|(fork, condition)| {
+                    (fork.name(), condition.active_at_timestamp_or_number(0, 0))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            active(spec.forks_iter().collect()),
+            active(DEV.forks_iter().collect())
+        );
+        assert!(spec.golemdb().is_some());
     }
 
     #[test]
@@ -99,5 +107,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let inline = ArkivChainSpecParser::parse(GENESIS).unwrap();
         assert_eq!(from_file.genesis_hash(), inline.genesis_hash());
+    }
+
+    #[test]
+    fn a_bad_section_fails_the_parse() {
+        let mut genesis: serde_json::Value = serde_json::from_str(GENESIS).unwrap();
+        genesis["config"]["arkiv"] = serde_json::json!({ "golemdb": { "hash_fn": "keccak-256" } });
+        let error = ArkivChainSpecParser::parse(&genesis.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `hash_fn`"),
+            "{error}"
+        );
     }
 }

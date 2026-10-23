@@ -1571,6 +1571,7 @@ dependencies = [
  "clap",
  "eyre",
  "reth",
+ "reth-cli",
  "reth-cli-util",
  "reth-db",
  "reth-engine-tree",
@@ -1599,10 +1600,11 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "eyre",
+ "golemdb-api",
  "reth-cli",
  "reth-ethereum",
- "reth-ethereum-cli",
  "reth-network-peers",
+ "serde",
  "serde_json",
 ]
 

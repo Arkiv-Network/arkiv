@@ -71,3 +71,5 @@ serde_json.workspace = true
 alloy-primitives.workspace = true
 # GolemDB directories for the store-opening unit tests.
 tempfile.workspace = true
+# `ChainSpecParser`, to read the example genesis file as `--chain` does.
+reth-cli.workspace = true

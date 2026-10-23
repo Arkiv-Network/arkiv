@@ -7,13 +7,13 @@ use tempfile::TempDir;
 const SEGMENT: &str = "rows";
 
 fn config() -> GolemDbConfig {
+    let limits = CellLimits {
+        max_cell_name_len: 32,
+        max_str_len: 128,
+        max_bytes_len: 128 * 1024,
+    };
     GolemDbConfig {
-        hash_function: HashAlgorithm::Keccak256,
-        cell_limits: CellLimits {
-            max_cell_name_len: 32,
-            max_str_len: 128,
-            max_bytes_len: 128 * 1024,
-        },
+        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, None),
         segments: vec![SegmentSpec {
             name: SEGMENT.into(),
             columns: 2,
@@ -226,11 +226,11 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
     drop(store);
 
     let mut limits = config();
-    limits.cell_limits.max_str_len += 1;
+    limits.genesis.cell_limits.max_str_len += 1;
     let mut segments = config();
     segments.segments[0].columns += 1;
     let mut hash = config();
-    hash.hash_function = HashAlgorithm::Blake3;
+    hash.genesis.hash_function = HashAlgorithm::Blake3;
     for other in [limits, segments, hash] {
         assert!(matches!(
             GolemDbStore::open(dir.path(), &other),
@@ -527,6 +527,21 @@ fn a_host_segment_may_not_be_named_commit_tags() {
     assert!(error.to_string().contains("duplicate"), "{error}");
 }
 
+/// Segments are the host's and the adapter's, so a genesis that declares its
+/// own is refused, and nothing is created.
+#[test]
+fn a_genesis_with_segments_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let mut config = config();
+    config.genesis.immutable_data = Some(golemdb::ImmutableDataConfig {
+        shard_span: SHARD_SPAN,
+        segments: vec![tags::segment()],
+    });
+    let error = GolemDbStore::open(dir.path(), &config).unwrap_err();
+    assert!(matches!(error, OpenError::InvalidConfig(_)), "{error}");
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
 /// A commit's tag row is found by the commit that published it, not by
 /// position, so a stray second row spoils only that commit's tag.
 #[test]
@@ -566,7 +581,7 @@ fn a_failed_commit_leaves_no_tag_row() {
     let store = GolemDbStore {
         database: golemdb::Database::open_with_options(
             dir.path(),
-            &golemdb::OpenConfig::new(config().genesis()),
+            &golemdb::OpenConfig::new(config().full_genesis().unwrap()),
             options,
         )
         .unwrap(),

@@ -15,6 +15,9 @@
 //!
 //! This is a consensus rule: a node without it rejects every block produced
 //! under it, so every node on the chain must run it.
+//!
+//! The spec also carries GolemDB's settings for the chain, from the genesis
+//! file's `config.arkiv.golemdb` (see [`ArkivChainSpec::golemdb`]).
 
 mod parser;
 
@@ -32,28 +35,49 @@ use reth_ethereum::chainspec::{
     ForkFilter, ForkId, Hardfork, Hardforks, Head,
 };
 use reth_network_peers::NodeRecord;
+use serde::Deserialize;
 
-/// reth's [`ChainSpec`] plus the Arkiv minimum-base-fee rule (see the crate docs).
+/// reth's [`ChainSpec`] plus the Arkiv minimum-base-fee rule and GolemDB's
+/// settings (see the crate docs).
 #[derive(Debug, Clone)]
 pub struct ArkivChainSpec {
     inner: ChainSpec,
     /// The genesis header's base fee, cached: the floor every later block's base
     /// fee is clamped to. Zero when the genesis header carries no base fee.
     min_base_fee: u64,
+    /// The genesis file's `config.arkiv.golemdb`, if it has one.
+    golemdb: Option<golemdb_api::Genesis>,
+}
+
+/// `config.arkiv` in the genesis file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, expecting = "an object with a `golemdb` section")]
+struct ArkivConfig {
+    golemdb: golemdb_api::Genesis,
 }
 
 impl ArkivChainSpec {
-    /// Wrap a reth chain spec. The floor is read from its genesis header.
-    pub fn new(inner: ChainSpec) -> Self {
+    /// Wrap a reth chain spec. The floor is read from its genesis header, and
+    /// GolemDB's settings from its genesis `config.arkiv`, which must be valid.
+    pub fn new(inner: ChainSpec) -> eyre::Result<Self> {
         let min_base_fee = inner.initial_base_fee().unwrap_or_default();
-        Self {
+        let golemdb = inner
+            .genesis()
+            .config
+            .extra_fields
+            .get_deserialized::<ArkivConfig>("arkiv")
+            .transpose()
+            .map_err(|e| eyre::eyre!("genesis config.arkiv: {e}"))?
+            .map(|config| config.golemdb);
+        Ok(Self {
             inner,
             min_base_fee,
-        }
+            golemdb,
+        })
     }
 
     /// Build from a geth-format genesis, the way `--chain <file>` does.
-    pub fn from_genesis(genesis: Genesis) -> Self {
+    pub fn from_genesis(genesis: Genesis) -> eyre::Result<Self> {
         Self::new(ChainSpec::from_genesis(genesis))
     }
 
@@ -66,17 +90,12 @@ impl ArkivChainSpec {
     pub fn min_base_fee(&self) -> u64 {
         self.min_base_fee
     }
-}
 
-impl From<ChainSpec> for ArkivChainSpec {
-    fn from(inner: ChainSpec) -> Self {
-        Self::new(inner)
-    }
-}
-
-impl From<Genesis> for ArkivChainSpec {
-    fn from(genesis: Genesis) -> Self {
-        Self::from_genesis(genesis)
+    /// GolemDB's settings from the genesis file's `config.arkiv.golemdb`, in
+    /// GolemDB's own genesis format, or `None` if it has none.
+    /// `genesis/example.json` in the repository shows the format.
+    pub fn golemdb(&self) -> Option<&golemdb_api::Genesis> {
+        self.golemdb.as_ref()
     }
 }
 
@@ -174,7 +193,9 @@ impl EthChainSpec for ArkivChainSpec {
 mod tests {
     use super::*;
     use alloy_eips::eip1559::{INITIAL_BASE_FEE, MIN_PROTOCOL_BASE_FEE};
+    use golemdb_api::{CellLimits, HashAlgorithm};
     use reth_ethereum::chainspec::DEV;
+    use serde_json::{Value, json};
 
     /// A genesis with EIP-1559 active from block 0, with or without an explicit
     /// base fee.
@@ -213,16 +234,20 @@ mod tests {
     #[test]
     fn floor_is_the_genesis_base_fee() {
         assert_eq!(
-            ArkivChainSpec::from_genesis(genesis(Some(10))).min_base_fee(),
+            ArkivChainSpec::from_genesis(genesis(Some(10)))
+                .unwrap()
+                .min_base_fee(),
             10
         );
         assert_eq!(
-            ArkivChainSpec::from_genesis(genesis(None)).min_base_fee(),
+            ArkivChainSpec::from_genesis(genesis(None))
+                .unwrap()
+                .min_base_fee(),
             INITIAL_BASE_FEE,
             "no baseFeePerGas in genesis: reth's 1 gwei default is the floor",
         );
         assert_eq!(
-            ArkivChainSpec::new((**DEV).clone()).min_base_fee(),
+            ArkivChainSpec::new((**DEV).clone()).unwrap().min_base_fee(),
             INITIAL_BASE_FEE,
             "--dev floors at reth's dev-genesis base fee",
         );
@@ -230,7 +255,7 @@ mod tests {
 
     #[test]
     fn empty_block_holds_the_floor_where_reth_would_decay() {
-        let spec = ArkivChainSpec::from_genesis(genesis(Some(10)));
+        let spec = ArkivChainSpec::from_genesis(genesis(Some(10))).unwrap();
         let parent = empty_parent(10, 60_000_000);
         assert_eq!(
             spec.inner().next_block_base_fee(&parent, 0),
@@ -257,7 +282,7 @@ mod tests {
 
     #[test]
     fn decay_stops_at_the_floor_not_below() {
-        let spec = ArkivChainSpec::from_genesis(genesis(None));
+        let spec = ArkivChainSpec::from_genesis(genesis(None)).unwrap();
         // 12.5% above the floor: one empty block lands exactly on the floor.
         let parent = empty_parent(INITIAL_BASE_FEE + INITIAL_BASE_FEE / 8, 30_000_000);
         assert_eq!(spec.next_block_base_fee(&parent, 0), Some(INITIAL_BASE_FEE));
@@ -268,7 +293,7 @@ mod tests {
 
     #[test]
     fn above_the_floor_is_plain_eip1559() {
-        let spec = ArkivChainSpec::from_genesis(genesis(Some(10)));
+        let spec = ArkivChainSpec::from_genesis(genesis(Some(10))).unwrap();
         // A full block raises the fee by 1/8; a well-above-floor empty block
         // decays by 1/8 — both exactly as reth computes them.
         for parent in [
@@ -293,8 +318,90 @@ mod tests {
         // EIP-1559 not active at block 0: the genesis header has no base fee.
         let mut genesis = genesis(None);
         genesis.config.london_block = Some(100);
-        let spec = ArkivChainSpec::from_genesis(genesis);
+        let spec = ArkivChainSpec::from_genesis(genesis).unwrap();
         assert_eq!(spec.min_base_fee(), 0);
         assert_eq!(spec.genesis_header().base_fee_per_gas, None);
+    }
+
+    /// `config.arkiv` with GolemDB's settings, then `edit`ed.
+    fn arkiv(edit: impl FnOnce(&mut Value)) -> Value {
+        let mut golemdb = json!({
+            "hash_function": "blake3",
+            "cell_limits": { "max_cell_name_len": 32, "max_str_len": 128, "max_bytes_len": 131072 }
+        });
+        edit(&mut golemdb);
+        json!({ "golemdb": golemdb })
+    }
+
+    /// The chain spec of a genesis whose `config.arkiv` is `arkiv`.
+    fn with_arkiv(arkiv: Value) -> eyre::Result<ArkivChainSpec> {
+        let mut genesis = genesis(None);
+        genesis.config.extra_fields.insert("arkiv".into(), arkiv);
+        ArkivChainSpec::from_genesis(genesis)
+    }
+
+    #[test]
+    fn golemdb_settings_come_from_config_arkiv() {
+        assert_eq!(
+            ArkivChainSpec::new((**DEV).clone()).unwrap().golemdb(),
+            None
+        );
+        assert_eq!(
+            ArkivChainSpec::from_genesis(genesis(None))
+                .unwrap()
+                .golemdb(),
+            None
+        );
+        let limits = CellLimits {
+            max_cell_name_len: 32,
+            max_str_len: 128,
+            max_bytes_len: 131072,
+        };
+        assert_eq!(
+            with_arkiv(arkiv(|_| {})).unwrap().golemdb(),
+            Some(&golemdb_api::Genesis::new(
+                HashAlgorithm::Blake3,
+                limits,
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn a_malformed_arkiv_section_is_refused() {
+        let mut unknown = arkiv(|_| {});
+        unknown["metering"] = json!({});
+        for (arkiv, expected) in [
+            (
+                json!(null),
+                "invalid type: null, expected an object with a `golemdb`",
+            ),
+            (json!({}), "missing field `golemdb`"),
+            (unknown, "unknown field `metering`"),
+            (
+                arkiv(|g| g["hash_fn"] = g["hash_function"].take()),
+                "unknown field `hash_fn`",
+            ),
+            (
+                arkiv(|g| g["hash_function"] = json!("keccak256")),
+                "unknown variant `keccak256`",
+            ),
+            (
+                arkiv(|g| {
+                    g.as_object_mut().unwrap().remove("cell_limits");
+                }),
+                "missing field `cell_limits`",
+            ),
+            (
+                arkiv(|g| g["cell_limits"]["max_str_len"] = json!(-1)),
+                "invalid value",
+            ),
+        ] {
+            let error = with_arkiv(arkiv.clone()).unwrap_err().to_string();
+            assert!(
+                error.starts_with("genesis config.arkiv: ") && error.contains(expected),
+                "{arkiv}: {error}"
+            );
+        }
     }
 }
