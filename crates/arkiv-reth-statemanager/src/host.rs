@@ -31,11 +31,11 @@ use arkiv_interfaces::statemanager::{
     EntityStore, EntityUpdates, EqualityIndexStore, PruningMeta, PruningStore, RangeIndexStore,
     ReadMode, SessionId, StateCommit, StateView, StoreKind,
 };
-use arkiv_interfaces::store::{BranchId, CommitId, SealedCommit, Store, StoreExt};
+use arkiv_interfaces::store::{BranchId, CommitId, SealedCommit, Store, StoreError, StoreExt};
 use core::sync::atomic::{AtomicU64, Ordering};
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::state::EvmState;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use crate::WriteOverlay;
 use std::sync::Arc;
@@ -480,6 +480,30 @@ impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
     }
 }
 
+/// Why [`BlockSeals::wait_for_commit`] has no commit to return.
+#[derive(Debug)]
+pub enum CommitWaitError {
+    /// The store failed the lookup.
+    Store(StoreError),
+    /// The block is not in the store, and no adoption of it is on the way.
+    NotComing([u8; 32]),
+}
+
+impl core::fmt::Display for CommitWaitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "commit_by_tag: {error:?}"),
+            Self::NotComing(hash) => write!(
+                f,
+                "block {} is not in the Arkiv store and no adoption of it is on the way",
+                alloy_primitives::B256::from(*hash)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CommitWaitError {}
+
 /// Which execution a seal belongs to.
 ///
 /// Height alone does not identify one. reth builds a block and validates it,
@@ -529,6 +553,10 @@ impl ExecutionKey {
 pub struct BlockSeals {
     pending: Mutex<BTreeMap<u64, Vec<(BranchId, SealedCommit)>>>,
     by_execution: Mutex<BTreeMap<ExecutionKey, SealedCommit>>,
+    /// The last canonical block adoption finished with, committed or not.
+    finished: Mutex<Option<[u8; 32]>>,
+    /// Signalled each time `finished` moves.
+    finished_signal: Condvar,
 }
 
 impl BlockSeals {
@@ -676,6 +704,57 @@ impl BlockSeals {
     /// Drop a candidate that will never be adopted — a speculative call.
     pub fn abandon(store: &HostStore, branch: BranchId) {
         let _ = store.discard(branch);
+    }
+
+    /// Adoption is done with canonical block `block_hash`, whether or not it
+    /// committed. Wakes every [`wait_for_commit`](Self::wait_for_commit).
+    pub fn finish_adoption(&self, block_hash: [u8; 32]) {
+        *self
+            .finished
+            .lock()
+            .expect("the seal registry's lock is never poisoned") = Some(block_hash);
+        self.finished_signal.notify_all();
+    }
+
+    /// The commit holding block `hash`, waiting for it while it is reth's
+    /// canonical head (`is_head`).
+    ///
+    /// Adoption commits a block a moment after reth makes it canonical, so the
+    /// next block can start executing before its parent is in the store, and
+    /// the store's head is then the grandparent's state. While the parent is
+    /// reth's head its adoption is on the way, so this waits for adoption to
+    /// finish with it, not for a time.
+    ///
+    /// [`CommitWaitError::NotComing`] when the block will not be committed:
+    /// adoption finished with it without committing, or it is not reth's head,
+    /// so no adoption of it is on the way.
+    pub fn wait_for_commit(
+        &self,
+        store: &HostStore,
+        hash: [u8; 32],
+        is_head: impl Fn() -> bool,
+    ) -> Result<CommitId, CommitWaitError> {
+        let committed = || store.commit_by_tag(hash).map_err(CommitWaitError::Store);
+        // The usual case, without the lock.
+        if let Some(commit) = committed()? {
+            return Ok(commit);
+        }
+        let mut finished = self
+            .finished
+            .lock()
+            .expect("the seal registry's lock is never poisoned");
+        loop {
+            if let Some(commit) = committed()? {
+                return Ok(commit);
+            }
+            if *finished == Some(hash) || !is_head() {
+                return Err(CommitWaitError::NotComing(hash));
+            }
+            finished = self
+                .finished_signal
+                .wait(finished)
+                .expect("the seal registry's lock is never poisoned");
+        }
     }
 }
 
@@ -1061,5 +1140,68 @@ mod tests {
             None,
             "and the numbering stops at the last transaction mined",
         );
+    }
+
+    // ── waiting for the parent's commit ────────────────────────────────────
+
+    #[test]
+    fn a_committed_block_is_returned_at_once() {
+        let (store, seals) = adoptable();
+        assert_eq!(
+            seals
+                .wait_for_commit(&store, [0u8; 32], || false)
+                .expect("committed"),
+            store.head(),
+        );
+    }
+
+    #[test]
+    fn a_missing_block_that_is_not_the_head_is_not_coming() {
+        let (store, seals) = adoptable();
+        assert!(matches!(
+            seals.wait_for_commit(&store, [1u8; 32], || false),
+            Err(CommitWaitError::NotComing(_))
+        ));
+    }
+
+    /// Wait for block `[1; 32]` as reth's head, with `adoption` started only
+    /// once the wait has seen the block missing, so the test always waits.
+    fn wait_with_adoption<T: Send + 'static>(
+        adoption: impl Fn(HostStore, Arc<BlockSeals>) -> T + Send + Clone + 'static,
+    ) -> (Result<CommitId, CommitWaitError>, T) {
+        let (store, seals) = adoptable();
+        let seals = Arc::new(seals);
+        let started = std::sync::OnceLock::new();
+        let waited = seals.wait_for_commit(&store, [1u8; 32], || {
+            started.get_or_init(|| {
+                let (store, seals, adoption) = (store.clone(), seals.clone(), adoption.clone());
+                std::thread::spawn(move || adoption(store, seals))
+            });
+            true
+        });
+        let adopted = started
+            .into_inner()
+            .expect("the wait asked whether the block is reth's head")
+            .join()
+            .expect("adoption");
+        (waited, adopted)
+    }
+
+    #[test]
+    fn the_head_is_returned_once_adoption_commits_it() {
+        let (waited, commit) = wait_with_adoption(|store, seals| {
+            let commit = store
+                .commit_tagged(store.begin(None).expect("begin"), [1u8; 32])
+                .expect("commit");
+            seals.finish_adoption([1u8; 32]);
+            commit
+        });
+        assert_eq!(waited.expect("committed"), commit);
+    }
+
+    #[test]
+    fn the_head_is_not_coming_once_adoption_finishes_without_committing_it() {
+        let (waited, ()) = wait_with_adoption(|_, seals| seals.finish_adoption([1u8; 32]));
+        assert!(matches!(waited, Err(CommitWaitError::NotComing(_))));
     }
 }

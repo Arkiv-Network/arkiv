@@ -31,7 +31,9 @@ use alloy_rpc_types_engine::ForkchoiceState;
 use arkiv_interfaces::store::{
     CommitId, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
 };
-use arkiv_reth_statemanager::{GolemAccounts, HostStore, check_chain, seed_genesis, segments};
+use arkiv_reth_statemanager::{
+    BlockSeals, GolemAccounts, HostStore, check_chain, seed_genesis, segments,
+};
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
     ForkChoiceSubscriptions, PersistedBlockNotifications, PersistedBlockSubscriptions,
@@ -80,16 +82,39 @@ pub struct ArkivProvider<N: ProviderNodeTypes> {
     /// the answer is a property of the store — see
     /// [`blocks_base`](Self::blocks_base).
     blocks_base: Arc<OnceLock<BlockNumber>>,
+    /// Adoption's signal, which reads of reth's head wait on.
+    seals: Arc<BlockSeals>,
 }
 
 impl<N: ProviderNodeTypes> ArkivProvider<N> {
-    /// Wrap reth's provider, over the store the answers will come from.
-    pub fn new(inner: BlockchainProvider<N>, store: HostStore) -> Self {
+    /// Wrap reth's provider, over the store the answers will come from and
+    /// the registry whose adoption commits to it.
+    pub fn new(inner: BlockchainProvider<N>, store: HostStore, seals: Arc<BlockSeals>) -> Self {
         Self {
             inner,
             store,
             blocks_base: Arc::new(OnceLock::new()),
+            seals,
         }
+    }
+
+    /// The commit holding reth's canonical head.
+    ///
+    /// reth makes a block canonical, and serves its receipts, a moment before
+    /// adoption commits it. A read of the current state in that window waits
+    /// for the commit rather than answering from the block before: a client
+    /// that sends its next transaction on seeing a receipt must have it
+    /// checked against the state that receipt describes.
+    fn tip_commit(&self) -> ProviderResult<CommitId> {
+        let head = self.inner.chain_info()?.best_hash;
+        let is_head = || {
+            self.inner
+                .chain_info()
+                .is_ok_and(|info| info.best_hash == head)
+        };
+        self.seals
+            .wait_for_commit(&self.store, head.0, is_head)
+            .map_err(ProviderError::other)
     }
 
     /// The provider being delegated to. Shrinks as trait groups move across.
@@ -116,6 +141,7 @@ impl<N: ProviderNodeTypes> Clone for ArkivProvider<N> {
             inner: self.inner.clone(),
             store: self.store.clone(),
             blocks_base: self.blocks_base.clone(),
+            seals: self.seals.clone(),
         }
     }
 }
@@ -1074,9 +1100,8 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     ///
     /// The window is one block wide, deliberately. Adoption commits the tip
     /// of each canonical notification, so at most the block reth has just
-    /// canonicalised is missing, and the store's head is that block's parent
-    /// state -- the newest durable state there is, since the store commits
-    /// only blocks it will not reorg.
+    /// canonicalised is missing. That block is reth's head, and a read of it
+    /// waits for its commit ([`tip_commit`](Self::tip_commit)).
     ///
     /// Beyond one block is not a lag, it is adoption having stopped, and the
     /// store's head is then genuinely stale. Serving it would answer an
@@ -1085,6 +1110,9 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// a right one. A block *behind* the store's head is refused for the same
     /// reason -- that is history this node does not keep.
     fn unadopted(&self, hash: BlockHash) -> ProviderResult<CommitId> {
+        if self.inner.chain_info()?.best_hash == hash {
+            return self.tip_commit();
+        }
         let Some(number) = self.inner.block_number(hash)? else {
             // Not a block reth knows either, so there is nothing to be behind.
             return Err(ProviderError::StateForHashNotFound(hash));
@@ -1627,7 +1655,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     type Primitives = N::Primitives;
 
     fn latest(&self) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.store.head())
+        self.with_accounts(self.tip_commit()?)
     }
 
     fn state_with_block_appended(
@@ -1650,8 +1678,8 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
             BlockNumberOrTag::Number(number) => self.commit_of_number(number)?,
             // Every other tag resolves to a block the node considers current.
             // Arkiv commits only blocks it will not reorg, so latest, safe and
-            // finalized are all the store's head.
-            _ => self.store.head(),
+            // finalized are all reth's head, once committed.
+            _ => self.tip_commit()?,
         };
         self.with_accounts(commit)
     }
@@ -1668,39 +1696,22 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
-        // Adoption runs on the canonical-state notification, on a blocking
-        // task, so reth canonicalises a block a moment before the store holds
-        // it. In that window reth's own head is a hash no commit is tagged
-        // with yet, and an `eth_call` at `latest` -- which reth resolves to
-        // that hash before it gets here -- would be refused for a chain that
-        // is perfectly healthy.
-        //
-        // The store's head is the answer `latest` is asking for, so that is
-        // what this serves. Only for reth's current head: any other unknown
-        // hash is still a block we genuinely cannot see, and answering from
-        // head would be a confident lie about a different block.
-        match self.commit_of(hash) {
-            Ok(commit) => self.state_at_commit(commit),
-            Err(error) => {
-                if self.inner.chain_info()?.best_hash == hash {
-                    return self.state_at_commit(self.store.head());
-                }
-                Err(error)
-            }
-        }
+        // reth's head, which reth resolves `latest` to before it gets here,
+        // waits for its commit in `commit_of`.
+        self.state_at_commit(self.commit_of(hash)?)
     }
 
     fn pending(&self) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.store.head())
+        self.with_accounts(self.tip_commit()?)
     }
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
         let _ = block_hash;
-        self.with_accounts(self.store.head()).map(Some)
+        self.with_accounts(self.tip_commit()?).map(Some)
     }
 
     fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
-        self.with_accounts(self.store.head()).map(Some)
+        self.with_accounts(self.tip_commit()?).map(Some)
     }
 }
 
@@ -2023,26 +2034,6 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         // covering the whole chain. Reporting the store's head, for both
         // frontiers, says what is actually true: everything up to the head is
         // durable, so there is nothing to replay.
-        // Where EVM execution reads its state. Without this the engine builds
-        // it from reth's database, which this node never writes: every
-        // account would read back as its genesis allocation, and silently --
-        // an unwritten database answers, it does not fault. See #178, which
-        // was this same hazard reached through a different path.
-        let evm_store = self.store.clone();
-        let evm_base: Arc<OnceLock<BlockNumber>> = Arc::default();
-        factory
-            .overlay_manager()
-            .set_evm_state(Arc::new(move |parent| {
-                let commit = commit_of_tag(&evm_store, parent)?;
-                let provider = ArkivStateProvider::new(
-                    evm_store.clone(),
-                    GolemAccounts::new(evm_store.clone(), commit),
-                    Arc::clone(&evm_base),
-                );
-                Ok(Box::new(provider.into_evm_state_provider()))
-            }))
-            .map_err(|_| eyre::eyre!("the overlay manager already has an EVM state source"))?;
-
         let frontier_store = self.store.clone();
         let genesis = BlockNumHash::new(
             spec.genesis().number.unwrap_or_default(),
@@ -2060,6 +2051,10 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
             }))
             .map_err(|_| eyre::eyre!("the overlay manager already has a frontier source"))?;
 
+        // Shared with the provider's factory, so a source installed below is
+        // the one execution reads.
+        let overlay = factory.overlay_manager().clone();
+
         // Seed reth's view of the chain from the Arkiv Store, not from its own
         // database.
         //
@@ -2076,24 +2071,48 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
             Some(latest) => BlockchainProvider::with_latest(factory, latest)?,
             None => BlockchainProvider::new(factory)?,
         };
-        Ok(ArkivProvider::new(inner, self.store))
+
+        // Where EVM execution reads its state. Without this the engine builds
+        // it from reth's database, which this node never writes: every
+        // account would read back as its genesis allocation, and silently --
+        // an unwritten database answers, it does not fault. See #178, which
+        // was this same hazard reached through a different path.
+        let evm_store = self.store.clone();
+        let evm_seals = self.seals.clone();
+        let evm_canonical = inner.canonical_in_memory_state();
+        let evm_base: Arc<OnceLock<BlockNumber>> = Arc::default();
+        overlay
+            .set_evm_state(Arc::new(move |parent| {
+                let commit = commit_of_tag(&evm_store, &evm_seals, &evm_canonical, parent)?;
+                let provider = ArkivStateProvider::new(
+                    evm_store.clone(),
+                    GolemAccounts::new(evm_store.clone(), commit),
+                    Arc::clone(&evm_base),
+                );
+                Ok(Box::new(provider.into_evm_state_provider()))
+            }))
+            .map_err(|_| eyre::eyre!("the overlay manager already has an EVM state source"))?;
+
+        Ok(ArkivProvider::new(inner, self.store, self.seals))
     }
 }
 
 /// The commit a parent block names, for a view execution will read.
 ///
-/// Falls back to the store's head when the tag is unknown. Adoption runs on
-/// the canonical-state notification, a moment behind reth canonicalising the
-/// block, so the parent of the block being built is briefly a hash no commit
-/// carries yet. The head is that parent's state: the store only ever holds
-/// blocks it will not reorg, so there is nothing newer to confuse it with.
-fn commit_of_tag(store: &HostStore, parent: B256) -> ProviderResult<CommitId> {
-    let found = store.commit_by_tag(parent.0).map_err(|e| {
-        ProviderError::other(std::io::Error::other(format!(
-            "golemdb commit_by_tag: {e:?}"
-        )))
-    })?;
-    Ok(found.unwrap_or_else(|| store.head()))
+/// Adoption commits a block a moment after reth makes it canonical, so the
+/// parent may not be committed yet. While it is reth's head this waits for
+/// adoption rather than reading the store's head, which would still be the
+/// grandparent's state. Any other parent missing from the store is an error.
+fn commit_of_tag(
+    store: &HostStore,
+    seals: &BlockSeals,
+    canonical: &CanonicalInMemoryState<reth_ethereum::EthPrimitives>,
+    parent: B256,
+) -> ProviderResult<CommitId> {
+    let is_head = || canonical.chain_info().best_hash == parent;
+    seals
+        .wait_for_commit(store, parent.0, is_head)
+        .map_err(ProviderError::other)
 }
 
 /// The sealed header of the block the store's head commit holds.

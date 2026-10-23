@@ -136,6 +136,8 @@ where
             evm,
             chain_id: ctx.chain_spec().chain().id(),
             pruning_map: pruning_map.clone(),
+            store: self.store.clone(),
+            seals: self.seals.clone(),
             config: EthereumBuilderConfig::new()
                 .with_extra_data(ctx.payload_builder_config().extra_data())
                 .with_state_root_resolver(arkiv_state_root_resolver(self.seals.clone())),
@@ -171,6 +173,7 @@ where
                     // only place anything is written.
                     let tip = notification.tip();
                     let height = tip.number;
+                    let block_hash = tip.hash().0;
                     // The block's own rows go into the append-only tier in the
                     // same commit as its state. Built before `adopt` because a
                     // block we cannot encode is one we must not commit state
@@ -179,6 +182,7 @@ where
                         Ok(writes) => writes,
                         Err(error) => {
                             warn!(target: "arkiv-reth", %error, height, "failed to encode the block's rows; its Arkiv state is not adopted");
+                            seals.finish_adoption(block_hash);
                             return notification;
                         }
                     };
@@ -192,7 +196,6 @@ where
                     // test. `catch_up` below already does the same thing.
                     let adopting_store = store.clone();
                     let adopting_seals = seals.clone();
-                    let block_hash = tip.hash().0;
                     let adopted = tokio::task::spawn_blocking(move || {
                         adopting_seals.adopt(&adopting_store, height, block_hash, &writes)
                     })
@@ -209,6 +212,7 @@ where
                             warn!(target: "arkiv-reth", %error, height, "the task adopting the block's Arkiv state did not finish")
                         }
                     }
+                    seals.finish_adoption(block_hash);
                     if let Err(error) = catch_up(provider, store, pruning_map).await {
                         warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
                     }
@@ -395,11 +399,14 @@ pub struct ArkivPayloadBuilder<Pool, Client, Evm> {
     config: EthereumBuilderConfig,
     chain_id: u64,
     pruning_map: ChainPruningMap,
+    store: HostStore,
+    seals: Arc<BlockSeals>,
 }
 
 impl<Pool, Client, Evm> PayloadBuilder for ArkivPayloadBuilder<Pool, Client, Evm>
 where
     Client: reth_storage_api::StateProviderFactory
+        + reth_storage_api::BlockNumReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + Clone,
     Pool: TransactionPool<Transaction = EthPooledTransaction>,
@@ -415,6 +422,19 @@ where
         BuildOutcome<Self::BuiltPayload>,
         reth_payload_builder_primitives::PayloadBuilderError,
     > {
+        // Build on the parent's state. Adoption commits it a moment after reth
+        // makes the parent canonical. `chain_info` is reth's head here: it
+        // answers from the store only when the store is ahead, and then the
+        // parent is committed already.
+        let parent = args.config.parent_header.hash();
+        let is_head = || {
+            self.client
+                .chain_info()
+                .is_ok_and(|info| info.best_hash == parent)
+        };
+        self.seals
+            .wait_for_commit(&self.store, parent.0, is_head)
+            .map_err(reth_payload_builder_primitives::PayloadBuilderError::other)?;
         let block = args.config.parent_header.number + 1;
         let keys = self
             .pruning_map
