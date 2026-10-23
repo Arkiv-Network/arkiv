@@ -7,17 +7,9 @@
 //! the adapter reports what GolemDB lacks:
 //!
 //! - a negated predicate: GolemDB has no NOT;
-//! - a filter that matches every record, with no group or an empty one:
-//!   GolemDB has no filter for that;
-//! - a prefix that ends inside a character: GolemDB's prefix is text;
 //! - a sort on a cell the filter does not hold to one type: a GolemDB sort
 //!   names one.
-//!
-//! An offset of 0 is no offset, so it is dropped.
-//!
-//! One difference is not in the query at all: unsorted, and as a sort's
-//! tie-break, GolemDB returns records in record ID order and Arkiv in key
-//! order.
+
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 

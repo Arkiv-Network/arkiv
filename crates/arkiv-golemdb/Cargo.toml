@@ -13,6 +13,5 @@ arkiv-interfaces.workspace = true
 golemdb-api.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
-# The query language, so the integration tests query as `arkiv_query` does.
 arkiv-query.workspace = true
+tempfile.workspace = true

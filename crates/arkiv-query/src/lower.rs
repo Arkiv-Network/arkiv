@@ -166,8 +166,6 @@ fn lower_inner(query: &Query, negate: bool) -> Result<Vec<AndGroup>, LowerError>
         Query::Lte { key, value } => leaf(key, value, CompareOp::Lte),
         Query::StartsWith { key, value } => leaf(key, value, CompareOp::Prefix),
 
-        // `exists`/`typeof`: a leaf like any other, and a negated one is the
-        // complement over the live set, exactly as `Not` of it would be.
         Query::Exists { key, attr_type } => {
             Ok(vec![AndGroup(vec![presence(key, *attr_type, negate)?])])
         }
