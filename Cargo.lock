@@ -1552,6 +1552,7 @@ dependencies = [
 name = "arkiv-reth"
 version = "0.5.1"
 dependencies = [
+ "alloy-consensus",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
@@ -1572,6 +1573,7 @@ dependencies = [
  "arkiv-valkey",
  "clap",
  "eyre",
+ "reqwest",
  "reth",
  "reth-cli",
  "reth-cli-util",
