@@ -36,6 +36,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::state::EvmState;
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::WriteOverlay;
 use std::sync::Arc;
@@ -480,6 +481,11 @@ impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
     }
 }
 
+/// How long [`BlockSeals::wait_for_commit`] waits for adoption to finish with
+/// reth's head. Adoption takes milliseconds, so a wait this long means it is
+/// stuck.
+pub const COMMIT_WAIT_LIMIT: Duration = Duration::from_secs(30);
+
 /// Why [`BlockSeals::wait_for_commit`] has no commit to return.
 #[derive(Debug)]
 pub enum CommitWaitError {
@@ -487,6 +493,15 @@ pub enum CommitWaitError {
     Store(StoreError),
     /// The block is not in the store, and no adoption of it is on the way.
     NotComing([u8; 32]),
+    /// The block is reth's head, but adoption did not finish with it in time.
+    TimedOut {
+        /// The block waited for.
+        block: [u8; 32],
+        /// How long the wait lasted.
+        waited: Duration,
+        /// The block the store's head commit holds, if it holds one.
+        saved_head: Option<[u8; 32]>,
+    },
 }
 
 impl core::fmt::Display for CommitWaitError {
@@ -498,6 +513,25 @@ impl core::fmt::Display for CommitWaitError {
                 "block {} is not in the Arkiv store and no adoption of it is on the way",
                 alloy_primitives::B256::from(*hash)
             ),
+            Self::TimedOut {
+                block,
+                waited,
+                saved_head,
+            } => {
+                write!(
+                    f,
+                    "block {} is reth's head, but adoption has not finished with it after {waited:?}; ",
+                    alloy_primitives::B256::from(*block)
+                )?;
+                match saved_head {
+                    Some(head) => write!(
+                        f,
+                        "the Arkiv store's head is block {}",
+                        alloy_primitives::B256::from(*head)
+                    ),
+                    None => write!(f, "the Arkiv store's head holds no block"),
+                }
+            }
         }
     }
 }
@@ -723,22 +757,36 @@ impl BlockSeals {
     /// next block can start executing before its parent is in the store, and
     /// the store's head is then the grandparent's state. While the parent is
     /// reth's head its adoption is on the way, so this waits for adoption to
-    /// finish with it, not for a time.
+    /// finish with it, for at most [`COMMIT_WAIT_LIMIT`].
     ///
     /// [`CommitWaitError::NotComing`] when the block will not be committed:
     /// adoption finished with it without committing, or it is not reth's head,
-    /// so no adoption of it is on the way.
+    /// so no adoption of it is on the way. [`CommitWaitError::TimedOut`] when
+    /// adoption did not finish with it within the limit.
     pub fn wait_for_commit(
         &self,
         store: &HostStore,
         hash: [u8; 32],
         is_head: impl Fn() -> bool,
     ) -> Result<CommitId, CommitWaitError> {
+        self.wait_for_commit_within(store, hash, is_head, COMMIT_WAIT_LIMIT)
+    }
+
+    /// [`wait_for_commit`](Self::wait_for_commit), waiting at most `limit`.
+    fn wait_for_commit_within(
+        &self,
+        store: &HostStore,
+        hash: [u8; 32],
+        is_head: impl Fn() -> bool,
+        limit: Duration,
+    ) -> Result<CommitId, CommitWaitError> {
         let committed = || store.commit_by_tag(hash).map_err(CommitWaitError::Store);
         // The usual case, without the lock.
         if let Some(commit) = committed()? {
             return Ok(commit);
         }
+        let started = Instant::now();
+        let deadline = started + limit;
         let mut finished = self
             .finished
             .lock()
@@ -750,10 +798,21 @@ impl BlockSeals {
             if *finished == Some(hash) || !is_head() {
                 return Err(CommitWaitError::NotComing(hash));
             }
+            // A deadline rather than a fixed timeout per wait, so that
+            // spurious and unrelated wakeups do not extend the wait.
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(CommitWaitError::TimedOut {
+                    block: hash,
+                    waited: started.elapsed(),
+                    saved_head: store.tag_of(store.head()).map_err(CommitWaitError::Store)?,
+                });
+            }
             finished = self
                 .finished_signal
-                .wait(finished)
-                .expect("the seal registry's lock is never poisoned");
+                .wait_timeout(finished, left)
+                .expect("the seal registry's lock is never poisoned")
+                .0;
         }
     }
 }
@@ -1197,6 +1256,28 @@ mod tests {
             commit
         });
         assert_eq!(waited.expect("committed"), commit);
+    }
+
+    #[test]
+    fn the_wait_for_the_head_ends_at_the_limit_naming_the_block_and_the_saved_head() {
+        let (store, seals) = adoptable();
+        let limit = Duration::from_millis(50);
+        let started = Instant::now();
+        let waited = seals.wait_for_commit_within(&store, [1u8; 32], || true, limit);
+        assert!(started.elapsed() >= limit);
+        let Err(
+            err @ CommitWaitError::TimedOut {
+                block, saved_head, ..
+            },
+        ) = waited
+        else {
+            panic!("the wait times out: {waited:?}");
+        };
+        assert_eq!(block, [1u8; 32]);
+        assert_eq!(saved_head, store.tag_of(store.head()).expect("tag_of"));
+        let message = err.to_string();
+        assert!(message.contains(&alloy_primitives::B256::from([1u8; 32]).to_string()));
+        assert!(message.contains("the Arkiv store's head"));
     }
 
     #[test]

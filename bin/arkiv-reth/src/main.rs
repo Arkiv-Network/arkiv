@@ -49,6 +49,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
+/// The block buffer limit a node on GolemDB runs with unless
+/// `--engine.block-buffer-limit` sets one: about 2.3 days of 2 s blocks.
+const GOLEMDB_BLOCK_BUFFER_LIMIT: u32 = 100_000;
+
 /// An example for the error messages.
 const PATH_EXAMPLE: &str = "ARKIV_STORE_PATH=/var/lib/arkiv/golemdb";
 
@@ -203,6 +207,19 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
     })
 }
 
+/// The engine settings a node on GolemDB catches up with.
+///
+/// GolemDB saves a block only once it is canonical, so the node cannot run
+/// reth's pipeline, which executes blocks without making them canonical one
+/// by one: every gap is downloaded instead, and the downloaded blocks wait in
+/// the block buffer until the gap is closed.
+fn set_golemdb_engine_args(engine: &mut reth::args::EngineArgs) {
+    engine.disable_backfill = true;
+    engine
+        .block_buffer_limit
+        .get_or_insert(GOLEMDB_BLOCK_BUFFER_LIMIT);
+}
+
 fn main() {
     // Enable backtraces unless the caller already set a preference.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -250,7 +267,11 @@ fn main() {
     // `ChainSpec`. The components closure gives the non-`node` subcommands
     // (`import`, `stage`, `re-execute`) the same executor and consensus the node
     // uses.
-    let result = Cli::<genesis::NodeChainSpecParser>::parse().run_with_components::<ArkivNode>(
+    let mut cli = Cli::<genesis::NodeChainSpecParser>::parse();
+    if on_golemdb {
+        cli.apply_node_command(|command| set_golemdb_engine_args(&mut command.engine));
+    }
+    let result = cli.run_with_components::<ArkivNode>(
         move |spec| {
             (
                 EthEvmConfig::new_with_evm_factory(
@@ -333,6 +354,30 @@ mod tests {
             Ok(_) => panic!("a store opened"),
             Err(error) => error.to_string(),
         }
+    }
+
+    #[test]
+    fn golemdb_downloads_every_gap_into_a_large_buffer() {
+        let mut engine = reth::args::EngineArgs::default();
+        set_golemdb_engine_args(&mut engine);
+        let config = engine.tree_config();
+        assert!(config.disable_backfill());
+        assert_eq!(config.block_buffer_limit(), GOLEMDB_BLOCK_BUFFER_LIMIT);
+    }
+
+    #[test]
+    fn a_block_buffer_limit_flag_wins_over_golemdbs() {
+        let mut cli = Cli::<genesis::NodeChainSpecParser>::try_parse_from([
+            "arkiv-reth",
+            "node",
+            "--engine.block-buffer-limit",
+            "64",
+        ])
+        .expect("the command line parses");
+        let command = cli.as_node_command_mut().expect("a node command");
+        set_golemdb_engine_args(&mut command.engine);
+        assert!(command.engine.disable_backfill);
+        assert_eq!(command.engine.block_buffer_limit, Some(64));
     }
 
     /// The path is a directory name as written: no URL rules apply to it.

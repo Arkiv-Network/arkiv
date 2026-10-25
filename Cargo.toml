@@ -10,9 +10,12 @@ license = "MIT"
 
 [workspace.dependencies]
 # reth, from our fork at github.com/Arkiv-Network/reth rather than upstream.
-# `arkiv/custom-golemdb` is the long-lived Arkiv line: it carries the seams that
-# let the engine run on a provider of our own, keep its chain outside reth's
-# database, and anchor the overlays on frontiers we supply.
+# `arkiv/golemdb-sync` builds on `arkiv/custom-golemdb`, the long-lived Arkiv
+# line that carries the seams that let the engine run on a provider of our own,
+# keep its chain outside reth's database, and anchor the overlays on frontiers
+# we supply. It adds what a GolemDB node needs to catch up after falling
+# behind: the engine waits for a block's parent state instead of failing, and
+# closes gaps by downloading blocks rather than by a pipeline run.
 #
 # The fork is public, so cargo fetches it over HTTPS with no credentials.
 #
@@ -22,58 +25,58 @@ license = "MIT"
 # the slim Docker builder has. We only use `reth::cli::Cli`, so nothing else in
 # that default set is required — except "asm-keccak" (assembly keccak256 on the
 # state-root/tx-hash hot path) and "jemalloc".
-reth = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb", default-features = false, features = [
+reth = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync", default-features = false, features = [
     "asm-keccak",
     "jemalloc",
 ] }
-reth-ethereum-cli = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-ethereum-cli = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # The `ChainSpecParser` trait behind `--chain`; arkiv-reth-chainspec implements it.
-reth-cli = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-cli = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # `NodeRecord`, the bootnode type in the `EthChainSpec` trait the Arkiv chain spec implements.
-reth-network-peers = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-network-peers = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # The jemalloc allocator itself. `reth`'s "jemalloc" feature only wires up the
 # jemalloc *stats* reporting in node-core/metrics/provider; the allocator has to
 # be declared as `#[global_allocator]` by the binary, which is what reth's own
 # main.rs does. `reth` doesn't re-export it, so we depend on it directly.
-reth-cli-util = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb", features = [
+reth-cli-util = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync", features = [
     "jemalloc",
 ] }
-reth-node-ethereum = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-node-ethereum = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # Umbrella crate used by the executor seam (matches the custom-evm example's deps).
 # Keep default features (std); the executor crate adds "evm" + "node".
-reth-ethereum = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-ethereum = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # Read-side state access for the arkiv_* RPC (the StateProvider snapshot).
-reth-storage-api = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-storage-api = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # The provider stack `ArkivProvider` delegates to while it is still reth's.
-reth-provider = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-chain-state = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-node-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-provider = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-chain-state = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-node-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 reth-primitives-traits = { version = "0.8.1", default-features = false }
 # Named in `RocksDBProviderFactory`'s signature; same version reth pins.
 rocksdb = "0.24"
-reth-node-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-db = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-db-api = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-execution-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-prune-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-stages-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-static-file-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-storage-errors = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-chainspec = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-trie = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-node-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-db = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-db-api = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-execution-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-prune-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-stages-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-static-file-types = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-storage-errors = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-chainspec = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-trie = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # Re-exports revm, for the `BundleState` that `HashedPostStateProvider` names.
-reth-revm = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-revm = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 # The engine-tree state-root seam: the header carries GolemDB's root, not an MPT root.
-reth-engine-tree = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-evm = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-node-api = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-ethereum-primitives = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-storage-overlay = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-engine-tree = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-evm = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-node-api = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-ethereum-primitives = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-storage-overlay = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 arkiv-reth-golemdbprovider = { path = "crates/arkiv-reth-golemdbprovider" }
-reth-basic-payload-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-ethereum-payload-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-payload-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
-reth-payload-builder-primitives = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/custom-golemdb" }
+reth-basic-payload-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-ethereum-payload-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-payload-builder = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
+reth-payload-builder-primitives = { git = "https://github.com/Arkiv-Network/reth", branch = "arkiv/golemdb-sync" }
 
 # JSON-RPC server plumbing for the arkiv_* namespace. Pinned to the exact version
 # reth v2.7.0 uses so the RpcModule we register merges into reth's rpc modules.

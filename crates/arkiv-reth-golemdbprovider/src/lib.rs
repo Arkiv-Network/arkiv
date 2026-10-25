@@ -32,7 +32,8 @@ use arkiv_interfaces::store::{
     CommitId, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
 };
 use arkiv_reth_statemanager::{
-    BlockSeals, GolemAccounts, HostStore, check_chain, check_genesis_root, seed_genesis, segments,
+    BlockSeals, CommitWaitError, GolemAccounts, HostStore, check_chain, check_genesis_root,
+    seed_genesis, segments,
 };
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
@@ -2116,7 +2117,13 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
 /// Adoption commits a block a moment after reth makes it canonical, so the
 /// parent may not be committed yet. While it is reth's head this waits for
 /// adoption rather than reading the store's head, which would still be the
-/// grandparent's state. Any other parent missing from the store is an error.
+/// grandparent's state.
+///
+/// A parent missing from the store that is not reth's head is reported as
+/// [`ProviderError::ParentStateNotReady`]: the engine keeps the block and
+/// executes it again once the parent becomes canonical and adoption saves
+/// it. A wait that times out stays an error, because it means adoption is
+/// stuck.
 fn commit_of_tag(
     store: &HostStore,
     seals: &BlockSeals,
@@ -2126,7 +2133,10 @@ fn commit_of_tag(
     let is_head = || canonical.chain_info().best_hash == parent;
     seals
         .wait_for_commit(store, parent.0, is_head)
-        .map_err(ProviderError::other)
+        .map_err(|err| match err {
+            CommitWaitError::NotComing(_) => ProviderError::ParentStateNotReady(parent),
+            err => ProviderError::other(err),
+        })
 }
 
 /// The sealed header of the block the store's head commit holds.
