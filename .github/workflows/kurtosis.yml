@@ -99,6 +99,15 @@ jobs:
           bun install --frozen-lockfile
           bun test
 
+      # After the other tests, and whether or not they passed: these stop and
+      # start the follower, and one that fails to catch up stays behind.
+      - name: Restart the follower and check it catches up
+        if: success() || failure()
+        working-directory: kurtosis/integration
+        env:
+          ARKIV_RESTART_TESTS: "1"
+        run: bun test follower-restart
+
       - name: Collect Kurtosis diagnostics
         if: always()
         run: |

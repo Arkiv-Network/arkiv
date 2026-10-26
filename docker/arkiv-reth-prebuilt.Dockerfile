@@ -23,40 +23,9 @@ RUN apt-get update \
     && mkdir -p /data && chown arkiv:arkiv /data
 
 ARG BINARY=arkiv-reth
-COPY ${BINARY} /usr/local/bin/arkiv-reth-bin
-RUN chmod 0755 /usr/local/bin/arkiv-reth-bin
+COPY ${BINARY} /usr/local/bin/arkiv-reth
+RUN chmod 0755 /usr/local/bin/arkiv-reth
 
-# ethereum-package currently supplies ENR bootnodes to the EL. Reth v2.5.0
-# accepts enode URLs for --bootnodes, but not ENRs; remove incompatible values
-# while leaving consensus-layer bootnodes untouched. Kept byte-identical with
-# the wrapper in arkiv-reth.Dockerfile — edit them in lockstep.
-RUN <<'EOF'
-cat > /usr/local/bin/arkiv-reth <<'SCRIPT'
-#!/bin/sh
-set -eu
-args=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --bootnodes=enr:*|--bootnodes=)
-            shift
-            continue
-            ;;
-    esac
-    if [ "$1" = "--bootnodes" ] && [ "$#" -ge 2 ]; then
-        case "$2" in
-            enr:*|"") ;;
-            *) args="$args --bootnodes $2" ;;
-        esac
-        shift 2
-        continue
-    fi
-    args="$args $1"
-    shift
-done
-eval "exec /usr/local/bin/arkiv-reth-bin $args"
-SCRIPT
-chmod +x /usr/local/bin/arkiv-reth
-EOF
 # ethpandaops/ethereum-package's reth launcher runs a binary named `reth`;
 # alias it so the image drops into a kurtosis `el_type: reth` participant.
 RUN ln -sf /usr/local/bin/arkiv-reth /usr/local/bin/reth

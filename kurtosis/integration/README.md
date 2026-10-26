@@ -20,7 +20,7 @@ bun test
 | `ARKIV_FUNDED_KEY`       | ethereum-package's first prefunded account | Pays for the transfers the tests need                   |
 
 The chain id is read from the RPC, so the same tests run against a bare
-`ARKIV_EXPERIMENTAL_STORE=memory arkiv-reth node --dev`:
+`ARKIV_STORE_PATH=/tmp/arkiv-golemdb arkiv-reth node --dev`:
 
 ```sh
 ARKIV_RPC_URL=http://127.0.0.1:8545 \
@@ -36,6 +36,21 @@ bun test
   of that transfer must be refused because gas is charged there.
 - `test/sdk-reads.test.ts` — the `arkiv_*` reads whose wire shape this node and
   SDK 0.7 agree on: `arkiv_getBlockTiming` and `arkiv_getEntityCount`.
+- `test/peering.test.ts` — a transfer sent to the follower is mined by the
+  sequencer, so the two nodes are peers over reth's p2p network.
+- `test/follower-restart.test.ts` — the follower, stopped while the sequencer
+  makes blocks and started again, catches up with the same blocks, serves
+  state at `latest` and keeps following. Four cases, one per way it can catch
+  up: 10 blocks behind, within Lighthouse's 32-slot sync tolerance, where
+  Lighthouse feeds reth the missed blocks (also with only reth restarted); 40
+  blocks, past that tolerance, where reth downloads the gap itself; and past
+  reth's backfill threshold, where reth runs its pipeline. They stop and start
+  Kurtosis services, so they run only with `ARKIV_RESTART_TESTS=1` inside the
+  enclave (`ARKIV_ENCLAVE`, default `arkiv-harness`), after the other tests:
+
+  ```sh
+  ARKIV_RESTART_TESTS=1 bun test follower-restart
+  ```
 
 The SDK's entity writes (`createEntity` and friends) and `select().fetch()`
 are not exercised: SDK 0.7 sends brotli-compressed RLP to
