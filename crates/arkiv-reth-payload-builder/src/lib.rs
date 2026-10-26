@@ -169,11 +169,13 @@ where
                 let pruning_map = pruning_map.clone();
                 async move {
                     // The block is canonical, so its Arkiv state is no longer
-                    // speculative: promote the seal to a commit. This is the
-                    // only place anything is written.
+                    // speculative: promote the seal to a commit, unless the
+                    // engine validator saved it already, before a child of it
+                    // executed.
                     let tip = notification.tip();
                     let height = tip.number;
                     let block_hash = tip.hash().0;
+                    let state_root = tip.state_root.0;
                     // The block's own rows go into the append-only tier in the
                     // same commit as its state. Built before `adopt` because a
                     // block we cannot encode is one we must not commit state
@@ -197,7 +199,7 @@ where
                     let adopting_store = store.clone();
                     let adopting_seals = seals.clone();
                     let adopted = tokio::task::spawn_blocking(move || {
-                        adopting_seals.adopt(&adopting_store, height, block_hash, &writes)
+                        adopting_seals.adopt(&adopting_store, height, block_hash, state_root, &writes)
                     })
                     .await;
                     match adopted {

@@ -5,20 +5,32 @@
 //! else — primitives, storage, engine types, pool, network, consensus, RPC add-ons
 //! — is reth's stock Ethereum set, reused through `EthereumNode::components()`.
 
+use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes};
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_golemdbprovider::ArkivStateRootStrategy;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
+use arkiv_reth_statemanager::segments::rows_for_block;
 use arkiv_reth_statemanager::{BlockSeals, HostStore};
+use reth::network::p2p::full_block::SealedBlockWithAccessList;
+use reth::payload::{BuiltPayloadExecutedBlock, PayloadBuilderResources};
+use reth::providers::ProviderResult;
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder, PayloadTypes},
     builder::{DebugNode, Node, NodeAdapter, components::ComponentsBuilder},
 };
+use reth_chain_state::ExecutedBlock;
+use reth_engine_tree::tree::payload_validator::TreeCtx;
 use reth_engine_tree::tree::state_root_strategy::StateRootStrategy;
-use reth_engine_tree::tree::{BasicEngineValidator, TreeConfig};
+use reth_engine_tree::tree::{
+    BasicEngineValidator, CacheWaitDurations, EngineApiTreeState, EngineValidator, TreeConfig,
+    ValidationOutcome, WaitForCaches,
+};
 use reth_ethereum::{
-    Block, EthPrimitives, engine::local::LocalPayloadAttributesBuilder, primitives::SealedBlock,
+    Block, EthPrimitives,
+    engine::local::LocalPayloadAttributesBuilder,
+    primitives::{Header, SealedBlock},
 };
 use reth_node_api::{
     AddOnsContext, EngineApiMessageVersion, EngineApiValidator, EngineObjectValidationError,
@@ -36,6 +48,7 @@ use reth_node_ethereum::{
 use reth_storage_api::EthStorage;
 use reth_storage_overlay::OverlayManager;
 use std::sync::Arc;
+use tracing::{debug, warn};
 
 /// The Arkiv node: Ethereum node types on [`ArkivChainSpec`], with the no-EVM
 /// executor in place of reth's EVM.
@@ -131,7 +144,7 @@ where
             EthereumEthApiBuilder::default(),
             ArkivPayloadValidatorBuilder,
             BasicEngineApiBuilder::default(),
-            ArkivEngineValidatorBuilder::new(self.seals.clone()),
+            ArkivEngineValidatorBuilder::new(self.store.clone(), self.seals.clone()),
             Default::default(),
             reth_node_builder::rpc::Identity::new(),
         ))
@@ -168,13 +181,15 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArkivNode {
 #[derive(Clone)]
 pub struct ArkivEngineValidatorBuilder {
     inner: BasicEngineValidatorBuilder<ArkivPayloadValidatorBuilder>,
+    store: HostStore,
     seals: Arc<BlockSeals>,
 }
 
 impl ArkivEngineValidatorBuilder {
-    pub fn new(seals: Arc<BlockSeals>) -> Self {
+    pub fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
         Self {
             inner: BasicEngineValidatorBuilder::new(ArkivPayloadValidatorBuilder),
+            store,
             seals,
         }
     }
@@ -191,10 +206,12 @@ impl<N> EngineValidatorBuilder<N> for ArkivEngineValidatorBuilder
 where
     N: FullNodeComponents<Types = ArkivNode, Evm: ConfigureEngineEvm<ExecutionData>>,
 {
-    type EngineValidator = BasicEngineValidator<
-        N::Provider,
-        N::Evm,
-        <ArkivPayloadValidatorBuilder as PayloadValidatorBuilder<N>>::Validator,
+    type EngineValidator = ArkivEngineValidator<
+        BasicEngineValidator<
+            N::Provider,
+            N::Evm,
+            <ArkivPayloadValidatorBuilder as PayloadValidatorBuilder<N>>::Validator,
+        >,
     >;
 
     async fn build_tree_validator(
@@ -208,8 +225,150 @@ where
             .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
         let strategy: Arc<dyn StateRootStrategy<EthPrimitives, N::Provider, N::Evm>> =
-            Arc::new(ArkivStateRootStrategy::new(self.seals));
-        Ok(validator.with_state_root_strategy(strategy))
+            Arc::new(ArkivStateRootStrategy::new(self.seals.clone()));
+        Ok(ArkivEngineValidator {
+            inner: validator.with_state_root_strategy(strategy),
+            store: self.store,
+            seals: self.seals,
+        })
+    }
+}
+
+/// reth's engine validator, saving a block's parent to the store before the
+/// block executes.
+///
+/// A block executes only over a parent the store has saved, and the store
+/// saves a block when reth makes it canonical. But reth also executes blocks
+/// whose parent is not canonical yet: when the consensus client sends a block
+/// before making its parent the head, and when reth downloads a gap and
+/// executes it block by block. So the parent is saved here first.
+///
+/// That is safe because reth executes a block only once it has executed its
+/// parent and found it valid, and the parent's state was sealed then. Saving
+/// it here is the same commit adoption makes once the parent is canonical,
+/// made earlier. The cost: a parent whose child is executed can no longer be
+/// reorged out, which Arkiv does not support for a canonical block either.
+pub struct ArkivEngineValidator<V> {
+    inner: V,
+    store: HostStore,
+    seals: Arc<BlockSeals>,
+}
+
+impl<V> ArkivEngineValidator<V> {
+    /// Save `parent` if it is an executed block the store has not saved, and
+    /// its own parent is saved. Anything else is left for execution to report:
+    /// it refuses a parent the store does not have.
+    fn save_parent(&self, parent: B256, ctx: &TreeCtx<'_, EthPrimitives>) {
+        if let Err(error) = self.try_save_parent(parent, ctx) {
+            warn!(target: "arkiv-reth", %parent, %error, "did not save the block before executing its child");
+        }
+    }
+
+    fn try_save_parent(&self, parent: B256, ctx: &TreeCtx<'_, EthPrimitives>) -> eyre::Result<()> {
+        let saved = self
+            .store
+            .commit_by_tag(parent.0)
+            .map_err(|error| eyre::eyre!("commit_by_tag: {error:?}"))?;
+        let executed = ctx.state().tree_state().executed_block_by_hash(parent);
+        let (None, Some(executed)) = (saved, executed) else {
+            return Ok(());
+        };
+        let block = executed.recovered_block();
+        // Its own parent first: saved already, or reth's head with its
+        // adoption on the way.
+        let grandparent = block.parent_hash;
+        let canonical = ctx.canonical_in_memory_state();
+        self.seals.wait_for_commit(&self.store, grandparent.0, || {
+            canonical.chain_info().best_hash == grandparent
+        })?;
+        let writes = rows_for_block(
+            block.header(),
+            &block.body().transactions,
+            block.senders(),
+            &executed.execution_outcome().result.receipts,
+            parent,
+        )?;
+        let saved = self
+            .seals
+            .adopt(
+                &self.store,
+                block.number,
+                parent.0,
+                block.state_root.0,
+                &writes,
+            )
+            .map_err(|error| eyre::eyre!("adopt: {error:?}"))?;
+        if saved.is_none() {
+            eyre::bail!("no sealed state has the block's state root");
+        }
+        debug!(target: "arkiv-reth", number = block.number, %parent, "saved the block before executing its child");
+        Ok(())
+    }
+}
+
+impl<V: EngineValidator<EthEngineTypes>> EngineValidator<EthEngineTypes>
+    for ArkivEngineValidator<V>
+{
+    fn validate_payload_attributes_against_header(
+        &self,
+        attr: &EthPayloadAttributes,
+        header: &Header,
+    ) -> Result<(), InvalidPayloadAttributesError> {
+        self.inner
+            .validate_payload_attributes_against_header(attr, header)
+    }
+
+    fn convert_payload_to_block(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<SealedBlock<Block>, NewPayloadError> {
+        self.inner.convert_payload_to_block(payload)
+    }
+
+    fn validate_payload(
+        &mut self,
+        payload: ExecutionData,
+        ctx: TreeCtx<'_, EthPrimitives>,
+    ) -> ValidationOutcome<EthPrimitives> {
+        self.save_parent(payload.parent_hash(), &ctx);
+        self.inner.validate_payload(payload, ctx)
+    }
+
+    fn validate_block(
+        &mut self,
+        block: SealedBlockWithAccessList<Block>,
+        ctx: TreeCtx<'_, EthPrimitives>,
+    ) -> ValidationOutcome<EthPrimitives> {
+        self.save_parent(block.header().parent_hash, &ctx);
+        self.inner.validate_block(block, ctx)
+    }
+
+    fn on_inserted_executed_block(
+        &self,
+        block: BuiltPayloadExecutedBlock<EthPrimitives>,
+    ) -> ProviderResult<ExecutedBlock<EthPrimitives>> {
+        self.inner.on_inserted_executed_block(block)
+    }
+
+    fn on_canonical_head_changed(&self, hash: B256, state: &EngineApiTreeState<EthPrimitives>) {
+        self.inner.on_canonical_head_changed(hash, state);
+    }
+
+    fn payload_builder_resources(
+        &self,
+        parent_hash: B256,
+        parent_header: &Header,
+        timestamp: u64,
+        state: &mut EngineApiTreeState<EthPrimitives>,
+    ) -> PayloadBuilderResources {
+        self.inner
+            .payload_builder_resources(parent_hash, parent_header, timestamp, state)
+    }
+}
+
+impl<V: WaitForCaches> WaitForCaches for ArkivEngineValidator<V> {
+    fn wait_for_caches(&self) -> CacheWaitDurations {
+        self.inner.wait_for_caches()
     }
 }
 
