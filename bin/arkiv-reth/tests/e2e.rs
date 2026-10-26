@@ -483,6 +483,27 @@ async fn query_operator_classes_over_a_live_node() {
         result_keys(&client.query("team STARTSWITH str('re')", 100, None).await),
         expect(&[0, 1])
     );
+    // Every type ranges, a `str` in raw byte order: blue < green < re < red.
+    assert_eq!(
+        result_keys(&client.query("team > str('blue')", 100, None).await),
+        expect(&[0, 1, 4])
+    );
+    assert_eq!(
+        result_keys(&client.query("team < str('re')", 100, None).await),
+        expect(&[2, 3, 4])
+    );
+    // A `key` ranges as unsigned bytes, which is the order of its fixed-width
+    // lowercase hex.
+    let mut by_key = k.clone();
+    by_key.sort();
+    assert_eq!(
+        result_keys(
+            &client
+                .query(&format!("$key >= key({})", by_key[2]), 100, None)
+                .await
+        ),
+        by_key[2..].iter().cloned().collect::<BTreeSet<_>>()
+    );
     assert_eq!(
         result_keys(
             &client
@@ -623,7 +644,7 @@ async fn query_operator_classes_over_a_live_node() {
         ("$expiresAt >= 1", "-32002"),                        // system u64 needs its tag
         ("$createdAt >= u64(1)", "-32002"),                   // returned, never queried
         ("rank != u256(30)", "-32002"),                       // != is not in the language
-        ("team >= str('blue')", "-32002"),                    // range on an unordered type
+        ("rank STARTSWITH u256(1)", "-32002"),                // a prefix needs a str
         ("exists($owner)", "-32002"),                         // presence takes a user attribute
         ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
         ("rank = i32(2147483648)", "-32003"), // literal out of range

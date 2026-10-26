@@ -14,9 +14,10 @@
 //!
 //! Two jobs beyond shape. First, **typing**: a value carries its own type, and
 //! this is where a value is checked against the attribute it is compared to
-//! (`$owner` takes an address) and against its operator (only the numeric types
-//! are ordered). A range operator on an equality-only type is an error here, not
-//! an empty result later — the spec is explicit that the two must not be
+//! (`$owner` takes an address) and against its operator. Every type the
+//! language can write is ordered, so the comparisons take any of them, but
+//! only a `str` has a prefix: `STARTSWITH` on anything else is an error here,
+//! not an empty result later — the spec is explicit that the two must not be
 //! confused. Second, **limits**: length, predicate count, nesting depth and
 //! `AND`/`OR` depth are bounded, because `parse` runs on unauthenticated RPC
 //! input.
@@ -246,8 +247,7 @@ impl Parser {
 
         match operator.token {
             Token::Eq | Token::Lt | Token::Lte | Token::Gt | Token::Gte => {
-                let (value, position) = self.parse_value(&key)?;
-                check_operator(&operator.token, &value, position)?;
+                let (value, _) = self.parse_value(&key)?;
                 Ok(comparison(&operator.token, key, value))
             }
             Token::StartsWith => {
@@ -579,25 +579,6 @@ fn check_value_type(key: &AnnotKey, value: &AnnotVal, position: usize) -> Result
     ))
 }
 
-/// The operator × type matrix: only the numeric types are ordered.
-fn check_operator(operator: &Token, value: &AnnotVal, position: usize) -> Result<(), ParseError> {
-    let ordered = matches!(
-        value.attr_type(),
-        AttributeType::Int | AttributeType::U64 | AttributeType::U256 | AttributeType::Decimal
-    );
-    let is_range = matches!(operator, Token::Lt | Token::Lte | Token::Gt | Token::Gte);
-    if is_range && !ordered {
-        return Err(ParseError::type_error(
-            position,
-            alloc::format!(
-                "{} values have no ordering — only i32, u64, u256 and dec support < <= > >=",
-                value.attr_type().name(),
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse `operand` when the `AND`/`OR` node at `position` joining it would
 /// nest more than [`limits::MAX_AND_OR_DEPTH`] levels: the node is one level
 /// above its deepest operand.
@@ -867,34 +848,61 @@ mod tests {
 
     // ── the operator × type matrix ──────────────────────────────────────
 
+    /// Every type the language can write is ordered, so each takes every
+    /// range operator.
     #[test]
-    fn ranges_are_allowed_on_the_numeric_types() {
-        for query in [
-            "level > i32(1)",
-            "level >= i32(1)",
-            "level < i32(1)",
-            "level <= i32(1)",
-            "balance > u256(1)",
-            "score >= dec(3.5)",
-        ] {
-            assert!(parse(query).is_ok(), "{query}");
+    fn ranges_are_allowed_on_every_type() {
+        let values = [
+            "i32(1)".to_string(),
+            "u64(1)".to_string(),
+            "u256(1)".to_string(),
+            "dec(3.5)".to_string(),
+            "true".to_string(),
+            "str('a')".to_string(),
+            format!("addr({})", addr_hex("ab")),
+            format!("key({})", word_hex("ab")),
+            format!("bytes32({})", word_hex("ab")),
+        ];
+        for value in &values {
+            for operator in ["<", "<=", ">", ">="] {
+                let query = format!("a {operator} {value}");
+                assert!(parse(&query).is_ok(), "{query}: {:?}", parse(&query));
+            }
         }
+        assert_eq!(
+            parse("name > str('a')").unwrap(),
+            Query::Gt {
+                key: user("name"),
+                value: AttributeValue::Str("a".into()),
+            }
+        );
+        assert_eq!(
+            parse("flagged <= false").unwrap(),
+            Query::Lte {
+                key: user("flagged"),
+                value: AttributeValue::Bool(false),
+            }
+        );
     }
 
+    /// The spec gives `$key`, `$owner` and `$creator` every comparison.
     #[test]
-    fn ranges_are_rejected_on_the_unordered_types() {
-        let unordered = [
-            "flagged > true".to_string(),
-            "name > str('a')".to_string(),
-            format!("who > addr({})", addr_hex("ab")),
-            format!("parent > key({})", word_hex("ab")),
-            format!("hash > bytes32({})", word_hex("ab")),
-        ];
-        for query in unordered {
-            let err = parse(&query).unwrap_err();
-            assert_eq!(err.kind, ParseErrorKind::TypeError, "{query}");
-            assert!(err.message.contains("no ordering"), "{query}: {err}");
-        }
+    fn ranges_are_allowed_on_the_system_attributes() {
+        assert_eq!(
+            parse(&format!("$owner > addr({})", addr_hex("ab"))).unwrap(),
+            Query::Gt {
+                key: built_in(BuiltIn::Owner),
+                value: AttributeValue::EthereumAddress([0xab; 20]),
+            }
+        );
+        assert!(parse(&format!("$creator <= addr({})", addr_hex("ab"))).is_ok());
+        assert_eq!(
+            parse(&format!("$key >= key({})", word_hex("ab"))).unwrap(),
+            Query::Gte {
+                key: built_in(BuiltIn::Key),
+                value: AttributeValue::EntityKey([0xab; 32]),
+            }
+        );
     }
 
     #[test]

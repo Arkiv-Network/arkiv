@@ -217,7 +217,7 @@ pub enum CellKind {
 pub struct TypeId(pub u8);
 
 impl TypeId {
-    /// A single byte, `0` or `1`. Equality only.
+    /// A single byte, `0` or `1`, so `false` orders before `true`.
     pub const BOOL: Self = Self(1);
     /// Four bytes, sign-bit-biased big-endian for ordering.
     pub const I32: Self = Self(2);
@@ -225,20 +225,21 @@ impl TypeId {
     pub const U256: Self = Self(3);
     /// A 256-bit signed decimal, 18 places, sign-bit-biased big-endian.
     pub const DEC: Self = Self(4);
-    /// Thirty-two opaque bytes. Equality only — no meaningful ordering.
+    /// Thirty-two opaque bytes, ordered as unsigned bytes.
     pub const BYTES32: Self = Self(5);
     /// Variable width, **field-only** — an attribute of this type is
     /// [`StoreError::InvalidArgument`].
     pub const BYTES: Self = Self(6);
-    /// UTF-8 up to a cap. Equality and prefix; ordering is raw byte order.
+    /// UTF-8 up to a cap, ordered as raw bytes. The one type with a prefix
+    /// match.
     pub const STR: Self = Self(7);
     /// Eight bytes, plain big-endian. The block-number domain.
     pub const U64: Self = Self(8);
 
     /// The Arkiv profile's registered types.
-    /// A 20-byte Ethereum address. Equality only.
+    /// A 20-byte Ethereum address, ordered as unsigned bytes.
     pub const ADDR: Self = Self(32);
-    /// A 32-byte Arkiv entity key. Equality only.
+    /// A 32-byte Arkiv entity key, ordered as unsigned bytes.
     pub const KEY: Self = Self(33);
 
     /// `0` is reserved; the tag byte's kind bit caps ids at 127.
@@ -256,9 +257,8 @@ impl TypeId {
     /// [`StoreError::InvalidQuery`] guard on range and prefix predicates.
     pub const fn index_class(self) -> IndexClass {
         match self.0 {
-            1 | 5 | 32 | 33 => IndexClass::Eq,
-            2 | 3 | 4 | 8 => IndexClass::EqRange,
-            7 => IndexClass::EqPrefix,
+            1 | 2 | 3 | 4 | 5 | 8 | 32 | 33 => IndexClass::EqRange,
+            7 => IndexClass::EqRangePrefix,
             6 => IndexClass::None,
             // Registered types declare their own; unknown ids are rejected at
             // write time, so equality is the safe floor here.
@@ -268,25 +268,27 @@ impl TypeId {
 }
 
 /// What a type's index supports. A range or prefix predicate against a type
-/// lacking it is [`StoreError::InvalidQuery`].
+/// lacking it is [`StoreError::InvalidQuery`]. Each class answers everything
+/// the one before it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexClass {
     /// Field-only: not indexable at all.
     None,
     Eq,
     EqRange,
-    EqPrefix,
+    /// A range and a byte-prefix match: `str`.
+    EqRangePrefix,
 }
 
 impl IndexClass {
     /// Whether `<`, `<=`, `>` and `>=` are answerable from this index.
     pub const fn supports_range(self) -> bool {
-        matches!(self, Self::EqRange)
+        matches!(self, Self::EqRange | Self::EqRangePrefix)
     }
 
     /// Whether a byte-prefix match is answerable from this index.
     pub const fn supports_prefix(self) -> bool {
-        matches!(self, Self::EqPrefix)
+        matches!(self, Self::EqRangePrefix)
     }
 }
 

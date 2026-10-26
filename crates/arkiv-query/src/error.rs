@@ -17,7 +17,7 @@ pub enum ParseErrorKind {
     /// Reported as [`rpc_error_codes::MALFORMED_INPUT`].
     MalformedInputError,
 
-    /// Well-formed but not well-typed: a range operator on an equality-only type,
+    /// Well-formed but not well-typed: `STARTSWITH` on a type other than `str`,
     /// an unknown type tag, a value whose type doesn't fit the attribute.
     ///
     /// Reported as [`rpc_error_codes::TYPE_ERROR`].

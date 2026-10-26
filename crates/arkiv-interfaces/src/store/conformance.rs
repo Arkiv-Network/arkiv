@@ -67,7 +67,8 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     query_sees_committed_state(store_generator);
     query_or_unions_and_dedups(store_generator);
     query_without_a_sort_pages_in_a_fixed_order(store_generator);
-    query_range_on_eq_only_type_is_invalid(store_generator);
+    query_range_follows_each_types_order(store_generator);
+    query_prefix_on_a_type_without_one_is_invalid(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
     genesis_is_readable_at_its_commit(store_generator);
@@ -1049,9 +1050,83 @@ fn query_without_a_sort_pages_in_a_fixed_order<S: Store>(store_generator: &dyn F
     assert_eq!(walked, all, "pages partition the matches, in that order");
 }
 
-/// A range predicate against an equality-only type is refused, rather than
+/// A range predicate follows its type's order: `false < true` for a `bool`,
+/// and unsigned byte order for a `str`, `bytes32`, `addr` or `key`, where a
+/// shorter `str` sorts before a longer one it is a prefix of.
+fn query_range_follows_each_types_order<S: Store>(store_generator: &dyn Fn() -> S) {
+    // A fixed-width value starting with `first`: `0x80` must sort above
+    // `0x7f`, which no sign bias would leave it.
+    let word = |first: u8, len: usize| {
+        let mut bytes = vec![0u8; len];
+        bytes[0] = first;
+        bytes
+    };
+
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    for (ordinal, (flag, text, first)) in [
+        (1u8, (0u8, "a", 0x00u8)),
+        (2, (1, "ab", 0x7f)),
+        (3, (1, "b", 0x80)),
+    ] {
+        create_record(
+            &mut store,
+            branch,
+            record_key(ordinal),
+            &[
+                ("f", Cell::attribute(TypeId::BOOL, vec![flag])),
+                ("s", str_attribute(text)),
+                ("h", Cell::attribute(TypeId::BYTES32, word(first, 32))),
+                ("a", Cell::attribute(TypeId::ADDR, word(first, 20))),
+                ("k", Cell::attribute(TypeId::KEY, word(first, 32))),
+            ],
+        );
+    }
+    let at = store.commit(branch).unwrap();
+
+    let compare = |cell: &str, op, type_id, value: Vec<u8>| {
+        let filter = Filter::Predicate(Predicate {
+            cell: cell.to_string(),
+            test: Test::Compare { op, type_id, value },
+        });
+        matched_keys(&store, at, &paged_query(filter, 0, 10))
+    };
+
+    assert_eq!(
+        compare("f", CompareOp::Gt, TypeId::BOOL, vec![0]),
+        vec![record_key(2), record_key(3)],
+        "false < true"
+    );
+    assert_eq!(
+        compare("s", CompareOp::Gt, TypeId::STR, b"a".to_vec()),
+        vec![record_key(2), record_key(3)],
+        "a prefix sorts before the strings it starts"
+    );
+    assert_eq!(
+        compare("s", CompareOp::Lte, TypeId::STR, b"ab".to_vec()),
+        vec![record_key(1), record_key(2)],
+    );
+    for (cell, type_id, len) in [
+        ("h", TypeId::BYTES32, 32),
+        ("a", TypeId::ADDR, 20),
+        ("k", TypeId::KEY, 32),
+    ] {
+        assert_eq!(
+            compare(cell, CompareOp::Gte, type_id, word(0x7f, len)),
+            vec![record_key(2), record_key(3)],
+            "{type_id:?} orders as unsigned bytes"
+        );
+        assert_eq!(
+            compare(cell, CompareOp::Lt, type_id, word(0x80, len)),
+            vec![record_key(1), record_key(2)],
+            "{type_id:?} orders as unsigned bytes"
+        );
+    }
+}
+
+/// A prefix predicate against any type but `str` is refused, rather than
 /// silently answered from an index that cannot support it.
-fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -> S) {
+fn query_prefix_on_a_type_without_one_is_invalid<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     create_record(
@@ -1065,16 +1140,16 @@ fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -
     let filter = Filter::Predicate(Predicate {
         cell: "h".to_string(),
         test: Test::Compare {
-            op: CompareOp::Gt,
+            op: CompareOp::Prefix,
             type_id: TypeId::BYTES32,
-            value: vec![0u8; 32],
+            value: vec![0u8; 4],
         },
     });
 
     assert_eq!(
         store.count(Some(committed), &filter, None).unwrap_err(),
         StoreError::InvalidQuery,
-        "bytes32 indexes equality only"
+        "only str has a prefix match"
     );
 }
 
@@ -1405,8 +1480,8 @@ fn query_presence_matches_records_carrying_the_attribute<S: Store>(
         "negated: the records not carrying it at all"
     );
 
-    // A type that is never indexed cannot be asked for, as a range on an
-    // equality-only type cannot: invalid, not empty.
+    // A type that is never indexed cannot be asked for, as a prefix on a type
+    // without one cannot: invalid, not empty.
     assert_eq!(
         store
             .query(

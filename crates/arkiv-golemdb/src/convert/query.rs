@@ -97,8 +97,6 @@ pub(crate) fn arkiv_query_result(page: &golemdb::QueryPage) -> Result<QueryResul
 /// written order.
 ///
 /// Every predicate in the tree is checked against its type's index first, as
-/// Arkiv checks it: a range on a `str` is invalid even though GolemDB could
-/// run it, and invalid under a `Not` as much as anywhere.
 fn golemdb_filter(filter: &Filter) -> Result<golemdb::Filter, StoreError> {
     if !answerable(filter) {
         return Err(StoreError::InvalidQuery);
@@ -256,7 +254,7 @@ mod tests {
     use crate::{GolemDbConfig, GolemDbStore};
     use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use arkiv_interfaces::store::{Page, RecordKey, Store};
-    use golemdb_api::marker::{Bytes32, I32, Str, U64};
+    use golemdb_api::marker::{Bool, Bytes20, Bytes32, I32, Str, U64};
     use golemdb_api::{Api, CellLimits, CellType, Genesis, HashAlgorithm, RecordLimits, Width};
     use std::ops::Bound;
     use tempfile::TempDir;
@@ -415,8 +413,8 @@ mod tests {
         );
     }
 
-    /// A type that is never indexed cannot be asked for, the same way a range
-    /// on an equality-only type cannot.
+    /// A type that is never indexed cannot be asked for, the same way a prefix
+    /// on a type without one cannot.
     #[test]
     fn a_presence_predicate_over_a_field_only_type_is_invalid() {
         assert_eq!(
@@ -510,6 +508,45 @@ mod tests {
         }
     }
 
+    /// Every indexed type is ordered, the non-numeric ones included: each
+    /// range is GolemDB's own, of that type.
+    #[test]
+    fn a_range_on_a_non_numeric_type_is_a_range_of_that_type() {
+        let at_least = |bounds| golemdb::Filter::Range {
+            field: cell_name("a"),
+            bounds,
+        };
+        for (arkiv, expected) in [
+            (
+                predicate("a", CompareOp::Gte, TypeId::BOOL, &[1]),
+                at_least(Bounds::new(Bool, Included(true), Unbounded)),
+            ),
+            (
+                predicate("a", CompareOp::Gte, TypeId::STR, b"blue"),
+                at_least(Bounds::new(Str, Included("blue"), Unbounded)),
+            ),
+            (
+                predicate("a", CompareOp::Gte, TypeId::ADDR, &[0xab; 20]),
+                at_least(Bounds::new(Bytes20, Included([0xab; 20]), Unbounded)),
+            ),
+            (
+                predicate("a", CompareOp::Gte, TypeId::BYTES32, &[0xab; 32]),
+                at_least(Bounds::new(Bytes32, Included([0xab; 32]), Unbounded)),
+            ),
+            // A `key` is GolemDB's 32 fixed bytes, as a `bytes32` is.
+            (
+                predicate("a", CompareOp::Gte, TypeId::KEY, &[0xab; 32]),
+                at_least(Bounds::new(Bytes32, Included([0xab; 32]), Unbounded)),
+            ),
+        ] {
+            assert_eq!(
+                query_op(&query(arkiv.clone()), None).unwrap().filter,
+                expected,
+                "{arkiv:?}"
+            );
+        }
+    }
+
     /// Arkiv's two's complement becomes GolemDB's sign-flipped encoding.
     #[test]
     fn a_signed_value_is_encoded_as_golemdb_encodes_it() {
@@ -531,13 +568,12 @@ mod tests {
         assert_eq!(query_op(&arkiv, None).unwrap().filter, expected);
     }
 
-    /// Arkiv's index rules hold even where GolemDB has an index for it, and
-    /// anywhere in the tree: under a `Not`, the query is invalid before it is
-    /// one GolemDB cannot run.
+    /// Arkiv's index rules hold anywhere in the tree: under a `Not`, the query
+    /// is invalid before it is one GolemDB cannot run.
     #[test]
     fn an_operation_the_type_does_not_index_is_invalid() {
         for invalid in [
-            predicate("name", CompareOp::Gt, TypeId::STR, b"a"),
+            predicate("hash", CompareOp::Prefix, TypeId::BYTES32, &[0; 32]),
             u64_is("n", CompareOp::Prefix, 1),
             predicate("blob", CompareOp::Eq, TypeId::BYTES, b"x"),
         ] {
