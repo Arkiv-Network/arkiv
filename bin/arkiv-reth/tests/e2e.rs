@@ -848,6 +848,41 @@ async fn query_operator_classes_over_a_live_node() {
             .is_err(),
         "a malformed cursor must be refused",
     );
+
+    // `select.count` is the size of the whole match set. Unselected, it is
+    // absent; selected alone, it is the entire answer: no entities, no cursor.
+    assert!(first.get("count").is_none(), "count only when selected");
+    let count_only = client
+        .query_raw(
+            "rank >= u256(20)",
+            serde_json::json!({ "select": { "count": true } }),
+        )
+        .await
+        .expect("count alone");
+    assert_eq!(count_only["count"], "0x4", "four ranks of 20 and up");
+    assert_eq!(count_only["data"], serde_json::json!([]));
+    assert!(
+        count_only.get("cursor").is_none(),
+        "no page, so no next one"
+    );
+
+    // Beside a field, it comes with every page, unchanged by the paging.
+    let counted = serde_json::json!({ "select": { "key": true, "count": true }, "limit": 3 });
+    let counted_page = client
+        .query_raw("rank >= u256(20)", counted.clone())
+        .await
+        .expect("first counted page");
+    assert_eq!(counted_page["count"], "0x4");
+    assert_eq!(result_keys(&counted_page).len(), 3);
+    let mut rest = counted;
+    rest["cursor"] = counted_page["cursor"].clone();
+    let counted_rest = client
+        .query_raw("rank >= u256(20)", rest)
+        .await
+        .expect("second counted page");
+    assert_eq!(counted_rest["count"], "0x4", "the match set, not the page");
+    assert_eq!(result_keys(&counted_rest).len(), 1);
+    assert!(counted_rest.get("cursor").is_none());
 }
 
 /// Every mutating op — update, extend, transfer, delete — driven over a live node
