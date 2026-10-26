@@ -23,6 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CACHE, BUILDER = ROOT / ".docker/caches", "arkiv-harness"
 ARGS_FILE = ROOT / "kurtosis/arkiv-chain.yaml"
+# Pinned: the genesis generator image wraps the package's own default
+# generator, so the two must move together (kurtosis/genesis-generator).
+PACKAGE = "github.com/ethpandaops/ethereum-package@903982a05382b9be07fca48579c75384df0a119c"
 enclave = sys.argv[1] if len(sys.argv) > 1 else "arkiv-harness"
 prebuilt = os.environ.get("ARKIV_RETH_BINARY")
 
@@ -123,6 +126,13 @@ if prebuilt:
 else:
     log("==> build images")
     buildx("arkiv-reth:dev", "docker/arkiv-reth.Dockerfile")
+# The genesis generator takes its arkiv-reth from the image above, so it can
+# only be built after it, with the builder that sees the local images.
+log("==> build the genesis generator")
+run(
+    "docker", "build", "-t", "arkiv-genesis-generator:dev",
+    str(ROOT / "kurtosis/genesis-generator"),
+)  # fmt: skip
 
 args_file = ARGS_FILE
 # Start the two-node network only after the image is available to Kurtosis.
@@ -130,7 +140,7 @@ remove_stopped_enclave(enclave)
 log(f"==> Arkiv chain (ethereum-package) -> enclave {enclave}")
 run(
     "kurtosis", "run", "--enclave", enclave,
-    "github.com/ethpandaops/ethereum-package",
+    PACKAGE,
     "--args-file", str(args_file.relative_to(ROOT)),
 )  # fmt: skip
 

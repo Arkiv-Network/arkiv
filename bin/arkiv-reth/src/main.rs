@@ -203,6 +203,19 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
     })
 }
 
+/// Close gaps by downloading blocks as far as reth allows, unless the
+/// operator changed `--engine.backfill-threshold`. A value equal to reth's
+/// default counts as unchanged.
+///
+/// A larger gap runs reth's pipeline, which executes blocks without saving
+/// them to GolemDB, so a node on GolemDB cannot catch up that way. reth clamps
+/// the threshold to its maximum, the most blocks a peer sends in one answer.
+fn download_gaps(engine: &mut reth::args::EngineArgs) {
+    if engine.backfill_run_threshold == reth::args::EngineArgs::default().backfill_run_threshold {
+        engine.backfill_run_threshold = u64::MAX;
+    }
+}
+
 fn main() {
     // Enable backtraces unless the caller already set a preference.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -250,7 +263,11 @@ fn main() {
     // `ChainSpec`. The components closure gives the non-`node` subcommands
     // (`import`, `stage`, `re-execute`) the same executor and consensus the node
     // uses.
-    let result = Cli::<genesis::NodeChainSpecParser>::parse().run_with_components::<ArkivNode>(
+    let mut cli = Cli::<genesis::NodeChainSpecParser>::parse();
+    if on_golemdb {
+        cli.apply_node_command(|node| download_gaps(&mut node.engine));
+    }
+    let result = cli.run_with_components::<ArkivNode>(
         move |spec| {
             (
                 EthEvmConfig::new_with_evm_factory(
@@ -315,6 +332,26 @@ mod tests {
 
     fn set(value: impl Into<OsString>) -> Option<OsString> {
         Some(value.into())
+    }
+
+    #[test]
+    fn gaps_are_downloaded_as_far_as_reth_allows() {
+        let mut engine = reth::args::EngineArgs::default();
+        download_gaps(&mut engine);
+        let config = engine.tree_config();
+        assert_eq!(config.backfill_run_threshold(), 1024);
+        // reth raises its block buffer with it, to hold the downloaded blocks.
+        assert_eq!(config.block_buffer_limit(), 2048);
+    }
+
+    #[test]
+    fn a_backfill_threshold_the_operator_set_is_kept() {
+        let mut engine = reth::args::EngineArgs {
+            backfill_run_threshold: 100,
+            ..Default::default()
+        };
+        download_gaps(&mut engine);
+        assert_eq!(engine.tree_config().backfill_run_threshold(), 100);
     }
 
     /// A chain spec whose genesis has `config.arkiv.golemdb` set to `golemdb`,

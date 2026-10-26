@@ -10,9 +10,10 @@ participants:
   # Participant 1 is the sole sequencer: its validator client proposes blocks.
   - el_type: reth
     el_image: arkiv-reth:dev
-    # The node needs a store named. This devnet runs on the in-process one.
+    # The node needs a store named. This devnet runs on GolemDB, inside the
+    # datadir the package gives reth.
     el_extra_env_vars:
-      ARKIV_EXPERIMENTAL_STORE: memory
+      ARKIV_STORE_PATH: /data/reth/execution-data/golemdb
     cl_type: lighthouse
     validator_count: 1
 
@@ -21,14 +22,18 @@ participants:
   - el_type: reth
     el_image: arkiv-reth:dev
     el_extra_env_vars:
-      ARKIV_EXPERIMENTAL_STORE: memory
+      ARKIV_STORE_PATH: /data/reth/execution-data/golemdb
     cl_type: lighthouse
     validator_count: 0
-    # ethereum-package currently emits an ENR as Reth's --bootnodes value,
-    # but this pinned Reth accepts enode URLs only. The follower's Lighthouse
-    # beacon node still uses the valid ENR for consensus synchronization.
-    el_extra_params:
-      - --bootnodes=
+
+# GolemDB's settings in the genesis give block 0 GolemDB's state root, and so a
+# hash the stock generator does not derive. This image adds the settings and
+# writes arkiv-reth's block 0 to SHADOW_FORK_FILE, which the CL genesis is then
+# built on (kurtosis/genesis-generator; up.py builds it).
+ethereum_genesis_generator_params:
+  image: arkiv-genesis-generator:dev
+  extra_env:
+    SHADOW_FORK_FILE: /data/metadata/arkiv-block-0.json
 
 network_params:
   preset: minimal
