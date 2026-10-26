@@ -35,20 +35,14 @@ fn new_store() -> ValkeyStore {
 
 #[test]
 #[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
-fn store_conformance() {
-    conformance::run_all(&new_store);
+fn conformance_part_one() {
+    conformance::run_part_one(&new_store);
 }
 
 #[test]
 #[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
-fn store_ext_conformance() {
-    conformance::run_all_ext(&new_store);
-}
-
-#[test]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
-fn segment_conformance() {
-    conformance::run_all_segments(&new_store);
+fn conformance_part_two() {
+    conformance::run_part_two(&new_store);
 }
 
 /// Appended rows outlive the connection too, addressable by both ordinal and

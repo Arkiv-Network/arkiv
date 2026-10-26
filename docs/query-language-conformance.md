@@ -144,7 +144,8 @@ as one byte, `0x00` or `0x01`. No adapter change was needed.
   name; that is part of Q2.
 
 **Tests:**
-- Store conformance suite, run on the in-memory store and on Valkey:
+- Store conformance suite, part one, run on the in-memory store, Valkey and
+  GolemDB:
   `query_range_follows_each_types_order` and
   `query_prefix_on_a_type_without_one_is_invalid` in
   [crates/arkiv-interfaces/src/store/conformance.rs](../crates/arkiv-interfaces/src/store/conformance.rs).
