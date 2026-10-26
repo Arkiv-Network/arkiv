@@ -6,11 +6,13 @@
 //! andExpr    → unary { AND unary }
 //! unary      → NOT unary | primary
 //! primary    → '(' expr ')' | predicate
-//! predicate  → attrRef compOp value | attrRef STARTSWITH strValue
+//! predicate  → attrRef compOp value | attrRef BETWEEN value AND value
+//!            | attrRef STARTSWITH strValue
 //!            | EXISTS '(' name ')' | TYPEOF '(' name ')' '=' typeTag
 //! ```
 //!
-//! Precedence, tightest first: `NOT`, `AND`, `OR`.
+//! Precedence, tightest first: `NOT`, `AND`, `OR`. The `AND` inside a
+//! `BETWEEN` is the predicate's own, not a conjunction.
 //!
 //! Two jobs beyond shape. First, **typing**: a value carries its own type, and
 //! this is where a value is checked against the attribute it is compared to
@@ -31,7 +33,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use arkiv_interfaces::entity::{AttributeType, AttributeValue};
-use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query};
+use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, ValueRange};
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
@@ -241,7 +243,8 @@ impl Parser {
         let Some(operator) = self.advance() else {
             return Err(ParseError::syntax(
                 self.end,
-                "expected a comparison operator (= < <= > >= STARTSWITH) after the attribute",
+                "expected a comparison operator (= < <= > >= BETWEEN STARTSWITH) after the \
+                 attribute",
             ));
         };
 
@@ -250,6 +253,7 @@ impl Parser {
                 let (value, _) = self.parse_value(&key)?;
                 Ok(comparison(&operator.token, key, value))
             }
+            Token::Between => self.parse_between(key),
             Token::StartsWith => {
                 let (value, position) = self.parse_value(&key)?;
                 if !matches!(value, AttributeValue::Str(_)) {
@@ -266,9 +270,34 @@ impl Parser {
             )),
             _ => Err(ParseError::syntax(
                 operator.start,
-                "expected a comparison operator (= < <= > >= STARTSWITH)",
+                "expected a comparison operator (= < <= > >= BETWEEN STARTSWITH)",
             )),
         }
+    }
+
+    /// `rangeTest = attrRef , BETWEEN , value , AND , value`, after the
+    /// `BETWEEN`. The `AND` is taken here, as the predicate's own, so
+    /// `a BETWEEN 1 AND 5 AND b = 2` is `(a BETWEEN 1 AND 5) AND b = 2`.
+    fn parse_between(&mut self, key: AnnotKey) -> Result<Query, ParseError> {
+        let (low, _) = self.parse_value(&key)?;
+        self.expect(
+            &Token::And,
+            self.next_position(),
+            "BETWEEN joins its two bounds with AND — a BETWEEN lo AND hi",
+        )?;
+        let (high, position) = self.parse_value(&key)?;
+        let types = (low.attr_type().name(), high.attr_type().name());
+        let bounds = ValueRange::new(low, high).ok_or_else(|| {
+            ParseError::type_error(
+                position,
+                alloc::format!(
+                    "BETWEEN bounds must be of one type, but they are {} and {}",
+                    types.0,
+                    types.1,
+                ),
+            )
+        })?;
+        Ok(Query::Between { key, bounds })
     }
 
     /// `existsTest = EXISTS , "(" , name , ")"` and
@@ -401,6 +430,7 @@ impl Parser {
             | Token::Not
             | Token::True
             | Token::False
+            | Token::Between
             | Token::StartsWith
             | Token::Exists
             | Token::TypeOf => Err(ParseError::syntax(
@@ -611,6 +641,7 @@ fn and_or_depth(query: &Query) -> usize {
         | Query::Gte { .. }
         | Query::Lt { .. }
         | Query::Lte { .. }
+        | Query::Between { .. }
         | Query::StartsWith { .. }
         | Query::Exists { .. } => 0,
     }
@@ -924,6 +955,117 @@ mod tests {
             kind_of("flagged STARTSWITH true"),
             ParseErrorKind::TypeError
         );
+    }
+
+    // ── BETWEEN ─────────────────────────────────────────────────────────
+
+    /// `name BETWEEN i32(low) AND i32(high)`.
+    fn between_ints(name: &str, low: i32, high: i32) -> Query {
+        Query::Between {
+            key: user(name),
+            bounds: ValueRange::new(AttributeValue::Int(low), AttributeValue::Int(high))
+                .expect("one type"),
+        }
+    }
+
+    #[test]
+    fn between_takes_two_bounds_of_one_type() {
+        assert_eq!(
+            parse("level BETWEEN 1 AND 5").unwrap(),
+            between_ints("level", 1, 5)
+        );
+        assert_eq!(
+            parse("level between i32(-5) and i32(5)").unwrap(),
+            between_ints("level", -5, 5)
+        );
+        // Every type with a literal ranges, so every one has a BETWEEN.
+        for (low, high) in [
+            ("u64(1)", "u64(9)"),
+            ("u256(1)", "u256(0x10)"),
+            ("dec(3.5)", "dec(5)"),
+            ("false", "true"),
+            ("str('a')", "str('b')"),
+        ] {
+            let query = format!("a BETWEEN {low} AND {high}");
+            assert!(parse(&query).is_ok(), "{query}: {:?}", parse(&query));
+        }
+        // A low bound above the high one is a query that matches nothing, not
+        // an error.
+        assert_eq!(
+            parse("level BETWEEN 5 AND 1").unwrap(),
+            between_ints("level", 5, 1)
+        );
+    }
+
+    /// The `AND` inside a `BETWEEN` is its own, wherever the predicate stands.
+    #[test]
+    fn between_owns_its_and() {
+        assert_eq!(
+            parse("a BETWEEN 1 AND 5 AND b = true").unwrap(),
+            Query::And(vec![between_ints("a", 1, 5), is_true("b")])
+        );
+        assert_eq!(
+            parse("b = true AND a BETWEEN 1 AND 5 AND c = true").unwrap(),
+            Query::And(vec![is_true("b"), between_ints("a", 1, 5), is_true("c")])
+        );
+        assert_eq!(
+            parse("b = true OR a BETWEEN 1 AND 5").unwrap(),
+            Query::Or(vec![is_true("b"), between_ints("a", 1, 5)])
+        );
+        // NOT takes the whole predicate, bounds and all.
+        assert_eq!(
+            parse("NOT a BETWEEN 1 AND 5").unwrap(),
+            Query::Not(Box::new(between_ints("a", 1, 5)))
+        );
+    }
+
+    #[test]
+    fn between_bounds_of_two_types_are_a_type_error() {
+        let err = parse("a BETWEEN i32(1) AND u64(5)").unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::TypeError);
+        assert!(err.message.contains("i32 and u64"), "{err}");
+        assert_eq!(err.failure_position, Some("a BETWEEN i32(1) AND ".len()));
+    }
+
+    #[test]
+    fn between_on_a_system_attribute_takes_its_type() {
+        assert_eq!(
+            parse("$expiresAt BETWEEN u64(10) AND u64(20)").unwrap(),
+            Query::Between {
+                key: built_in(BuiltIn::ExpiresAt),
+                bounds: ValueRange::new(AttributeValue::U64(10), AttributeValue::U64(20)).unwrap(),
+            }
+        );
+        // Each bound is held to the attribute's type, as any value is.
+        assert_eq!(
+            kind_of("$expiresAt BETWEEN 10 AND 20"),
+            ParseErrorKind::TypeError
+        );
+        assert_eq!(
+            kind_of(&format!(
+                "$owner BETWEEN addr({}) AND u64(1)",
+                addr_hex("ab")
+            )),
+            ParseErrorKind::TypeError
+        );
+    }
+
+    #[test]
+    fn between_needs_its_full_shape() {
+        for query in [
+            "a BETWEEN",
+            "a BETWEEN 1",
+            "a BETWEEN 1 5",
+            "a BETWEEN 1 OR 5",
+            "a BETWEEN AND 5",
+            "a BETWEEN 1 AND",
+        ] {
+            assert_eq!(
+                kind_of(query),
+                ParseErrorKind::MalformedInputError,
+                "`{query}` should not parse"
+            );
+        }
     }
 
     // ── system attributes ───────────────────────────────────────────────
@@ -1332,6 +1474,10 @@ mod tests {
         // Keywords lex as keywords, so they never reach an attribute position.
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
+        assert_eq!(
+            kind_of("between = true"),
+            ParseErrorKind::MalformedInputError
+        );
         // A type name is only a tag before `(`; bare, it is rejected by name.
         let err = parse("str = true").unwrap_err();
         assert!(err.message.contains("type name"), "{err}");
@@ -1406,21 +1552,22 @@ mod tests {
         );
     }
 
-    /// The spec's worked example, minus the predicates this version cuts.
+    /// The spec's worked example, with its elided hex filled in.
     #[test]
     fn the_specs_example_query_parses() {
         let query = format!(
             "    level       >= i32(10)
              AND balance     >  u256(1000000)
-             AND score       >= dec(3.5)
-             AND score       <= dec(5)
+             AND score       BETWEEN dec(3.5) AND dec(5)
              AND name        =  str('Bob')
              AND desc        STARTSWITH str('ab')
              AND parent      =  key({})
              AND hash        =  bytes32({})
              AND flagged     =  true
              AND $owner      =  addr({})
-             AND $expiresAt  <  u64(1200000)",
+             AND $expiresAt  <  u64(1200000)
+             AND exists(reviewedBy)
+             AND typeof(age) =  i32",
             word_hex("12"),
             word_hex("45"),
             addr_hex("ab"),

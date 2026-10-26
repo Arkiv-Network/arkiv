@@ -421,6 +421,48 @@ fn a_range_follows_the_order_of_every_type() {
     }
 }
 
+/// `BETWEEN` includes both bounds, in the type's order, and matches nothing
+/// when its low bound is above its high one. It counts as it queries, and
+/// combines with the live-entity bound the RPC adds.
+#[test]
+fn a_between_includes_both_bounds() {
+    let entities: Vec<Entity> = [(1, -5, "a"), (2, 0, "ab"), (3, 5, "b")]
+        .into_iter()
+        .map(|(n, level, team)| {
+            entity_with(
+                n,
+                vec![
+                    Attribute::new("level", AttributeValue::Int(level)),
+                    Attribute::new("team", AttributeValue::Str(team.into())),
+                ],
+            )
+        })
+        .collect();
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, &entities);
+
+    for (query, expected) in [
+        ("level BETWEEN -5 AND 0", vec![1, 2]),
+        ("level BETWEEN 0 AND 0", vec![2]),
+        ("level BETWEEN -6 AND 6", vec![1, 2, 3]),
+        ("level BETWEEN 1 AND 4", vec![]),
+        ("level BETWEEN 5 AND -5", vec![]),
+        ("team BETWEEN str('a') AND str('ab')", vec![1, 2]),
+        (
+            "level BETWEEN -5 AND 5 AND $expiresAt > u64(999)",
+            vec![1, 2, 3],
+        ),
+        ("level BETWEEN 0 AND 5 OR team = str('a')", vec![1, 2, 3]),
+    ] {
+        assert_eq!(matched(&store, filter(query)), expected, "{query}");
+        let count = store
+            .count(None, &filter(query), None)
+            .expect("GolemDB counts the query")
+            .into_value();
+        assert_eq!(count, expected.len() as u64, "{query}");
+    }
+}
+
 /// The shapes `arkiv_query` sends: bounded to live entities by an AND, and
 /// ORs. A NOT has no GolemDB counterpart.
 #[test]

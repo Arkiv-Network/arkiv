@@ -472,6 +472,14 @@ pub enum Test {
         type_id: TypeId,
         value: Vec<u8>,
     },
+    /// The attribute's value, which must be of `type_id`, lies between `low`
+    /// and `high`, both included: the query language's `BETWEEN`. A `low`
+    /// above `high` matches nothing.
+    Between {
+        type_id: TypeId,
+        low: Vec<u8>,
+        high: Vec<u8>,
+    },
     /// The attribute is present and indexed, with no comparison: under any
     /// type when `type_id` is `None`, under exactly that type when it is
     /// `Some`. The query language's `exists(name)` and `typeof(name) = tag`.
@@ -486,6 +494,7 @@ impl Test {
     pub const fn is_answerable(&self) -> bool {
         match self {
             Self::Compare { op, type_id, .. } => op.permitted_by(type_id.index_class()),
+            Self::Between { type_id, .. } => type_id.index_class().supports_range(),
             // `None` spans the indexed types, so only a named field-only type
             // is unanswerable.
             Self::Exists { type_id: None } => true,
@@ -1370,6 +1379,11 @@ impl Predicate {
             Some(cell) if matches!(cell.kind, CellKind::Attribute) => match &self.test {
                 Test::Compare { op, type_id, value } => {
                     cell.type_id == *type_id && compare(*op, &cell.value, value, *type_id)
+                }
+                Test::Between { type_id, low, high } => {
+                    cell.type_id == *type_id
+                        && compare(CompareOp::Gte, &cell.value, low, *type_id)
+                        && compare(CompareOp::Lte, &cell.value, high, *type_id)
                 }
                 // Presence of an indexed attribute: any type, or exactly one.
                 Test::Exists { type_id: None } => {

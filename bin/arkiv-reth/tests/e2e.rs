@@ -504,6 +504,36 @@ async fn query_operator_classes_over_a_live_node() {
         ),
         by_key[2..].iter().cloned().collect::<BTreeSet<_>>()
     );
+    // BETWEEN includes both bounds, and its AND is its own.
+    assert_eq!(
+        result_keys(
+            &client
+                .query("rank BETWEEN u256(20) AND u256(40)", 100, None)
+                .await
+        ),
+        expect(&[1, 2, 3])
+    );
+    assert_eq!(
+        result_keys(
+            &client
+                .query(
+                    "team BETWEEN str('blue') AND str('green') AND rank > u256(30)",
+                    100,
+                    None
+                )
+                .await
+        ),
+        expect(&[3, 4])
+    );
+    assert!(
+        result_keys(
+            &client
+                .query("rank BETWEEN u256(40) AND u256(20)", 100, None)
+                .await
+        )
+        .is_empty(),
+        "an inverted BETWEEN matches nothing"
+    );
     assert_eq!(
         result_keys(
             &client
@@ -645,6 +675,8 @@ async fn query_operator_classes_over_a_live_node() {
         ("$createdAt >= u64(1)", "-32002"),                   // returned, never queried
         ("rank != u256(30)", "-32002"),                       // != is not in the language
         ("rank STARTSWITH u256(1)", "-32002"),                // a prefix needs a str
+        ("rank BETWEEN u256(1) AND i32(5)", "-32002"),        // bounds of two types
+        ("between = true", "-32001"),                         // a reserved word
         ("exists($owner)", "-32002"),                         // presence takes a user attribute
         ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
         ("rank = i32(2147483648)", "-32003"), // literal out of range

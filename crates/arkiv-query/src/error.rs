@@ -18,7 +18,8 @@ pub enum ParseErrorKind {
     MalformedInputError,
 
     /// Well-formed but not well-typed: `STARTSWITH` on a type other than `str`,
-    /// an unknown type tag, a value whose type doesn't fit the attribute.
+    /// `BETWEEN` bounds of two types, an unknown type tag, a value whose type
+    /// doesn't fit the attribute.
     ///
     /// Reported as [`rpc_error_codes::TYPE_ERROR`].
     TypeError,

@@ -69,6 +69,7 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     query_without_a_sort_pages_in_a_fixed_order(store_generator);
     query_range_follows_each_types_order(store_generator);
     query_prefix_on_a_type_without_one_is_invalid(store_generator);
+    query_between_includes_both_bounds(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
     genesis_is_readable_at_its_commit(store_generator);
@@ -1150,6 +1151,59 @@ fn query_prefix_on_a_type_without_one_is_invalid<S: Store>(store_generator: &dyn
         store.count(Some(committed), &filter, None).unwrap_err(),
         StoreError::InvalidQuery,
         "only str has a prefix match"
+    );
+}
+
+/// A `Between` includes both of its bounds, follows its type's order, and
+/// matches nothing when its low bound is above its high one.
+fn query_between_includes_both_bounds<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    for (ordinal, level) in [(1u8, -2i32), (2, 0), (3, 2)] {
+        create_record(
+            &mut store,
+            branch,
+            record_key(ordinal),
+            &[(
+                "level",
+                Cell::attribute(TypeId::I32, level.to_be_bytes().to_vec()),
+            )],
+        );
+    }
+    let at = store.commit(branch).unwrap();
+
+    let between = |type_id, low: Vec<u8>, high: Vec<u8>| {
+        Filter::Predicate(Predicate {
+            cell: "level".to_string(),
+            test: Test::Between { type_id, low, high },
+        })
+    };
+    let levels = |low: i32, high: i32| {
+        let filter = between(
+            TypeId::I32,
+            low.to_be_bytes().to_vec(),
+            high.to_be_bytes().to_vec(),
+        );
+        matched_keys(&store, at, &paged_query(filter, 0, 10))
+    };
+
+    assert_eq!(
+        levels(-2, 0),
+        vec![record_key(1), record_key(2)],
+        "both bounds are included, and -2 sorts below 0"
+    );
+    assert_eq!(
+        levels(0, 0),
+        vec![record_key(2)],
+        "a bound may be the value"
+    );
+    assert_eq!(levels(2, -2), Vec::<RecordKey>::new(), "an inverted range");
+    assert_eq!(
+        store
+            .count(Some(at), &between(TypeId::BYTES, vec![0], vec![1]), None)
+            .unwrap_err(),
+        StoreError::InvalidQuery,
+        "a type without a range has no between"
     );
 }
 

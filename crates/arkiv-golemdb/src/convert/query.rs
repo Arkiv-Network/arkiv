@@ -3,7 +3,8 @@
 //! GolemDB can express them, and GolemDB's page back as a [`QueryResult`].
 //!
 //! The filter crosses node for node: an `And` or `Or` is GolemDB's own, over
-//! the same children in the same order, and each predicate is one leaf.
+//! the same children in the same order, and each predicate is one leaf. A
+//! `Between` is one `Range` leaf, both sides included.
 //! Nothing is merged or rearranged, so GolemDB runs the query as it was
 //! written. What has no counterpart is [`StoreError::NotImplemented`], as the
 //! rest of the adapter reports what GolemDB lacks:
@@ -159,6 +160,17 @@ fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
             };
             return Ok(golemdb::Filter::Exists { field, ty });
         }
+        // `BETWEEN` is GolemDB's range with both sides included, which takes
+        // inverted bounds as matching nothing, as the language does.
+        Test::Between { type_id, low, high } => {
+            let bounds = Bounds::try_new(
+                cell_type(*type_id)?,
+                Included(operand(*type_id, low)?),
+                Included(operand(*type_id, high)?),
+            )
+            .map_err(invalid_query)?;
+            return Ok(golemdb::Filter::Range { field, bounds });
+        }
         Test::Compare { op, type_id, value } => (*op, *type_id, value),
     };
     let bounds =
@@ -213,6 +225,7 @@ fn held_type(filter: &Filter, name: &str) -> Option<TypeId> {
     match filter {
         Filter::Predicate(Predicate { cell, test }) if cell == name => match test {
             Test::Compare { type_id, .. }
+            | Test::Between { type_id, .. }
             | Test::Exists {
                 type_id: Some(type_id),
             } => Some(*type_id),
@@ -266,6 +279,17 @@ mod tests {
                 op,
                 type_id,
                 value: value.to_vec(),
+            },
+        })
+    }
+
+    fn between(cell: &str, type_id: TypeId, low: &[u8], high: &[u8]) -> Filter {
+        Filter::Predicate(Predicate {
+            cell: cell.into(),
+            test: Test::Between {
+                type_id,
+                low: low.to_vec(),
+                high: high.to_vec(),
             },
         })
     }
@@ -508,6 +532,39 @@ mod tests {
         }
     }
 
+    /// A `Between` is one range, not an `And` of two, with both sides
+    /// included and a signed value encoded as GolemDB encodes it.
+    #[test]
+    fn a_between_is_one_range_with_both_sides_included() {
+        let converted = query_op(
+            &query(between(
+                "n",
+                TypeId::U64,
+                &3u64.to_be_bytes(),
+                &7u64.to_be_bytes(),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(converted.filter, u64_range("n", Included(3), Included(7)));
+
+        let converted = query_op(
+            &query(between(
+                "level",
+                TypeId::I32,
+                &(-5i32).to_be_bytes(),
+                &5i32.to_be_bytes(),
+            )),
+            None,
+        )
+        .unwrap();
+        let expected = golemdb::Filter::Range {
+            field: cell_name("level"),
+            bounds: Bounds::new(I32, Included(-5), Included(5)),
+        };
+        assert_eq!(converted.filter, expected);
+    }
+
     /// Every indexed type is ordered, the non-numeric ones included: each
     /// range is GolemDB's own, of that type.
     #[test]
@@ -576,6 +633,7 @@ mod tests {
             predicate("hash", CompareOp::Prefix, TypeId::BYTES32, &[0; 32]),
             u64_is("n", CompareOp::Prefix, 1),
             predicate("blob", CompareOp::Eq, TypeId::BYTES, b"x"),
+            between("blob", TypeId::BYTES, b"x", b"y"),
         ] {
             for filter in [
                 invalid.clone(),
@@ -628,6 +686,12 @@ mod tests {
             cell: "n".into(),
             direction: SortDirection::Descending,
         });
+        assert_eq!(
+            query_op(&arkiv, None).unwrap().sort,
+            [golemdb::SortKey::desc("n", CellType::Uint(Width::W8))]
+        );
+        // A `Between` holds its cell to its type as a comparison does.
+        arkiv.filter = between("n", TypeId::U64, &[0; 8], &[0xff; 8]);
         assert_eq!(
             query_op(&arkiv, None).unwrap().sort,
             [golemdb::SortKey::desc("n", CellType::Uint(Width::W8))]

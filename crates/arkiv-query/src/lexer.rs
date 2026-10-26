@@ -2,10 +2,8 @@
 //!
 //! Tokens:
 //! - grouping and comparison: `(` `)` `=` `!=` `<` `<=` `>` `>=`
-//! - keywords, case-insensitive: `AND` `OR` `NOT` `TRUE` `FALSE` `STARTSWITH`
-//!   `EXISTS` `TYPEOF`. The last two are **reserved but unimplemented** — they
-//!   lex so the parser can reject them by name instead of mistaking them for an
-//!   attribute.
+//! - keywords, case-insensitive: `AND` `OR` `NOT` `TRUE` `FALSE` `BETWEEN`
+//!   `STARTSWITH` `EXISTS` `TYPEOF`. A keyword is never an attribute name.
 //! - typed literals: a [`TypeTag`] immediately followed by `(`, whose body is
 //!   captured **raw** and validated later by [`literal`](crate::literal). Keeping
 //!   the body raw is what lets one lexer handle bodies as different as `-5`,
@@ -83,6 +81,8 @@ pub(crate) enum Token {
     And,
     Or,
     Not,
+    /// `BETWEEN` — `attr BETWEEN lo AND hi`.
+    Between,
     StartsWith,
     /// `EXISTS` — opens `exists(name)`.
     Exists,
@@ -431,6 +431,8 @@ fn keyword_token(word: &str) -> Option<Token> {
         Some(Token::True)
     } else if word.eq_ignore_ascii_case("false") {
         Some(Token::False)
+    } else if word.eq_ignore_ascii_case("between") {
+        Some(Token::Between)
     } else if word.eq_ignore_ascii_case("startswith") {
         Some(Token::StartsWith)
     } else if word.eq_ignore_ascii_case("exists") {
@@ -486,6 +488,10 @@ mod tests {
         assert_eq!(
             kinds("startswith STARTSWITH"),
             vec![Token::StartsWith, Token::StartsWith]
+        );
+        assert_eq!(
+            kinds("between BETWEEN"),
+            vec![Token::Between, Token::Between]
         );
     }
 

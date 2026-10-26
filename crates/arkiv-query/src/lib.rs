@@ -15,7 +15,7 @@
 //! ```text
 //!     level       >= i32(10)
 //! AND balance     >  u256(1000000)
-//! AND score       >= dec(3.5)
+//! AND score       BETWEEN dec(3.5) AND dec(5)
 //! AND name        =  str('Bob')
 //! AND desc        STARTSWITH str('ab')
 //! AND parent      =  key(0x123…)
@@ -41,6 +41,11 @@
 //! `STARTSWITH` is the only pattern operator: a raw UTF-8 byte prefix, no
 //! normalization, and on anything but a `str` a parse error rather than an
 //! empty result.
+//!
+//! `a BETWEEN lo AND hi` matches what `a >= lo AND a <= hi` does: both bounds
+//! included, of one type, and nothing at all when `lo` is above `hi`. The
+//! `AND` inside it is its own, so `a BETWEEN 1 AND 5 AND b = 2` is
+//! `(a BETWEEN 1 AND 5) AND b = 2`.
 //!
 //! ## What this version leaves out
 //!

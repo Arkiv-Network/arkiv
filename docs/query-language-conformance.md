@@ -25,15 +25,15 @@ changing the code and changing the spec).
 | [Q2](#q2--golemdb-treats-key-and-bytes32-as-one-type) | GolemDB treats `key` and `bytes32` as one type | GolemDB adapter | P1 | open |
 | [Q3](#q3--range-operators-only-on-numeric-types) | Range operators only on numeric types | parser, store | P1 | done |
 | [Q4](#q4---is-rejected) | `!=` is rejected | parser, AST | P2 | open |
-| [Q5](#q5--between-is-not-implemented) | `BETWEEN` is not implemented | lexer, parser, AST, store | P2 | open |
+| [Q5](#q5--between-is-not-implemented) | `BETWEEN` is not implemented | lexer, parser, AST, store | P2 | done |
 | [Q6](#q6--untagged-quoted-strings-accepted-for-system-attributes) | Untagged quoted strings accepted for `$owner` `$creator` `$key` | parser | P3 | decision |
 | [Q7](#q7--type-tags-are-case-insensitive) | Type tags are case-insensitive | lexer, parser | P3 | decision |
 | [Q8](#q8--andor-nesting-capped-at-4-levels) | `AND`/`OR` nesting capped at 4 levels | parser limits | P3 | decision |
 | [S1–S6](#spec-text-issues) | Problems in the spec text itself | spec | P2 | open |
-| [D1–D2](#out-of-date-crate-docs) | Out-of-date crate docs | docs | P3 | open |
+| [D1–D2](#out-of-date-crate-docs) | Out-of-date crate docs | docs | P3 | in progress |
 
-Suggested order: Q1 and Q2 first, since they affect every deployment. Q3 is
-done, which unblocks Q4. Q5 can be done independently.
+Suggested order: Q1 and Q2 first, since they affect every deployment. Q3 and
+Q5 are done, and Q3 unblocks Q4.
 
 ---
 
@@ -56,10 +56,10 @@ the test harness defaults to the in-memory store
 (`ARKIV_EXPERIMENTAL_STORE=memory`).
 
 **Where:**
-- [`node`, crates/arkiv-golemdb/src/convert/query.rs:126](../crates/arkiv-golemdb/src/convert/query.rs#L126)
+- [`node`, crates/arkiv-golemdb/src/convert/query.rs:125](../crates/arkiv-golemdb/src/convert/query.rs#L125)
 - [`store_failure`, crates/arkiv-reth-rpc/src/lib.rs:200-205](../crates/arkiv-reth-rpc/src/lib.rs#L200-L205)
 - [`spawn_process`, crates/arkiv-harness/src/node.rs:255-256](../crates/arkiv-harness/src/node.rs#L255-L256)
-- e2e `NOT` tests on the in-memory store: [bin/arkiv-reth/tests/e2e.rs:605-625](../bin/arkiv-reth/tests/e2e.rs#L605-L625)
+- e2e `NOT` tests on the in-memory store: [bin/arkiv-reth/tests/e2e.rs:635-655](../bin/arkiv-reth/tests/e2e.rs#L635-L655)
 
 **Tasks:**
 - [ ] Decide how GolemDB answers `NOT`: native support in GolemDB, or
@@ -90,7 +90,7 @@ so the adapter cannot tell them apart:
   `-32603`.
 
 **Where:**
-- [`leaf`, crates/arkiv-golemdb/src/convert/query.rs:140-154](../crates/arkiv-golemdb/src/convert/query.rs#L140-L154)
+- [`leaf`, crates/arkiv-golemdb/src/convert/query.rs:139-153](../crates/arkiv-golemdb/src/convert/query.rs#L139-L153)
 - Adapter test asserting the refusal: [crates/arkiv-golemdb/tests/query.rs:351-371](../crates/arkiv-golemdb/tests/query.rs#L351-L371)
 
 **Tasks:**
@@ -187,9 +187,9 @@ that type, and its value differs. It is listed for every type except `bytes`.
 it.
 
 **Where:**
-- [`Parser::parse_predicate`, crates/arkiv-query/src/parse.rs:263-266](../crates/arkiv-query/src/parse.rs#L263-L266)
-- [`Query`, crates/arkiv-interfaces/src/query.rs:28-65](../crates/arkiv-interfaces/src/query.rs#L28-L65)
-- e2e test asserting the rejection: [bin/arkiv-reth/tests/e2e.rs:646](../bin/arkiv-reth/tests/e2e.rs#L646)
+- [`Parser::parse_predicate`, crates/arkiv-query/src/parse.rs:267-270](../crates/arkiv-query/src/parse.rs#L267-L270)
+- [`Query`, crates/arkiv-interfaces/src/query.rs:28-68](../crates/arkiv-interfaces/src/query.rs#L28-L68)
+- e2e test asserting the rejection: [bin/arkiv-reth/tests/e2e.rs:676](../bin/arkiv-reth/tests/e2e.rs#L676)
 - `cut_operators_name_their_replacement` in [crates/arkiv-query/src/parse.rs](../crates/arkiv-query/src/parse.rs)
 
 **Suggested approach:** with Q3 done, `a != v` can be lowered to
@@ -210,7 +210,7 @@ indexed `i32` `a` other than 3, on both stores.
 
 ## Q5 — `BETWEEN` is not implemented
 
-**Status:** open · **Priority:** P2
+**Status:** done · **Priority:** P2
 
 **Spec:**
 - `a BETWEEN lo AND hi` is inclusive at both ends, the same as
@@ -222,30 +222,65 @@ indexed `i32` `a` other than 3, on both stores.
   `a BETWEEN 1 AND 5 AND b = 2` is `(a BETWEEN 1 AND 5) AND b = 2`.
 - `BETWEEN` is a reserved word.
 
-**Code:** it isn't a keyword in the lexer and has no AST variant.
-`a BETWEEN i32(1) AND i32(5)` fails with `-32001 expected a comparison
-operator`. Because `BETWEEN` isn't reserved, `between = true` and
-`BETWEEN = true` are accepted as attribute names.
+**Before:** it wasn't a keyword in the lexer and had no AST variant.
+`a BETWEEN i32(1) AND i32(5)` failed with `-32001 expected a comparison
+operator`, and `between = true` was accepted as an attribute name.
 
-**Where:**
-- [`keyword_token`, crates/arkiv-query/src/lexer.rs:423-443](../crates/arkiv-query/src/lexer.rs#L423-L443)
-- [`Parser::parse_attr_ref`, crates/arkiv-query/src/parse.rs:389-415](../crates/arkiv-query/src/parse.rs#L389-L415) (reserved-word list)
-- [`Query`, crates/arkiv-interfaces/src/query.rs:28-65](../crates/arkiv-interfaces/src/query.rs#L28-L65)
+**Resolution:**
+- Lexer: `BETWEEN` is a case-insensitive keyword
+  ([`keyword_token`, crates/arkiv-query/src/lexer.rs:423-445](../crates/arkiv-query/src/lexer.rs#L423-L445)).
+- Parser: after the attribute, `parse_between` takes `value AND value` itself,
+  so the inner `AND` never reaches the conjunction
+  ([`Parser::parse_between`, crates/arkiv-query/src/parse.rs:281](../crates/arkiv-query/src/parse.rs#L281)).
+  Bounds of two types are `-32002` at the high bound, and each bound is held
+  to a system attribute's type as any value is. `between` is in the
+  reserved-word list.
+- AST: `Query::Between { key, bounds: ValueRange }`. `ValueRange` has private
+  fields and a constructor that refuses two types, so mixed bounds cannot be
+  represented
+  ([`ValueRange`, crates/arkiv-interfaces/src/query.rs:108](../crates/arkiv-interfaces/src/query.rs#L108)).
+- Store: one `Test::Between { type_id, low, high }`, both bounds included,
+  rather than a pair of comparisons. The in-memory and Valkey stores evaluate
+  it with the shared matcher; a type without a range is `InvalidQuery`
+  ([`Test`, crates/arkiv-interfaces/src/store.rs:478](../crates/arkiv-interfaces/src/store.rs#L478)).
+- GolemDB: one `Filter::Range` leaf with both sides `Included`. GolemDB takes
+  inverted bounds as matching nothing, which is the spec's `lo > hi` rule. A
+  sort takes its type from a `BETWEEN` as from a comparison
+  ([`leaf`, crates/arkiv-golemdb/src/convert/query.rs:165](../crates/arkiv-golemdb/src/convert/query.rs#L165)).
+- Docs: the `arkiv-query` crate docs and example, the parser's grammar
+  summary, the lexer header and the `TYPE_ERROR` code docs.
 
-GolemDB's range filter already takes both bounds at once (`Bounds::try_new`
-in [crates/arkiv-golemdb/src/convert/query.rs](../crates/arkiv-golemdb/src/convert/query.rs)),
-so the adapter can lower `BETWEEN` to a single leaf.
+**Tests:**
+- Parser: `between_takes_two_bounds_of_one_type`, `between_owns_its_and`,
+  `between_bounds_of_two_types_are_a_type_error`,
+  `between_on_a_system_attribute_takes_its_type` and
+  `between_needs_its_full_shape`; `between = true` in
+  `keywords_and_type_names_cannot_be_attributes`; the spec's full worked
+  example in `the_specs_example_query_parses`.
+- Lowering: `between_is_one_test_with_both_bounds`,
+  `between_includes_both_ends_and_orders_negatives` and
+  `bounds_of_two_types_cannot_be_built` in
+  [crates/arkiv-interfaces/src/query/filter.rs](../crates/arkiv-interfaces/src/query/filter.rs).
+- Store conformance suite (in-memory and Valkey):
+  `query_between_includes_both_bounds`.
+- GolemDB adapter: `a_between_is_one_range_with_both_sides_included`, plus a
+  `Between` case in the sort and invalid-query tests.
+- GolemDB on disk, through the parser, queries and counts:
+  `a_between_includes_both_bounds` in
+  [crates/arkiv-golemdb/tests/query.rs](../crates/arkiv-golemdb/tests/query.rs).
+- Live node (in-memory store): `query_operator_classes_over_a_live_node`
+  asserts `BETWEEN` on `u256` and `str`, an inverted range, and the
+  `-32002`/`-32001` errors for mixed bounds and `between = true`.
 
 **Tasks:**
-- [ ] Lexer: add `BETWEEN` as a keyword.
-- [ ] Parser: `rangeTest`, with the inner `AND` taken by the predicate.
-- [ ] Type check: same tag on both bounds, else `-32002`.
-- [ ] AST variant, or lowering to `Gte AND Lte`.
-- [ ] `lo > hi` matches nothing on both stores, rather than erroring.
-- [ ] Reject `between` as an attribute name.
-- [ ] Use `BETWEEN` in `the_specs_example_query_parses` in
-      [crates/arkiv-query/src/parse.rs](../crates/arkiv-query/src/parse.rs),
-      which currently writes the spec's example as `>= … AND <= …`.
+- [x] Lexer: add `BETWEEN` as a keyword.
+- [x] Parser: `rangeTest`, with the inner `AND` taken by the predicate.
+- [x] Type check: same tag on both bounds, else `-32002`.
+- [x] AST variant (`Query::Between`), lowered to one store test and one
+      GolemDB range.
+- [x] `lo > hi` matches nothing on both stores, rather than erroring.
+- [x] Reject `between` as an attribute name.
+- [x] Use `BETWEEN` in `the_specs_example_query_parses`.
 
 **Done when:** every `BETWEEN` row in the
 [repro table](#repro-queries) gives the spec's result.
@@ -262,7 +297,7 @@ so the adapter can lower `BETWEEN` to a single leaf.
 **Code:** `$owner = '0x…'`, `$creator = '0x…'` and `$key = '0x…'` are
 accepted, for compatibility with how the JS SDK writes them.
 
-**Where:** [`bare_str_value`, crates/arkiv-query/src/parse.rs:523-546](../crates/arkiv-query/src/parse.rs#L523-L546)
+**Where:** [`bare_str_value`, crates/arkiv-query/src/parse.rs:553-576](../crates/arkiv-query/src/parse.rs#L553-L576)
 
 **Tasks:**
 - [ ] Decide: document this in the spec, or remove it once the SDK sends the
@@ -285,8 +320,8 @@ stated (see S5).
   under case-sensitive names.
 
 **Where:**
-- [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:44-58](../crates/arkiv-query/src/lexer.rs#L44-L58)
-- [`validate_user_name`, crates/arkiv-query/src/parse.rs:626-643](../crates/arkiv-query/src/parse.rs#L626-L643)
+- [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:42-57](../crates/arkiv-query/src/lexer.rs#L42-L57)
+- [`validate_user_name`, crates/arkiv-query/src/parse.rs:657-674](../crates/arkiv-query/src/parse.rs#L657-L674)
 
 **Tasks:**
 - [ ] Decide whether tags are case-sensitive, and write it into the spec.
@@ -341,9 +376,10 @@ itself, to fix in the spec.
 - [ ] **D1.** The crate docs in [crates/arkiv-query/src/lib.rs](../crates/arkiv-query/src/lib.rs)
       say `!=` is reserved. Accurate today, but they will need rewriting with
       Q4. (The ordering paragraph was rewritten with Q3.)
-- [ ] **D2.** The header of [crates/arkiv-query/src/lexer.rs](../crates/arkiv-query/src/lexer.rs)
-      still calls `EXISTS` and `TYPEOF` "reserved but unimplemented", and the
-      `Token::Int` doc says "System attributes only". Neither is true any more.
+- [ ] **D2.** The `Token::Int` doc in [crates/arkiv-query/src/lexer.rs](../crates/arkiv-query/src/lexer.rs)
+      says "System attributes only", which is no longer true. (The lexer
+      header, which called `EXISTS` and `TYPEOF` "reserved but
+      unimplemented", was rewritten with Q5.)
 
 ---
 
@@ -355,10 +391,11 @@ takes 40 hex digits, and `key` and `bytes32` take 64.
 
 | Query | Spec | Current | Source | Item |
 |---|---|---|---|---|
-| `a BETWEEN i32(1) AND i32(5)` | OK | `-32001` | parser | Q5 |
-| `a BETWEEN 1 AND 5 AND b = 2` | OK, `(a BETWEEN 1 AND 5) AND b = 2` | `-32001` | parser | Q5 |
-| `a BETWEEN i32(1) AND u64(5)` | `-32002` | `-32001` | code | Q5 |
-| `between = true` | error (reserved word) | OK | parser | Q5 |
+| `a BETWEEN i32(1) AND i32(5)` | OK | OK (was `-32001`) | tests | Q5 ✓ |
+| `a BETWEEN 1 AND 5 AND b = 2` | OK, `(a BETWEEN 1 AND 5) AND b = 2` | as the spec (was `-32001`) | tests | Q5 ✓ |
+| `a BETWEEN i32(1) AND u64(5)` | `-32002` | `-32002` (was `-32001`) | tests | Q5 ✓ |
+| `a BETWEEN 5 AND 1` | matches nothing | matches nothing (was `-32001`) | tests | Q5 ✓ |
+| `between = true` | error (reserved word) | `-32001` (was OK) | tests | Q5 ✓ |
 | `a != i32(3)` | OK | `-32002` | parser | Q4 |
 | `name >= str('a')` | OK | OK (was `-32002`) | tests | Q3 ✓ |
 | `flag > false` | OK | OK (was `-32002`) | tests | Q3 ✓ |
@@ -390,6 +427,8 @@ Behavior that matches §4; keep it that way while fixing the items above.
   an error.
 - `< <= > >=` on every type except `bytes`, in the spec's order, on the
   in-memory, Valkey and GolemDB stores (Q3).
+- `BETWEEN`, inclusive at both ends, with its own `AND`, one type for both
+  bounds, and nothing matched when `lo > hi`; one GolemDB range (Q5).
 - `exists` and `typeof` see only indexed user attributes and refuse `$` names.
 - Names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, case-sensitive; `$`
   and `#` rejected.
