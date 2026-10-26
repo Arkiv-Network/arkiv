@@ -1573,6 +1573,7 @@ dependencies = [
  "clap",
  "eyre",
  "reth",
+ "reth-chain-state",
  "reth-cli",
  "reth-cli-util",
  "reth-db",

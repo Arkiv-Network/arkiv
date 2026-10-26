@@ -98,15 +98,20 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
         }
     }
 
-    /// The commit holding reth's canonical head.
+    /// The commit holding the head this node reports: reth's canonical head,
+    /// or the store's when the store has got further (`chain_info`).
     ///
     /// reth makes a block canonical, and serves its receipts, a moment before
     /// adoption commits it. A read of the current state in that window waits
     /// for the commit rather than answering from the block before: a client
     /// that sends its next transaction on seeing a receipt must have it
     /// checked against the state that receipt describes.
+    ///
+    /// While the node catches up the store can be ahead instead, since the
+    /// engine validator saves a block before reth makes it canonical. The
+    /// state served is then the store's head, the block the node reports.
     fn tip_commit(&self) -> ProviderResult<CommitId> {
-        let head = self.inner.chain_info()?.best_hash;
+        let head = self.chain_info()?.best_hash;
         let is_head = || {
             self.inner
                 .chain_info()
@@ -1448,9 +1453,11 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
 
     /// Whichever half of the Arkiv Store has got further.
     ///
-    /// While the node runs, reth is ahead: it holds blocks in memory that the
-    /// store has not committed yet, and reporting the store's number would
-    /// have the node believe it was behind itself (#166).
+    /// While the node runs, reth is usually ahead: it holds blocks in memory
+    /// that the store has not committed yet, and reporting the store's number
+    /// would have the node believe it was behind itself (#166). While it
+    /// catches up the store can be ahead, saving a block before reth makes it
+    /// canonical.
     ///
     /// After a crash the opposite holds. reth's database has only what it
     /// managed to flush, while the store kept every block it committed, so
@@ -1458,7 +1465,8 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
     /// from it strands the node on a block the store cannot serve (#176).
     ///
     /// Neither half is ever ahead of the real chain: the store commits only
-    /// adopted blocks, and reth's memory holds only blocks it built. So the
+    /// blocks reth has executed on the chain it follows, and reth's memory
+    /// holds only blocks it built. So the
     /// further of the two is the best answer available, and it is the right
     /// one in both situations.
     fn furthest_tip(&self, inner: BlockNumber) -> ProviderResult<BlockNumber> {

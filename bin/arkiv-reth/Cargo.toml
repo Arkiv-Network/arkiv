@@ -31,6 +31,8 @@ arkiv-reth-statemanager.workspace = true
 arkiv-reth-golemdbprovider.workspace = true
 # The engine-tree state-root seam and the add-ons the validator builder names.
 reth-engine-tree.workspace = true
+# `ExecutedBlock`, the parent the engine validator saves before its child.
+reth-chain-state.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-storage-overlay.workspace = true

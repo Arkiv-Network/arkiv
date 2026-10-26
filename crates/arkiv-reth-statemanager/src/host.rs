@@ -557,6 +557,10 @@ pub struct BlockSeals {
     finished: Mutex<Option<[u8; 32]>>,
     /// Signalled each time `finished` moves.
     finished_signal: Condvar,
+    /// Held for a whole [`adopt`](Self::adopt). Two callers save blocks: the
+    /// adoption task, and the engine validator saving a parent before its
+    /// child executes.
+    adopting: Mutex<()>,
 }
 
 impl BlockSeals {
@@ -614,20 +618,15 @@ impl BlockSeals {
         index.retain(|key, _| key.height > height);
     }
 
-    /// A block at `height` became canonical: commit its candidate and drop
-    /// every other candidate at or below that height.
+    /// Save block `block_hash` at `height`: commit its candidate and drop
+    /// every other candidate at or below that height. A block saved already
+    /// is left as it is.
     ///
-    /// Which candidate? The **last** sealed at that height.
+    /// Which candidate? One whose root is the block's `state_root`, the root
+    /// its header carries. A height can hold several candidates (a payload
+    /// builder re-builds as transactions arrive), and the root names the one
+    /// whose state this block has.
     ///
-    /// Not the first: a payload builder re-builds as transactions arrive, so a
-    /// height accumulates several candidates and the early ones are the
-    /// emptier ones. The last execution before a block goes canonical is reth
-    /// validating the block it chose, so its seal is the one that matches the
-    /// transactions actually in it.
-    ///
-    /// ponytail: last-at-height, which is ordering and not identity. Naming
-    /// the right seal outright needs the header to carry the Arkiv state root,
-    /// which is what installing a `StateRootStrategy` buys.
     /// # The block's own rows
     ///
     /// `writes` are the header, transactions and receipts of the block going
@@ -644,8 +643,13 @@ impl BlockSeals {
         store: &HostStore,
         height: u64,
         block_hash: [u8; 32],
+        state_root: [u8; 32],
         writes: &[SegmentWrite],
     ) -> Result<Option<CommitId>, ViewError> {
+        let _adopting = self
+            .adopting
+            .lock()
+            .expect("the seal registry's lock is never poisoned");
         let stale: BTreeMap<u64, Vec<(BranchId, SealedCommit)>> = {
             let mut pending = self
                 .pending
@@ -659,12 +663,12 @@ impl BlockSeals {
         let mut losers = Vec::new();
         for (h, candidates) in stale {
             for (branch, sealed) in candidates {
-                if h == height {
+                if h == height && sealed.state_root == state_root {
                     if let Some(previous) = winner.replace((branch, sealed)) {
                         losers.push(previous.0);
                     }
                 } else {
-                    // A height reth passed over.
+                    // A height reth passed over, or another candidate here.
                     losers.push(branch);
                 }
             }
@@ -675,6 +679,12 @@ impl BlockSeals {
             let _ = store.discard(branch);
         }
         self.forget_executions_through(height);
+        if let Some(saved) = store.commit_by_tag(block_hash)? {
+            if let Some((branch, _)) = winner {
+                let _ = store.discard(branch);
+            }
+            return Ok(Some(saved));
+        }
         match winner {
             Some((branch, _)) => {
                 // One call, not one per row. A block is a row per transaction
@@ -931,7 +941,7 @@ mod tests {
 
         let (store, seals) = adoptable();
         let branch = store.begin(Some(store.head())).expect("begin");
-        seals
+        let sealed = seals
             .seal(&store, ExecutionKey::new(1, vec![]), branch)
             .expect("seal");
 
@@ -941,7 +951,7 @@ mod tests {
             a_row(crate::segments::RECEIPTS, 0x7a, b"receipt"),
         ];
         let commit = seals
-            .adopt(&store, 1, [0xb1; 32], &writes)
+            .adopt(&store, 1, [0xb1; 32], sealed.state_root, &writes)
             .expect("adopt")
             .expect("a candidate was sealed at this height");
 
@@ -976,6 +986,7 @@ mod tests {
                 &store,
                 1,
                 [0xb1; 32],
+                [0; 32],
                 &[a_row(crate::segments::BLOCKS, 0xb1, b"header")],
             )
             .expect("adopt");
@@ -1001,11 +1012,13 @@ mod tests {
         use arkiv_interfaces::store::SegmentAddress;
 
         let (store, seals) = adoptable();
+        let mut root = [0; 32];
         for _ in 0..2 {
             let branch = store.begin(Some(store.head())).expect("begin");
-            seals
+            root = seals
                 .seal(&store, ExecutionKey::new(1, vec![]), branch)
-                .expect("seal");
+                .expect("seal")
+                .state_root;
         }
 
         let commit = seals
@@ -1013,6 +1026,7 @@ mod tests {
                 &store,
                 1,
                 [0xb1; 32],
+                root,
                 &[a_row(crate::segments::BLOCKS, 0xb1, b"header")],
             )
             .expect("adopt")
@@ -1033,6 +1047,50 @@ mod tests {
             None,
             "the loser appended nothing",
         );
+    }
+
+    /// A candidate is saved only for the block whose root it has.
+    #[test]
+    fn a_candidate_with_another_root_is_not_saved() {
+        let (store, seals) = adoptable();
+        let before = store.head();
+        let branch = store.begin(Some(store.head())).expect("begin");
+        let sealed = seals
+            .seal(&store, ExecutionKey::new(1, vec![]), branch)
+            .expect("seal");
+        let mut other = sealed.state_root;
+        other[0] ^= 1;
+
+        let adopted = seals
+            .adopt(&store, 1, [0xb1; 32], other, &[])
+            .expect("adopt");
+
+        assert_eq!(adopted, None);
+        assert_eq!(store.head(), before, "nothing was committed");
+    }
+
+    /// Saving a block that is saved already returns its commit and writes
+    /// nothing. The adoption task and the engine validator can both reach it.
+    #[test]
+    fn a_saved_block_is_not_saved_again() {
+        let (store, seals) = adoptable();
+        let rows = [a_row(crate::segments::BLOCKS, 0xb1, b"header")];
+        let mut saves = Vec::new();
+        for _ in 0..2 {
+            let branch = store.begin(Some(store.head())).expect("begin");
+            let sealed = seals
+                .seal(&store, ExecutionKey::new(1, vec![]), branch)
+                .expect("seal");
+            saves.push(
+                seals
+                    .adopt(&store, 1, [0xb1; 32], sealed.state_root, &rows)
+                    .expect("adopt")
+                    .expect("saved"),
+            );
+        }
+
+        assert_eq!(saves[0], saves[1], "the same commit both times");
+        assert_eq!(store.head(), saves[0], "and only one commit");
     }
 
     /// Across several blocks, the `transactions` and `receipts` ordinals stay
@@ -1103,11 +1161,11 @@ mod tests {
                 .expect("the block's parts agree");
 
             let branch = store.begin(Some(store.head())).expect("begin");
-            seals
+            let sealed = seals
                 .seal(&store, ExecutionKey::new(height, vec![]), branch)
                 .expect("seal");
             seals
-                .adopt(&store, height, block_hash.0, &writes)
+                .adopt(&store, height, block_hash.0, sealed.state_root, &writes)
                 .expect("adopt")
                 .expect("a candidate was sealed at this height");
             mined.extend(transactions.iter().map(|tx| *tx.hash()));
