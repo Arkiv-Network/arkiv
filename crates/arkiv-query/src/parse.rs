@@ -980,11 +980,23 @@ mod tests {
         );
         // Every type with a literal ranges, so every one has a BETWEEN.
         for (low, high) in [
-            ("u64(1)", "u64(9)"),
-            ("u256(1)", "u256(0x10)"),
-            ("dec(3.5)", "dec(5)"),
-            ("false", "true"),
-            ("str('a')", "str('b')"),
+            ("u64(1)".to_string(), "u64(9)".to_string()),
+            ("u256(1)".to_string(), "u256(0x10)".to_string()),
+            ("dec(3.5)".to_string(), "dec(5)".to_string()),
+            ("false".to_string(), "true".to_string()),
+            ("str('a')".to_string(), "str('b')".to_string()),
+            (
+                format!("addr({})", addr_hex("01")),
+                format!("addr({})", addr_hex("ab")),
+            ),
+            (
+                format!("key({})", word_hex("01")),
+                format!("key({})", word_hex("ab")),
+            ),
+            (
+                format!("bytes32({})", word_hex("01")),
+                format!("bytes32({})", word_hex("ab")),
+            ),
         ] {
             let query = format!("a BETWEEN {low} AND {high}");
             assert!(parse(&query).is_ok(), "{query}: {:?}", parse(&query));
@@ -1034,6 +1046,47 @@ mod tests {
             Query::Between {
                 key: built_in(BuiltIn::ExpiresAt),
                 bounds: ValueRange::new(AttributeValue::U64(10), AttributeValue::U64(20)).unwrap(),
+            }
+        );
+        // `$owner`, `$creator` and `$key` take every comparison, BETWEEN too.
+        assert_eq!(
+            parse(&format!(
+                "$owner BETWEEN addr({}) AND addr({})",
+                addr_hex("01"),
+                addr_hex("ab")
+            ))
+            .unwrap(),
+            Query::Between {
+                key: built_in(BuiltIn::Owner),
+                bounds: ValueRange::new(
+                    AttributeValue::EthereumAddress([0x01; 20]),
+                    AttributeValue::EthereumAddress([0xab; 20])
+                )
+                .unwrap(),
+            }
+        );
+        assert!(
+            parse(&format!(
+                "$creator BETWEEN addr({}) AND addr({})",
+                addr_hex("01"),
+                addr_hex("ab")
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            parse(&format!(
+                "$key BETWEEN key({}) AND key({})",
+                word_hex("01"),
+                word_hex("ab")
+            ))
+            .unwrap(),
+            Query::Between {
+                key: built_in(BuiltIn::Key),
+                bounds: ValueRange::new(
+                    AttributeValue::EntityKey([0x01; 32]),
+                    AttributeValue::EntityKey([0xab; 32])
+                )
+                .unwrap(),
             }
         );
         // Each bound is held to the attribute's type, as any value is.
