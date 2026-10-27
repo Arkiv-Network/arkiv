@@ -312,7 +312,7 @@ mod tests {
             store
                 .create(
                     branch,
-                    entity_records::record_key(entity.key),
+                    entity_records::record_key(entity.key).expect("an entity key"),
                     entity_records::to_cells(entity).expect("maps"),
                     None,
                 )
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn an_overlarge_result_is_refused_rather_than_truncated() {
-        let entities: Vec<Entity> = (0..8).map(|i| entity(i, 1, "x")).collect();
+        let entities: Vec<Entity> = (1..=8).map(|i| entity(i, 1, "x")).collect();
         let (store, at) = stored(&entities);
         let indices = StoreIndices::new(&store, at);
         // Sanity: within the real cap everything comes back.

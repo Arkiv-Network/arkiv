@@ -30,6 +30,8 @@ pub enum EntityError {
     Store(StoreError),
     /// A record could not be mapped to or from an entity.
     Record(RecordError),
+    /// The key is in the account namespace, where no entity is written.
+    AccountKey(EntityAddress),
 }
 
 impl From<StoreError> for EntityError {
@@ -81,26 +83,16 @@ fn merge(base: &mut EntityUpdates, next: EntityUpdates) {
 impl<S: Store> GolemStateView<S> {
     /// Read an entity, or `None` if it does not exist at that read mode.
     fn get(&self, address: EntityAddress, read: ReadMode) -> Result<Option<Entity>, EntityError> {
-        let record = self
-            .store
-            .get(
-                self.target(read),
-                entity_records::record_key(address),
-                None,
-                None,
-            )?
-            .into_value();
-        record
-            .as_ref()
-            .map(entity_records::from_record)
-            .transpose()
-            .map_err(Into::into)
+        entity_records::read(&self.store, self.target(read), address)
     }
 
     /// Apply `updates` to an entity, creating it if it does not exist.
     fn update(&mut self, updates: EntityUpdates) -> Result<(), EntityError> {
         let address = updates.entity;
-        let key = entity_records::record_key(address);
+        // A write there would land on the account's record.
+        let Some(key) = entity_records::record_key(address) else {
+            return Err(EntityError::AccountKey(address));
+        };
 
         if updates.delete {
             // Absent is not an error: a view may tombstone something it also
@@ -208,7 +200,10 @@ mod tests {
         }
     }
 
-    use arkiv_interfaces::store::ReadTarget;
+    use arkiv_interfaces::primitives::UserBalance;
+    use arkiv_interfaces::statemanager::AccountBalancesStore;
+    use arkiv_interfaces::store::reference::MemStore;
+    use arkiv_interfaces::store::{ReadTarget, RecordKey};
 
     use crate::view::tests::view;
 
@@ -282,7 +277,7 @@ mod tests {
             .store
             .get(
                 ReadTarget::Branch(view.branch),
-                entity_records::record_key([1; 32]),
+                entity_records::record_key([1; 32]).unwrap(),
                 None,
                 None,
             )
@@ -313,6 +308,45 @@ mod tests {
         let mut view = view();
         view.update(EntityUpdates::deletion([7; 32]))
             .expect("tombstone without a record");
+    }
+
+    const ACCOUNT: [u8; 20] = [0xaa; 20];
+
+    /// A view where `ACCOUNT` holds a balance, and the key its record sits at.
+    fn funded_account() -> (GolemStateView<MemStore>, EntityAddress) {
+        let mut view = view();
+        view.set_balance(ACCOUNT, UserBalance::from_u64(500))
+            .expect("fund");
+        (view, RecordKey::from_address(ACCOUNT).0)
+    }
+
+    #[test]
+    fn an_account_key_holds_no_entity() {
+        // The account's record is there, but it is not an entity's.
+        let (view, key) = funded_account();
+        assert_eq!(
+            view.get(key, ReadMode::ViewWithOverlay).expect("read"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_entity_write_to_an_account_key_is_refused() {
+        // A delete there would take the account's balance and nonces with it.
+        let (mut view, key) = funded_account();
+        assert_eq!(
+            view.update(EntityUpdates::deletion(key)),
+            Err(EntityError::AccountKey(key))
+        );
+        assert_eq!(
+            view.update(EntityUpdates::create(Entity { key, ..entity(1) })),
+            Err(EntityError::AccountKey(key))
+        );
+        assert_eq!(
+            view.get_balance(ACCOUNT, ReadMode::ViewWithOverlay)
+                .expect("balance"),
+            UserBalance::from_u64(500)
+        );
     }
 
     #[test]

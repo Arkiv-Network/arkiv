@@ -1511,6 +1511,74 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
     );
 }
 
+/// Keys a caller can name where GolemDB holds a record that is not an entity:
+/// an account's and GolemDB's own. An operation there reverts and a view call is
+/// mined; a store fault instead fails every block built while it is pooled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_that_hold_no_entity_find_none() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    let transactions = || async {
+        client
+            .provider()
+            .get_transaction_count(caller)
+            .await
+            .expect("transaction count")
+    };
+    let nonce = transactions().await;
+
+    let account = B256::left_padding_from(caller.as_slice());
+    // `#recordKeys` holds a cell for every record in the store.
+    let golemdb = [b"#params".as_slice(), b"#recordKeys"].map(B256::right_padding_from);
+    let keys = [account, golemdb[0], golemdb[1]];
+
+    let mut ops = vec![
+        patch_payload(account, Bytes::from_static(b"x")),
+        Operation::extend_expiry(account, 0, 5000),
+        Operation::transfer_ownership(account, Address::repeat_byte(0xbb)),
+    ];
+    ops.extend(keys.map(Operation::delete));
+    for op in &ops {
+        assert!(
+            !client.try_execute(vec![op.clone()]).await,
+            "an operation on a key that holds no entity must revert"
+        );
+    }
+
+    for key in keys {
+        assert!(client.get_entity(key).await.is_null());
+        assert!(!client.debug_entity_exists(key).await);
+
+        let view = TransactionRequest::default()
+            .with_to(ARKIV_ADDRESS)
+            .with_input(IEntityRegistry::customAttributeNamesCall { entityKey: key }.abi_encode())
+            .with_nonce(transactions().await)
+            .with_gas_limit(1_000_000)
+            .with_gas_price(1_000_000_000)
+            .with_chain_id(DEV_CHAIN_ID);
+        client
+            .provider()
+            .send_transaction(view)
+            .await
+            .expect("the pool accepts a view call")
+            .with_timeout(Some(Duration::from_secs(30)))
+            .get_receipt()
+            .await
+            .expect("a view call sent as a transaction is mined");
+    }
+
+    // Still an account: its nonce counts every transaction.
+    assert_eq!(
+        transactions().await,
+        nonce + (ops.len() + keys.len()) as u64
+    );
+}
+
 /// The base fee of every block up to `until`, as the RPC reports it.
 async fn base_fees(client: &ArkivClient<impl Provider>, until: u64) -> Vec<u64> {
     let mut fees = Vec::new();
