@@ -414,6 +414,25 @@ async fn estimated_gas_is_accepted_by_the_pool() {
         .await
         .expect("update receipt");
     assert!(receipt.status(), "update must succeed");
+
+    // Delete: reth runs every estimate probe on one EVM. If a probe's delete
+    // stuck, the next would revert EntityNotFound and the estimate would climb
+    // to the block gas cap.
+    let delete = registry.execute(vec![Operation::delete(key)]);
+    let estimate = delete.estimate_gas().await.expect("delete estimates");
+    assert!(estimate < 1_000_000, "delete estimated at {estimate}");
+    assert!(
+        !client.get_entity(key).await.is_null(),
+        "estimating a delete must not delete"
+    );
+    let receipt = delete
+        .send()
+        .await
+        .expect("delete with estimated gas accepted by the pool")
+        .get_receipt()
+        .await
+        .expect("delete receipt");
+    assert!(receipt.status(), "delete must succeed");
 }
 
 /// Every query-operator class — eq, IN, ranges, glob, boolean, negation, built-in
