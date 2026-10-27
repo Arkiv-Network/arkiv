@@ -1822,6 +1822,7 @@ async fn a_golemdb_store_with_another_genesis_root_is_refused() {
                 columns,
             })
             .collect(),
+        pruning: None,
     };
     let store: HostStore =
         std::sync::Arc::new(arkiv_golemdb::GolemDbStore::open(&directory, &config).unwrap());

@@ -31,7 +31,7 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, RecordLimits};
+pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, PruningConfig, RecordLimits};
 
 use convert::{
     arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
@@ -40,7 +40,9 @@ use convert::{
 };
 use tags::TagRow;
 
-/// Fixed when the database is created; reopening with anything else fails.
+/// The genesis and segments are fixed when the database is created, and the
+/// same on every node of a chain; reopening with others fails. The pruning is
+/// the node's own and may change between opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GolemDbConfig {
     /// GolemDB's settings, as the chain's genesis file gives them. They declare
@@ -48,6 +50,8 @@ pub struct GolemDbConfig {
     pub genesis: Genesis,
     /// The segments rows may be appended to.
     pub segments: Vec<SegmentSpec>,
+    /// How many past commits to keep; `None` keeps them all.
+    pub pruning: Option<PruningConfig>,
 }
 
 /// A segment: its name, and how many byte columns each of its rows has.
@@ -105,8 +109,11 @@ impl GolemDbStore {
     /// Open `directory`, creating it with `config` if it is new. Only one
     /// process may open a directory.
     pub fn open(directory: &Path, config: &GolemDbConfig) -> Result<Self, OpenError> {
-        let database =
-            golemdb::Database::open(directory, &golemdb::OpenConfig::new(config.full_genesis()?))?;
+        let mut open = golemdb::OpenConfig::new(config.full_genesis()?);
+        if let Some(pruning) = config.pruning {
+            open = open.with_pruning(pruning);
+        }
+        let database = golemdb::Database::open(directory, &open)?;
         Ok(Self { database })
     }
 

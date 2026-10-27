@@ -10,10 +10,13 @@ participants:
   # Participant 1 is the sole sequencer: its validator client proposes blocks.
   - el_type: reth
     el_image: arkiv-reth:dev
-    # The node needs a store named. This devnet runs on GolemDB, inside the
-    # datadir the package gives reth.
     el_extra_env_vars:
+      # The node needs a store named. This devnet runs on GolemDB, inside the
+      # datadir the package gives reth.
       ARKIV_STORE_PATH: /data/reth/execution-data/golemdb
+      # How much history GolemDB keeps: `head-only` (the default), a number of
+      # past blocks besides the head, or `archive` for every block.
+      ARKIV_STORE_HISTORY: head-only
     cl_type: lighthouse
     validator_count: 1
 
@@ -23,6 +26,7 @@ participants:
     el_image: arkiv-reth:dev
     el_extra_env_vars:
       ARKIV_STORE_PATH: /data/reth/execution-data/golemdb
+      ARKIV_STORE_HISTORY: head-only
     cl_type: lighthouse
     validator_count: 0
 

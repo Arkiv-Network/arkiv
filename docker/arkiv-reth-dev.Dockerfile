@@ -71,6 +71,9 @@ EXPOSE 8545 8546 8551 30303 30303/udp
 # The dev node runs on GolemDB, next to the datadir. The production images name
 # no store: a node there must choose one.
 ENV ARKIV_STORE_PATH=/data/golemdb
+# How much history GolemDB keeps: `head-only` (the default), a number of past
+# blocks besides the head, or `archive` for every block.
+ENV ARKIV_STORE_HISTORY=head-only
 ENTRYPOINT ["arkiv-reth"]
 # `arkiv` must NOT appear in --http.api/--ws.api: reth rejects unknown module
 # names; the arkiv_* namespace is merged onto both transports at launch.

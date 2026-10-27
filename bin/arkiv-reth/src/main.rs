@@ -122,7 +122,14 @@ fn expand_home(path: PathBuf) -> eyre::Result<PathBuf> {
 /// new.
 fn open_golemdb(directory: &Path, spec: &ArkivChainSpec) -> eyre::Result<HostStore> {
     let at = directory.display();
-    let config = golemdb_config(spec)?;
+    let history = match std::env::var("ARKIV_STORE_HISTORY") {
+        Err(std::env::VarError::NotPresent) => "head-only".to_owned(),
+        history => history.map_err(|e| eyre::eyre!("ARKIV_STORE_HISTORY: {e}"))?,
+    };
+    let config = arkiv_golemdb::GolemDbConfig {
+        pruning: pruning_config(&history)?,
+        ..golemdb_config(spec)?
+    };
     let store = arkiv_golemdb::GolemDbStore::open(directory, &config).map_err(|e| match e {
         arkiv_golemdb::OpenError::GenesisMismatch => eyre::eyre!(
             "open GolemDB at {at}: it was created with other GolemDB settings. Delete it if \
@@ -134,6 +141,7 @@ fn open_golemdb(directory: &Path, spec: &ArkivChainSpec) -> eyre::Result<HostSto
         target: "arkiv-reth",
         directory = %at,
         hash_function = ?config.genesis.hash_function,
+        %history,
         "Arkiv state on GolemDB"
     );
     Ok(Arc::new(store))
@@ -200,7 +208,25 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
                 columns,
             })
             .collect(),
+        pruning: None,
     })
+}
+
+/// GolemDB's pruning for the history `ARKIV_STORE_HISTORY` names: a number
+/// keeps that many past blocks besides the head, `archive` every commit, and
+/// `head-only` (the default) only the head.
+fn pruning_config(history: &str) -> eyre::Result<Option<arkiv_golemdb::PruningConfig>> {
+    let window = match history {
+        "archive" => return Ok(None),
+        "head-only" => 0,
+        n => n.parse().map_err(|_| {
+            eyre::eyre!(
+                "ARKIV_STORE_HISTORY={history}: use an integer number of blocks, 'archive' or \
+                 'head-only'"
+            )
+        })?,
+    };
+    Ok(Some(arkiv_golemdb::PruningConfig::new(window)))
 }
 
 /// Close gaps by downloading blocks as far as reth allows, unless the
@@ -403,6 +429,24 @@ mod tests {
                 "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
             }
         })
+    }
+
+    /// `archive` keeps every commit, `head-only` and `0` the head alone, and a
+    /// number that many blocks besides; anything else is refused.
+    #[test]
+    fn history_names_the_pruning_window() {
+        let window = |history| pruning_config(history).unwrap().map(|p| p.window());
+        assert_eq!(window("archive"), None);
+        assert_eq!(window("head-only"), Some(0));
+        assert_eq!(window("0"), Some(0));
+        assert_eq!(window("100"), Some(100));
+        for wrong in ["-1", "", "abc"] {
+            let error = pruning_config(wrong).unwrap_err().to_string();
+            assert!(
+                error.contains("use an integer number of blocks"),
+                "{wrong}: {error}"
+            );
+        }
     }
 
     /// GolemDB has no settings of its own: they come from the genesis file.

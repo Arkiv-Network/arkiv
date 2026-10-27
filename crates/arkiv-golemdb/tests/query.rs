@@ -32,6 +32,7 @@ fn config() -> GolemDbConfig {
     GolemDbConfig {
         genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
         segments: vec![],
+        pruning: None,
     }
 }
 

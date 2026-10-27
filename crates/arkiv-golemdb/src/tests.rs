@@ -23,6 +23,7 @@ fn config() -> GolemDbConfig {
             name: SEGMENT.into(),
             columns: 2,
         }],
+        pruning: None,
     }
 }
 

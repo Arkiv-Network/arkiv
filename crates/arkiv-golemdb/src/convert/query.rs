@@ -662,6 +662,7 @@ mod tests {
         let config = GolemDbConfig {
             genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
             segments: vec![],
+            pruning: None,
         };
         let store = GolemDbStore::open(dir.path(), &config).unwrap();
         let branch = store.begin(None).unwrap();
