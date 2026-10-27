@@ -8,8 +8,11 @@
 //! twelve zeros are the reservation — an [`EntityAddress`] is a derived 32-byte
 //! value, so one landing in that range is a hash collision rather than a layout
 //! mistake, and [`tests::an_account_key_cannot_be_an_entity_key`] pins the property.
+//! A caller can still name such a key in an operation, so entity reads and writes
+//! check for it: see [`is_account_key`].
 //!
 //! [`EntityAddress`]: arkiv_interfaces::primitives::EntityAddress
+//! [`is_account_key`]: arkiv_interfaces::entity_records::is_account_key
 //!
 //! # One record, three cells
 //!
@@ -364,8 +367,13 @@ mod tests {
         assert_eq!(&account.0[..12], &[0u8; 12]);
         assert_eq!(account.as_address(), Some(ALICE));
 
-        let entity = entity_records::record_key([0x37; 32]);
+        let entity = entity_records::record_key([0x37; 32]).unwrap();
         assert_ne!(account, entity);
+        assert_eq!(
+            entity_records::record_key(account.0),
+            None,
+            "no entity record key in the reserved range"
+        );
         assert_eq!(
             entity.as_address(),
             None,

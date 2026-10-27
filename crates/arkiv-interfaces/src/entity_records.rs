@@ -1,4 +1,4 @@
-//! An [`Entity`] as a GolemDB [`Record`], and back.
+//! An [`Entity`] as a GolemDB [`Record`] and back, and reading one by its key ([`read`]).
 //!
 //! # Why this is here and not in a backend crate
 //!
@@ -11,7 +11,8 @@
 //!
 //! # The layout
 //!
-//! One entity is one record, keyed by the entity address.
+//! One entity is one record, keyed by the entity address. An account's key holds
+//! an account's record, so [`record_key`] has no entity record key for it.
 //!
 //! Every system cell is named by its [`annotations`] constant: the API spec's name,
 //! `$`-prefixed.
@@ -48,7 +49,9 @@ use alloc::vec::Vec;
 use crate::constants::ENTITY_MAX_ATTRIBUTES;
 use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
-use crate::store::{Cell, CellKind, CellName, Record, RecordKey, TypeId};
+use crate::store::{
+    Cell, CellKind, CellName, ReadTarget, Record, RecordKey, Store, StoreError, TypeId,
+};
 
 /// The system cells of the layout above, which every entity record holds.
 const SYSTEM_CELLS: usize = 7;
@@ -101,9 +104,33 @@ pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
     }
 }
 
-/// The record key for an entity: its address, which is already 32 bytes.
-pub const fn record_key(key: EntityAddress) -> RecordKey {
-    RecordKey::from_entity(key)
+/// The record key for an entity: its address, which is already 32 bytes. `None`
+/// for an account's key, where no entity is read or written.
+pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
+    if is_account_key(key) {
+        None
+    } else {
+        Some(RecordKey::from_entity(key))
+    }
+}
+
+/// Whether `key` is an account's: an address left-padded with twelve zero bytes.
+/// A caller can name any key; at an account's there is no entity.
+pub const fn is_account_key(key: EntityAddress) -> bool {
+    RecordKey::from_entity(key).as_address().is_some()
+}
+
+/// The entity at `key` as of `target`, or `None` if there is none.
+pub fn read<S, E>(store: &S, target: ReadTarget, key: EntityAddress) -> Result<Option<Entity>, E>
+where
+    S: Store + ?Sized,
+    E: From<StoreError> + From<RecordError>,
+{
+    let Some(record_key) = record_key(key) else {
+        return Ok(None);
+    };
+    let record = store.get(target, record_key, None, None)?.into_value();
+    Ok(record.as_ref().map(from_record).transpose()?)
 }
 
 /// A system cell name, as a `&str`.
@@ -306,7 +333,7 @@ mod tests {
 
     fn as_record(entity: &Entity) -> Record {
         Record {
-            key: record_key(entity.key),
+            key: record_key(entity.key).unwrap(),
             version: RecordVersion(1),
             cells: to_cells(entity).expect("maps"),
         }

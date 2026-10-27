@@ -315,6 +315,11 @@ impl Store for GolemDbStore {
         projection: Option<&[CellName]>,
         budget: Option<Budget>,
     ) -> Result<Metered<Option<Record>>, StoreError> {
+        // GolemDB's own records sit at fixed keys a caller can name. None is
+        // Arkiv's, and `#recordKeys` holds a cell for every record there is.
+        if golemdb_cells::system::by_key(&key.0).is_some() {
+            return Ok(metered(None));
+        }
         let target = match target {
             ReadTarget::Branch(branch) => golemdb::ReadTarget::Branch(branch_id(branch)),
             ReadTarget::Commit(commit) => golemdb::ReadTarget::Commit(golemdb_commit(commit)),

@@ -110,6 +110,21 @@ fn every_type_round_trips() {
     assert_eq!(read, cells);
 }
 
+/// GolemDB's own records sit at fixed keys a caller can name; none is Arkiv's.
+#[test]
+fn golemdb_system_keys_hold_no_record() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    commit_record(&store, 1);
+    let branch = store.begin(Some(store.head())).unwrap();
+    for system in golemdb_cells::system::ALL {
+        for target in [ReadTarget::Commit(store.head()), ReadTarget::Branch(branch)] {
+            let read = store.get(target, RecordKey(system.key), None, None);
+            assert_eq!(read.map(Metered::into_value), Ok(None), "{system:?}");
+        }
+    }
+}
+
 /// GolemDB has no key type: only the entity's own `$key` comes back as `KEY`.
 #[test]
 fn other_key_cells_read_back_as_bytes32() {
@@ -160,7 +175,7 @@ fn an_entity_with_creation_flags_round_trips() {
     store
         .create(
             branch,
-            record_key(entity.key),
+            record_key(entity.key).unwrap(),
             to_cells(&entity).unwrap(),
             None,
         )
