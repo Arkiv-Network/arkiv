@@ -45,7 +45,7 @@ fn genesis_root(spec: &ArkivChainSpec) -> eyre::Result<B256> {
     let accounts = GenesisAccount::from_alloc(&spec.genesis().alloc);
     // The commit's tag sits outside the state root, so any tag gives the same
     // root.
-    let commit = seed_genesis(&store, [0; 32], accounts)
+    let commit = seed_genesis(&store, [0; 32], spec.fee_schedule(), accounts)
         .map_err(|e| eyre::eyre!("compute GolemDB's genesis root: {e:?}"))?
         .ok_or_else(|| eyre::eyre!("compute GolemDB's genesis root: the store has a genesis"))?;
     let root = store
@@ -100,6 +100,27 @@ mod tests {
             g["alloc"]["0x2222222222222222222222222222222222222222"]["balance"] = "0x2".into();
         });
         assert_ne!(richer.0.genesis_hash(), genesis, "balance");
+    }
+
+    /// Every fee-schedule value is part of block 0: two chains that differ in
+    /// only one of them have different genesis blocks.
+    #[test]
+    fn the_genesis_hash_covers_every_fee_schedule_value() {
+        let genesis = specs(|_| {}).0.genesis_hash();
+        for name in [
+            "capacity_rate",
+            "cell_byte_units",
+            "index_byte_units",
+            "c_cell",
+            "c_idx",
+            "max_lifetime",
+        ] {
+            let changed = specs(|g| {
+                let value = &mut g["config"]["arkiv"]["tokenomics"][name];
+                *value = (value.as_u64().unwrap() + 1).into();
+            });
+            assert_ne!(changed.0.genesis_hash(), genesis, "{name}");
+        }
     }
 
     /// A file for an experimental store, without GolemDB's settings, keeps

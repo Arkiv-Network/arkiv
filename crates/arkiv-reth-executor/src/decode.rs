@@ -410,7 +410,12 @@ mod tests {
             caller,
             block_number: block,
             gas_supplied: 1_000_000,
+            tx_gas: 0,
+            floor_gas: 0,
+            golemdb_cost_before: 0,
             chain_id,
+            max_lifetime: 7_884_000,
+            keep_writes: true,
         }
     }
 

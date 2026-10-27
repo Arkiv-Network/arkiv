@@ -43,8 +43,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange, RecordKey,
-    RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey, SegmentOrdinal,
-    SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp, WriteOutcome,
+    RecordMeta, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey,
+    SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteDetails,
+    WriteOp, WriteOutcome,
 };
 use core::ops::Range;
 use fred::prelude::*;
@@ -168,10 +169,21 @@ impl Drop for ValkeyStore {
 /// Nothing here meters: cost is the real store's concern, priced against a
 /// schedule this one does not have. Inventing numbers would give call sites
 /// something that looks like a cost and means nothing.
+///
+/// Effects are another matter: what a write did to a record's cells is a fact
+/// of the data, not of a price, and storage is priced from it. Writes report
+/// them exactly, by GolemDB's size rule ([`WriteDetails::between`]).
 const fn free_receipt() -> Receipt {
+    receipt(WriteDetails::ZERO)
+}
+
+/// A zero-cost receipt carrying a write's effects.
+const fn receipt(details: WriteDetails) -> Receipt {
     Receipt {
         cost: CostUnits(0),
         schedule: ScheduleVersion(0),
+        priced_at: None,
+        details,
     }
 }
 
@@ -237,7 +249,7 @@ impl Store for ValkeyStore {
         _budget: Option<Budget>,
     ) -> Result<Metered<RecordKey>, StoreError> {
         self.call(move |backend| async move { backend.create(branch, key, cells).await })
-            .map(with_free_receipt)
+            .map(|(key, details)| Metered::new(key, receipt(details)))
     }
 
     fn get(
@@ -250,7 +262,9 @@ impl Store for ValkeyStore {
         let projection = projection.map(<[CellName]>::to_vec);
         self.call(move |backend| async move {
             let found = backend.read(target, key).await?;
-            Ok(found.map(|record| record.to_record(key, projection.as_deref())))
+            found
+                .map(|record| record.to_record(key, projection.as_deref()))
+                .transpose()
         })
         .map(with_free_receipt)
     }
@@ -266,7 +280,7 @@ impl Store for ValkeyStore {
         self.call(move |backend| async move {
             backend.patch(branch, key, expected_version, changes).await
         })
-        .map(with_free_receipt)
+        .map(|(version, details)| Metered::new(version, receipt(details)))
     }
 
     fn delete(
@@ -277,7 +291,7 @@ impl Store for ValkeyStore {
         _budget: Option<Budget>,
     ) -> Result<Metered<()>, StoreError> {
         self.call(move |backend| async move { backend.delete(branch, key, expected_version).await })
-            .map(with_free_receipt)
+            .map(|details| Metered::new((), receipt(details)))
     }
 
     fn query(
@@ -295,7 +309,7 @@ impl Store for ValkeyStore {
             // implementation, so filter semantics cannot diverge by backend.
             let mut matched = Vec::new();
             for (key, record) in &state {
-                let full = record.to_record(*key, None);
+                let full = record.to_record(*key, None)?;
                 if query.filter.matches(&full)? {
                     matched.push(full);
                 }
@@ -333,7 +347,7 @@ impl Store for ValkeyStore {
             let state = backend.state_at(at).await?;
             let mut matched = 0;
             for (key, record) in &state {
-                if filter.matches(&record.to_record(*key, None))? {
+                if filter.matches(&record.to_record(*key, None)?)? {
                     matched += 1;
                 }
             }
@@ -444,27 +458,31 @@ impl StoreExt for ValkeyStore {
             self.call(move |backend| async move { backend.snapshot_diff(branch).await })?;
 
         let mut outcomes = Vec::with_capacity(ops.len());
+        let mut total = free_receipt();
         for op in ops {
             let outcome = match op {
                 WriteOp::Create { key, cells } => self
                     .create(branch, key, cells, budget)
-                    .map(|_| WriteOutcome::Created),
+                    .map(|done| done.map(|_| WriteOutcome::Created)),
                 WriteOp::Patch {
                     key,
                     expected_version,
                     changes,
                 } => self
                     .patch(branch, key, expected_version, changes, budget)
-                    .map(|new| WriteOutcome::Patched(new.into_value())),
+                    .map(|done| done.map(WriteOutcome::Patched)),
                 WriteOp::Delete {
                     key,
                     expected_version,
                 } => self
                     .delete(branch, key, expected_version, budget)
-                    .map(|_| WriteOutcome::Deleted),
+                    .map(|done| done.map(|()| WriteOutcome::Deleted)),
             };
             match outcome {
-                Ok(applied) => outcomes.push(applied),
+                Ok(applied) => {
+                    total.accumulate(&applied.receipt);
+                    outcomes.push(applied.into_value());
+                }
                 Err(error) => {
                     self.call(move |backend| async move {
                         backend.restore_diff(branch, saved, version).await
@@ -478,7 +496,7 @@ impl StoreExt for ValkeyStore {
         // per-call increments above would otherwise leave behind.
         let bumped = BranchVersion(version.0 + 1);
         self.call(move |backend| async move { backend.set_version(branch, bumped).await })?;
-        Ok(with_free_receipt(outcomes))
+        Ok(Metered::new(outcomes, total))
     }
 
     fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError> {
@@ -506,7 +524,8 @@ impl StoreExt for ValkeyStore {
                     backend
                         .read(target, key)
                         .await?
-                        .map(|record| record.to_record(key, projection.as_deref())),
+                        .map(|record| record.to_record(key, projection.as_deref()))
+                        .transpose()?,
                 );
             }
             Ok(found)
@@ -515,11 +534,15 @@ impl StoreExt for ValkeyStore {
     }
 }
 
-/// Drop the cells a projection excludes. Applied after matching, because a
-/// predicate may name a cell the caller did not ask to see.
+/// Drop the cells a projection excludes, and the size unless it asked for
+/// `#meta`. Applied after matching, because a predicate may name a cell the
+/// caller did not ask to see.
 fn project(mut record: Record, projection: Option<&[CellName]>) -> Record {
     if let Some(wanted) = projection {
         record.cells.retain(|(name, _)| wanted.contains(name));
+        if !wanted.iter().any(|name| name == RecordMeta::CELL) {
+            record.meta = None;
+        }
     }
     record
 }

@@ -116,6 +116,13 @@ struct Operation {
 //   protocol-bounded domain: expiresAt <= MAX_EXPIRES_AT and minLifetime <=
 //   MAX_LIFETIME (both ProtocolParams; typed revert above, never truncation).
 //   expiresAt == MAX_EXPIRES_AT ⇒ permanent (exempt from the lifetime bound).
+//   Permanent expiry isn't available in iteration 1 of the tokenomics: storage
+//   is paid per block upfront, so a create or extend asking for it reverts as
+//   exceeding MAX_LIFETIME.
+//   MAX_LIFETIME is the fee schedule's max_lifetime. A target beyond it reverts
+//   with ExpiryBeyondMaxLifetime(uint64 target, uint64 currentBlock,
+//   uint64 maxLifetime), checked when the operation runs; an extend that keeps
+//   the expiry is a no-op and not checked.
 //   Otherwise: target = max(expiresAt, current + minLifetime);
 //   require target > current and target <= current + MAX_LIFETIME.
 //   extend_expiry additionally requires target >= $expiresAt (> extends,
@@ -458,3 +465,94 @@ shorten (`extend_expiry`), is dead-on-arrival (`target ≤ current`), or breaks
 the lifetime domain (`expiresAt > MAX_EXPIRES_AT`, `minLifetime > MAX_LIFETIME`,
 or a finite `target > current + MAX_LIFETIME`); transfer to zero/self; op auth
 failure (owner-only).
+
+## 7. Fee API (draft)
+
+This section specifies the proposed [tokenomics](tokenomics-spec.md) API, not a claim that
+these methods or receipt additions are already implemented. The spec defines pricing,
+settlement and [quote validity](tokenomics-spec.md#estimation).
+
+### `arkiv_estimateFee`
+
+Uses the positional params of `eth_estimateGas`: `[transaction, block?, stateOverride?]`.
+All quantities are compact `0x` hex strings. The quote executes on top of the requested block;
+its `blockNumber` is the following block, whose context and fee schedule determine the quote.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `transaction` | required | Transaction object described below |
+| `block` | `latest` | Block number, tag or hash; `pending` executes on top of the pending block |
+| `stateOverride` | none | Per-address balance and nonce overrides, as in `eth_estimateGas` |
+
+| Transaction field | Default | Rule |
+| --- | --- | --- |
+| `from` | zero address | Used for owner checks and entity key derivation; callers should set it |
+| `to` | required | Must be `ARKIV_ADDRESS`; other transactions use `eth_estimateGas` |
+| `input` or `data` | required | The `execute` calldata |
+| `value` | ignored | Executes as if value were unlimited; returns the required amount |
+| `gas` | node cap | Upper bound on compute gas; exceeding it fails the estimate |
+| `maxFeePerGas`, `maxPriorityFeePerGas` | none | Determine `priorityFee` and `computeFee`, not the gas count or required value |
+| `gasPrice` | none | Accepted for legacy transactions |
+| `nonce`, `type`, `chainId` | as in `eth_estimateGas` | Types 3 and 4 are rejected |
+| `accessList`, `authorizationList` | empty | Non-empty lists are rejected |
+
+The result is an object with these fields; names in the formula column refer to the spec.
+
+| Result field | Formula or meaning |
+| --- | --- |
+| `blockNumber` | The block priced for: the one after `block` |
+| `gasLimit` | `compute_gas`, exact for the quoted context, with no margin |
+| `requiredValue` | `storage_fee + purge_fee`; minimum value for that context |
+| `storageGas`, `purgeGas` | `storage_gas`, `purge_gas` |
+| `storageFee`, `purgeFee` | The corresponding fees in wei |
+| `baseFee` | Base fee for `blockNumber`, derived from `block` under the spec's base-fee rule |
+| `priorityFee` | `min(maxPriorityFeePerGas, maxFeePerGas − baseFee)`; zero when fee fields are absent |
+| `computeFee` | `(baseFee + priorityFee) × gasLimit` |
+| `totalFee` | `computeFee + requiredValue` |
+| `minBaseFee`, `capacityRate` | The fee schedule values used |
+| `pendingScheduleAt` | Activation block of an announced schedule change, or `null` |
+
+There is no sender funding check and no `InsufficientValue` failure. Other execution reverts
+are returned as at inclusion. Storage gas is rounded up once over the batch, not per operation.
+The SDK may add a value buffer; neither that buffer nor `pendingScheduleAt` guarantees validity
+at a later height. State changes, expiry and schedule changes can require a new quote.
+
+| Code | Error | Condition |
+| --- | --- | --- |
+| 3 | execution reverted | Batch fails; `data` contains the typed revert |
+| −32000 | gas required exceeds allowance | Compute exceeds `gas` or the node cap |
+| −32602 | invalid params | Wrong `to`, type 3 or 4, or non-empty access/authorization list |
+| −32006 | block unavailable | Requested block is outside the retained range |
+
+### `eth_estimateGas`
+
+Returns compute gas as a single quantity, equal to `arkiv_estimateFee`'s `gasLimit` for the
+same successful execution context. Unlike the Arkiv quote, it requires sufficient `value` and
+applies its normal funding checks. Too little value returns error 3 with
+`InsufficientValue(required, provided)` as revert data.
+
+### Receipts and fee logs
+
+| Surface | Field | Meaning |
+| --- | --- | --- |
+| Transaction | `gasLimit`, `maxFeePerGas`, `maxPriorityFeePerGas` | Compute limit and EIP-1559 price caps |
+| Transaction | `value` | Cap on storage and purge fees |
+| Receipt | `gasUsed`, `effectiveGasPrice` | Compute gas and `base_fee + priority_fee` |
+| Receipt (new) | `storageGas`, `purgeGas` | Storage and purge quantities, priced at `min_base_fee` |
+| Receipt (new) | `storageFee`, `purgeFee` | Amounts paid into the pool, in wei |
+| Header | `gasUsed`, `baseFeePerGas` | Sum of receipt compute gas; block base fee |
+
+```solidity
+event ValueReceived(address indexed sender, uint256 value);
+event ValueReturned(address indexed sender, uint256 change);
+```
+
+On success, `ValueReceived` is the first log when `value > 0`; `ValueReturned` is the last
+when `change > 0`. Both are discarded on revert. The sender's cost is
+`gasUsed × effectiveGasPrice + storageFee + purgeFee`, equivalently
+`gasUsed × effectiveGasPrice + value − change`.
+
+### `arkiv_getFeeSchedule`
+
+Returns the active GolemDB and Arkiv schedule and any pending schedule with its activation
+block. The [fee schedule rules](tokenomics-spec.md#fee-schedule) govern activation.

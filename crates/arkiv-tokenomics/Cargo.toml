@@ -1,0 +1,18 @@
+[package]
+name = "arkiv-tokenomics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Arkiv's storage pricing as pure, checked arithmetic: storage units from a
+# record's size, storage time per operation, a transaction's gas meter and the
+# `$rate` rule. No store, no host: the executor reads the inputs and applies
+# the results.
+
+[dependencies]
+arkiv-interfaces.workspace = true
+
+[dev-dependencies]
+# keccak256, to prove the schedule's record key is the hash it says it is.
+alloy-primitives.workspace = true

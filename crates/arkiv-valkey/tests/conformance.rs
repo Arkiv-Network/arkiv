@@ -45,6 +45,12 @@ fn conformance_part_two() {
     conformance::run_part_two(&new_store);
 }
 
+#[test]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+fn write_details_conformance() {
+    conformance::run_write_details(&new_store);
+}
+
 /// Appended rows outlive the connection too, addressable by both ordinal and
 /// key — the half of the segment contract `MemStore` cannot demonstrate.
 #[test]

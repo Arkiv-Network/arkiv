@@ -27,6 +27,32 @@ pub trait CostModel {
     fn query_cost(&self, stats: &QueryStats) -> Gas;
 }
 
+/// One transaction's gas, by what it pays for. Settlement, receipts and the
+/// fee estimate all read this one structure, so the three cannot disagree.
+///
+/// Plain data, here rather than with the arithmetic that fills it, so an
+/// execution result can carry it without depending on the pricing crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GasBreakdown {
+    /// The transaction terms, the operations and GolemDB's work, floored once
+    /// at the EIP-7623 minimum.
+    pub compute_gas: Gas,
+    /// The storage bought, rounded up once per transaction.
+    pub storage_gas: Gas,
+    /// The deletion reserve bought. Zero until purge reserves are collected.
+    pub purge_gas: Gas,
+}
+
+impl GasBreakdown {
+    /// `gas_used`: the three parts together, or `None` if they do not fit.
+    pub const fn total(&self) -> Option<Gas> {
+        match self.compute_gas.checked_add(self.storage_gas) {
+            Some(sum) => sum.checked_add(self.purge_gas),
+            None => None,
+        }
+    }
+}
+
 // --- Provisional schedule (non-final placeholder numbers) --------------------
 
 /// Base cost to create an entity.

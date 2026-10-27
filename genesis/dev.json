@@ -31,6 +31,14 @@
           "max_cells": 39,
           "max_indexed_cells": 36
         }
+      },
+      "tokenomics": {
+        "capacity_rate": 14,
+        "cell_byte_units": 1,
+        "index_byte_units": 1,
+        "c_cell": 64,
+        "c_idx": 64,
+        "max_lifetime": 7884000
       }
     }
   },

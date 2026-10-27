@@ -21,7 +21,7 @@ use core::ops::Bound;
 use std::collections::BTreeMap;
 
 use arkiv_golemdb_state::{GolemStateView, ViewError};
-use arkiv_interfaces::entity::{AttributeValue, Entity};
+use arkiv_interfaces::entity::AttributeValue;
 use arkiv_interfaces::gas::PlaceholderCost;
 use arkiv_interfaces::primitives::{
     EntityAddress, EntityCreationNonce, UserAddress, UserBalance, UserNonce,
@@ -29,9 +29,12 @@ use arkiv_interfaces::primitives::{
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, Commitment, EntityCreationNoncesStore,
     EntityStore, EntityUpdates, EqualityIndexStore, PruningMeta, PruningStore, RangeIndexStore,
-    ReadMode, SessionId, StateCommit, StateView, StoreKind,
+    ReadMode, SessionId, StateCommit, StateView, StoreKind, StoredEntity,
 };
-use arkiv_interfaces::store::{BranchId, CommitId, SealedCommit, Store, StoreError, StoreExt};
+use arkiv_interfaces::store::{
+    BranchId, CommitId, Metered, SealedCommit, Store, StoreError, StoreExt,
+};
+use arkiv_tokenomics::{FeeSchedule, FeeScheduleSource};
 use core::sync::atomic::{AtomicU64, Ordering};
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::state::EvmState;
@@ -127,15 +130,15 @@ where
 {
     type Error = HostError<E>;
 
-    fn get_entity(
+    fn get_entity_with_meta(
         &self,
         address: EntityAddress,
         read: ReadMode,
-    ) -> Result<Option<Entity>, Self::Error> {
-        Ok(self.golem.get_entity(address, read)?)
+    ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
+        Ok(self.golem.get_entity_with_meta(address, read)?)
     }
 
-    fn update_entity(&mut self, updates: EntityUpdates) -> Result<(), Self::Error> {
+    fn update_entity(&mut self, updates: EntityUpdates) -> Result<Metered<()>, Self::Error> {
         Ok(self.golem.update_entity(updates)?)
     }
 
@@ -229,14 +232,14 @@ where
         &self,
         owner: UserAddress,
         read: ReadMode,
-    ) -> Result<EntityCreationNonce, Self::Error> {
+    ) -> Result<Metered<EntityCreationNonce>, Self::Error> {
         Ok(self.golem.get_entity_creation_nonce(owner, read)?)
     }
 
     fn fetch_increment_entity_creation_nonce(
         &mut self,
         owner: UserAddress,
-    ) -> Result<EntityCreationNonce, Self::Error> {
+    ) -> Result<Metered<EntityCreationNonce>, Self::Error> {
         Ok(self.golem.fetch_increment_entity_creation_nonce(owner)?)
     }
 
@@ -404,6 +407,19 @@ where
     }
 }
 
+/// The block's fee schedule, from GolemDB's side of the view.
+impl<B, C, E> FeeScheduleSource for HostStateView<B, C>
+where
+    B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
+    E: core::fmt::Debug,
+{
+    type Error = HostError<E>;
+
+    fn fee_schedule(&self) -> Result<FeeSchedule, Self::Error> {
+        Ok(self.golem.fee_schedule()?)
+    }
+}
+
 impl<B, C, E> StateView for HostStateView<B, C>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
@@ -421,6 +437,20 @@ where
 
     fn has_store(&self, _store: StoreKind) -> bool {
         true
+    }
+
+    /// The frame covers what GolemDB holds. The account mirror is not rolled
+    /// back with it, which is why account writes stay outside the frame.
+    fn begin_frame(&mut self) -> Result<(), <Self as StateView>::Error> {
+        Ok(self.golem.begin_frame()?)
+    }
+
+    fn merge_frame(&mut self) -> Result<(), <Self as StateView>::Error> {
+        Ok(self.golem.merge_frame()?)
+    }
+
+    fn discard_frame(&mut self) -> Result<(), <Self as StateView>::Error> {
+        Ok(self.golem.discard_frame()?)
     }
 
     fn graduate(self, block: BlockRef) -> Result<StateCommit, <Self as StateView>::Error> {
@@ -773,6 +803,7 @@ mod tests {
     use super::*;
     use alloy_primitives::U256;
     use arkiv_golemdb_state::GolemStateManager;
+    use arkiv_interfaces::entity::Entity;
     use arkiv_interfaces::statemanager::StateManager;
     use arkiv_interfaces::store::Store;
     use arkiv_interfaces::store::reference::MemStore;

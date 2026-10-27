@@ -44,6 +44,7 @@
 //!   upstream; when it lands it belongs in that function and nowhere else.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Debug;
@@ -121,6 +122,238 @@ pub struct ScheduleVersion(pub u64);
 pub struct Receipt {
     pub cost: CostUnits,
     pub schedule: ScheduleVersion,
+    /// The commit whose pricing schedule the call was priced against. `None`
+    /// where a store prices nothing, or rejected the call before pricing it.
+    pub priced_at: Option<CommitId>,
+    /// What a write did to the record's user cells. Zero for reads.
+    pub details: WriteDetails,
+}
+
+impl Receipt {
+    /// Add `other`'s cost and details to this receipt, as the receipts of
+    /// several calls add up. The schedule and pricing commit are left alone:
+    /// summed receipts no longer name one call.
+    pub fn accumulate(&mut self, other: &Receipt) {
+        self.cost = CostUnits(self.cost.0.saturating_add(other.cost.0));
+        self.details.accumulate(&other.details);
+    }
+}
+
+/// A write's effects on a record's user cells, as the store reports them.
+///
+/// Bytes follow GolemDB's size rule: a cell counts `(8 + name) + (1 + value)`
+/// bytes, an index entry `name + 2 + value`. Deleted bytes are reported, never
+/// refunded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteDetails {
+    pub cells_created: u64,
+    pub cells_updated: u64,
+    pub cells_deleted: u64,
+    pub index_joins: u64,
+    pub index_leaves: u64,
+    pub cell_bytes_written: u64,
+    pub cell_bytes_deleted: u64,
+    pub index_bytes_written: u64,
+    pub index_bytes_deleted: u64,
+}
+
+impl WriteDetails {
+    /// No effects: a read, or a store that does not report them.
+    pub const ZERO: Self = Self {
+        cells_created: 0,
+        cells_updated: 0,
+        cells_deleted: 0,
+        index_joins: 0,
+        index_leaves: 0,
+        cell_bytes_written: 0,
+        cell_bytes_deleted: 0,
+        index_bytes_written: 0,
+        index_bytes_deleted: 0,
+    };
+
+    /// Add `other`'s counts to these.
+    pub fn accumulate(&mut self, other: &WriteDetails) {
+        self.cells_created = self.cells_created.saturating_add(other.cells_created);
+        self.cells_updated = self.cells_updated.saturating_add(other.cells_updated);
+        self.cells_deleted = self.cells_deleted.saturating_add(other.cells_deleted);
+        self.index_joins = self.index_joins.saturating_add(other.index_joins);
+        self.index_leaves = self.index_leaves.saturating_add(other.index_leaves);
+        self.cell_bytes_written = self
+            .cell_bytes_written
+            .saturating_add(other.cell_bytes_written);
+        self.cell_bytes_deleted = self
+            .cell_bytes_deleted
+            .saturating_add(other.cell_bytes_deleted);
+        self.index_bytes_written = self
+            .index_bytes_written
+            .saturating_add(other.index_bytes_written);
+        self.index_bytes_deleted = self
+            .index_bytes_deleted
+            .saturating_add(other.index_bytes_deleted);
+    }
+
+    /// Count one cell going from `before` to `after`, as GolemDB counts it.
+    ///
+    /// An unchanged cell, or one of the engine's own (`#…`, `@…`), counts
+    /// nothing. "Unchanged" means unchanged as stored, which is coarser than
+    /// [`Cell`] equality: see [`stored_alike`]. Otherwise the old value is
+    /// deleted and the new one written, each with its index entry if it is an
+    /// attribute: an update of an attribute leaves the index and joins it again.
+    pub fn change(
+        &mut self,
+        name: &str,
+        before: Option<&Cell>,
+        after: Option<&Cell>,
+    ) -> Result<(), StoreError> {
+        let unchanged = match (before, after) {
+            (Some(before), Some(after)) => stored_alike(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged || matches!(name.as_bytes().first(), Some(b'#' | b'@')) {
+            return Ok(());
+        }
+        match (before, after) {
+            (None, Some(_)) => add(&mut self.cells_created, 1)?,
+            (Some(_), Some(_)) => add(&mut self.cells_updated, 1)?,
+            (Some(_), None) => add(&mut self.cells_deleted, 1)?,
+            (None, None) => return Ok(()),
+        }
+        if let Some(cell) = before {
+            add(&mut self.cell_bytes_deleted, cell_size(name, cell)?)?;
+            if cell.kind == CellKind::Attribute {
+                add(&mut self.index_leaves, 1)?;
+                add(&mut self.index_bytes_deleted, index_size(name, cell)?)?;
+            }
+        }
+        if let Some(cell) = after {
+            add(&mut self.cell_bytes_written, cell_size(name, cell)?)?;
+            if cell.kind == CellKind::Attribute {
+                add(&mut self.index_joins, 1)?;
+                add(&mut self.index_bytes_written, index_size(name, cell)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The effects of a record going from the cells `before` to the cells
+    /// `after`: a create is `between(∅, cells)`, a delete `between(cells, ∅)`.
+    pub fn between<'a>(
+        before: impl IntoIterator<Item = (&'a CellName, &'a Cell)>,
+        after: impl IntoIterator<Item = (&'a CellName, &'a Cell)>,
+    ) -> Result<Self, StoreError> {
+        let before: BTreeMap<&str, &Cell> = before
+            .into_iter()
+            .map(|(name, cell)| (name.as_str(), cell))
+            .collect();
+        let after: BTreeMap<&str, &Cell> = after
+            .into_iter()
+            .map(|(name, cell)| (name.as_str(), cell))
+            .collect();
+        let mut details = Self::ZERO;
+        for (name, cell) in &before {
+            details.change(name, Some(cell), after.get(name).copied())?;
+        }
+        for (name, cell) in &after {
+            if !before.contains_key(name) {
+                details.change(name, None, Some(cell))?;
+            }
+        }
+        Ok(details)
+    }
+}
+
+/// Whether two cells are the same once stored: same kind, same value, and the
+/// same type up to GolemDB's encoding.
+///
+/// GolemDB has no key type, so `KEY` and `BYTES32` both store as 32 fixed
+/// bytes, and switching one for the other with the bytes and kind kept is no
+/// write there. Effects must agree with GolemDB, so they treat the two alike;
+/// [`Cell`] equality stays exact, because a reader still sees the type it set.
+fn stored_alike(a: &Cell, b: &Cell) -> bool {
+    a.kind == b.kind && a.value == b.value && stored_type(a.type_id) == stored_type(b.type_id)
+}
+
+/// The type GolemDB stores a value under, where two of Arkiv's share one.
+const fn stored_type(type_id: TypeId) -> TypeId {
+    match type_id {
+        TypeId::KEY => TypeId::BYTES32,
+        other => other,
+    }
+}
+
+/// The bytes a cell takes, by GolemDB's size rule: an 8-byte key, the name,
+/// and the value with its one-byte type tag.
+pub fn cell_size(name: &str, cell: &Cell) -> Result<u64, StoreError> {
+    size(&[8, name.len(), 1, cell.value.len()])
+}
+
+/// The bytes an attribute's index entry takes, by GolemDB's size rule: the
+/// name, two bytes, and the value without its tag.
+pub fn index_size(name: &str, cell: &Cell) -> Result<u64, StoreError> {
+    size(&[name.len(), 2, cell.value.len()])
+}
+
+/// The sizes are consensus input, so a sum that does not fit is a failure,
+/// never a saturated count.
+fn size(parts: &[usize]) -> Result<u64, StoreError> {
+    parts.iter().try_fold(0u64, |total, &part| {
+        let part = u64::try_from(part).map_err(|_| StoreError::Internal)?;
+        total.checked_add(part).ok_or(StoreError::Internal)
+    })
+}
+
+fn add(total: &mut u64, amount: u64) -> Result<(), StoreError> {
+    *total = total.checked_add(amount).ok_or(StoreError::Internal)?;
+    Ok(())
+}
+
+/// A record's size, as GolemDB keeps it in its `#meta` cell: the record's user
+/// cells and what they take, by the same size rule as [`WriteDetails`].
+///
+/// GolemDB's own figure is the source; the other stores, which have no engine
+/// to ask, compute it with [`from_cells`](Self::from_cells).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecordMeta {
+    pub cells: u64,
+    pub cell_bytes: u64,
+    pub indexed_cells: u64,
+    pub index_bytes: u64,
+}
+
+impl RecordMeta {
+    /// The cell name GolemDB keeps a record's meta under.
+    pub const CELL: &'static str = "#meta";
+
+    /// The size of a record holding `cells`, as GolemDB counts it: every cell
+    /// but the engine's own (`#…`, `@…`), each attribute with its index entry.
+    pub fn from_cells<'a>(
+        cells: impl IntoIterator<Item = (&'a CellName, &'a Cell)>,
+    ) -> Result<Self, StoreError> {
+        let mut meta = Self::default();
+        for (name, cell) in cells {
+            if matches!(name.as_bytes().first(), Some(b'#' | b'@')) {
+                continue;
+            }
+            add(&mut meta.cells, 1)?;
+            add(&mut meta.cell_bytes, cell_size(name, cell)?)?;
+            if cell.kind == CellKind::Attribute {
+                add(&mut meta.indexed_cells, 1)?;
+                add(&mut meta.index_bytes, index_size(name, cell)?)?;
+            }
+        }
+        Ok(meta)
+    }
+
+    /// The meta a read reports: present on a full read, and on a projected
+    /// one only if it asked for [`CELL`](Self::CELL), as GolemDB does.
+    pub fn read<'a>(
+        cells: impl IntoIterator<Item = (&'a CellName, &'a Cell)>,
+        projection: Option<&[CellName]>,
+    ) -> Result<Option<Self>, StoreError> {
+        let wanted = projection.is_none_or(|names| names.iter().any(|name| name == Self::CELL));
+        wanted.then(|| Self::from_cells(cells)).transpose()
+    }
 }
 
 /// A data-plane result: the value, plus what producing it cost.
@@ -140,6 +373,11 @@ impl<T> Metered<T> {
     /// and host paths where the cost is accounted elsewhere.
     pub fn into_value(self) -> T {
         self.value
+    }
+
+    /// Convert the value, keeping the receipt.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Metered<U> {
+        Metered::new(f(self.value), self.receipt)
     }
 }
 
@@ -380,7 +618,7 @@ pub fn validate_cell_name(name: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// A record as read back: its key, its version, and its cells.
+/// A record as read back: its key, its version, its cells, and its size.
 ///
 /// Cells are self-describing on the way out, mirroring the stored tag byte, so
 /// a reader never consults a schema. Ordering is ascending by name, so equal
@@ -390,6 +628,8 @@ pub struct Record {
     pub key: RecordKey,
     pub version: RecordVersion,
     pub cells: Vec<(CellName, Cell)>,
+    /// The record's size. `None` when a projected read left it out.
+    pub meta: Option<RecordMeta>,
 }
 
 impl Record {
@@ -1466,3 +1706,180 @@ pub mod conformance;
 
 #[cfg(feature = "conformance")]
 pub mod reference;
+
+#[cfg(feature = "conformance")]
+pub mod priced;
+
+#[cfg(test)]
+mod write_details_tests {
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    use super::*;
+
+    fn n(value: u64) -> Cell {
+        Cell::attribute(TypeId::U64, value.to_be_bytes().to_vec())
+    }
+
+    fn note(value: &str) -> Cell {
+        Cell::field(TypeId::STR, value.as_bytes().to_vec())
+    }
+
+    fn change(name: &str, before: Option<&Cell>, after: Option<&Cell>) -> WriteDetails {
+        let mut details = WriteDetails::ZERO;
+        details.change(name, before, after).unwrap();
+        details
+    }
+
+    #[test]
+    fn sizes_follow_golemdbs_rule() {
+        // (8 + 1) + (1 + 8) and 1 + 2 + 8, the figures GolemDB reports for `n`.
+        assert_eq!(cell_size("n", &n(7)).unwrap(), 18);
+        assert_eq!(index_size("n", &n(7)).unwrap(), 11);
+        // (8 + 4) + (1 + 2) for a two-byte string field.
+        assert_eq!(cell_size("note", &note("ab")).unwrap(), 15);
+    }
+
+    #[test]
+    fn a_new_attribute_writes_its_cell_and_joins_the_index() {
+        let details = change("n", None, Some(&n(7)));
+        assert_eq!(
+            details,
+            WriteDetails {
+                cells_created: 1,
+                index_joins: 1,
+                cell_bytes_written: 18,
+                index_bytes_written: 11,
+                ..WriteDetails::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_field_writes_only_its_cell() {
+        let details = change("note", None, Some(&note("ab")));
+        assert_eq!(
+            details,
+            WriteDetails {
+                cells_created: 1,
+                cell_bytes_written: 15,
+                ..WriteDetails::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn an_updated_attribute_leaves_and_joins_again() {
+        let details = change("n", Some(&n(7)), Some(&n(8)));
+        assert_eq!(
+            details,
+            WriteDetails {
+                cells_updated: 1,
+                index_joins: 1,
+                index_leaves: 1,
+                cell_bytes_written: 18,
+                cell_bytes_deleted: 18,
+                index_bytes_written: 11,
+                index_bytes_deleted: 11,
+                ..WriteDetails::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn a_field_becoming_an_attribute_only_joins() {
+        let field = Cell::field(TypeId::U64, 7u64.to_be_bytes().to_vec());
+        let details = change("n", Some(&field), Some(&n(7)));
+        assert_eq!(
+            details,
+            WriteDetails {
+                cells_updated: 1,
+                index_joins: 1,
+                cell_bytes_written: 18,
+                cell_bytes_deleted: 18,
+                index_bytes_written: 11,
+                ..WriteDetails::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn a_removed_attribute_deletes_its_cell_and_leaves_the_index() {
+        let details = change("n", Some(&n(7)), None);
+        assert_eq!(
+            details,
+            WriteDetails {
+                cells_deleted: 1,
+                index_leaves: 1,
+                cell_bytes_deleted: 18,
+                index_bytes_deleted: 11,
+                ..WriteDetails::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn unchanged_absent_and_engine_cells_count_nothing() {
+        assert_eq!(change("n", Some(&n(7)), Some(&n(7))), WriteDetails::ZERO);
+        assert_eq!(change("n", None, None), WriteDetails::ZERO);
+        assert_eq!(change("#meta", None, Some(&n(7))), WriteDetails::ZERO);
+        assert_eq!(change("@admin", Some(&n(7)), None), WriteDetails::ZERO);
+    }
+
+    #[test]
+    fn key_and_bytes32_with_the_same_bytes_are_stored_alike() {
+        let key = Cell::attribute(TypeId::KEY, vec![7; 32]);
+        let bytes32 = Cell::attribute(TypeId::BYTES32, vec![7; 32]);
+        assert_eq!(change("v", Some(&key), Some(&bytes32)), WriteDetails::ZERO);
+        assert_eq!(change("v", Some(&bytes32), Some(&key)), WriteDetails::ZERO);
+        let other_bytes = Cell::attribute(TypeId::BYTES32, vec![8; 32]);
+        assert_eq!(change("v", Some(&key), Some(&other_bytes)).cells_updated, 1);
+        let as_field = Cell::field(TypeId::BYTES32, vec![7; 32]);
+        assert_eq!(change("v", Some(&key), Some(&as_field)).index_leaves, 1);
+    }
+
+    #[test]
+    fn between_counts_the_whole_difference() {
+        let before = vec![
+            ("n".to_string(), n(7)),
+            ("note".to_string(), note("ab")),
+            ("kept".to_string(), n(1)),
+        ];
+        let after = vec![
+            ("n".to_string(), n(8)),
+            ("kept".to_string(), n(1)),
+            ("extra".to_string(), note("x")),
+        ];
+        let details = WriteDetails::between(
+            before.iter().map(|(name, cell)| (name, cell)),
+            after.iter().map(|(name, cell)| (name, cell)),
+        )
+        .unwrap();
+        let mut expected = change("n", Some(&n(7)), Some(&n(8)));
+        expected.accumulate(&change("note", Some(&note("ab")), None));
+        expected.accumulate(&change("extra", None, Some(&note("x"))));
+        assert_eq!(details, expected);
+    }
+
+    #[test]
+    fn create_and_delete_are_the_difference_from_and_to_nothing() {
+        let cells = vec![("n".to_string(), n(7)), ("note".to_string(), note("ab"))];
+        let none: Vec<(CellName, Cell)> = Vec::new();
+        let created = WriteDetails::between(
+            none.iter().map(|(k, v)| (k, v)),
+            cells.iter().map(|(k, v)| (k, v)),
+        )
+        .unwrap();
+        let deleted = WriteDetails::between(
+            cells.iter().map(|(k, v)| (k, v)),
+            none.iter().map(|(k, v)| (k, v)),
+        )
+        .unwrap();
+        assert_eq!(created.cells_created, 2);
+        assert_eq!(created.cell_bytes_written, 18 + 15);
+        assert_eq!(created.index_bytes_written, 11);
+        assert_eq!(deleted.cells_deleted, 2);
+        assert_eq!(deleted.cell_bytes_deleted, 18 + 15);
+        assert_eq!(deleted.index_bytes_deleted, 11);
+    }
+}

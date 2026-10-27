@@ -52,6 +52,9 @@ pub struct NodeBuilder {
     store: Option<(String, String)>,
     /// Whether this node's Arkiv state is in GolemDB, inside its datadir.
     golemdb: bool,
+    /// Where the node's log goes, kept after the [`Node`] drops, when a test
+    /// chose it. Otherwise a temporary file removed on drop.
+    log_file: Option<PathBuf>,
 }
 
 impl NodeBuilder {
@@ -68,6 +71,7 @@ impl NodeBuilder {
             env: Vec::new(),
             store: None,
             golemdb: false,
+            log_file: None,
         }
     }
 
@@ -151,6 +155,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Write the node's log to `path` and keep it after the [`Node`] drops,
+    /// pass or fail, for a test that leaves a record of its run behind.
+    pub fn log_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.log_file = Some(path.into());
+        self
+    }
+
     /// Launch the node.
     pub fn spawn(self) -> Node {
         assert!(
@@ -165,8 +176,9 @@ impl NodeBuilder {
     }
 }
 
-/// A running `arkiv-reth`. Killed and its datadir and log removed on drop; a
-/// drop while the thread is panicking prints the tail of the log first.
+/// A running `arkiv-reth`. Killed and its datadir and log removed on drop (a log
+/// set with [`NodeBuilder::log_file`] is kept); a drop while the thread is
+/// panicking prints the tail of the log first.
 pub struct Node {
     config: NodeBuilder,
     http_port: u16,
@@ -184,7 +196,10 @@ impl Node {
         let name = format!("arkiv-harness-{}-{seq}", std::process::id());
         let datadir = std::env::temp_dir().join(&name);
         // A sibling of the datadir, so wiping the datadir mid-run keeps the log.
-        let log_path = std::env::temp_dir().join(format!("{name}.log"));
+        let log_path = config
+            .log_file
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("{name}.log")));
         let _ = std::fs::remove_dir_all(&datadir);
 
         // Three ports the OS certifies as free. Their listeners hold them until
@@ -438,7 +453,9 @@ impl Drop for Node {
         }
         self.kill();
         let _ = std::fs::remove_dir_all(&self.datadir);
-        let _ = std::fs::remove_file(&self.log_path);
+        if self.config.log_file.is_none() {
+            let _ = std::fs::remove_file(&self.log_path);
+        }
         // The store outlives the process on purpose, so nothing else will clean
         // it up. Best-effort: a server that has already gone away leaves keys
         // behind under the recognisable `arkiv-test:` prefix.

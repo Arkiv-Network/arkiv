@@ -26,7 +26,10 @@
 //! pays `gas_used × effective_gas_price`, where the effective price is
 //! `min(max_fee, base_fee + priority_fee)` (a legacy tx's `gasPrice`); the base-fee
 //! share is burned and the tip is credited to the block beneficiary. Unused gas is
-//! never charged.
+//! never charged. One exception to the burn: the base-fee share of an entity
+//! transaction's storage gas is credited to the pool, the account at
+//! [`ARKIV_ADDRESS`] ([`credit_pool`]), together with any value a successful call
+//! there was sent.
 //!
 //! - **Plain transfer** — debit sender (value + flat 21k gas), bump nonce,
 //!   credit recipient. Computed in Rust, committed as a `BundleState`.
@@ -115,7 +118,7 @@ use reth_ethereum::{
 use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
-use arkiv_interfaces::gas::CostModel;
+use arkiv_interfaces::gas::{CostModel, GasBreakdown};
 use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
@@ -126,6 +129,7 @@ use arkiv_reth_statemanager::{
     BlockSeals, ExecutionKey, HostStateView, HostStore, WriteOverlay, host_manager,
     open_block_branch,
 };
+use arkiv_tokenomics::{FeeSchedule, FeeScheduleSource};
 use std::sync::Arc;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
@@ -151,13 +155,28 @@ const ARKIV_TX_GAS: u64 = 21_000;
 /// the pool accepts — otherwise a cheap op (update, delete, …) estimates below
 /// the floor and the SDK's send is rejected before it ever executes.
 fn intrinsic_gas(data: &[u8]) -> u64 {
+    tx_gas(data).max(floor_gas(data))
+}
+
+/// The calldata's tokens, as EIP-2028 and EIP-7623 count them: a zero byte is
+/// one, any other byte four.
+fn calldata_tokens(data: &[u8]) -> u64 {
     let zero = data.iter().filter(|b| **b == 0).count() as u64;
     let nonzero = data.len() as u64 - zero;
-    let tokens = zero + 4 * nonzero;
+    zero + 4 * nonzero
+}
 
-    let initial = 21_000 + 4 * tokens;
-    let floor = 21_000 + 10 * tokens;
-    initial.max(floor)
+/// A transaction's own terms: 21,000 plus its calldata (4 per token). An
+/// entity transaction adds them to its compute rather than taking the larger
+/// of them and the ops.
+fn tx_gas(data: &[u8]) -> u64 {
+    21_000 + 4 * calldata_tokens(data)
+}
+
+/// The least a transaction pays for its calldata (EIP-7623: 21,000 plus 10
+/// per token), applied once to an entity transaction's compute.
+fn floor_gas(data: &[u8]) -> u64 {
+    21_000 + 10 * calldata_tokens(data)
 }
 
 /// An alloy `U256` as the spec's [`UserBalance`] bytes.
@@ -305,9 +324,9 @@ fn debit<V: StateView, DBError>(
 ///   The base-fee share is burned. A zero tip credits nothing, so the beneficiary
 ///   is not touched into existence as an empty account.
 ///
-/// With [`FeeEnv::charge`] off only the value moves and the nonce bumps, as in
-/// revm with `disable_fee_charge`. Only gas actually used is charged; there is no
-/// up-front `gas_limit` debit and refund because nothing runs between the two.
+/// With [`FeeEnv::charge`] off only the value moves, and a zero value not at
+/// all. Only gas actually used is charged; there is no up-front `gas_limit`
+/// debit and refund because nothing runs between the two.
 fn charge_sender<V: StateView, DBError>(
     view: &mut V,
     fees: &FeeEnv,
@@ -317,7 +336,6 @@ fn charge_sender<V: StateView, DBError>(
     tx: &TxEnv,
 ) -> Result<(), EVMError<DBError>> {
     let sender = sender.into_array();
-    debit(view, fees, sender, value_out, "debit sender value")?;
     if !fees.charge {
         // A question, not a transaction: reth turns fee charging off for
         // `eth_call` and `eth_estimateGas`. revm bumps the nonce anyway, on a
@@ -325,20 +343,78 @@ fn charge_sender<V: StateView, DBError>(
         // the store's branch, and that branch is the block's. Bumping here
         // would let an estimate advance the sender's nonce for real, and the
         // pool would then reject the very transaction being estimated for.
+        // A zero debit would write all the same, creating an account for a
+        // caller that has none, so a probe moves only a value there is.
+        if !value_out.is_zero() {
+            debit(view, fees, sender, value_out, "debit sender value")?;
+        }
         return Ok(());
     }
+    debit(view, fees, sender, value_out, "debit sender value")?;
     view.fetch_increment_acc_nonce(sender)
         .map_err(state_fault("bump sender nonce"))?;
 
+    // `u64` gas times a `u128` price always fits `U256`. Checked all the same,
+    // so a change to either width fails loudly rather than capping a charge.
+    let overflow = || EVMError::Custom("a gas charge does not fit U256".into());
     let price = fees.effective_gas_price(tx);
-    let gas_cost = U256::from(gas_used).saturating_mul(U256::from(price));
+    let gas_cost = U256::from(gas_used)
+        .checked_mul(U256::from(price))
+        .ok_or_else(overflow)?;
     debit(view, fees, sender, gas_cost, "debit sender gas")?;
 
     let tip = price.saturating_sub(u128::from(fees.base_fee));
     if tip > 0 {
-        let reward = U256::from(gas_used).saturating_mul(U256::from(tip));
+        let reward = U256::from(gas_used)
+            .checked_mul(U256::from(tip))
+            .ok_or_else(overflow)?;
         view.fetch_add_balance(fees.beneficiary.into_array(), as_balance(reward))
             .map_err(state_fault("credit beneficiary tip"))?;
+    }
+    Ok(())
+}
+
+/// The value a call to [`ARKIV_ADDRESS`] moves to the pool: all of `tx.value`
+/// when it succeeded, none when it reverted, as a revert undoes a value
+/// transfer in the EVM. A probe moves none either: like its nonce, a moved
+/// value would land on the block's branch.
+fn value_in(fees: &FeeEnv, succeeded: bool, tx: &TxEnv) -> U256 {
+    if fees.charge && succeeded {
+        tx.value
+    } else {
+        U256::ZERO
+    }
+}
+
+/// Credit the pool, the account at [`ARKIV_ADDRESS`], after [`charge_sender`]
+/// settled the same transaction: `value_in`, the value a successful call was
+/// sent (a payable contract keeps what it is sent), and `base_fee ×
+/// storage_gas`, the base-fee share of the storage bought, which is then not
+/// burned. The sender paid both already, the value as `value_out` and the
+/// share inside the gas charge.
+///
+/// With [`FeeEnv::charge`] off nothing moves, so a probe leaves the pool as it
+/// was. A zero credit touches nothing, so the pool comes into existence with
+/// its first credit, not with the first call to its address.
+fn credit_pool<V: StateView, DBError>(
+    view: &mut V,
+    fees: &FeeEnv,
+    value_in: U256,
+    storage_gas: u64,
+) -> Result<(), EVMError<DBError>> {
+    if !fees.charge {
+        return Ok(());
+    }
+    // `u64` gas times a `u64` base fee always fits `U256`; the value was
+    // debited from a balance, so it fits as well. The sum saturates like the
+    // balance it is added to, as every credit here does (recipient, tip). That
+    // never loses money while the total supply fits `U256`: nothing mints
+    // after genesis, so the genesis allocations bound every balance.
+    let storage_fee = U256::from(storage_gas) * U256::from(fees.base_fee);
+    let credit = value_in.saturating_add(storage_fee);
+    if !credit.is_zero() {
+        view.fetch_add_balance(ARKIV_ADDRESS.into_array(), as_balance(credit))
+            .map_err(state_fault("credit pool"))?;
     }
     Ok(())
 }
@@ -715,13 +791,29 @@ fn arkiv_transact<DB: Database>(
     if to == ARKIV_ADDRESS {
         let selector = tx.data.get(..4).unwrap_or_default();
         if selector == IEntityRegistry::entityNonceCall::SELECTOR {
-            return arkiv_entity_nonce_call(store, branch, db, &tx, block_number, &fees);
+            return arkiv_entity_nonce_call(store, branch, db, &tx, block_number, &fees, checks);
         }
         if selector == IEntityRegistry::customAttributeNamesCall::SELECTOR {
-            return arkiv_custom_attribute_names_call(store, branch, db, &tx, block_number, &fees);
+            return arkiv_custom_attribute_names_call(
+                store,
+                branch,
+                db,
+                &tx,
+                block_number,
+                &fees,
+                checks,
+            );
         }
         if selector == IEntityRegistry::attributeTypeIdCall::SELECTOR {
-            return arkiv_attribute_type_id_call(store, branch, db, &tx, block_number, &fees);
+            return arkiv_attribute_type_id_call(
+                store,
+                branch,
+                db,
+                &tx,
+                block_number,
+                &fees,
+                checks,
+            );
         }
         if selector == purgeExpiredCall::SELECTOR {
             return arkiv_purge_expired(store, branch, db, block_number, &tx);
@@ -730,8 +822,12 @@ fn arkiv_transact<DB: Database>(
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
-    // intrinsics should the transfer carry data.
+    // intrinsics should the transfer carry data. The sender checks bound the
+    // charge by the gas limit, so a limit below it halts before any write.
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
+    if tx.gas_limit < gas_used {
+        return Ok(out_of_gas());
+    }
     let value_out = if to == tx.caller {
         U256::ZERO
     } else {
@@ -788,6 +884,7 @@ fn arkiv_purge_expired<DB: Database>(
         let Some(entity) = view
             .get_entity(key_bytes, ReadMode::ViewWithOverlay)
             .map_err(state_fault("read purge entity"))?
+            .into_value()
         else {
             continue;
         };
@@ -801,7 +898,8 @@ fn arkiv_purge_expired<DB: Database>(
             return Ok(out_of_gas());
         }
         view.update_entity(EntityUpdates::deletion(key_bytes))
-            .map_err(state_fault("stage purge deletion"))?;
+            .map_err(state_fault("stage purge deletion"))?
+            .into_value();
     }
     let deltas = view
         .get_uncommitted_deltas()
@@ -870,39 +968,86 @@ fn arkiv_entity_transact<DB: Database>(
     }
 
     let caller = tx.caller;
-    let env = ExecEnv {
-        caller: caller.into_array(),
-        block_number,
-        gas_supplied: tx.gas_limit,
-        chain_id: tx.chain_id.unwrap_or(1),
-    };
 
     // One view for the whole transaction: the entity phase and the sender
     // phase stage into the same overlay; a revert stages no entity changes, so
     // the one commit at the end flushes exactly what should land.
-    let mut view = open_view(store, branch, db, block_number, fees)?;
+    // Not `open_view`: frames do not nest, and the executor opens the
+    // transaction's own frame, which a speculative run discards
+    // (`ExecEnv::keep_writes`). Nothing else here writes in one: the sender
+    // phase moves nothing with fee charging off.
+    let mut view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
+    // The schedule at the block's base, the same for every transaction in it.
+    // A chain without one does not start, so its absence here is a fault.
+    let schedule = view
+        .fee_schedule()
+        .map_err(state_fault("read fee schedule"))?;
     check_sender(&view, checks, fees, tx)?;
+    // The keys the batch creates are derived from this nonce. Reading it is
+    // entity cost, so its receipt starts the batch's meter.
     let start_nonce = view
-        .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
+        .get_entity_creation_nonce(caller.into_array(), ReadMode::ViewWithOverlay)
         .map_err(state_fault("read minting nonce"))?;
-    let outcome = match decode_ops(&env, &tx.data, start_nonce) {
+    let env = ExecEnv {
+        caller: caller.into_array(),
+        block_number,
+        gas_supplied: tx.gas_limit,
+        tx_gas: tx_gas(&tx.data),
+        floor_gas: floor_gas(&tx.data),
+        golemdb_cost_before: start_nonce.receipt.cost.0,
+        chain_id: tx.chain_id.unwrap_or(1),
+        max_lifetime: schedule.max_lifetime,
+        // `eth_call` and `eth_estimateGas` run with charging off on the
+        // block's branch, one probe after another: their writes must not
+        // outlive the probe.
+        keep_writes: fees.charge,
+    };
+    let outcome = match decode_ops(&env, &tx.data, start_nonce.value) {
         Ok(ops) => {
             let costs = *view.cost_model();
-            run_ops(&mut view, costs, &env, ops).map_err(|e| EVMError::Custom(e.to_string()))?
+            run_ops(&mut view, costs, &schedule, &env, ops)
+                .map_err(|e| EVMError::Custom(e.to_string()))?
         }
-        Err(e) => Outcome {
-            gas_used: 0,
-            revert: Some(revert::decode_revert_data(&e)),
-            logs: Vec::new(),
-        },
+        // Calldata that does not decode runs no op: it pays its own terms and
+        // the nonce read before it, at least the floor, at most the gas
+        // supplied. A sum that does not fit is out of gas, as everywhere.
+        Err(e) => {
+            let (compute_gas, revert) = match env.tx_gas.checked_add(env.golemdb_cost_before) {
+                Some(compute) => (
+                    compute.max(env.floor_gas).min(env.gas_supplied),
+                    revert::decode_revert_data(&e),
+                ),
+                None => (
+                    env.gas_supplied,
+                    revert::revert_data(&arkiv_interfaces::RevertReason::OutOfGas),
+                ),
+            };
+            Outcome {
+                gas: GasBreakdown {
+                    compute_gas,
+                    storage_gas: 0,
+                    purge_gas: 0,
+                },
+                revert: Some(revert),
+                logs: Vec::new(),
+            }
+        }
     };
 
-    // Sender phase: charge gas, bump the EOA nonce. The charged/reported figure
-    // is floored at the pool's intrinsic minimum so a cheap batch still
-    // estimates to a pool-acceptable gas limit.
-    let gas_used = outcome.gas_used.max(floor);
-    charge_sender(&mut view, fees, caller, U256::ZERO, gas_used, tx)?;
-    let evm_state = close_view(view, fees, "commit transaction")?;
+    // Sender phase: charge gas, bump the EOA nonce. The batch's breakdown
+    // already holds the transaction's terms and the floor, applied once, so a
+    // cheap batch still estimates to a pool-acceptable gas limit. Then the
+    // pool: the value of a successful batch and its storage share.
+    let gas_used = outcome
+        .gas
+        .total()
+        .ok_or_else(|| EVMError::Custom("the transaction's gas does not fit u64".into()))?;
+    let value_in = value_in(fees, outcome.revert.is_none(), tx);
+    charge_sender(&mut view, fees, caller, value_in, gas_used, tx)?;
+    credit_pool(&mut view, fees, value_in, outcome.gas.storage_gas)?;
+    StateView::commit(&mut view).map_err(state_fault("commit transaction"))?;
+    let evm_state = view.finish().map_err(state_fault("close view"))?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
@@ -927,9 +1072,13 @@ fn arkiv_entity_transact<DB: Database>(
 /// the return — so the *accounting* around it is written once here rather than
 /// per view. `answer` returns `Ok(return_data)` or `Err(revert_data)`.
 ///
-/// The only state staged is the sender's flat gas charge + EOA nonce bump:
-/// meaningless for an `eth_call` (the diff is discarded), but it keeps reth's
-/// sender invariants intact if the call ever arrives as a mined transaction.
+/// The only state staged is the sender's flat gas charge + EOA nonce bump, and
+/// the value of an answered call to the pool: meaningless for an `eth_call`
+/// (the diff is discarded), but it keeps reth's sender invariants intact if the
+/// call ever arrives as a mined transaction. So the sender is checked like any
+/// transaction's, before the first write: the view writes through to the
+/// block's branch, and an error after a write would leave the write behind.
+#[allow(clippy::too_many_arguments)]
 fn arkiv_view_call<DB: Database>(
     store: &HostStore,
     branch: BranchId,
@@ -937,13 +1086,22 @@ fn arkiv_view_call<DB: Database>(
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
+    checks: Option<SenderChecks>,
     answer: impl FnOnce(&mut DB) -> Result<Result<Vec<u8>, Vec<u8>>, EVMError<DB::Error>>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+    // The sender checks bound the charge by the gas limit, so a limit below
+    // the flat charge halts here, before any write.
+    let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
+    if tx.gas_limit < gas_used {
+        return Ok(out_of_gas());
+    }
     let output = answer(db)?;
 
-    let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
     let mut view = open_view(store, branch, db, block_number, fees)?;
-    charge_sender(&mut view, fees, tx.caller, U256::ZERO, gas_used, tx)?;
+    check_sender(&view, checks, fees, tx)?;
+    let value_in = value_in(fees, output.is_ok(), tx);
+    charge_sender(&mut view, fees, tx.caller, value_in, gas_used, tx)?;
+    credit_pool(&mut view, fees, value_in, 0)?;
     let state = close_view(view, fees, "commit view call")?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
@@ -980,7 +1138,8 @@ fn view_entity<DB: Database>(
         .map_err(state_fault("open view"))?;
     let entity = view
         .get_entity(key.0, ReadMode::ViewOnBase)
-        .map_err(state_fault("read entity"))?;
+        .map_err(state_fault("read entity"))?
+        .into_value();
     view.finish().map_err(state_fault("close view"))?;
     Ok(entity)
 }
@@ -997,8 +1156,9 @@ fn arkiv_entity_nonce_call<DB: Database>(
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
+    checks: Option<SenderChecks>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(store, branch, db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, branch, db, tx, block_number, fees, checks, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
@@ -1006,7 +1166,8 @@ fn arkiv_entity_nonce_call<DB: Database>(
         let nonce = host_manager(store, branch, db, parent_ref(block_number))
             .map_err(state_fault("open view"))?
             .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
-            .map_err(state_fault("read minting nonce"))?;
+            .map_err(state_fault("read minting nonce"))?
+            .into_value();
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
             &nonce.get(),
         )))
@@ -1027,8 +1188,9 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
+    checks: Option<SenderChecks>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(store, branch, db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, branch, db, tx, block_number, fees, checks, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
@@ -1059,8 +1221,9 @@ fn arkiv_attribute_type_id_call<DB: Database>(
     tx: &TxEnv,
     block_number: u64,
     fees: &FeeEnv,
+    checks: Option<SenderChecks>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    arkiv_view_call(store, branch, db, tx, block_number, fees, |db| {
+    arkiv_view_call(store, branch, db, tx, block_number, fees, checks, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
             Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
@@ -1117,14 +1280,14 @@ fn strip_trailing_zeros(mut v: Vec<u8>) -> Vec<u8> {
 /// to emit (empty on revert). The state itself needs no field here — it is
 /// staged in the view the batch ran over.
 struct Outcome {
-    gas_used: u64,
+    gas: GasBreakdown,
     revert: Option<Bytes>,
     logs: Vec<Log>,
 }
 
 /// Run a decoded batch through the write view: on success, fold the staged
-/// deltas into the index stores and advance the minting nonce per create; on a
-/// revert nothing is staged.
+/// deltas into the index stores; on a revert nothing is staged. Each create
+/// advances the minting nonce itself, inside the batch's frame.
 ///
 /// Generic over the view, so the same batch logic runs on any `StateView`
 /// backend. `costs` is passed rather than read off the view: a cost schedule is
@@ -1132,16 +1295,13 @@ struct Outcome {
 fn run_ops<V: StateView, C: CostModel>(
     view: &mut V,
     costs: C,
+    schedule: &FeeSchedule,
     env: &ExecEnv,
     ops: Vec<Op>,
 ) -> Result<Outcome, eyre::Report> {
-    let create_count = ops
-        .iter()
-        .filter(|o| matches!(o, Op::Create { .. }))
-        .count() as u64;
-
     let mut effects = Vec::new();
     let out = ArkivExecutor::with_cost(costs)
+        .with_schedule(*schedule)
         .apply_with_effects(env, view, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
@@ -1156,19 +1316,15 @@ fn run_ops<V: StateView, C: CostModel>(
             view.range_index_mut()
                 .apply_deltas(&deltas)
                 .map_err(|e| eyre::eyre!("range index apply_deltas: {e:?}"))?;
-            for _ in 0..create_count {
-                view.fetch_increment_entity_creation_nonce(env.caller)
-                    .map_err(|e| eyre::eyre!("advance minting nonce: {e:?}"))?;
-            }
             let logs = effects.iter().map(entity_operation_log).collect();
             Ok(Outcome {
-                gas_used: out.gas_used,
+                gas: out.gas,
                 revert: None,
                 logs,
             })
         }
         ExecStatus::Reverted => Ok(Outcome {
-            gas_used: out.gas_used,
+            gas: out.gas,
             revert: out.revert.as_ref().map(revert::revert_data),
             logs: Vec::new(),
         }),
@@ -1422,6 +1578,539 @@ mod tests {
                 .unwrap(),
             UserBalance::ZERO
         );
+    }
+
+    /// A probe (`eth_call`, `eth_estimateGas`) from a caller with no account
+    /// leaves the branch exactly as it was: no zero-balance account appears.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+    fn a_probe_writes_no_account() {
+        use arkiv_interfaces::statemanager::StateManager;
+        use arkiv_interfaces::store::{Store, StoreExt};
+
+        let store = std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
+        let branch = store.begin(None).expect("begin");
+        store
+            .commit_tagged(branch, CLAMP_GENESIS.hash)
+            .expect("tag genesis");
+        let mut view = arkiv_golemdb_state::GolemStateManager::new(store)
+            .view(CLAMP_GENESIS)
+            .expect("view");
+        let before = view.digest().unwrap();
+
+        let probe = FeeEnv {
+            charge: false,
+            ..clamp_fees(false)
+        };
+        charge_sender::<_, core::convert::Infallible>(
+            &mut view,
+            &probe,
+            Address::repeat_byte(0xbb),
+            U256::ZERO,
+            50_000,
+            &TxEnv::default(),
+        )
+        .expect("a probe settles");
+        assert_eq!(view.digest().unwrap(), before, "the branch is untouched");
+    }
+
+    /// What one entity transaction through the whole entry left behind.
+    struct Settled {
+        success: bool,
+        gas_used: u64,
+        sender_paid: U256,
+        beneficiary_got: U256,
+        /// The balance of the pool, the account at [`ARKIV_ADDRESS`].
+        pool_got: U256,
+        /// The revert payload, when it did not succeed.
+        revert: Option<Bytes>,
+        /// Whether the branch holds an account record for the pool.
+        pool_exists: bool,
+    }
+
+    const HOST_SENDER: Address = Address::repeat_byte(0xa1);
+    const HOST_BENEFICIARY: Address = Address::repeat_byte(0xb0);
+    const HOST_FUNDS: u128 = 1_000_000_000_000_000_000;
+    const HOST_BASE_FEE: u64 = 7;
+    const HOST_GAS_PRICE: u128 = 10;
+
+    /// A store under the host's view, priced at `prices`, with genesis: a
+    /// funded sender and a fee schedule.
+    fn host_store(prices: arkiv_interfaces::store::priced::Prices) -> HostStore {
+        use arkiv_interfaces::store::priced::Priced;
+        use arkiv_reth_statemanager::{GenesisAccount, seed_genesis};
+
+        let store: HostStore = std::sync::Arc::new(Priced::new(
+            arkiv_interfaces::store::reference::MemStore::new(),
+            prices,
+        ));
+        seed_genesis(
+            &store,
+            [0x11; 32],
+            Some(&FeeSchedule::with_placeholder_weights(1_000_000)),
+            [GenesisAccount {
+                address: HOST_SENDER,
+                balance: U256::from(HOST_FUNDS),
+                nonce: 0,
+            }],
+        )
+        .expect("seed")
+        .expect("fresh");
+        store
+    }
+
+    /// Run `ops` as one entity transaction on a fresh block branch over
+    /// `store`, as reth would, and read back what it charged and credited.
+    fn run_entity_tx(
+        store: &HostStore,
+        ops: Vec<arkiv_bindings::Operation>,
+        charge: bool,
+    ) -> Settled {
+        use alloy_sol_types::SolCall;
+        run_call(
+            store,
+            IEntityRegistry::executeCall { ops }.abi_encode(),
+            U256::ZERO,
+            charge,
+        )
+    }
+
+    /// Run a call to [`ARKIV_ADDRESS`] with `data` and `value` through the
+    /// whole entry, like [`run_entity_tx`].
+    fn run_call(store: &HostStore, data: Vec<u8>, value: U256, charge: bool) -> Settled {
+        let (branch, out) = transact(store, call_tx(data, value), charge, None);
+        let out = out.expect("the transaction executes");
+        let view = branch_view(store, branch);
+        let balance = |address: Address| {
+            U256::from_be_bytes(
+                view.get_balance(address.into_array(), ReadMode::ViewWithOverlay)
+                    .unwrap()
+                    .to_be_bytes(),
+            )
+        };
+        Settled {
+            success: out.result.is_success(),
+            gas_used: out.result.tx_gas_used(),
+            sender_paid: U256::from(HOST_FUNDS) - balance(HOST_SENDER),
+            beneficiary_got: balance(HOST_BENEFICIARY),
+            pool_got: balance(ARKIV_ADDRESS),
+            revert: (!out.result.is_success())
+                .then(|| out.result.output().cloned())
+                .flatten(),
+            pool_exists: {
+                use arkiv_interfaces::store::{ReadTarget, Store};
+                store
+                    .get(
+                        ReadTarget::Branch(branch),
+                        arkiv_golemdb_state::accounts::record_key(ARKIV_ADDRESS.into_array()),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .value
+                    .is_some()
+            },
+        }
+    }
+
+    /// A view of `branch` over `store`, to read back what a transaction left.
+    fn branch_view(
+        store: &HostStore,
+        branch: BranchId,
+    ) -> arkiv_golemdb_state::GolemStateView<HostStore> {
+        use arkiv_interfaces::store::Store;
+        arkiv_golemdb_state::GolemStateView::new(
+            store.clone(),
+            branch,
+            store.head(),
+            CLAMP_GENESIS,
+            arkiv_interfaces::statemanager::SessionId([9; 16]),
+        )
+    }
+
+    /// A call to [`ARKIV_ADDRESS`] from the funded sender with ample gas.
+    fn call_tx(data: Vec<u8>, value: U256) -> TxEnv {
+        TxEnv {
+            caller: HOST_SENDER,
+            gas_limit: 10_000_000,
+            gas_price: HOST_GAS_PRICE,
+            kind: TxKind::Call(ARKIV_ADDRESS),
+            data: data.into(),
+            value,
+            chain_id: Some(1),
+            ..TxEnv::default()
+        }
+    }
+
+    /// Every sender check on, as for a mined transaction.
+    fn all_checks() -> SenderChecks {
+        SenderChecks {
+            nonce: true,
+            fees: FeeChecks {
+                base_fee: true,
+                priority_fee: true,
+                balance: true,
+                charge: true,
+            },
+        }
+    }
+
+    /// Run `tx` through the whole entry on a fresh block branch, with `checks`
+    /// as reth would pass them, and return the branch with the entry's result.
+    #[allow(clippy::type_complexity)]
+    fn transact(
+        store: &HostStore,
+        tx: TxEnv,
+        charge: bool,
+        checks: Option<SenderChecks>,
+    ) -> (
+        BranchId,
+        Result<ResultAndState<HaltReason>, EVMError<core::convert::Infallible>>,
+    ) {
+        use arkiv_interfaces::store::Store;
+
+        let branch = store.begin(Some(store.head())).expect("begin");
+        let mut db = reth_ethereum::evm::revm::database_interface::EmptyDBTyped::<
+            core::convert::Infallible,
+        >::default();
+        let fees = FeeEnv {
+            base_fee: HOST_BASE_FEE,
+            beneficiary: HOST_BENEFICIARY,
+            charge,
+            solvency_checked: true,
+        };
+        (
+            branch,
+            arkiv_transact(store, branch, &mut db, 1, fees, checks, tx),
+        )
+    }
+
+    /// Whether `branch` holds exactly what a fresh branch at head holds.
+    fn untouched(store: &HostStore, branch: BranchId) -> bool {
+        use arkiv_interfaces::store::Store;
+        let fresh = store.begin(Some(store.head())).expect("begin");
+        branch_view(store, branch).digest().unwrap() == branch_view(store, fresh).digest().unwrap()
+    }
+
+    const FREE: arkiv_interfaces::store::priced::Prices = arkiv_interfaces::store::priced::Prices {
+        get: 0,
+        create: 0,
+        patch: 0,
+        delete: 0,
+    };
+
+    fn create() -> arkiv_bindings::Operation {
+        arkiv_bindings::Operation::create(0, 0, 100, 0, Vec::new())
+    }
+
+    /// Through the whole entry, on the host's view, GolemDB's work reaches the
+    /// gas reth records, the sender's debit and the beneficiary's tip.
+    ///
+    /// On the free store the create pays 102,826: compute, 102,824, and
+    /// storage, 2. Storage is the empty record's 1,042 units for its 100 blocks
+    /// at 14 micro-gas per unit-block, 1.46 gas, rounded up. Compute is its
+    /// `PlaceholderCost` (80,000) and the transaction's terms, `tx_gas` =
+    /// 21,000 + 4 × 456 calldata tokens = 22,824, above the floor of 21,000 +
+    /// 10 × 456 = 25,560. The 420 calldata bytes hold 12 non-zero ones: 3 of
+    /// the selector `0x49650044`, one in each of the six head words (array
+    /// offset, length, element offset, op tag, bytes offset, bytes length), and
+    /// 3 in the 224-byte `Create` payload (its offset, `minLifetime` 100, the
+    /// attributes offset). So 408 + 4 × 12 = 456 tokens.
+    ///
+    /// The priced store adds exactly GolemDB's work, 114, at one gas per unit:
+    /// - the start-nonce read before the batch: a read, 1;
+    /// - the create's existence check: a read, 1;
+    /// - the entity write: the view's own read, then a create, 1 + 10 = 11;
+    /// - the minting-nonce step, 101: a read of the sender's account (1), then
+    ///   a patch of it (100) setting `$minted`. A patch, not a create, because
+    ///   genesis funded the sender: its account record already holds `$balance`
+    ///   and `$nonce`. A sender without an account would pay 1 + 10 = 11 here.
+    #[test]
+    fn golemdbs_work_reaches_settlement() {
+        let free = run_entity_tx(&host_store(FREE), vec![create()], true);
+        let priced = run_entity_tx(
+            &host_store(arkiv_interfaces::store::priced::Prices::DISTINCT),
+            vec![create()],
+            true,
+        );
+        assert!(free.success && priced.success);
+        assert_eq!(free.gas_used, 102_824 + 2);
+        assert_eq!(priced.gas_used, 102_824 + 2 + 114);
+        for settled in [&free, &priced] {
+            let gas = U256::from(settled.gas_used);
+            assert_eq!(settled.sender_paid, gas * U256::from(HOST_GAS_PRICE));
+            assert_conserved(settled, 2, U256::ZERO);
+        }
+    }
+
+    /// Where the sender's money went: the tip to the beneficiary, the base-fee
+    /// share of `storage_gas` and `value` to the pool, the rest of the base fee
+    /// burned. Nothing else moves, so the three add up to the sender's debit.
+    fn assert_conserved(settled: &Settled, storage_gas: u64, value: U256) {
+        let gas = U256::from(settled.gas_used);
+        let base_fee = U256::from(HOST_BASE_FEE);
+        let tip = U256::from(HOST_GAS_PRICE - u128::from(HOST_BASE_FEE));
+        let burned = base_fee * (gas - U256::from(storage_gas));
+        assert_eq!(settled.beneficiary_got, tip * gas, "the tip");
+        assert_eq!(
+            settled.pool_got,
+            base_fee * U256::from(storage_gas) + value,
+            "the pool's credit"
+        );
+        assert_eq!(
+            settled.sender_paid,
+            burned + settled.beneficiary_got + settled.pool_got,
+            "sender debit = burn + tip + pool credit"
+        );
+    }
+
+    /// The value a successful entity transaction is sent goes to the pool,
+    /// beside the storage share: a create's 2 storage gas at base fee 7, 14.
+    #[test]
+    fn the_pool_gets_the_storage_share_and_the_value() {
+        let value = U256::from(1_000);
+        let settled = run_call(
+            &host_store(FREE),
+            IEntityRegistry::executeCall {
+                ops: vec![create()],
+            }
+            .abi_encode(),
+            value,
+            true,
+        );
+        assert!(settled.success);
+        assert_eq!(settled.pool_got, U256::from(14 + 1_000));
+        assert!(settled.pool_exists);
+        assert_eq!(
+            settled.sender_paid,
+            U256::from(settled.gas_used) * U256::from(HOST_GAS_PRICE) + value
+        );
+        assert_conserved(&settled, 2, value);
+    }
+
+    /// A reverted batch keeps its value with the sender, as a revert undoes a
+    /// value transfer in the EVM, and buys no storage: the pool gets nothing
+    /// and does not come into existence. Calldata that does not decode and a
+    /// batch out of gas revert the same way. Out of gas here is an empty batch
+    /// on a store whose read price overflows with the transaction's terms, as
+    /// in `an_overflowing_cost_before_the_batch_is_out_of_gas`.
+    #[test]
+    fn a_reverted_transaction_keeps_its_value_and_credits_no_pool() {
+        use arkiv_interfaces::store::priced::Prices;
+
+        let ghost = alloy_primitives::B256::repeat_byte(0x42);
+        let overflowing = Prices {
+            get: u64::MAX,
+            ..Prices::DISTINCT
+        };
+        let cases = [
+            (
+                "a business-rule revert",
+                FREE,
+                IEntityRegistry::executeCall {
+                    ops: vec![arkiv_bindings::Operation::extend_expiry(ghost, 0, 100)],
+                }
+                .abi_encode(),
+            ),
+            (
+                "a decode failure",
+                FREE,
+                IEntityRegistry::executeCall::SELECTOR.to_vec(),
+            ),
+            (
+                "out of gas",
+                overflowing,
+                IEntityRegistry::executeCall { ops: Vec::new() }.abi_encode(),
+            ),
+        ];
+        for (case, prices, data) in cases {
+            let settled = run_call(&host_store(prices), data, U256::from(1_000), true);
+            assert!(!settled.success, "{case}");
+            assert!(!settled.pool_exists, "{case}: no pool account");
+            assert_eq!(
+                settled.sender_paid,
+                U256::from(settled.gas_used) * U256::from(HOST_GAS_PRICE),
+                "{case}: the sender pays gas only"
+            );
+            assert_conserved(&settled, 0, U256::ZERO);
+        }
+        assert_eq!(
+            run_call(
+                &host_store(overflowing),
+                IEntityRegistry::executeCall { ops: Vec::new() }.abi_encode(),
+                U256::from(1_000),
+                true
+            )
+            .revert,
+            Some(revert::revert_data(
+                &arkiv_interfaces::RevertReason::OutOfGas
+            )),
+            "the last case is out of gas"
+        );
+    }
+
+    /// A view call mined as a transaction is checked like any other before it
+    /// writes: a sender who covers the value but not the gas is refused with
+    /// the typed invalid-transaction error, and the block's branch is left
+    /// exactly as it was, with no debit, no nonce bump, no credit.
+    #[test]
+    fn a_view_call_the_sender_cannot_pay_for_writes_nothing() {
+        let store = host_store(FREE);
+        let (branch, out) = transact(
+            &store,
+            call_tx(
+                IEntityRegistry::entityNonceCall { owner: HOST_SENDER }.abi_encode(),
+                U256::from(HOST_FUNDS - 1),
+            ),
+            true,
+            Some(all_checks()),
+        );
+        assert!(
+            matches!(
+                out,
+                Err(EVMError::Transaction(
+                    InvalidTransaction::LackOfFundForMaxFee { .. }
+                ))
+            ),
+            "{out:?}"
+        );
+        assert!(untouched(&store, branch), "the branch is untouched");
+    }
+
+    /// A gas limit below the flat charge of a view call or a plain transfer
+    /// halts out of gas before any write. The sender checks only bound the
+    /// charge by the limit, so settling would debit more than they proved,
+    /// clamp, and fail with the value and the nonce bump already written.
+    #[test]
+    fn a_gas_limit_below_the_charge_halts_before_any_write() {
+        let view_call = TxEnv {
+            gas_limit: 20_000,
+            ..call_tx(
+                IEntityRegistry::entityNonceCall { owner: HOST_SENDER }.abi_encode(),
+                U256::from(1_000),
+            )
+        };
+        let transfer = TxEnv {
+            gas_limit: 20_000,
+            kind: TxKind::Call(Address::repeat_byte(0xc0)),
+            ..call_tx(Vec::new(), U256::from(1_000))
+        };
+        for (case, tx) in [("a view call", view_call), ("a transfer", transfer)] {
+            let store = host_store(FREE);
+            let (branch, out) = transact(&store, tx, true, Some(all_checks()));
+            let out = out.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert!(
+                matches!(
+                    out.result,
+                    ExecutionResult::Halt {
+                        reason: HaltReason::OutOfGas(_),
+                        ..
+                    }
+                ),
+                "{case}: {:?}",
+                out.result
+            );
+            assert!(untouched(&store, branch), "{case}: the branch is untouched");
+        }
+    }
+
+    /// A probe moves no value, like its nonce: the pool and the sender stay as
+    /// they were.
+    #[test]
+    fn a_probe_moves_no_value() {
+        let settled = run_call(
+            &host_store(FREE),
+            IEntityRegistry::executeCall {
+                ops: vec![create()],
+            }
+            .abi_encode(),
+            U256::from(1_000),
+            false,
+        );
+        assert!(settled.success);
+        assert_eq!(settled.sender_paid, U256::ZERO);
+        assert_eq!(settled.pool_got, U256::ZERO);
+    }
+
+    /// A view call mined as a transaction follows the same rule: its value
+    /// goes to the pool when it answers, and stays with the sender when it
+    /// reverts. It buys no storage.
+    #[test]
+    fn a_view_call_sends_its_value_to_the_pool_when_it_answers() {
+        let value = U256::from(500);
+        let answered = run_call(
+            &host_store(FREE),
+            IEntityRegistry::entityNonceCall { owner: HOST_SENDER }.abi_encode(),
+            value,
+            true,
+        );
+        assert!(answered.success);
+        assert_conserved(&answered, 0, value);
+
+        let malformed = run_call(
+            &host_store(FREE),
+            IEntityRegistry::entityNonceCall::SELECTOR.to_vec(),
+            value,
+            true,
+        );
+        assert!(!malformed.success);
+        assert_conserved(&malformed, 0, U256::ZERO);
+    }
+
+    /// A reverted batch pays for the GolemDB work it did: the start-nonce read
+    /// and the extend's existence read, 2.
+    #[test]
+    fn a_reverted_transaction_pays_its_golemdb_work() {
+        let ghost = alloy_primitives::B256::repeat_byte(0x42);
+        let extend = || arkiv_bindings::Operation::extend_expiry(ghost, 0, 100);
+        let free = run_entity_tx(&host_store(FREE), vec![extend()], true);
+        let priced = run_entity_tx(
+            &host_store(arkiv_interfaces::store::priced::Prices::DISTINCT),
+            vec![extend()],
+            true,
+        );
+        assert!(!free.success && !priced.success);
+        assert_eq!(priced.gas_used - free.gas_used, 2);
+        assert_eq!(
+            priced.sender_paid,
+            U256::from(priced.gas_used) * U256::from(HOST_GAS_PRICE)
+        );
+    }
+
+    /// Calldata that does not decode pays its terms and the start-nonce read;
+    /// when those do not fit `u64` together, the transaction is out of gas,
+    /// pays all it supplied, and says so rather than naming the decode error.
+    ///
+    #[test]
+    fn an_overflowing_cost_before_the_batch_is_out_of_gas() {
+        let prices = arkiv_interfaces::store::priced::Prices {
+            get: u64::MAX,
+            ..arkiv_interfaces::store::priced::Prices::DISTINCT
+        };
+        let store = host_store(prices);
+        let settled = run_entity_tx(&store, Vec::new(), true);
+        assert!(!settled.success);
+        assert_eq!(settled.gas_used, 10_000_000, "all the gas supplied");
+        assert_eq!(
+            settled.revert,
+            Some(revert::revert_data(
+                &arkiv_interfaces::RevertReason::OutOfGas
+            )),
+        );
+    }
+
+    /// A probe reports the same gas as the transaction it estimates, and
+    /// settles nothing: no debit, no tip, no pool credit.
+    #[test]
+    fn a_probe_reports_gas_and_settles_nothing() {
+        let prices = arkiv_interfaces::store::priced::Prices::DISTINCT;
+        let charged = run_entity_tx(&host_store(prices), vec![create()], true);
+        let probe = run_entity_tx(&host_store(prices), vec![create()], false);
+        assert!(probe.success);
+        assert_eq!(probe.gas_used, charged.gas_used);
+        assert_eq!(probe.sender_paid, U256::ZERO);
+        assert_eq!(probe.beneficiary_got, U256::ZERO);
+        assert_eq!(probe.pool_got, U256::ZERO);
     }
 
     /// The ordinary path still just moves money.

@@ -180,7 +180,8 @@ mod tests {
         let next = manager.view(ONE).expect("view at block one");
         assert_eq!(
             next.get_entity([1; 32], ReadMode::ViewOnBase)
-                .expect("read"),
+                .expect("read")
+                .value,
             Some(entity(1)),
         );
         assert!(next.has_store(StoreKind::Entities));
@@ -203,12 +204,14 @@ mod tests {
         assert!(
             a.get_entity([2; 32], ReadMode::ViewWithOverlay)
                 .expect("read")
+                .value
                 .is_none(),
             "one view must not see another's staged writes",
         );
         assert!(
             b.get_entity([1; 32], ReadMode::ViewWithOverlay)
                 .expect("read")
+                .value
                 .is_none(),
         );
     }

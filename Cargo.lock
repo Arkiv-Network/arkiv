@@ -1513,8 +1513,10 @@ dependencies = [
 name = "arkiv-golemdb-state"
 version = "0.5.1"
 dependencies = [
+ "arkiv-golemdb",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
+ "arkiv-tokenomics",
  "arkiv-valkey",
 ]
 
@@ -1561,6 +1563,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "arkiv-bindings",
+ "arkiv-genesis",
  "arkiv-golemdb",
  "arkiv-harness",
  "arkiv-interfaces",
@@ -1603,6 +1606,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "arkiv-tokenomics",
  "eyre",
  "golemdb-api",
  "reth-cli",
@@ -1623,6 +1627,7 @@ dependencies = [
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-statemanager",
+ "arkiv-tokenomics",
  "eyre",
  "reth-ethereum",
  "tracing",
@@ -1639,6 +1644,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "arkiv-interfaces",
  "arkiv-reth-statemanager",
+ "arkiv-tokenomics",
  "eyre",
  "reth-chain-state",
  "reth-chainspec",
@@ -1728,6 +1734,7 @@ dependencies = [
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
+ "arkiv-tokenomics",
  "eyre",
  "reth-engine-tree",
  "reth-ethereum",
@@ -1751,6 +1758,14 @@ dependencies = [
  "arkiv-interfaces",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "arkiv-tokenomics"
+version = "0.5.1"
+dependencies = [
+ "alloy-primitives",
+ "arkiv-interfaces",
 ]
 
 [[package]]

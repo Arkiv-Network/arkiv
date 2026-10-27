@@ -91,7 +91,35 @@ them. The container has no Docker access, so Kurtosis runs stay on the host.
 cargo test -p arkiv-interfaces
 ```
 
-## Releasing
+### Load test
+
+A load test throws a seeded mix of entity transactions, value transfers and
+deliberately failing transactions at a local dev node from many senders, and
+tracks every transaction into a block. It stops at the first broken invariant:
+a lost or duplicated transaction, a nonce gap, an unexpected outcome, or an
+entity that reads back other than expected. It runs by hand, not in CI.
+
+```sh
+# 300 transactions from 16 senders, a fresh seed
+cargo nextest run -p arkiv-reth --test load --run-ignored only --no-capture -- load
+
+# Larger, or replaying a run's seed
+ARKIV_LOAD_TXS=5000 ARKIV_LOAD_SENDERS=19 cargo nextest run -p arkiv-reth --test load --run-ignored only --no-capture -- load
+ARKIV_LOAD_SEED=42 cargo nextest run -p arkiv-reth --test load --run-ignored only --no-capture -- load
+
+# The watcher's self-check: a transaction recorded but never sent must fail the run
+cargo nextest run -p arkiv-reth --test load --run-ignored only -- a_lost_transaction
+```
+
+Each run prints its report's path and keeps a directory of its own,
+`$TMPDIR/arkiv-load-<seed>-<time>-<pid>/`, holding `report.json`, the node's
+`node.log`, and `transactions.jsonl`: every transaction on one line, with its
+ops, expected and actual outcome, gas used, effective gas price and fee. The report alone says how the run went: `outcome` is
+`passed`, `failed` (see `violations`; the report then also holds every
+transaction's timeline, the last blocks, the pool and the model next to the
+node's answer), `aborted` (the test panicked outside a check), or still
+`running` (the run was killed). Attach the directory's files to an issue as
+they are.
 
 Every merged commit on `main` is pushed to GHCR automatically as
 `ghcr.io/arkiv-network/arkiv-reth` and `ghcr.io/arkiv-network/arkiv-reth-dev`,

@@ -79,6 +79,14 @@ fn commit_and_reopen(view: GolemStateView<ValkeyStore>) -> GolemStateView<Valkey
     )
 }
 
+/// The shared `StateView` contract, so entity write details and the frame
+/// rules hold on Valkey as they do on `MemStore` and GolemDB.
+#[test]
+#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+fn conformance() {
+    arkiv_interfaces::statemanager::conformance::run_all(&view);
+}
+
 #[test]
 #[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
 fn an_entity_round_trips_through_the_network_seam() {
@@ -88,12 +96,14 @@ fn an_entity_round_trips_through_the_network_seam() {
 
     assert_eq!(
         view.get_entity([1; 32], ReadMode::ViewWithOverlay)
-            .expect("overlay read"),
+            .expect("overlay read")
+            .value,
         Some(entity(1, 10)),
     );
     assert_eq!(
         view.get_entity([1; 32], ReadMode::ViewOnBase)
-            .expect("base read"),
+            .expect("base read")
+            .value,
         None,
         "the base must not see this view's staged writes",
     );
@@ -101,7 +111,8 @@ fn an_entity_round_trips_through_the_network_seam() {
     let view = commit_and_reopen(view);
     assert_eq!(
         view.get_entity([1; 32], ReadMode::ViewOnBase)
-            .expect("read after commit"),
+            .expect("read after commit")
+            .value,
         Some(entity(1, 10)),
     );
 }
@@ -155,7 +166,8 @@ fn accounts_and_entities_share_one_store_without_colliding() {
     );
     assert_eq!(
         view.get_entity([1; 32], ReadMode::ViewOnBase)
-            .expect("read"),
+            .expect("read")
+            .value,
         Some(entity(1, 10)),
     );
 }

@@ -75,6 +75,7 @@ Values are placeholders.
 | `golemdb.#params` | Custom, chain parameters, immutable after genesis | `#params` (record 0) | cell limits: phase 1; the rest: phase 3 |
 | `golemdb.@meteringModel` | Custom, GolemDB and host (Arkiv) code versions of model 1; activation is always commit 0 | `@meteringModel` (record 32) | planned (phase 3) |
 | `golemdb.@modelWeight` | Custom, model 1's weights: GolemDB's own and Arkiv's `host.*` prices and limits | `@modelWeight` (record 33) | planned (phase 3) |
+| `tokenomics` | Custom, interim: Arkiv's fee schedule (`capacity_rate`, `cell_byte_units`, `index_byte_units`, `c_cell`, `c_idx`, `max_lifetime`), required wherever the `arkiv` section is. Moves into `golemdb.@modelWeight` as `host.arkiv.*` weights once GolemDB persists and returns them | the fee-schedule user record at `keccak256("arkiv.fee_schedule")`, one `u64` cell per `host.arkiv.*` name | done (interim) |
 | `arkiv_state` | Custom, seed of Arkiv's protocol state: the storage pool `balance`; `R`, `L`, `purge_cursor`, `live_bytes` start at 0 | the `arkiv_state` user record | planned (phase 4) |
 
 ## 3. Rules
@@ -92,7 +93,8 @@ Values are placeholders.
   `#params`; the file cannot set them.
 - **Fixed user-record order.** User record IDs follow creation order, and the
   state trie is keyed by record ID, so order determines the root. The node passes
-  `arkiv_state` first, then accounts by ascending address. Nothing iterates a
+  the interim fee-schedule record first, then `arkiv_state`, then accounts by
+  ascending address. Nothing iterates a
   hash map.
 - **Key mode is caller-assigned** (`#keyMode` 0). Accounts (padded address) and
   `arkiv_state` have keys Arkiv chooses.

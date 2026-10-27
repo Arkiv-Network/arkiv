@@ -18,6 +18,8 @@ arkiv-golemdb-state.workspace = true
 # The committed lanes: entities, index, balances, nonces, minting nonces.
 # The uncommitted lane(s): the pruning map.
 arkiv-reth-uncommitted-store.workspace = true
+# The fee schedule genesis writes and blocks read back.
+arkiv-tokenomics.workspace = true
 
 # `alloc`, the genesis file's accounts.
 alloy-genesis.workspace = true

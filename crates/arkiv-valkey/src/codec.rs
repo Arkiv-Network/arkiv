@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use arkiv_interfaces::store::{
-    Cell, CellName, Record, RecordKey, RecordVersion, SegmentKey, SegmentRow,
+    Cell, CellName, Record, RecordKey, RecordMeta, RecordVersion, SegmentKey, SegmentRow,
+    StoreError,
 };
 
 /// Marks an absent record: a branch tombstone, or the empty side of a change.
@@ -26,9 +27,13 @@ pub(crate) struct Stored {
 
 impl Stored {
     /// Present this record to a caller, applying a projection if one was
-    /// asked for.
-    pub(crate) fn to_record(&self, key: RecordKey, projection: Option<&[CellName]>) -> Record {
-        Record {
+    /// asked for. The size is computed from every cell, as GolemDB keeps it.
+    pub(crate) fn to_record(
+        &self,
+        key: RecordKey,
+        projection: Option<&[CellName]>,
+    ) -> Result<Record, StoreError> {
+        Ok(Record {
             key,
             version: self.version,
             cells: self
@@ -37,7 +42,8 @@ impl Stored {
                 .filter(|(name, _)| projection.is_none_or(|wanted| wanted.contains(name)))
                 .map(|(name, cell)| (name.clone(), cell.clone()))
                 .collect(),
-        }
+            meta: RecordMeta::read(&self.cells, projection)?,
+        })
     }
 }
 

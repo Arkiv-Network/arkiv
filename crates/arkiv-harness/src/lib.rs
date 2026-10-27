@@ -12,7 +12,7 @@
 mod client;
 mod node;
 
-pub use client::{ArkivClient, connect, connect_reader, hex_quantity, result_keys};
+pub use client::{ArkivClient, PoolHashes, connect, connect_reader, hex_quantity, result_keys};
 pub use node::{Node, NodeBuilder};
 
 // Protocol re-exports: build calldata and predict minted keys from one import.

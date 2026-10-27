@@ -18,7 +18,7 @@ use core::ops::Range;
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Cell, CellChange, CellKind, CellName, CommitId, Origin,
     ReadTarget, RecordChange, RecordKey, RecordVersion, SealedCommit, SegmentAddress, SegmentKey,
-    SegmentOrdinal, SegmentRow, StoreError, validate_cell_name,
+    SegmentOrdinal, SegmentRow, StoreError, WriteDetails, validate_cell_name,
 };
 use fred::prelude::*;
 
@@ -974,7 +974,7 @@ impl Backend {
         branch: BranchId,
         key: RecordKey,
         cells: Vec<(CellName, Cell)>,
-    ) -> Result<RecordKey, StoreError> {
+    ) -> Result<(RecordKey, WriteDetails), StoreError> {
         if cells.is_empty() {
             return Err(StoreError::InvalidArgument);
         }
@@ -990,16 +990,18 @@ impl Backend {
         if self.read(ReadTarget::Branch(branch), key).await?.is_some() {
             return Err(StoreError::AlreadyExists);
         }
+        let cells: BTreeMap<CellName, Cell> = cells.into_iter().collect();
+        let details = WriteDetails::between(core::iter::empty(), &cells)?;
         self.stage(
             branch,
             key,
             Some(&Stored {
                 version: RecordVersion(1),
-                cells: cells.into_iter().collect(),
+                cells,
             }),
         )
         .await?;
-        Ok(key)
+        Ok((key, details))
     }
 
     pub(crate) async fn patch(
@@ -1008,7 +1010,7 @@ impl Backend {
         key: RecordKey,
         expected_version: Option<RecordVersion>,
         changes: Vec<(CellName, CellChange)>,
-    ) -> Result<RecordVersion, StoreError> {
+    ) -> Result<(RecordVersion, WriteDetails), StoreError> {
         for (name, change) in &changes {
             validate_cell_name(name)?;
             if let CellChange::Set(cell) = change {
@@ -1041,10 +1043,11 @@ impl Backend {
             return Err(StoreError::InvalidArgument);
         }
 
+        let details = WriteDetails::between(&record.cells, &staged)?;
         record.cells = staged;
         record.version = RecordVersion(record.version.0 + 1);
         self.stage(branch, key, Some(&record)).await?;
-        Ok(record.version)
+        Ok((record.version, details))
     }
 
     pub(crate) async fn delete(
@@ -1052,7 +1055,7 @@ impl Backend {
         branch: BranchId,
         key: RecordKey,
         expected_version: Option<RecordVersion>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<WriteDetails, StoreError> {
         if !self.branch_exists(branch).await? {
             return Err(StoreError::HandleInvalid);
         }
@@ -1065,7 +1068,9 @@ impl Backend {
         if expected_version.is_some_and(|expected| expected != record.version) {
             return Err(StoreError::Conflict);
         }
-        self.stage(branch, key, None).await
+        let details = WriteDetails::between(&record.cells, core::iter::empty())?;
+        self.stage(branch, key, None).await?;
+        Ok(details)
     }
 
     /// Replace a branch's staged writes wholesale — the rollback half of an
@@ -1424,8 +1429,12 @@ impl Backend {
             let (key, before, after) = codec::decode_change(&encoded).map_err(internal)?;
             changes.push(RecordChange {
                 key,
-                before: before.map(|record| record.to_record(key, None)),
-                after: after.map(|record| record.to_record(key, None)),
+                before: before
+                    .map(|record| record.to_record(key, None))
+                    .transpose()?,
+                after: after
+                    .map(|record| record.to_record(key, None))
+                    .transpose()?,
             });
         }
         changes.sort_by_key(|change| change.key);

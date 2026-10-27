@@ -18,8 +18,10 @@ use alloc::vec::Vec;
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::entity_records::{self, RecordError};
 use arkiv_interfaces::primitives::EntityAddress;
-use arkiv_interfaces::statemanager::{Commitment, EntityStore, EntityUpdates, ReadMode};
-use arkiv_interfaces::store::{CellChange, CellName, Store, StoreError};
+use arkiv_interfaces::statemanager::{
+    Commitment, EntityStore, EntityUpdates, ReadMode, StoredEntity,
+};
+use arkiv_interfaces::store::{CellChange, CellName, Metered, Receipt, Store, StoreError};
 
 use crate::view::{GolemStateView, ViewError};
 
@@ -81,13 +83,48 @@ fn merge(base: &mut EntityUpdates, next: EntityUpdates) {
 }
 
 impl<S: Store> GolemStateView<S> {
-    /// Read an entity, or `None` if it does not exist at that read mode.
-    fn get(&self, address: EntityAddress, read: ReadMode) -> Result<Option<Entity>, EntityError> {
-        entity_records::read(&self.store, self.target(read), address)
+    /// Read an entity with its record's size, or `None` if it does not exist
+    /// at that read mode. The receipt is kept either way. A full read always
+    /// carries the size, so a record without one is a store fault. An
+    /// account's key holds no entity, so it reads as `None` without a read.
+    fn get_stored(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<StoredEntity>>, EntityError> {
+        let Some(key) = entity_records::record_key(address) else {
+            return Ok(Metered::new(None, Receipt::default()));
+        };
+        let record = self.store.get(self.target(read), key, None, None)?;
+        let stored = record
+            .value
+            .as_ref()
+            .map(|record| {
+                Ok::<_, EntityError>(StoredEntity {
+                    entity: entity_records::from_record(record)?,
+                    meta: record.meta.ok_or(StoreError::Internal)?,
+                })
+            })
+            .transpose()?;
+        Ok(Metered::new(stored, record.receipt))
     }
 
-    /// Apply `updates` to an entity, creating it if it does not exist.
-    fn update(&mut self, updates: EntityUpdates) -> Result<(), EntityError> {
+    /// [`get_stored`](Self::get_stored), without the size.
+    fn get(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<Entity>>, EntityError> {
+        Ok(self
+            .get_stored(address, read)?
+            .map(|found| found.map(|stored| stored.entity)))
+    }
+
+    /// Apply `updates` to an entity, creating it if it does not exist, and
+    /// return the combined receipt of its read and write. An absent delete
+    /// succeeds with a zero receipt until failed-call receipts are supported.
+    /// Errors do not roll back writes; the caller owns the transaction frame.
+    fn update(&mut self, updates: EntityUpdates) -> Result<Metered<()>, EntityError> {
         let address = updates.entity;
         // A write there would land on the account's record.
         let Some(key) = entity_records::record_key(address) else {
@@ -97,24 +134,23 @@ impl<S: Store> GolemStateView<S> {
         if updates.delete {
             // Absent is not an error: a view may tombstone something it also
             // created, and the net delta is still a deletion.
-            match self.store.delete(self.branch, key, None, None) {
-                Ok(_) | Err(StoreError::NotFound) => {}
+            let deleted = match self.store.delete(self.branch, key, None, None) {
+                Ok(deleted) => deleted,
+                Err(StoreError::NotFound) => Metered::new((), Receipt::default()),
                 Err(error) => return Err(error.into()),
-            }
+            };
             self.record(address, updates);
-            return Ok(());
+            return Ok(deleted);
         }
 
         // Read-modify-write through the overlay, so two updates in one view compose.
         let existing = self.get(address, ReadMode::ViewWithOverlay)?;
-        let mut entity = existing.clone().unwrap_or_default();
+        let mut entity = existing.value.clone().unwrap_or_default();
         updates.apply_to(&mut entity);
         let cells = entity_records::to_cells(&entity)?;
 
-        match existing {
-            None => {
-                self.store.create(self.branch, key, cells, None)?;
-            }
+        let written = match existing.value {
+            None => self.store.create(self.branch, key, cells, None)?.receipt,
             Some(previous) => {
                 // Patch rather than replace, and remove the cells that are no longer
                 // there: an attribute dropped from the entity must leave the record,
@@ -129,12 +165,15 @@ impl<S: Store> GolemStateView<S> {
                         changes.push((name.clone(), CellChange::Remove));
                     }
                 }
-                self.store.patch(self.branch, key, None, changes, None)?;
+                self.store
+                    .patch(self.branch, key, None, changes, None)?
+                    .receipt
             }
-        }
-
+        };
         self.record(address, updates);
-        Ok(())
+        let mut receipt = existing.receipt;
+        receipt.accumulate(&written);
+        Ok(Metered::new((), receipt))
     }
 
     fn record(&mut self, address: EntityAddress, updates: EntityUpdates) {
@@ -153,15 +192,15 @@ impl<S: Store> GolemStateView<S> {
 impl<S: Store> EntityStore for GolemStateView<S> {
     type Error = ViewError;
 
-    fn get_entity(
+    fn get_entity_with_meta(
         &self,
         address: EntityAddress,
         read: ReadMode,
-    ) -> Result<Option<Entity>, Self::Error> {
-        self.get(address, read).map_err(Into::into)
+    ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
+        self.get_stored(address, read).map_err(Into::into)
     }
 
-    fn update_entity(&mut self, updates: EntityUpdates) -> Result<(), Self::Error> {
+    fn update_entity(&mut self, updates: EntityUpdates) -> Result<Metered<()>, Self::Error> {
         self.update(updates).map_err(Into::into)
     }
 
@@ -212,7 +251,10 @@ mod tests {
         let mut view = view();
         view.update(EntityUpdates::create(entity(1)))
             .expect("create");
-        let back = view.get([1; 32], ReadMode::ViewWithOverlay).expect("read");
+        let back = view
+            .get([1; 32], ReadMode::ViewWithOverlay)
+            .expect("read")
+            .value;
         assert_eq!(back, Some(entity(1)));
     }
 
@@ -223,10 +265,14 @@ mod tests {
         let mut view = view();
         view.update(EntityUpdates::create(entity(1)))
             .expect("create");
-        assert_eq!(view.get([1; 32], ReadMode::ViewOnBase).expect("read"), None);
+        assert_eq!(
+            view.get([1; 32], ReadMode::ViewOnBase).expect("read").value,
+            None
+        );
         assert!(
             view.get([1; 32], ReadMode::ViewWithOverlay)
                 .expect("read")
+                .value
                 .is_some()
         );
     }
@@ -245,6 +291,7 @@ mod tests {
         let back = view
             .get([1; 32], ReadMode::ViewWithOverlay)
             .expect("read")
+            .value
             .unwrap();
         assert_eq!(back.owner, [9; 20]);
         assert_eq!(
@@ -270,6 +317,7 @@ mod tests {
         let back = view
             .get([1; 32], ReadMode::ViewWithOverlay)
             .expect("read")
+            .value
             .unwrap();
         assert!(back.attributes.is_empty());
 
@@ -298,7 +346,9 @@ mod tests {
         view.update(EntityUpdates::deletion([1; 32]))
             .expect("delete");
         assert_eq!(
-            view.get([1; 32], ReadMode::ViewWithOverlay).expect("read"),
+            view.get([1; 32], ReadMode::ViewWithOverlay)
+                .expect("read")
+                .value,
             None
         );
     }
@@ -322,12 +372,12 @@ mod tests {
 
     #[test]
     fn an_account_key_holds_no_entity() {
-        // The account's record is there, but it is not an entity's.
+        // The account's record is there, but it is not an entity's, so it is
+        // not even read.
         let (view, key) = funded_account();
-        assert_eq!(
-            view.get(key, ReadMode::ViewWithOverlay).expect("read"),
-            None
-        );
+        let read = view.get(key, ReadMode::ViewWithOverlay).expect("read");
+        assert_eq!(read.value, None);
+        assert_eq!(read.receipt, Receipt::default());
     }
 
     #[test]
@@ -438,7 +488,9 @@ mod tests {
         view.update(EntityUpdates::create(with_str.clone()))
             .expect("create");
         assert_eq!(
-            view.get([1; 32], ReadMode::ViewWithOverlay).expect("read"),
+            view.get([1; 32], ReadMode::ViewWithOverlay)
+                .expect("read")
+                .value,
             Some(with_str)
         );
     }

@@ -26,15 +26,21 @@
 //! - **Index lookups.** They answer from committed state, and nothing here can
 //!   commit: the suite holds a view, not the store behind it. Covered by each
 //!   implementation's own tests instead.
+//! - **Costs.** A view over a store that prices nothing reports zero, which
+//!   cannot tell a kept receipt from a dropped one. Write details are exact on
+//!   every store, so those are asserted; costs are each implementation's to
+//!   test, over a store that prices.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::entity::{Attribute, AttributeValue, Entity};
+use crate::entity_records;
 use crate::primitives::{EntityAddress, UserAddress, UserBalance};
 use crate::statemanager::{
     BlockRef, EntityUpdates, PruningMeta, PruningStore, ReadMode, StateView,
 };
+use crate::store::{RecordMeta, WriteDetails};
 
 const ALICE: UserAddress = [0xaa; 20];
 const BOB: UserAddress = [0xbb; 20];
@@ -63,6 +69,15 @@ pub fn run_all<V: StateView>(new_view: &dyn Fn() -> V) {
     a_dropped_attribute_leaves_the_entity(new_view);
     two_writes_to_one_entity_collapse_into_one_delta(new_view);
     deltas_come_back_in_ascending_entity_order(new_view);
+    entity_writes_report_their_exact_effects(new_view);
+    an_entity_read_reports_its_records_size(new_view);
+    minting_nonce_writes_report_their_effects(new_view);
+
+    // frames
+    a_discarded_frame_rolls_back_entities_and_the_minting_nonce(new_view);
+    a_merged_frame_keeps_its_writes(new_view);
+    frames_do_not_nest(new_view);
+    closing_a_frame_that_was_never_opened_fails(new_view);
 
     // pruning
     the_pruning_set_stages_then_commits(new_view);
@@ -101,6 +116,21 @@ fn address(key: u8) -> EntityAddress {
     [key; 32]
 }
 
+/// What an entity going from `before` to `after` does to its record's cells.
+fn effects(before: Option<&Entity>, after: Option<&Entity>) -> WriteDetails {
+    let cells = |entity: Option<&Entity>| {
+        entity
+            .map(|entity| entity_records::to_cells(entity).unwrap())
+            .unwrap_or_default()
+    };
+    let (before, after) = (cells(before), cells(after));
+    WriteDetails::between(
+        before.iter().map(|(name, cell)| (name, cell)),
+        after.iter().map(|(name, cell)| (name, cell)),
+    )
+    .unwrap()
+}
+
 fn gbp(n: u64) -> UserBalance {
     UserBalance::from_u64(n)
 }
@@ -123,7 +153,10 @@ fn an_unseen_account_is_zero<V: StateView>(new_view: &dyn Fn() -> V) {
             "and a zero transaction nonce"
         );
         assert_eq!(
-            view.get_entity_creation_nonce(ALICE, read).unwrap().get(),
+            view.get_entity_creation_nonce(ALICE, read)
+                .unwrap()
+                .value
+                .get(),
             0,
             "and a zero creation nonce"
         );
@@ -247,12 +280,14 @@ fn nonces_advance_by_one_and_report_the_value_before<V: StateView>(new_view: &dy
     assert_eq!(
         view.fetch_increment_entity_creation_nonce(ALICE)
             .unwrap()
+            .value
             .get(),
         0
     );
     assert_eq!(
         view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
             .unwrap()
+            .value
             .get(),
         1
     );
@@ -275,6 +310,7 @@ fn the_two_nonces_are_independent<V: StateView>(new_view: &dyn Fn() -> V) {
     assert_eq!(
         view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
             .unwrap()
+            .value
             .get(),
         1
     );
@@ -306,7 +342,8 @@ fn a_created_entity_reads_back_through_the_overlay<V: StateView>(new_view: &dyn 
         .unwrap();
     assert_eq!(
         view.get_entity(address(1), ReadMode::ViewWithOverlay)
-            .unwrap(),
+            .unwrap()
+            .value,
         Some(entity(1)),
         "every field of a created entity survives the round trip"
     );
@@ -317,7 +354,9 @@ fn the_base_does_not_see_staged_entity_writes<V: StateView>(new_view: &dyn Fn() 
     view.update_entity(EntityUpdates::create(entity(1)))
         .unwrap();
     assert_eq!(
-        view.get_entity(address(1), ReadMode::ViewOnBase).unwrap(),
+        view.get_entity(address(1), ReadMode::ViewOnBase)
+            .unwrap()
+            .value,
         None
     );
 }
@@ -330,7 +369,8 @@ fn a_deleted_entity_reads_as_absent<V: StateView>(new_view: &dyn Fn() -> V) {
         .unwrap();
     assert_eq!(
         view.get_entity(address(1), ReadMode::ViewWithOverlay)
-            .unwrap(),
+            .unwrap()
+            .value,
         None
     );
 }
@@ -350,6 +390,7 @@ fn a_dropped_attribute_leaves_the_entity<V: StateView>(new_view: &dyn Fn() -> V)
     let back = view
         .get_entity(address(1), ReadMode::ViewWithOverlay)
         .unwrap()
+        .value
         .expect("the entity is still there");
     assert!(back.attributes.is_empty(), "the attribute is gone");
 }
@@ -386,6 +427,269 @@ fn deltas_come_back_in_ascending_entity_order<V: StateView>(new_view: &dyn Fn() 
         .map(|d| d.entity)
         .collect();
     assert_eq!(seen, vec![address(1), address(2), address(3)]);
+}
+
+/// Write details are a pricing input, so every view reports them exactly:
+/// what the record's cells did, its own read adding nothing.
+fn entity_writes_report_their_exact_effects<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    let created = view
+        .update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+    assert_eq!(
+        created.receipt.details,
+        effects(None, Some(&entity(1))),
+        "a create writes every cell"
+    );
+
+    let mut changed = entity(1);
+    changed.attributes.pop();
+    let patched = view
+        .update_entity(EntityUpdates {
+            entity: address(1),
+            attributes: Some(changed.attributes.clone()),
+            ..EntityUpdates::default()
+        })
+        .unwrap();
+    assert_eq!(
+        patched.receipt.details,
+        effects(Some(&entity(1)), Some(&changed)),
+        "a patch reports only the cells it moved"
+    );
+
+    let read = view
+        .get_entity(address(1), ReadMode::ViewWithOverlay)
+        .unwrap();
+    assert_eq!(
+        read.receipt.details,
+        WriteDetails::ZERO,
+        "a read writes nothing"
+    );
+
+    let deleted = view
+        .update_entity(EntityUpdates::deletion(address(1)))
+        .unwrap();
+    assert_eq!(
+        deleted.receipt.details,
+        effects(Some(&changed), None),
+        "a delete removes every cell"
+    );
+}
+
+/// The size an entity read reports is its record's, by the shared size rule,
+/// and it moves by exactly what each write reported: the size before a write
+/// plus the write's effects is the size after it. That is what pricing reads.
+fn an_entity_read_reports_its_records_size<V: StateView>(new_view: &dyn Fn() -> V) {
+    let size_of = |entity: &Entity| {
+        let cells = entity_records::to_cells(entity).unwrap();
+        RecordMeta::from_cells(cells.iter().map(|(name, cell)| (name, cell))).unwrap()
+    };
+    let moved = |before: RecordMeta, details: WriteDetails| RecordMeta {
+        cells: before.cells + details.cells_created - details.cells_deleted,
+        cell_bytes: before.cell_bytes + details.cell_bytes_written - details.cell_bytes_deleted,
+        indexed_cells: before.indexed_cells + details.index_joins - details.index_leaves,
+        index_bytes: before.index_bytes + details.index_bytes_written - details.index_bytes_deleted,
+    };
+    let stored = |view: &V| {
+        view.get_entity_with_meta(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+    };
+
+    let mut view = new_view();
+    assert_eq!(stored(&view), None, "nothing there yet");
+
+    let created = view
+        .update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+    let after_create = stored(&view).expect("the entity exists");
+    assert_eq!(after_create.entity, entity(1));
+    assert_eq!(after_create.meta, size_of(&entity(1)), "a create's size");
+    assert_eq!(
+        after_create.meta,
+        moved(RecordMeta::default(), created.receipt.details),
+        "is what the create reported"
+    );
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        Some(after_create.entity.clone()),
+        "and the plain read is the same entity"
+    );
+
+    // `entity(1)` holds `body`, unindexed bytes, and `level`, an indexed
+    // number. Each patch replaces the attribute set with the next one. Bytes
+    // cannot be indexed, so `level`, as a string, is the one that flips.
+    let body = entity(1).attributes[0].clone();
+    let level = |indexed: bool| {
+        let value = AttributeValue::Str("one".into());
+        if indexed {
+            Attribute::new(b"level".to_vec(), value)
+        } else {
+            Attribute::unindexed(b"level".to_vec(), value)
+        }
+    };
+    let patches = [
+        ("a changed type", vec![body.clone(), level(true)]),
+        (
+            "an attribute becoming a field",
+            vec![body.clone(), level(false)],
+        ),
+        (
+            "a field becoming an attribute",
+            vec![body.clone(), level(true)],
+        ),
+        ("a removed attribute", vec![body]),
+    ];
+    let mut before = after_create.meta;
+    for (what, attributes) in patches {
+        let patched = view
+            .update_entity(EntityUpdates {
+                entity: address(1),
+                attributes: Some(attributes.clone()),
+                ..EntityUpdates::default()
+            })
+            .unwrap();
+        let after = stored(&view).expect("the entity exists");
+        assert_eq!(after.entity.attributes, attributes, "{what}: the entity");
+        assert_eq!(after.meta, size_of(&after.entity), "{what}: the size");
+        assert_eq!(
+            after.meta,
+            moved(before, patched.receipt.details),
+            "{what}: the size before, moved by what the patch reported"
+        );
+        before = after.meta;
+    }
+
+    let deleted = view
+        .update_entity(EntityUpdates::deletion(address(1)))
+        .unwrap();
+    assert_eq!(
+        moved(before, deleted.receipt.details),
+        RecordMeta::default(),
+        "a delete takes the whole size with it"
+    );
+    assert_eq!(stored(&view), None, "and leaves nothing to read");
+}
+
+/// The minting nonce is one cell: created with the account's first mint,
+/// updated by every one after.
+fn minting_nonce_writes_report_their_effects<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    let first = view.fetch_increment_entity_creation_nonce(ALICE).unwrap();
+    assert_eq!(first.receipt.details.cells_created, 1);
+    assert_eq!(first.receipt.details.cells_updated, 0);
+
+    let second = view.fetch_increment_entity_creation_nonce(ALICE).unwrap();
+    assert_eq!(second.receipt.details.cells_created, 0);
+    assert_eq!(second.receipt.details.cells_updated, 1);
+
+    let read = view
+        .get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
+        .unwrap();
+    assert_eq!(read.receipt.details, WriteDetails::ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// frames
+// ---------------------------------------------------------------------------
+
+/// A reverted transaction: the frame's entity and minting-nonce writes go,
+/// and so do their deltas, while what came before the frame stays.
+fn a_discarded_frame_rolls_back_entities_and_the_minting_nonce<V: StateView>(
+    new_view: &dyn Fn() -> V,
+) {
+    let mut view = new_view();
+    view.update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+
+    view.begin_frame().unwrap();
+    view.update_entity(EntityUpdates::create(entity(2)))
+        .unwrap();
+    view.fetch_increment_entity_creation_nonce(ALICE).unwrap();
+    view.discard_frame().unwrap();
+
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        Some(entity(1)),
+        "a write from before the frame survives"
+    );
+    assert_eq!(
+        view.get_entity(address(2), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        None,
+        "the frame's entity is gone"
+    );
+    assert_eq!(
+        view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+            .get(),
+        0,
+        "and so is its minting-nonce increment"
+    );
+    let deltas = view.get_uncommitted_deltas().unwrap();
+    assert_eq!(
+        deltas.len(),
+        1,
+        "the delta log is back to the one write outside the frame"
+    );
+    assert_eq!(deltas[0].entity, address(1));
+}
+
+fn a_merged_frame_keeps_its_writes<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    view.begin_frame().unwrap();
+    view.update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+    view.fetch_increment_entity_creation_nonce(ALICE).unwrap();
+    view.merge_frame().unwrap();
+
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        Some(entity(1))
+    );
+    assert_eq!(
+        view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+            .get(),
+        1
+    );
+    assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
+}
+
+/// One frame per transaction. A refused `begin_frame` leaves the open frame as
+/// it was, so the discard still reaches back to the one real begin.
+fn frames_do_not_nest<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    view.begin_frame().unwrap();
+    view.update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+    assert!(
+        view.begin_frame().is_err(),
+        "a second frame while one is open is refused"
+    );
+    view.discard_frame().unwrap();
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        None
+    );
+    assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+}
+
+fn closing_a_frame_that_was_never_opened_fails<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    assert!(view.merge_frame().is_err());
+    assert!(view.discard_frame().is_err());
 }
 
 // ---------------------------------------------------------------------------

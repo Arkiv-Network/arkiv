@@ -9,6 +9,14 @@ license.workspace = true
 name = "arkiv-reth"
 path = "src/main.rs"
 
+# The load test runs by hand, never in CI: `test = false` keeps it out of a
+# plain `cargo test` or `cargo nextest run`, including CI's `-- --ignored` run;
+# `--test load` selects it (see the README).
+[[test]]
+name = "load"
+path = "tests/load/main.rs"
+test = false
+
 # The assembly point and nothing else: reth's host plus the two things Arkiv
 # replaces. Anything more than wiring belongs in one of the crates below.
 
@@ -75,3 +83,5 @@ serde.workspace = true
 serde_json.workspace = true
 # GolemDB directories for the store-opening unit tests.
 tempfile.workspace = true
+# The load test's senders: the dev chain's funded, mnemonic-derived keys.
+arkiv-genesis.workspace = true

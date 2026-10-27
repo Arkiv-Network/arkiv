@@ -39,6 +39,21 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// covers the watcher and the polling that follows it.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What a node's transaction pool holds: transactions ready to be mined, and
+/// those parked behind a nonce gap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoolHashes {
+    pub pending: BTreeSet<B256>,
+    pub queued: BTreeSet<B256>,
+}
+
+impl PoolHashes {
+    /// Whether the pool holds `hash`, pending or queued.
+    pub fn contains(&self, hash: &B256) -> bool {
+        self.pending.contains(hash) || self.queued.contains(hash)
+    }
+}
+
 /// A typed RPC client bound to one node.
 pub struct ArkivClient<P> {
     provider: P,
@@ -248,33 +263,41 @@ impl<P: Provider> ArkivClient<P> {
             ),
             Err(e) => format!("<unknown: {e}>"),
         };
-        let content = match self
+        let pool = match self.pool_hashes().await {
+            Ok(pool) => pool,
+            Err(e) => return format!("<unknown: {e}> (status: {status})"),
+        };
+        let group = if pool.pending.contains(&tx_hash) {
+            "pending"
+        } else if pool.queued.contains(&tx_hash) {
+            "queued"
+        } else {
+            "absent"
+        };
+        format!("{group} (status: {status})")
+    }
+
+    /// The hashes the node's transaction pool holds, from `txpool_content`.
+    pub async fn pool_hashes(&self) -> eyre::Result<PoolHashes> {
+        let content = self
             .provider
             .raw_request::<_, serde_json::Value>("txpool_content".into(), ())
             .await
-        {
-            Ok(content) => content,
-            Err(e) => return format!("<unknown: {e}> (status: {status})"),
-        };
-
-        let wanted = tx_hash.to_string();
-        let holds = |group: &serde_json::Value| {
+            .map_err(|e| eyre::eyre!("txpool_content: {e}"))?;
+        let hashes = |group: &serde_json::Value| -> BTreeSet<B256> {
             group
                 .as_object()
                 .into_iter()
                 .flat_map(|by_sender| by_sender.values())
                 .filter_map(serde_json::Value::as_object)
                 .flat_map(|by_nonce| by_nonce.values())
-                .any(|tx| tx["hash"].as_str() == Some(wanted.as_str()))
+                .filter_map(|tx| tx["hash"].as_str()?.parse().ok())
+                .collect()
         };
-        let group = if holds(&content["pending"]) {
-            "pending"
-        } else if holds(&content["queued"]) {
-            "queued"
-        } else {
-            "absent"
-        };
-        format!("{group} (status: {status})")
+        Ok(PoolHashes {
+            pending: hashes(&content["pending"]),
+            queued: hashes(&content["queued"]),
+        })
     }
 
     // ── arkiv_* reads ────────────────────────────────────────────────────────

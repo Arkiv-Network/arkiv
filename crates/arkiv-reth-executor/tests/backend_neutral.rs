@@ -61,7 +61,12 @@ fn a_batch_runs_against_golemdb_and_lands_in_the_store() {
         caller: ALICE,
         block_number: 1,
         gas_supplied: 10_000_000,
+        tx_gas: 0,
+        floor_gas: 0,
+        golemdb_cost_before: 0,
         chain_id: 7738577,
+        max_lifetime: 7_884_000,
+        keep_writes: true,
     };
 
     let ops = vec![create(1), create(2)];
@@ -70,7 +75,7 @@ fn a_batch_runs_against_golemdb_and_lands_in_the_store() {
         .expect("apply");
 
     assert_eq!(out.status, ExecStatus::Ok);
-    assert!(out.gas_used > 0, "a create is not free");
+    assert!(out.gas_used() > 0, "a create is not free");
 
     let deltas = view.get_uncommitted_deltas().expect("deltas");
     assert_eq!(deltas.len(), 2, "one net delta per created entity");
@@ -81,6 +86,7 @@ fn a_batch_runs_against_golemdb_and_lands_in_the_store() {
         let entity = view
             .get_entity(delta.entity, ReadMode::ViewWithOverlay)
             .expect("read")
+            .value
             .expect("the entity exists");
         assert_eq!(entity.owner, ALICE);
         assert_eq!(entity.attributes.len(), 2);
@@ -105,5 +111,5 @@ fn creation_nonces_advance_on_the_golemdb_backend() {
     let after = view
         .get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
         .expect("read");
-    assert_eq!(after.get(), before.get() + 1);
+    assert_eq!(after.value.get(), before.value.get() + 1);
 }

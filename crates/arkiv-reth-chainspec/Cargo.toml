@@ -33,6 +33,8 @@ serde.workspace = true
 serde_json.workspace = true
 # GolemDB's genesis format, which `config.arkiv.golemdb` is in.
 golemdb-api.workspace = true
+# `FeeSchedule`, which `config.arkiv.tokenomics` is read into.
+arkiv-tokenomics.workspace = true
 
 [dev-dependencies]
 alloy-rlp.workspace = true

@@ -280,6 +280,20 @@ fn main() {
         async move |builder, _| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
             let store = open(&builder.config().chain);
+            // A chain without a fee schedule could price nothing, so it does
+            // not start, whatever store it runs on.
+            let fee_schedule = builder
+                .config()
+                .chain
+                .fee_schedule()
+                .copied()
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "the genesis file has no config.arkiv.tokenomics, the fee schedule every \
+                     Arkiv chain needs; `arkiv-reth dump-genesis --chain dev` prints a genesis \
+                     that has one"
+                    )
+                })?;
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone());
@@ -302,7 +316,8 @@ fn main() {
                 });
             let launcher = builder.engine_api_launcher().with_provider_builder(
                 ArkivProviderBuilder::new(store.clone(), seals.clone())
-                    .check_genesis_root(on_golemdb),
+                    .check_genesis_root(on_golemdb)
+                    .fee_schedule(Some(fee_schedule)),
             );
             let handle = builder
                 .launch_with(DebugNodeLauncher::new(launcher))
@@ -355,11 +370,17 @@ mod tests {
     }
 
     /// A chain spec whose genesis has `config.arkiv.golemdb` set to `golemdb`,
-    /// or no section.
+    /// with a placeholder fee schedule, or no section.
     fn spec(golemdb: Option<Value>) -> ArkivChainSpec {
         let mut genesis = json!({ "config": { "chainId": 424242 } });
         if let Some(golemdb) = golemdb {
-            genesis["config"]["arkiv"] = json!({ "golemdb": golemdb });
+            genesis["config"]["arkiv"] = json!({
+                "golemdb": golemdb,
+                "tokenomics": {
+                    "capacity_rate": 14, "cell_byte_units": 1, "index_byte_units": 1,
+                    "c_cell": 64, "c_idx": 64, "max_lifetime": 7_884_000
+                }
+            });
         }
         ArkivChainSpec::from_genesis(serde_json::from_value(genesis).unwrap()).unwrap()
     }

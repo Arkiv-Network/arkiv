@@ -29,9 +29,9 @@ use std::sync::Mutex;
 use super::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Origin, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange,
-    RecordKey, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey,
-    SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp,
-    WriteOutcome, validate_cell_name,
+    RecordKey, RecordMeta, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress,
+    SegmentKey, SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt,
+    WriteDetails, WriteOp, WriteOutcome, validate_cell_name,
 };
 use alloc::string::{String, ToString};
 use core::ops::Range;
@@ -49,8 +49,22 @@ impl RecordData {
     /// a projection was asked for.
     ///
     /// Cells come out in ascending name order, because the backing map is
-    /// ordered — so two equal records always compare equal.
-    fn to_record(&self, key: RecordKey, projection: Option<&[CellName]>) -> Record {
+    /// ordered — so two equal records always compare equal. The size is
+    /// computed from every cell, projected or not, as GolemDB keeps it.
+    fn to_record(
+        &self,
+        key: RecordKey,
+        projection: Option<&[CellName]>,
+    ) -> Result<Record, StoreError> {
+        Ok(Record {
+            meta: RecordMeta::read(&self.cells, projection)?,
+            ..self.cells_record(key, projection)
+        })
+    }
+
+    /// The record without its size, for matching and sorting, which only look
+    /// at cells.
+    fn cells_record(&self, key: RecordKey, projection: Option<&[CellName]>) -> Record {
         let cells = self
             .cells
             .iter()
@@ -61,6 +75,7 @@ impl RecordData {
             key,
             version: self.version,
             cells,
+            meta: None,
         }
     }
 }
@@ -235,10 +250,21 @@ const _: () = {
 /// Cost is the real store's concern, priced against a schedule this
 /// implementation does not have. Inventing numbers would give call sites
 /// something that looks like a cost and means nothing.
+///
+/// Effects are another matter: what a write did to a record's cells is a fact
+/// of the data, not of a price, and storage is priced from it. Writes report
+/// them exactly, by GolemDB's size rule ([`WriteDetails::between`]).
 const fn free_receipt() -> Receipt {
+    receipt(WriteDetails::ZERO)
+}
+
+/// A zero-cost receipt carrying a write's effects.
+const fn receipt(details: WriteDetails) -> Receipt {
     Receipt {
         cost: CostUnits(0),
         schedule: ScheduleVersion(0),
+        priced_at: None,
+        details,
     }
 }
 
@@ -347,7 +373,7 @@ impl Inner {
         }
 
         let previous = &self.commit_snapshot(origin)?.state;
-        let changes = record_changes_between(previous, &root_state.state);
+        let changes = record_changes_between(previous, &root_state.state)?;
         // The seal already computed this; a commit writes what it froze.
         let hash = root_state
             .sealed
@@ -551,14 +577,16 @@ impl Inner {
         if state.state.contains_key(&key) {
             return Err(StoreError::AlreadyExists);
         }
+        let cells: BTreeMap<CellName, Cell> = cells.into_iter().collect();
+        let details = WriteDetails::between(core::iter::empty(), &cells)?;
         state.state.insert(
             key,
             RecordData {
                 version: RecordVersion(1),
-                cells: cells.into_iter().collect(),
+                cells,
             },
         );
-        Ok(with_free_receipt(key))
+        Ok(Metered::new(key, receipt(details)))
     }
 
     fn get(
@@ -571,7 +599,8 @@ impl Inner {
         let found = self
             .state_for_target(target)?
             .get(&key)
-            .map(|record| record.to_record(key, projection));
+            .map(|record| record.to_record(key, projection))
+            .transpose()?;
         Ok(with_free_receipt(found))
     }
 
@@ -613,9 +642,10 @@ impl Inner {
             return Err(StoreError::InvalidArgument);
         }
 
+        let details = WriteDetails::between(&record.cells, &staged)?;
         record.cells = staged;
         record.version = RecordVersion(record.version.0 + 1);
-        Ok(with_free_receipt(record.version))
+        Ok(Metered::new(record.version, receipt(details)))
     }
 
     fn delete(
@@ -630,8 +660,9 @@ impl Inner {
         if expected_version.is_some_and(|expected| expected != record.version) {
             return Err(StoreError::Conflict);
         }
+        let details = WriteDetails::between(&record.cells, core::iter::empty())?;
         state.state.remove(&key);
-        Ok(with_free_receipt(()))
+        Ok(Metered::new((), receipt(details)))
     }
 
     fn query(
@@ -657,7 +688,7 @@ impl Inner {
             .skip(query.page.offset as usize)
             .take(query.page.limit as usize)
             .map(|key| state[&key].to_record(key, query.projection.as_deref()))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         Ok(with_free_receipt(QueryResult {
             records,
@@ -718,28 +749,32 @@ impl Inner {
         // semantic one.
         let saved = self.branch_state(branch)?.clone();
         let mut outcomes = Vec::with_capacity(ops.len());
+        let mut total = free_receipt();
 
         for op in ops {
             let outcome = match op {
                 WriteOp::Create { key, cells } => self
                     .create(branch, key, cells, budget)
-                    .map(|_| WriteOutcome::Created),
+                    .map(|done| done.map(|_| WriteOutcome::Created)),
                 WriteOp::Patch {
                     key,
                     expected_version,
                     changes,
                 } => self
                     .patch(branch, key, expected_version, changes, budget)
-                    .map(|version| WriteOutcome::Patched(version.into_value())),
+                    .map(|done| done.map(WriteOutcome::Patched)),
                 WriteOp::Delete {
                     key,
                     expected_version,
                 } => self
                     .delete(branch, key, expected_version, budget)
-                    .map(|_| WriteOutcome::Deleted),
+                    .map(|done| done.map(|()| WriteOutcome::Deleted)),
             };
             match outcome {
-                Ok(applied) => outcomes.push(applied),
+                Ok(applied) => {
+                    total.accumulate(&applied.receipt);
+                    outcomes.push(applied.into_value());
+                }
                 Err(error) => {
                     self.restore_branch(branch, saved);
                     return Err(error);
@@ -751,7 +786,7 @@ impl Inner {
         // per-call increments above would otherwise leave behind.
         let state = self.branch_state_mut(branch)?;
         state.version = BranchVersion(saved.version.0 + 1);
-        Ok(with_free_receipt(outcomes))
+        Ok(Metered::new(outcomes, total))
     }
 
     fn commit_hash(&self, commit: CommitId) -> Result<[u8; 32], StoreError> {
@@ -777,8 +812,9 @@ impl Inner {
                 state
                     .get(key)
                     .map(|record| record.to_record(*key, projection))
+                    .transpose()
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(with_free_receipt(found))
     }
 }
@@ -1078,7 +1114,7 @@ fn evaluate_filter(
 ) -> Result<Vec<RecordKey>, StoreError> {
     let mut matched = Vec::new();
     for (key, data) in state {
-        if filter.matches(&data.to_record(*key, None))? {
+        if filter.matches(&data.cells_record(*key, None))? {
             matched.push(*key);
         }
     }
@@ -1091,7 +1127,7 @@ fn evaluate_filter(
 /// tie-break — so the ordering is total and two implementations agreeing on
 /// the match set also agree on the page.
 fn sort_keys_by_cell(state: &BTreeMap<RecordKey, RecordData>, keys: &mut [RecordKey], sort: &Sort) {
-    let sort_value = |key: &RecordKey| state[key].to_record(*key, None).sort_key(&sort.cell);
+    let sort_value = |key: &RecordKey| state[key].cells_record(*key, None).sort_key(&sort.cell);
 
     keys.sort_by(|left, right| {
         let ordering = match (sort_value(left), sort_value(right)) {
@@ -1120,7 +1156,7 @@ fn sort_keys_by_cell(state: &BTreeMap<RecordKey, RecordData>, keys: &mut [Record
 fn record_changes_between(
     before: &BTreeMap<RecordKey, RecordData>,
     after: &BTreeMap<RecordKey, RecordData>,
-) -> Vec<RecordChange> {
+) -> Result<Vec<RecordChange>, StoreError> {
     let mut changes = Vec::new();
 
     for (key, previous) in before {
@@ -1128,12 +1164,12 @@ fn record_changes_between(
             Some(current) if current.cells == previous.cells => {}
             Some(current) => changes.push(RecordChange {
                 key: *key,
-                before: Some(previous.to_record(*key, None)),
-                after: Some(current.to_record(*key, None)),
+                before: Some(previous.to_record(*key, None)?),
+                after: Some(current.to_record(*key, None)?),
             }),
             None => changes.push(RecordChange {
                 key: *key,
-                before: Some(previous.to_record(*key, None)),
+                before: Some(previous.to_record(*key, None)?),
                 after: None,
             }),
         }
@@ -1144,13 +1180,13 @@ fn record_changes_between(
             changes.push(RecordChange {
                 key: *key,
                 before: None,
-                after: Some(current.to_record(*key, None)),
+                after: Some(current.to_record(*key, None)?),
             });
         }
     }
 
     changes.sort_by_key(|change| change.key);
-    changes
+    Ok(changes)
 }
 
 /// A deterministic digest over logical record content.
@@ -1237,6 +1273,11 @@ mod tests {
     #[test]
     fn conformance_part_two() {
         crate::store::conformance::run_part_two(&MemStore::new);
+    }
+
+    #[test]
+    fn conformance_write_details() {
+        crate::store::conformance::run_write_details(&MemStore::new);
     }
 
     /// A 20-byte address survives the trip into the 32-byte key space, and an

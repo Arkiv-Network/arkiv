@@ -1972,6 +1972,8 @@ pub struct ArkivProviderBuilder {
     seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
     /// Whether the store's genesis commit must have block 0's `stateRoot`.
     check_genesis_root: bool,
+    /// The genesis fee schedule to seed, if the chain has one.
+    fee_schedule: Option<arkiv_tokenomics::FeeSchedule>,
 }
 
 impl ArkivProviderBuilder {
@@ -1984,6 +1986,7 @@ impl ArkivProviderBuilder {
             store,
             seals,
             check_genesis_root: false,
+            fee_schedule: None,
         }
     }
 
@@ -1991,6 +1994,14 @@ impl ArkivProviderBuilder {
     /// `stateRoot`. For a store whose root block 0's header carries: GolemDB.
     pub const fn check_genesis_root(mut self, check: bool) -> Self {
         self.check_genesis_root = check;
+        self
+    }
+
+    /// The chain's genesis fee schedule, which genesis writes into the store.
+    /// The builder is generic over the chain spec, so it is told rather than
+    /// reading it there.
+    pub const fn fee_schedule(mut self, schedule: Option<arkiv_tokenomics::FeeSchedule>) -> Self {
+        self.fee_schedule = schedule;
         self
     }
 }
@@ -2027,8 +2038,13 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         let genesis_hash = spec.genesis_hash();
         check_chain(&self.store, genesis_hash.0)?;
         let alloc = arkiv_reth_statemanager::GenesisAccount::from_alloc(&spec.genesis().alloc);
-        if let Some(commit) = seed_genesis(&self.store, genesis_hash.0, alloc)
-            .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}"))?
+        if let Some(commit) = seed_genesis(
+            &self.store,
+            genesis_hash.0,
+            self.fee_schedule.as_ref(),
+            alloc,
+        )
+        .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}"))?
         {
             tracing::info!(
                 target: "arkiv-reth",

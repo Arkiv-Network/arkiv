@@ -164,6 +164,25 @@ pub fn run_part_two<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     an_empty_range_still_says_where_the_commit_stood(store_generator);
 }
 
+/// Run every write-effects assertion against stores built by `new_store`.
+///
+/// Separate from [`run_all`] because storage is priced from these effects, so
+/// every backend must report them exactly as GolemDB does, including a store
+/// that conforms to nothing else here yet. The figures are GolemDB's size rule
+/// written out: a cell counts `(8 + name) + (1 + value)` bytes, an attribute's
+/// index entry `name + 2 + value`.
+pub fn run_write_details<S: Store>(store_generator: &dyn Fn() -> S) {
+    a_create_reports_every_cell(store_generator);
+    a_patch_reports_only_what_changed(store_generator);
+    a_field_becoming_an_attribute_joins_the_index(store_generator);
+    a_delete_reports_every_cell(store_generator);
+    a_read_reports_no_effects(store_generator);
+    every_type_counts_its_canonical_width(store_generator);
+    key_and_bytes32_are_one_stored_type(store_generator);
+    a_read_reports_the_records_size(store_generator);
+    the_size_moves_by_what_each_write_reports(store_generator);
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -2091,7 +2110,7 @@ fn apply_batch_matches_individual_writes<S: StoreExt>(store_generator: &dyn Fn()
 }
 
 /// A batched read answers exactly what the same keys read one at a time would,
-/// including the misses and their positions.
+/// including the misses and their positions, and each record's size.
 fn batch_ops_and_individual_ops_are_indistinguishable<S: StoreExt>(
     store_generator: &dyn Fn() -> S,
 ) {
@@ -2115,6 +2134,12 @@ fn batch_ops_and_individual_ops_are_indistinguishable<S: StoreExt>(
         .collect();
 
     assert_eq!(together, separately);
+    assert!(
+        together[0]
+            .as_ref()
+            .is_some_and(|record| record.meta.is_some()),
+        "a batched full read carries the size"
+    );
 }
 
 /// The retention window always includes the head, and is well-ordered.
@@ -2603,5 +2628,420 @@ fn an_empty_range_still_says_where_the_commit_stood<S: Store>(store_generator: &
         store.segment_range_of("receipts", second),
         Ok(0..0),
         "a segment the store has never seen has no length to report",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// write effects
+// ---------------------------------------------------------------------------
+
+/// `n` (an attribute `u64`) and `note` (a two-byte `str` field), the record the
+/// effects assertions start from: `n` takes 18 cell bytes and 11 index bytes,
+/// `note` 15 cell bytes.
+fn effects_record() -> Vec<(&'static str, Cell)> {
+    vec![
+        ("n", u64_attribute(7)),
+        ("note", Cell::field(TypeId::STR, b"ab".to_vec())),
+    ]
+}
+
+fn a_create_reports_every_cell<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = store.begin(None).unwrap();
+    let created = store
+        .create(branch, record_key(1), cell_map(&effects_record()), None)
+        .expect("create succeeds");
+    assert_eq!(
+        created.receipt.details,
+        WriteDetails {
+            cells_created: 2,
+            index_joins: 1,
+            cell_bytes_written: 18 + 15,
+            index_bytes_written: 11,
+            ..WriteDetails::ZERO
+        },
+        "a create writes every cell, and the attribute joins the index"
+    );
+}
+
+fn a_patch_reports_only_what_changed<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    let mut cells = effects_record();
+    cells.push(("kept", u64_attribute(1)));
+    create_record(&mut store, branch, record_key(1), &cells);
+
+    let patched = store
+        .patch(
+            branch,
+            record_key(1),
+            None,
+            vec![
+                ("n".to_string(), CellChange::Set(u64_attribute(8))),
+                ("note".to_string(), CellChange::Remove),
+                ("kept".to_string(), CellChange::Set(u64_attribute(1))),
+                (
+                    "extra".to_string(),
+                    CellChange::Set(Cell::field(TypeId::STR, b"x".to_vec())),
+                ),
+                ("missing".to_string(), CellChange::Remove),
+            ],
+            None,
+        )
+        .expect("patch succeeds");
+    // `n` changes: 18 bytes out and in, and its index entry leaves and joins.
+    // `note` goes: 15 bytes out. `extra` arrives: (8 + 5) + (1 + 1) = 15 bytes.
+    // `kept` is set to what it already holds and `missing` was never there:
+    // neither counts.
+    assert_eq!(
+        patched.receipt.details,
+        WriteDetails {
+            cells_created: 1,
+            cells_updated: 1,
+            cells_deleted: 1,
+            index_joins: 1,
+            index_leaves: 1,
+            cell_bytes_written: 18 + 15,
+            cell_bytes_deleted: 18 + 15,
+            index_bytes_written: 11,
+            index_bytes_deleted: 11,
+        },
+        "a patch counts changed, added and removed cells, nothing else"
+    );
+}
+
+fn a_field_becoming_an_attribute_joins_the_index<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(
+        &mut store,
+        branch,
+        record_key(1),
+        &[("n", Cell::field(TypeId::U64, 7u64.to_be_bytes().to_vec()))],
+    );
+    let patched = store
+        .patch(
+            branch,
+            record_key(1),
+            None,
+            set_cell("n", u64_attribute(7)),
+            None,
+        )
+        .expect("patch succeeds");
+    assert_eq!(
+        patched.receipt.details,
+        WriteDetails {
+            cells_updated: 1,
+            index_joins: 1,
+            cell_bytes_written: 18,
+            cell_bytes_deleted: 18,
+            index_bytes_written: 11,
+            ..WriteDetails::ZERO
+        },
+        "the same value under another kind is an update that joins the index"
+    );
+}
+
+fn a_delete_reports_every_cell<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(&mut store, branch, record_key(1), &effects_record());
+    let deleted = store
+        .delete(branch, record_key(1), None, None)
+        .expect("delete succeeds");
+    assert_eq!(
+        deleted.receipt.details,
+        WriteDetails {
+            cells_deleted: 2,
+            index_leaves: 1,
+            cell_bytes_deleted: 18 + 15,
+            index_bytes_deleted: 11,
+            ..WriteDetails::ZERO
+        },
+        "a delete removes every cell, and the attribute leaves the index"
+    );
+}
+
+fn a_read_reports_no_effects<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    create_record(&mut store, branch, record_key(1), &effects_record());
+    let read = store
+        .get(ReadTarget::Branch(branch), record_key(1), None, None)
+        .expect("get succeeds");
+    assert_eq!(
+        read.receipt.details,
+        WriteDetails::ZERO,
+        "a read writes nothing"
+    );
+}
+
+/// Every type's value counts at its canonical width, so the size rule holds
+/// for whatever an entity stores. The name `v` keeps the arithmetic visible:
+/// a cell is `(8 + 1) + (1 + width)`, an index entry `1 + 2 + width`.
+fn every_type_counts_its_canonical_width<S: Store>(store_generator: &dyn Fn() -> S) {
+    let cases: [(Cell, u64); 10] = [
+        (Cell::attribute(TypeId::BOOL, vec![1]), 1),
+        (Cell::attribute(TypeId::I32, vec![0x80, 0, 0, 7]), 4),
+        (Cell::attribute(TypeId::U256, vec![7; 32]), 32),
+        (Cell::attribute(TypeId::DEC, vec![7; 32]), 32),
+        (Cell::attribute(TypeId::BYTES32, vec![7; 32]), 32),
+        (Cell::attribute(TypeId::KEY, vec![7; 32]), 32),
+        (Cell::field(TypeId::BYTES, vec![7; 5]), 5),
+        (Cell::attribute(TypeId::STR, b"seven".to_vec()), 5),
+        (Cell::attribute(TypeId::U64, 7u64.to_be_bytes().to_vec()), 8),
+        (Cell::attribute(TypeId::ADDR, vec![7; 20]), 20),
+    ];
+    for (ordinal, (cell, width)) in (1u8..).zip(cases) {
+        let store = store_generator();
+        let branch = store.begin(None).unwrap();
+        let indexed = cell.kind == CellKind::Attribute;
+        let type_id = cell.type_id;
+        let created = store
+            .create(
+                branch,
+                record_key(ordinal),
+                vec![("v".to_string(), cell)],
+                None,
+            )
+            .expect("create succeeds");
+        let expected = WriteDetails {
+            cells_created: 1,
+            index_joins: u64::from(indexed),
+            cell_bytes_written: 8 + 1 + 1 + width,
+            index_bytes_written: if indexed { 1 + 2 + width } else { 0 },
+            ..WriteDetails::ZERO
+        };
+        assert_eq!(
+            created.receipt.details, expected,
+            "type {type_id:?} counts at width {width}"
+        );
+    }
+}
+
+/// `KEY` and `BYTES32` store alike: switching one for the other, with the bytes
+/// and kind kept, writes nothing, in either direction. Changing the bytes, or
+/// the kind, still does. A 32-byte `v` is (8 + 1) + (1 + 32) = 42 cell bytes
+/// and 1 + 2 + 32 = 35 index bytes.
+fn key_and_bytes32_are_one_stored_type<S: Store>(store_generator: &dyn Fn() -> S) {
+    let key = Cell::attribute(TypeId::KEY, vec![7; 32]);
+    let bytes32 = Cell::attribute(TypeId::BYTES32, vec![7; 32]);
+    let patched = |from: Cell, to: Cell| {
+        let mut store = store_generator();
+        let branch = store.begin(None).unwrap();
+        create_record(&mut store, branch, record_key(1), &[("v", from)]);
+        store
+            .patch(branch, record_key(1), None, set_cell("v", to), None)
+            .expect("patch succeeds")
+            .receipt
+            .details
+    };
+    assert_eq!(
+        patched(key.clone(), bytes32.clone()),
+        WriteDetails::ZERO,
+        "KEY to BYTES32, same bytes and kind, is no write"
+    );
+    assert_eq!(
+        patched(bytes32.clone(), key.clone()),
+        WriteDetails::ZERO,
+        "BYTES32 to KEY, same bytes and kind, is no write"
+    );
+    assert_eq!(
+        patched(key.clone(), Cell::attribute(TypeId::BYTES32, vec![8; 32])),
+        WriteDetails {
+            cells_updated: 1,
+            index_joins: 1,
+            index_leaves: 1,
+            cell_bytes_written: 42,
+            cell_bytes_deleted: 42,
+            index_bytes_written: 35,
+            index_bytes_deleted: 35,
+            ..WriteDetails::ZERO
+        },
+        "other bytes are a write"
+    );
+    assert_eq!(
+        patched(key, Cell::field(TypeId::BYTES32, vec![7; 32])),
+        WriteDetails {
+            cells_updated: 1,
+            index_leaves: 1,
+            cell_bytes_written: 42,
+            cell_bytes_deleted: 42,
+            index_bytes_deleted: 35,
+            ..WriteDetails::ZERO
+        },
+        "another kind is a write that leaves the index"
+    );
+}
+
+/// A full read reports the record's size, as GolemDB keeps it in `#meta`:
+/// every user cell, `$`-prefixed ones included, by the rule [`WriteDetails`]
+/// uses. `n` is 18 cell and 11 index bytes, `note` 15 cell bytes, and
+/// `$expiresAt` (8 + 10) + (1 + 8) = 27 cell and 10 + 2 + 8 = 20 index bytes.
+/// A projected read reports it only if it asks for `#meta`. Committed reads
+/// and query results carry it the same way: GolemDB reads them on another
+/// path than a branch read.
+fn a_read_reports_the_records_size<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    let mut cells = effects_record();
+    cells.push(("$expiresAt", u64_attribute(100)));
+    create_record(&mut store, branch, record_key(1), &cells);
+
+    let expected = RecordMeta {
+        cells: 3,
+        cell_bytes: 18 + 15 + 27,
+        indexed_cells: 2,
+        index_bytes: 11 + 20,
+    };
+    let record =
+        read_record(&store, ReadTarget::Branch(branch), record_key(1)).expect("the record exists");
+    assert_eq!(record.meta, Some(expected), "a full read carries the size");
+    assert_eq!(
+        RecordMeta::from_cells(cell_map(&cells).iter().map(|(name, cell)| (name, cell))),
+        Ok(expected),
+        "and the shared size rule agrees with it"
+    );
+
+    let projected = |names: &[&str]| {
+        let names: Vec<CellName> = names.iter().map(|name| name.to_string()).collect();
+        store
+            .get(
+                ReadTarget::Branch(branch),
+                record_key(1),
+                Some(&names),
+                None,
+            )
+            .expect("get succeeds")
+            .into_value()
+            .expect("the record exists")
+            .meta
+    };
+    assert_eq!(
+        projected(&["n"]),
+        None,
+        "a projection without #meta leaves it out"
+    );
+    assert_eq!(
+        projected(&["n", RecordMeta::CELL]),
+        Some(expected),
+        "and one that asks for it gets the whole record's size"
+    );
+
+    let commit = store.commit(branch).expect("commit succeeds");
+    let committed = read_record(&store, ReadTarget::Commit(commit), record_key(1))
+        .expect("the record is committed");
+    assert_eq!(
+        committed.meta,
+        Some(expected),
+        "a committed read carries it too"
+    );
+
+    let queried = |projection: Option<&[&str]>| {
+        let query = Query {
+            projection: projection.map(|names| names.iter().map(|name| name.to_string()).collect()),
+            ..paged_query(
+                equals_filter("n", TypeId::U64, 7u64.to_be_bytes().to_vec()),
+                0,
+                10,
+            )
+        };
+        let records = store
+            .query(Some(commit), &query, None)
+            .expect("query succeeds")
+            .into_value()
+            .records;
+        assert_eq!(records.len(), 1, "the query finds the record");
+        records[0].meta
+    };
+    assert_eq!(queried(None), Some(expected), "so does a full query result");
+    assert_eq!(
+        queried(Some(&["n"])),
+        None,
+        "a query projection without #meta leaves it out"
+    );
+    assert_eq!(
+        queried(Some(&["n", RecordMeta::CELL])),
+        Some(expected),
+        "and one that asks for it gets the whole record's size"
+    );
+}
+
+/// The size after a write is the size before it, moved by exactly what the
+/// write reported: the identity storage pricing rests on.
+fn the_size_moves_by_what_each_write_reports<S: Store>(store_generator: &dyn Fn() -> S) {
+    let store = store_generator();
+    let branch = store.begin(None).unwrap();
+    let size = |store: &S| {
+        read_record(store, ReadTarget::Branch(branch), record_key(1))
+            .map(|record| record.meta.expect("a full read carries the size"))
+            .unwrap_or_default()
+    };
+    let moved = |before: RecordMeta, details: WriteDetails| RecordMeta {
+        cells: before.cells + details.cells_created - details.cells_deleted,
+        cell_bytes: before.cell_bytes + details.cell_bytes_written - details.cell_bytes_deleted,
+        indexed_cells: before.indexed_cells + details.index_joins - details.index_leaves,
+        index_bytes: before.index_bytes + details.index_bytes_written - details.index_bytes_deleted,
+    };
+
+    let created = store
+        .create(branch, record_key(1), cell_map(&effects_record()), None)
+        .expect("create succeeds")
+        .receipt
+        .details;
+    let after_create = size(&store);
+    assert_eq!(
+        after_create,
+        moved(RecordMeta::default(), created),
+        "a create"
+    );
+
+    let patches: [(&str, Vec<(CellName, CellChange)>); 4] = [
+        (
+            "a change, an addition and a removal",
+            vec![
+                ("n".to_string(), CellChange::Set(u64_attribute(8))),
+                ("note".to_string(), CellChange::Remove),
+                ("extra".to_string(), CellChange::Set(str_attribute("xyz"))),
+            ],
+        ),
+        (
+            "a cell set to what it holds",
+            set_cell("n", u64_attribute(8)),
+        ),
+        (
+            "an attribute becoming a field",
+            set_cell("extra", Cell::field(TypeId::STR, b"xyz".to_vec())),
+        ),
+        (
+            "a change of type",
+            set_cell("n", Cell::attribute(TypeId::I32, vec![0x80, 0, 0, 8])),
+        ),
+    ];
+    let mut before = after_create;
+    for (what, changes) in patches {
+        let details = store
+            .patch(branch, record_key(1), None, changes, None)
+            .expect("patch succeeds")
+            .receipt
+            .details;
+        let after = size(&store);
+        assert_eq!(after, moved(before, details), "{what}");
+        before = after;
+    }
+
+    let deleted = store
+        .delete(branch, record_key(1), None, None)
+        .expect("delete succeeds")
+        .receipt
+        .details;
+    assert_eq!(
+        moved(before, deleted),
+        RecordMeta::default(),
+        "a delete takes the whole size with it"
+    );
+    assert!(
+        read_record(&store, ReadTarget::Branch(branch), record_key(1)).is_none(),
+        "and a deleted record has no size to read"
     );
 }

@@ -13,6 +13,9 @@ pub mod indices;
 pub mod manager;
 pub mod view;
 
+#[cfg(test)]
+mod metering_tests;
+
 pub use manager::GolemStateManager;
 pub use view::{GolemStateView, ViewError};
 
