@@ -1085,22 +1085,16 @@ fn evaluate_filter(
     Ok(matched)
 }
 
-/// Sort matched keys by one cell, in the requested direction.
+/// Sort matched keys by one cell, as [`Sort`] orders them.
 ///
-/// Records lacking the sort cell sort last, and ascending key order is the
-/// tie-break — so the ordering is total and two implementations agreeing on
-/// the match set also agree on the page.
+/// `keys` arrive in key order, this store's own, and the sort is stable and
+/// compares values only, so ties keep key order in either direction. A record
+/// with no value sorts below every value, as `None` orders before `Some`.
 fn sort_keys_by_cell(state: &BTreeMap<RecordKey, RecordData>, keys: &mut [RecordKey], sort: &Sort) {
-    let sort_value = |key: &RecordKey| state[key].to_record(*key, None).sort_key(&sort.cell);
+    let sort_value = |key: &RecordKey| state[key].to_record(*key, None).sort_key(sort);
 
     keys.sort_by(|left, right| {
-        let ordering = match (sort_value(left), sort_value(right)) {
-            (Some(left_value), Some(right_value)) => left_value.cmp(&right_value),
-            (Some(_), None) => core::cmp::Ordering::Less,
-            (None, Some(_)) => core::cmp::Ordering::Greater,
-            (None, None) => core::cmp::Ordering::Equal,
-        };
-        let ordering = ordering.then_with(|| left.cmp(right));
+        let ordering = sort_value(left).cmp(&sort_value(right));
         match sort.direction {
             SortDirection::Ascending => ordering,
             SortDirection::Descending => ordering.reverse(),

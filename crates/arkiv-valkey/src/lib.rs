@@ -524,20 +524,15 @@ fn project(mut record: Record, projection: Option<&[CellName]>) -> Record {
     record
 }
 
-/// Sort matched records by one cell, in the requested direction.
+/// Sort matched records by one cell, as [`Sort`] orders them.
 ///
-/// Records lacking the sort cell sort last, and ascending key order is the
-/// tie-break — so the ordering is total and two implementations agreeing on
-/// the match set also agree on the page.
+/// `records` arrive in key order, this store's own, and the sort is stable
+/// and compares values only, so ties keep key order in either direction. A
+/// record with no value sorts below every value, as `None` orders before
+/// `Some`.
 fn sort_records(records: &mut [Record], sort: &Sort) {
     records.sort_by(|left, right| {
-        let ordering = match (left.sort_key(&sort.cell), right.sort_key(&sort.cell)) {
-            (Some(left_value), Some(right_value)) => left_value.cmp(&right_value),
-            (Some(_), None) => core::cmp::Ordering::Less,
-            (None, Some(_)) => core::cmp::Ordering::Greater,
-            (None, None) => core::cmp::Ordering::Equal,
-        };
-        let ordering = ordering.then_with(|| left.key.cmp(&right.key));
+        let ordering = left.sort_key(sort).cmp(&right.sort_key(sort));
         match sort.direction {
             SortDirection::Ascending => ordering,
             SortDirection::Descending => ordering.reverse(),

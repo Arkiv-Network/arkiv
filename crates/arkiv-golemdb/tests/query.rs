@@ -13,7 +13,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::query::Query as ArkivQuery;
-use arkiv_interfaces::store::{Filter, Page, Query, Store, StoreError};
+use arkiv_interfaces::store::{Filter, Page, Query, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
 
@@ -505,4 +505,85 @@ fn star_matches_every_entity() {
     assert_eq!(count(&live_at(500)), Ok(3));
     assert_eq!(count(&live_at(1_000)), Ok(0), "every entity has expired");
     assert_eq!(matched(&store, live_at(500)), [1, 2, 3]);
+}
+
+/// `text`, a whole query string, as the store query `arkiv_query` runs: its
+/// filter, its `ORDER BY` as the sort, and one page of `limit` from `offset`.
+/// The entity numbers of that page, in page order.
+fn sorted_page(store: &GolemDbStore, text: &str, offset: u64, limit: u64) -> Vec<u8> {
+    let statement = arkiv_query::parse_statement(text).unwrap();
+    let query = Query {
+        filter: Filter::from(&statement.filter),
+        sort: statement.order.as_ref().map(Sort::from),
+        page: Page { offset, limit },
+        ..Query::default()
+    };
+    store
+        .query(None, &query, None)
+        .expect("GolemDB answers the sorted query")
+        .into_value()
+        .records
+        .iter()
+        .map(|record| record.key.0[0])
+        .collect()
+}
+
+/// `ORDER BY` through the parser: the attribute read as the type it names,
+/// an entity without a value of that type below every value, so first
+/// ascending and last descending, and ties in creation order either way. The
+/// entities are created in key order, so creation order is key order here.
+/// Pages take the sorted matches in turn.
+#[test]
+fn order_by_sorts_by_one_attribute_read_as_one_type() {
+    let ranked = |n, rank: AttributeValue| {
+        entity_with(
+            n,
+            vec![
+                Attribute::new("rank", rank),
+                Attribute::new("team", AttributeValue::Str("red".into())),
+            ],
+        )
+    };
+    let dir = TempDir::new().unwrap();
+    let store = store_with(
+        &dir,
+        &[
+            ranked(1, AttributeValue::U64(20)),
+            ranked(2, AttributeValue::U64(10)),
+            // No rank at all, and a rank that is not a `u64`.
+            entity(3, "red"),
+            ranked(4, AttributeValue::Int(5)),
+            // Ties with 2.
+            ranked(5, AttributeValue::U64(10)),
+            ranked(6, AttributeValue::U64(30)),
+        ],
+    );
+    let red = |order: &str| format!("team = str('red') ORDER BY {order}");
+
+    assert_eq!(
+        sorted_page(&store, &red("rank AS u64"), 0, 10),
+        [3, 4, 2, 5, 1, 6]
+    );
+    assert_eq!(
+        sorted_page(&store, &red("rank AS u64 DESC"), 0, 10),
+        [6, 1, 2, 5, 3, 4]
+    );
+    // Read as an `i32`, only 4 has a value, and the rest keep creation order.
+    assert_eq!(
+        sorted_page(&store, &red("rank AS i32 DESC"), 0, 10),
+        [4, 1, 2, 3, 5, 6]
+    );
+    // Pages partition the sorted matches.
+    for (offset, page) in [(0, [6, 1]), (2, [2, 5]), (4, [3, 4])] {
+        assert_eq!(
+            sorted_page(&store, &red("rank AS u64 DESC"), offset, 2),
+            page,
+            "page at {offset}"
+        );
+    }
+    // A system attribute sorts as the type it holds: each owner is `[n; 20]`.
+    assert_eq!(
+        sorted_page(&store, &red("$owner DESC"), 0, 10),
+        [6, 5, 4, 3, 2, 1]
+    );
 }

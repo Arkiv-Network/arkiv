@@ -1,6 +1,7 @@
 //! Queries: the query language, and the trait that answers it.
 
 mod filter;
+mod order;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -125,6 +126,37 @@ impl ValueRange {
     pub fn high(&self) -> &AnnotVal {
         &self.high
     }
+}
+
+/// A whole query string: the [`Query`] that selects entities, and the order to
+/// return them in — `<query> [ORDER BY …]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    pub filter: Query,
+    /// Absent, matches come in the store's own order.
+    pub order: Option<OrderBy>,
+}
+
+/// `ORDER BY key AS attr_type [ASC | DESC]`: by one attribute, read as one
+/// type.
+///
+/// An entity without the attribute, or holding another type there, has no
+/// value to sort by: it sorts below every value, so first ascending and last
+/// descending. Entities that tie come in the store's own order, in either
+/// direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderBy {
+    pub key: AnnotKey,
+    pub attr_type: AttributeType,
+    pub direction: Direction,
+}
+
+/// Which way an [`OrderBy`] runs. `ASC` when the query names neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    #[default]
+    Ascending,
+    Descending,
 }
 
 /// Where to start and how many to return.

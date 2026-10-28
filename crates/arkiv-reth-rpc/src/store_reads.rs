@@ -15,7 +15,7 @@ use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::query::Query as ArkivQuery;
-use arkiv_interfaces::store::{CommitId, Filter, Page, Query, ReadTarget, Store, StoreError};
+use arkiv_interfaces::store::{CommitId, Filter, Page, Query, ReadTarget, Sort, Store, StoreError};
 
 /// Why a store read failed.
 #[derive(Debug)]
@@ -61,13 +61,15 @@ pub struct EntityPage {
     pub total_matched: Option<u64>,
 }
 
-/// Entities matching `query`, as of `at`, one page at a time. With
-/// `total_matched`, the page also counts the whole match set, which runs the
-/// filter to completion rather than stopping once the page is full.
+/// Entities matching `query`, as of `at`, one page at a time, in `sort`'s
+/// order or with none in the store's own. With `total_matched`, the page also
+/// counts the whole match set, which runs the filter to completion rather
+/// than stopping once the page is full.
 pub fn query<S: Store + ?Sized>(
     store: &S,
     at: CommitId,
     query: &ArkivQuery,
+    sort: Option<&Sort>,
     offset: u64,
     limit: u64,
     total_matched: bool,
@@ -77,7 +79,7 @@ pub fn query<S: Store + ?Sized>(
             Some(at),
             &Query {
                 filter: Filter::from(query),
-                sort: None,
+                sort: sort.cloned(),
                 page: Page { offset, limit },
                 // The whole record: an entity is reconstructed from all of it.
                 projection: None,

@@ -11,9 +11,12 @@
 //!
 //! - a `Not`: GolemDB has no NOT;
 //! - [`Filter::All`], and an `And` or `Or` with no child: GolemDB has no filter
-//!   for every record, or for none;
-//! - a sort on a cell the filter does not hold to one type: a GolemDB sort
-//!   names one.
+//!   for every record, or for none.
+//!
+//! A sort is GolemDB's own, of the one key it takes, and orders as [`Sort`]
+//! specifies: the cell read as one type, a record without a value of it below
+//! every value, and ties in GolemDB's own order, the order the records were
+//! created in.
 //!
 //! A query keeps well within GolemDB's cap of 64 nested `And`/`Or` levels: the
 //! parser builds a chain of one connective as one node and refuses a query
@@ -38,11 +41,7 @@ pub(crate) fn query_op(
     budget: Option<Budget>,
 ) -> Result<golemdb::QueryOp, StoreError> {
     let filter = golemdb_filter(&query.filter)?;
-    let sort = query
-        .sort
-        .as_ref()
-        .map(|sort| sort_key(sort, &query.filter))
-        .transpose()?;
+    let sort = query.sort.as_ref().map(sort_key).transpose()?;
     let mut op = golemdb::QueryOp::from_filter(filter, golemdb_budget(budget))
         .sort(sort)
         .limit(query.page.limit);
@@ -200,40 +199,16 @@ fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
     })
 }
 
-/// Arkiv sorts by whatever type the cell holds, GolemDB by the cell read as one
-/// type. The two agree when the filter holds the cell to one type, since every
-/// match then holds that type there. Otherwise there is no type to give.
-fn sort_key(sort: &Sort, filter: &Filter) -> Result<golemdb::SortKey, StoreError> {
-    let type_id = held_type(filter, &sort.cell).ok_or(StoreError::NotImplemented)?;
-    let ty = cell_type(type_id)?;
-    Ok(match sort.direction {
-        SortDirection::Ascending => golemdb::SortKey::asc(&sort.cell, ty),
-        SortDirection::Descending => golemdb::SortKey::desc(&sort.cell, ty),
-    })
-}
-
-/// The type `filter` holds the cell `name` to, if it holds it to one: a
-/// predicate on that cell holds it to its type, an `And` to the type any child
-/// holds it to, and an `Or` to the one every child holds it to. A `Not` holds
-/// it to none, and so does a bare `exists`, which spans every indexed type.
-fn held_type(filter: &Filter, name: &str) -> Option<TypeId> {
-    match filter {
-        Filter::Predicate(Predicate { cell, test }) if cell == name => match test {
-            Test::Compare { type_id, .. }
-            | Test::Between { type_id, .. }
-            | Test::Exists {
-                type_id: Some(type_id),
-            } => Some(*type_id),
-            Test::Exists { type_id: None } => None,
-        },
-        Filter::Predicate(_) | Filter::All | Filter::Not(_) => None,
-        Filter::And(children) => children.iter().find_map(|child| held_type(child, name)),
-        Filter::Or(children) => {
-            let mut types = children.iter().map(|child| held_type(child, name));
-            let first = types.next()??;
-            types.all(|type_id| type_id == Some(first)).then_some(first)
-        }
-    }
+/// The sort as GolemDB's: the cell read as the sort's type, as Arkiv reads
+/// it. A type that is never indexed cannot be sorted by, the same way a
+/// presence test cannot ask for one.
+fn sort_key(sort: &Sort) -> Result<golemdb::SortKey, StoreError> {
+    let direction = match sort.direction {
+        SortDirection::Ascending => golemdb::Direction::Asc,
+        SortDirection::Descending => golemdb::Direction::Desc,
+    };
+    golemdb::SortKey::try_new(&sort.cell, cell_type(sort.type_id)?, direction)
+        .map_err(invalid_query)
 }
 
 /// A predicate's operand encoded as [`golemdb_cell`] writes a cell, so a leaf
@@ -263,7 +238,7 @@ mod tests {
     use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use arkiv_interfaces::store::{Page, RecordKey, Store};
     use golemdb_api::marker::{Bool, Bytes20, Bytes32, I32, Str, U64};
-    use golemdb_api::{Api, CellLimits, CellType, Genesis, HashAlgorithm, RecordLimits, Width};
+    use golemdb_api::{Api, CellLimits, Genesis, HashAlgorithm, RecordLimits};
     use std::ops::Bound;
     use tempfile::TempDir;
 
@@ -672,68 +647,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_sort_takes_its_type_from_the_filter() {
-        let mut arkiv = query(u64_is("n", CompareOp::Gte, 1));
+    /// `query` over blue records, sorted by `n` read as `type_id`.
+    fn sorted_by_n(type_id: TypeId, direction: SortDirection) -> Query {
+        let mut arkiv = query(str_is("color", CompareOp::Eq, "blue"));
         arkiv.sort = Some(Sort {
             cell: "n".into(),
-            direction: SortDirection::Descending,
+            type_id,
+            direction,
         });
-        assert_eq!(
-            query_op(&arkiv, None).unwrap().sort,
-            [golemdb::SortKey::desc("n", CellType::Uint(Width::W8))]
-        );
-        // A `Between` holds its cell to its type as a comparison does.
-        arkiv.filter = between("n", TypeId::U64, &[0; 8], &[0xff; 8]);
-        assert_eq!(
-            query_op(&arkiv, None).unwrap().sort,
-            [golemdb::SortKey::desc("n", CellType::Uint(Width::W8))]
-        );
-
-        arkiv.sort = Some(Sort {
-            cell: "other".into(),
-            direction: SortDirection::Ascending,
-        });
-        assert_eq!(query_op(&arkiv, None), Err(StoreError::NotImplemented));
+        arkiv
     }
 
-    /// An `And` holds a cell to the type any child holds it to, an `Or` to the
-    /// one every child holds it to.
+    /// The sort's own type, whatever the filter says of the cell or does not.
     #[test]
-    fn a_sort_takes_its_type_through_and_and_or() {
-        let sorted = |filter: Filter| {
-            let mut arkiv = query(filter);
-            arkiv.sort = Some(Sort {
-                cell: "n".into(),
-                direction: SortDirection::Ascending,
-            });
-            query_op(&arkiv, None).map(|op| op.sort)
-        };
-        let by_n = Ok(vec![golemdb::SortKey::asc("n", CellType::Uint(Width::W8))]);
-        let blue = || str_is("color", CompareOp::Eq, "blue");
+    fn a_sort_reads_its_cell_as_its_type() {
         assert_eq!(
-            sorted(Filter::And(vec![blue(), u64_is("n", CompareOp::Gte, 1)])),
-            by_n
+            query_op(&sorted_by_n(TypeId::U64, SortDirection::Descending), None)
+                .unwrap()
+                .sort,
+            [golemdb::SortKey::desc("n", U64)]
         );
         assert_eq!(
-            sorted(Filter::Or(vec![
-                u64_is("n", CompareOp::Eq, 1),
-                u64_is("n", CompareOp::Gt, 5),
-            ])),
-            by_n
+            query_op(&sorted_by_n(TypeId::STR, SortDirection::Ascending), None)
+                .unwrap()
+                .sort,
+            [golemdb::SortKey::asc("n", Str)]
         );
+        // A `key` is the `bytes32` it is stored as.
         assert_eq!(
-            sorted(Filter::Or(vec![u64_is("n", CompareOp::Eq, 1), blue()])),
-            Err(StoreError::NotImplemented),
-            "one child leaves `n` out"
+            query_op(&sorted_by_n(TypeId::KEY, SortDirection::Ascending), None)
+                .unwrap()
+                .sort,
+            [golemdb::SortKey::asc("n", Bytes32)]
         );
+    }
+
+    #[test]
+    fn a_sort_by_a_field_only_type_is_invalid() {
         assert_eq!(
-            sorted(Filter::Or(vec![
-                u64_is("n", CompareOp::Eq, 1),
-                i32_is("n", CompareOp::Eq, 1),
-            ])),
-            Err(StoreError::NotImplemented),
-            "the children hold `n` to two types"
+            query_op(&sorted_by_n(TypeId::BYTES, SortDirection::Ascending), None),
+            Err(StoreError::InvalidQuery)
         );
     }
 

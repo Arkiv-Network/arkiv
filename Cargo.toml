@@ -91,11 +91,11 @@ alloy-primitives = { version = "1.6", features = ["rlp"] }
 alloy-consensus = "2.5"
 alloy-evm = "0.39"
 
-golemdb-api = { git = "https://github.com/Arkiv-Network/golemdb", branch = "main" }
-golemdb-cells = { git = "https://github.com/Arkiv-Network/golemdb", branch = "main" }
-golemdb-pruning = { git = "https://github.com/Arkiv-Network/golemdb", branch = "main" }
-golemdb-storage = { git = "https://github.com/Arkiv-Network/golemdb", branch = "main" }
-golemdb-storage-mdbx = { git = "https://github.com/Arkiv-Network/golemdb", branch = "main" }
+golemdb-api = { git = "https://github.com/Arkiv-Network/golemdb", branch = "francesco/query_sort" }
+golemdb-cells = { git = "https://github.com/Arkiv-Network/golemdb", branch = "francesco/query_sort" }
+golemdb-pruning = { git = "https://github.com/Arkiv-Network/golemdb", branch = "francesco/query_sort" }
+golemdb-storage = { git = "https://github.com/Arkiv-Network/golemdb", branch = "francesco/query_sort" }
+golemdb-storage-mdbx = { git = "https://github.com/Arkiv-Network/golemdb", branch = "francesco/query_sort" }
 
 # alloy RPC client stack used by arkiv-cli (talks to a node over JSON-RPC) and
 # arkiv-genesis (mnemonic-derived dev signers). Kept on the same 2.5 line reth

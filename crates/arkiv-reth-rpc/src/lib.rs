@@ -22,7 +22,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query};
-use arkiv_interfaces::store::{CommitId, Store, StoreError, StoreExt};
+use arkiv_interfaces::store::{CommitId, Sort, Store, StoreError, StoreExt};
 use arkiv_reth_statemanager::HostStore;
 use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
 use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
@@ -305,7 +305,8 @@ where
 /// reused to read those entities' full bytes — so the keys and the entities are
 /// read from a single consistent state.
 ///
-/// The query is bounded to entities still live at that block — see [`live_at`].
+/// The query is bounded to entities still live at that block — see [`live_at`]
+/// — and its matches come in the order its `ORDER BY` asks for.
 fn run_query<Provider>(
     provider: &Provider,
     store: &HostStore,
@@ -315,7 +316,8 @@ fn run_query<Provider>(
 where
     Provider: BlockNumReader + HeaderProvider,
 {
-    let query = arkiv_query::parse(q).map_err(|e| query_error(&e))?;
+    let statement = arkiv_query::parse_statement(q).map_err(|e| query_error(&e))?;
+    let sort = statement.order.as_ref().map(Sort::from);
     let projection = Projection::resolve(options.select.as_ref()).map_err(invalid_params)?;
     let page_size =
         arkiv_rpc_types::method::resolve_limit(options.limit).map_err(invalid_params)?;
@@ -343,7 +345,7 @@ where
                 }
             };
 
-            let live = live_at(query.clone(), block_number);
+            let live = live_at(statement.filter.clone(), block_number);
             // `count` alone selects no entity, so there is no page to read:
             // the count is the whole answer, with no cursor to a next page.
             if projection.is_count_only() {
@@ -358,8 +360,16 @@ where
             }
 
             let limit = page_size;
-            let page = store_reads::query(&**store, at, &live, offset, limit, projection.count)
-                .map_err(store_failure("query"))?;
+            let page = store_reads::query(
+                &**store,
+                at,
+                &live,
+                sort.as_ref(),
+                offset,
+                limit,
+                projection.count,
+            )
+            .map_err(store_failure("query"))?;
 
             // A full page may have more behind it; a short one is the end.
             let more = page.entities.len() as u64 == limit;
@@ -395,7 +405,13 @@ where
     Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
 {
     let query = match &request.query {
-        Some(text) => arkiv_query::parse(text).map_err(|e| query_error(&e))?,
+        // A count has no order, so an `ORDER BY` is read and set aside: the
+        // query string a page was asked with counts as it is.
+        Some(text) => {
+            arkiv_query::parse_statement(text)
+                .map_err(|e| query_error(&e))?
+                .filter
+        }
         None => Query::All,
     };
     read_at(

@@ -47,6 +47,27 @@
 //! `AND` inside it is its own, so `a BETWEEN 1 AND 5 AND b = 2` is
 //! `(a BETWEEN 1 AND 5) AND b = 2`.
 //!
+//! ## Sorting
+//!
+//! A query may end with `ORDER BY attr [AS tag] [ASC | DESC]`, which sorts its
+//! matches by one attribute read as one type: a user attribute names the
+//! type, as every value does, and a system attribute sorts as the one it
+//! holds. `ASC` is the default. [`parse_statement`] reads a whole query
+//! string, the clause included, into a
+//! [`Statement`](arkiv_interfaces::query::Statement); [`parse()`] reads the
+//! predicates alone and refuses the clause.
+//!
+//! ```
+//! use arkiv_query::parse_statement;
+//! use arkiv_interfaces::query::Direction;
+//!
+//! let statement = parse_statement("rank >= u256(10) ORDER BY rank AS u256 DESC").unwrap();
+//! assert_eq!(statement.order.unwrap().direction, Direction::Descending);
+//!
+//! // A user attribute can hold any type, so the clause has to name one.
+//! assert!(parse_statement("* ORDER BY rank").is_err());
+//! ```
+//!
 //! ## What this version leaves out
 //!
 //! `!=` is **reserved but not implemented**: typed value-negation is
@@ -82,4 +103,4 @@ pub mod parse;
 
 pub use error::{ParseError, ParseErrorKind};
 pub use literal::MAX_STR_BYTES;
-pub use parse::parse;
+pub use parse::{parse, parse_statement};

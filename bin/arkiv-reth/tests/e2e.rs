@@ -902,6 +902,53 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(counted_rest["count"], "0x4", "the match set, not the page");
     assert_eq!(result_keys(&counted_rest).len(), 1);
     assert!(counted_rest.get("cursor").is_none());
+
+    // `ORDER BY` sorts by one attribute, read as the type it names. Ranks 20
+    // to 50 are entities 1 to 4.
+    let in_order = |page: &serde_json::Value| -> Vec<String> {
+        page["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|entity| entity["key"].as_str().expect("key").to_string())
+            .collect()
+    };
+    let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
+    let ascending = client
+        .query_raw(
+            "rank >= u256(20) ORDER BY rank AS u256",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("ascending by rank");
+    assert_eq!(in_order(&ascending), keys(&[1, 2, 3, 4]), "ASC by default");
+
+    // A cursor carries on through the sorted matches.
+    let by_rank_desc = "rank >= u256(20) ORDER BY rank AS u256 DESC";
+    let sorted_page = client
+        .query_raw(by_rank_desc, serde_json::json!({ "limit": 3 }))
+        .await
+        .expect("first page by rank, descending");
+    assert_eq!(in_order(&sorted_page), keys(&[4, 3, 2]));
+    let sorted_rest = client
+        .query_raw(
+            by_rank_desc,
+            serde_json::json!({ "limit": 3, "cursor": sorted_page["cursor"] }),
+        )
+        .await
+        .expect("second page by rank, descending");
+    assert_eq!(in_order(&sorted_rest), keys(&[1]));
+    assert!(sorted_rest.get("cursor").is_none());
+
+    // A user attribute names the type to sort it as; a count sets the order
+    // aside.
+    let untyped = client
+        .query_raw("* ORDER BY rank", serde_json::json!({}))
+        .await
+        .expect_err("a user attribute needs AS <tag>")
+        .to_string();
+    assert!(untyped.contains("-32002"), "a type error: {untyped}");
+    assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);
 }
 
 /// Every mutating op — update, extend, transfer, delete — driven over a live node
