@@ -38,24 +38,26 @@ use crate::store_reads::ReadError;
 /// Why a past block cannot be read: the store no longer holds its state.
 const NOT_RETAINED: &str = "state for this block is not retained";
 
-/// How many `arkiv_*` reads run at once; further calls wait for a turn. Each
-/// read holds one GolemDB read slot at a time. The node shares a fixed number
-/// of slots, block import included, and with none left every read fails.
-const MAX_CONCURRENT_READS: usize = 32;
+/// How many `arkiv_*` reads run at once unless the node is told otherwise.
+/// Each read holds one GolemDB read slot at a time. The node shares a fixed
+/// number of slots, block import included, and with none left every read fails.
+pub const DEFAULT_MAX_CONCURRENT_READS: usize = 32;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
 ///
 /// `provider` hands out a fresh state snapshot per call (`StateProviderFactory`) and
-/// answers block-header/number reads for `arkiv_getBlockTiming`.
+/// answers block-header/number reads for `arkiv_getBlockTiming`. At most
+/// `max_concurrent_reads` reads run at once; further calls wait for a turn.
 pub fn arkiv_module<Provider>(
     provider: Provider,
     store: HostStore,
+    max_concurrent_reads: usize,
 ) -> eyre::Result<RpcModule<Semaphore>>
 where
     Provider:
         StateProviderFactory + HeaderProvider + BlockNumReader + Clone + Send + Sync + 'static,
 {
-    let mut module = RpcModule::new(Semaphore::new(MAX_CONCURRENT_READS));
+    let mut module = RpcModule::new(Semaphore::new(max_concurrent_reads));
 
     let p = provider.clone();
     let st = store.clone();
