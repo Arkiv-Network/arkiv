@@ -23,7 +23,6 @@ fn config() -> GolemDbConfig {
             name: SEGMENT.into(),
             columns: 2,
         }],
-        pruning: None,
     }
 }
 
@@ -48,7 +47,7 @@ fn stage(store: &GolemDbStore, n: u8) -> BranchId {
 }
 
 fn open(dir: &TempDir) -> GolemDbStore {
-    GolemDbStore::open(dir.path(), &config()).unwrap()
+    GolemDbStore::open(dir.path(), &config(), None).unwrap()
 }
 
 fn cell(kind: CellKind, type_id: TypeId, value: &[u8]) -> Cell {
@@ -256,7 +255,7 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
     hash.genesis.hash_function = HashAlgorithm::Blake3;
     for other in [limits, record_limits, segments, hash] {
         assert!(matches!(
-            GolemDbStore::open(dir.path(), &other),
+            GolemDbStore::open(dir.path(), &other, None),
             Err(OpenError::GenesisMismatch)
         ));
     }
@@ -312,7 +311,7 @@ const CHILD_DIR: &str = "ARKIV_GOLEMDB_TEST_CHILD_DIR";
 #[test]
 fn a_killed_process_keeps_only_its_commits() {
     if let Some(dir) = std::env::var_os(CHILD_DIR) {
-        let store = GolemDbStore::open(dir.as_ref(), &config()).unwrap();
+        let store = GolemDbStore::open(dir.as_ref(), &config(), None).unwrap();
         store.commit_tagged(stage(&store, 1), [1; 32]).unwrap();
         stage(&store, 2);
         eprintln!("ready");
@@ -546,7 +545,7 @@ fn a_host_segment_may_not_be_named_commit_tags() {
         name: tags::SEGMENT.into(),
         columns: 1,
     });
-    let error = GolemDbStore::open(dir.path(), &config).unwrap_err();
+    let error = GolemDbStore::open(dir.path(), &config, None).unwrap_err();
     assert!(error.to_string().contains("duplicate"), "{error}");
 }
 
@@ -577,7 +576,7 @@ fn a_genesis_with_segments_is_refused() {
         shard_span: SHARD_SPAN,
         segments: vec![tags::segment()],
     });
-    let error = GolemDbStore::open(dir.path(), &config).unwrap_err();
+    let error = GolemDbStore::open(dir.path(), &config, None).unwrap_err();
     assert!(matches!(error, OpenError::InvalidConfig(_)), "{error}");
     assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
 }

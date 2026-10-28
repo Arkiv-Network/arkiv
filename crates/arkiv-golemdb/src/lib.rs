@@ -40,9 +40,7 @@ use convert::{
 };
 use tags::TagRow;
 
-/// The genesis and segments are fixed when the database is created, and the
-/// same on every node of a chain; reopening with others fails. The pruning is
-/// the node's own and may change between opens.
+/// Fixed when the database is created; reopening with anything else fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GolemDbConfig {
     /// GolemDB's settings, as the chain's genesis file gives them. They declare
@@ -50,8 +48,6 @@ pub struct GolemDbConfig {
     pub genesis: Genesis,
     /// The segments rows may be appended to.
     pub segments: Vec<SegmentSpec>,
-    /// How many past commits to keep; `None` keeps them all.
-    pub pruning: Option<PruningConfig>,
 }
 
 /// A segment: its name, and how many byte columns each of its rows has.
@@ -107,10 +103,15 @@ impl core::fmt::Debug for GolemDbStore {
 
 impl GolemDbStore {
     /// Open `directory`, creating it with `config` if it is new. Only one
-    /// process may open a directory.
-    pub fn open(directory: &Path, config: &GolemDbConfig) -> Result<Self, OpenError> {
+    /// process may open a directory. `pruning` is how many past commits to
+    /// keep, `None` all; it may change between opens.
+    pub fn open(
+        directory: &Path,
+        config: &GolemDbConfig,
+        pruning: Option<PruningConfig>,
+    ) -> Result<Self, OpenError> {
         let mut open = golemdb::OpenConfig::new(config.full_genesis()?);
-        if let Some(pruning) = config.pruning {
+        if let Some(pruning) = pruning {
             open = open.with_pruning(pruning);
         }
         let database = golemdb::Database::open(directory, &open)?;

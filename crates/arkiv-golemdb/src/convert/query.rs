@@ -662,9 +662,8 @@ mod tests {
         let config = GolemDbConfig {
             genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
             segments: vec![],
-            pruning: None,
         };
-        let store = GolemDbStore::open(dir.path(), &config).unwrap();
+        let store = GolemDbStore::open(dir.path(), &config, None).unwrap();
         let branch = store.begin(None).unwrap();
         for (n, level, name) in [(1, -5, "alpha"), (2, 3, "beta"), (3, 10, "albert")] {
             let cells = vec![

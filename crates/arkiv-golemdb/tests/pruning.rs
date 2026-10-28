@@ -1,4 +1,4 @@
-//! `GolemDbConfig::pruning` reaches GolemDB: the space a database takes after
+//! The pruning [`GolemDbStore::open`] takes reaches GolemDB: the space a database takes after
 //! commits through [`GolemDbStore`] follows how much history it keeps.
 
 use arkiv_golemdb::{
@@ -20,7 +20,7 @@ const WINDOW: u64 = 100;
 /// Old data leaves the window and then waits up to [`MAX_WAIT_COMMITS`](golemdb_pruning::MAX_WAIT_COMMITS) to go.
 const COMMITS: u16 = (WINDOW + 10 * golemdb_pruning::MAX_WAIT_COMMITS) as u16;
 
-fn config(pruning: Option<PruningConfig>) -> GolemDbConfig {
+fn config() -> GolemDbConfig {
     let limit = |bytes: usize| u32::try_from(bytes).unwrap();
     let limits = CellLimits {
         max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
@@ -34,7 +34,6 @@ fn config(pruning: Option<PruningConfig>) -> GolemDbConfig {
     GolemDbConfig {
         genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
         segments: vec![],
-        pruning,
     }
 }
 
@@ -60,7 +59,7 @@ fn entity(n: u16) -> Entity {
 /// pruning frees are used again.
 fn db_size(pruning: Option<PruningConfig>) -> u64 {
     let dir = TempDir::new().unwrap();
-    let store = GolemDbStore::open(dir.path(), &config(pruning)).unwrap();
+    let store = GolemDbStore::open(dir.path(), &config(), pruning).unwrap();
     for n in 1..=COMMITS {
         let entity = entity(n);
         let branch = store.begin(None).unwrap();
