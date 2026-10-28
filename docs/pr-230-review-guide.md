@@ -13,7 +13,7 @@ One commit on top of `main` (#239). Every decision, with its date, is in
 
 One reviewer for GolemDB metering, one for the integration into genesis and execution. Both
 read `crates/arkiv-golemdb-state`: the first checks the numbers it reports, the second its
-rollback rules. Settlement goes to the second.
+rollback rules. Settlement goes to the reviewer focussing on execution.
 
 - **GolemDB metering into fees:**
   - what each store call reports (`Receipt`, `WriteDetails`, `#meta`), and that MemStore,
