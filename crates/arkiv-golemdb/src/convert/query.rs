@@ -12,8 +12,6 @@
 //! - a `Not`: GolemDB has no NOT;
 //! - [`Filter::All`], and an `And` or `Or` with no child: GolemDB has no filter
 //!   for every record, or for none;
-//! - a presence test for `key`: GolemDB stores a `key` as the 32 fixed bytes
-//!   a `bytes32` is, so it cannot tell the two apart;
 //! - a sort on a cell the filter does not hold to one type: a GolemDB sort
 //!   names one.
 //!
@@ -137,8 +135,7 @@ fn children_of(children: &[Filter]) -> Result<Vec<golemdb::Filter>, StoreError> 
 }
 
 /// One predicate as a leaf. `KEY` and `BYTES32` are one GolemDB type, so a
-/// comparison leaf of either matches both, and a presence test for `KEY` has
-/// none.
+/// leaf of either, a comparison or a presence test, matches both.
 fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
     let field = cell_name(&predicate.cell);
     let (op, type_id, value) = match &predicate.test {
@@ -146,13 +143,11 @@ fn leaf(predicate: &Predicate) -> Result<golemdb::Filter, StoreError> {
         // type the same way: none for any, one for exactly that.
         Test::Exists { type_id } => {
             let ty = match type_id {
-                // `typeof(attr) = key` would also answer every `bytes32`
-                // holder. A `key` attribute reads back from GolemDB as a
-                // `bytes32` anyway, so `typeof(attr) = bytes32` is the one
-                // GolemDB answers, and it finds both.
-                Some(TypeId::KEY) => return Err(StoreError::NotImplemented),
                 // Two conversions, each with its own error: Arkiv's type to
-                // GolemDB's, then that to an indexable one.
+                // GolemDB's, then that to an indexable one. For now `KEY` is
+                // the `bytes32` it is stored as, so `typeof(attr) = key` also
+                // finds the `bytes32` holders, as `typeof(attr) = bytes32`
+                // finds the `key` ones.
                 Some(type_id) => {
                     Some(ExistsType::try_from(cell_type(*type_id)?).map_err(invalid_query)?)
                 }
@@ -448,21 +443,19 @@ mod tests {
     }
 
     /// GolemDB stores a `key` as the 32 fixed bytes a `bytes32` is, so a
-    /// presence test for `key` has no leaf, while one for `bytes32` is the
-    /// `Exists` leaf of those bytes, which a `key` holder matches too.
+    /// presence test for either is the `Exists` leaf of those bytes.
     #[test]
-    fn a_presence_predicate_for_key_is_not_implemented() {
-        assert_eq!(
-            golemdb_filter(&presence("parent", Some(TypeId::KEY))),
-            Err(StoreError::NotImplemented)
-        );
-        assert_eq!(
-            golemdb_filter(&presence("parent", Some(TypeId::BYTES32))),
-            Ok(golemdb::Filter::Exists {
-                field: cell_name("parent"),
-                ty: Some(ExistsType::of(Bytes32)),
-            })
-        );
+    fn a_presence_predicate_for_key_is_the_bytes32_leaf() {
+        for type_id in [TypeId::KEY, TypeId::BYTES32] {
+            assert_eq!(
+                golemdb_filter(&presence("parent", Some(type_id))),
+                Ok(golemdb::Filter::Exists {
+                    field: cell_name("parent"),
+                    ty: Some(ExistsType::of(Bytes32)),
+                }),
+                "{type_id:?}"
+            );
+        }
     }
 
     #[test]

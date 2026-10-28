@@ -327,11 +327,10 @@ fn a_query_with_the_typeof_operator_matches_the_records_whose_attribute_has_that
 }
 
 /// GolemDB stores a `key` as the 32 fixed bytes a `bytes32` is, so it cannot
-/// tell the two apart. `typeof(attr) = key` is not implemented rather than
-/// also answering the `bytes32` holders; `typeof(attr) = bytes32` finds both,
-/// as a `key` attribute reads back from GolemDB as a `bytes32` anyway.
+/// tell the two apart. For now `typeof(attr) = key` is the `bytes32` presence
+/// test, so it and `typeof(attr) = bytes32` both find both.
 #[test]
-fn typeof_key_is_not_implemented_and_typeof_bytes32_finds_both() {
+fn typeof_key_and_typeof_bytes32_both_find_both() {
     let dir = TempDir::new().unwrap();
     let store = store_with(
         &dir,
@@ -353,27 +352,16 @@ fn typeof_key_is_not_implemented_and_typeof_bytes32_finds_both() {
         ],
     );
 
-    let typeof_key = Query {
-        filter: filter("typeof(parent) = key"),
-        page: Page {
-            offset: 0,
-            limit: 10,
-        },
-        ..Query::default()
-    };
-    assert_eq!(
-        store
-            .query(None, &typeof_key, None)
-            .map(|page| page.into_value()),
-        Err(StoreError::NotImplemented)
-    );
-    assert_eq!(
-        store
-            .count(None, &typeof_key.filter, None)
-            .map(|count| count.into_value()),
-        Err(StoreError::NotImplemented)
-    );
-    assert_eq!(matched(&store, filter("typeof(parent) = bytes32")), [1, 2]);
+    for text in ["typeof(parent) = key", "typeof(parent) = bytes32"] {
+        assert_eq!(matched(&store, filter(text)), [1, 2], "{text}");
+        assert_eq!(
+            store
+                .count(None, &filter(text), None)
+                .map(|count| count.into_value()),
+            Ok(2),
+            "{text}"
+        );
+    }
 }
 
 /// A range follows its type's order for the types that are not numbers:

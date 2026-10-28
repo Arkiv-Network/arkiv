@@ -395,7 +395,7 @@ impl Store for GolemDbStore {
     }
 
     /// The query runs as written, so what GolemDB cannot run yet is
-    /// `NotImplemented`: a `Not`, a presence test for `key`, and a sort.
+    /// `NotImplemented`: a `Not` and a sort.
     /// Matches come in GolemDB's own order, the order the records were
     /// created in, and paging runs over that order within GolemDB's own query
     /// limit, over which a page is `LimitExceeded`.
