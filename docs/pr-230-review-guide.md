@@ -1,99 +1,164 @@
 # Review guide: tokenomics iteration 1 (#230)
 
-One commit on top of `main` (`092e718`, #239). The plan with every decision and its date is
-`docs/tokenomics-iteration-1-plan.md`; this guide is the short path through the code.
+One commit on top of `main` (#239). Every decision, with its date, is in
+`docs/tokenomics-iteration-1-plan.md`. This guide is the short path through the code.
+
+- [Review split](#review-split)
+- [1. Concepts](#1-concepts)
+- [2. Changes](#2-changes)
+- [3. How GolemDB's metering reaches the fee](#3-how-golemdbs-metering-reaches-the-fee)
+- [4. Size](#4-size)
+
+## Review split
+
+One reviewer for GolemDB metering, one for the integration into genesis and execution. Both
+read `crates/arkiv-golemdb-state`: the first checks the numbers it reports, the second its
+rollback rules. Settlement goes to the second.
+
+- **GolemDB metering into fees:**
+  - what each store call reports (`Receipt`, `WriteDetails`, `#meta`), and that MemStore,
+    Valkey and GolemDB agree (`crates/arkiv-interfaces/src/store.rs`, `store/conformance.rs`,
+    `crates/arkiv-golemdb/src/convert.rs`);
+  - how the state layer adds them up (`metering_tests.rs`);
+  - the pricing in `crates/arkiv-tokenomics`: size rule, storage time, rounding;
+  - the executor's gas meter (`BatchMeter` in `arkiv.rs`);
+  - section 3, and the pricing rules in `docs/tokenomics-spec.md`.
+- **Integration into genesis and execution:**
+  - the fee schedule, from the genesis file to the store record, and the node refusing to
+    start without one (`arkiv-reth-chainspec`, `arkiv-reth-statemanager/src/genesis.rs`,
+    `bin/arkiv-reth/src/main.rs`);
+  - one rollback frame per transaction, `eth_call` and `eth_estimateGas` discarding theirs,
+    and how this fits with #239 (`apply_with_effects`, `arkiv_entity_transact`);
+  - every path where a user's transaction could cause an error that fails the block instead
+    of a revert (see #240);
+  - settlement: `charge_sender`, `value_in`, `credit_pool`, the sender checks (`lib.rs`).
+
+Where the time might go, as a rough guide only; follow what you find:
+
+| Reviewer | Most time | Skim |
+| --- | --- | --- |
+| GolemDB metering | `arkiv-tokenomics`; `arkiv-interfaces/src/store.rs` with the store conformance suite | `arkiv-golemdb-state` (receipts), `arkiv-golemdb/src/convert.rs`, `BatchMeter` in `arkiv-reth-executor/src/arkiv.rs` |
+| Integration | `arkiv-reth-executor`: `arkiv.rs` (ops) and `lib.rs` (settlement) | `arkiv-golemdb-state` (frames, reserved keys), `arkiv-reth-chainspec`, `arkiv-reth-statemanager/src/genesis.rs`, `bin/arkiv-reth/src/main.rs` |
+
+The load test (`bin/arkiv-reth/tests/load/`) is optional reading: it changes no production
+code.
 
 ## 1. Concepts
 
-- **One fee from outside.** An entity transaction is an ordinary gas transaction:
-  `gasUsed` = compute + storage + purge gas, priced and settled by EIP-1559 as before.
-  `eth_estimateGas` covers it because it runs the same executor. No receipt fields, no new
-  RPC; the split exists inside the node only (`GasBreakdown`), ready for the target
-  tokenomics.
-- **Compute gas** = the transaction's terms (21,000 + calldata, the EIP-7623 floor applied
-  once) + each op's cost (`PlaceholderCost`) + the work GolemDB reports in its receipts
-  (cost 0 until GolemDB prices calls).
-- **Storage gas** = storage units × blocks bought × `capacity_rate` / 10⁶, rounded up once
-  per batch. Units follow GolemDB's size rule: a cell is `(8 + name) + (1 + value)` bytes
-  plus `c_cell`, an index entry `name + 2 + value` plus `c_idx`. A create buys its size
-  for its lifetime, a patch its net growth for the blocks left, an extend its size for the
-  added blocks; a shrink, a transfer and a delete buy nothing.
-- **Purge gas** is 0: the purge reserve is not collected in this iteration.
-- **The pool** is the account at `ARKIV_ADDRESS`. It receives `base_fee × storage_gas`
-  (otherwise burned) and the value sent with a successful call. The tip goes to the
-  beneficiary as before. Sender debit = burn + tip + pool credit + value.
-- **The fee schedule** (`host.arkiv.*`: `capacity_rate`, unit weights, `max_lifetime`)
-  comes from the genesis file (`config.arkiv.tokenomics`), is seeded as a store record at
-  genesis, and is read at each block's base. A chain without one does not start. A create
-  or extend beyond `max_lifetime` (six months) reverts with a typed reason.
-- **One frame per transaction.** A batch's ops run on the block's branch inside one frame:
-  any failure discards it whole. The gas meter lives outside the frame, so a reverted batch
-  still pays for GolemDB's work. A probe (`eth_call`, `eth_estimateGas`) always discards it
-  (`ExecEnv::keep_writes`).
-- **Never a fault for user input.** Arithmetic overflow anywhere is an `OutOfGas` revert;
-  the state layer's receipt sums saturate. An op on a key that holds a non-entity record (an
-  account's, GolemDB's own, the fee schedule's) reverts with `NotFound` / `AlreadyExists`:
-  the fee schedule's key is new in this PR and is now reserved like the others.
+- **One fee, as for any transaction.** `gasUsed` = compute + storage + purge gas, charged
+  with EIP-1559 as before. `eth_estimateGas` includes all three. No new receipt fields or
+  RPC methods; the split exists only inside the node (`GasBreakdown`).
+- **Compute gas** = 21,000 + calldata (with the EIP-7623 floor) + each op's cost
+  (`PlaceholderCost`) + the cost GolemDB reports for its reads and writes (0 for now).
+- **Storage gas** = storage units × blocks × `capacity_rate` / 10⁶, rounded up once per
+  transaction. Units follow GolemDB's size rule: a cell is `(8 + name) + (1 + value)` bytes
+  plus `c_cell`, an index entry `name + 2 + value` bytes plus `c_idx`.
+  - A create pays for its size over its lifetime.
+  - A patch pays for its growth over the blocks left.
+  - An extend pays for the entity's size over the added blocks.
+  - A shrinking patch, a transfer and a delete pay nothing.
+- **Purge gas** is always 0 for now.
+- **The pool** is the account at `ARKIV_ADDRESS`. It gets `base_fee × storage_gas`, which
+  would otherwise be burned, plus any value sent with a successful call. The tip goes to the
+  block producer as before. So the sender pays the burned fee + the tip + the pool's share +
+  the value.
+- **The fee schedule** (`capacity_rate`, the unit weights, `max_lifetime`) is set in the
+  genesis file (`config.arkiv.tokenomics`), stored as a record at genesis, and read at the
+  start of each block. Without one the node does not start. A create or extend beyond
+  `max_lifetime` (six months) reverts.
+- **All or nothing per transaction.** A transaction's ops run inside one rollback frame; if
+  any op fails, all are undone. The gas meter is outside the frame, so a reverted
+  transaction still pays for the GolemDB work it did. `eth_call` and `eth_estimateGas`
+  always roll back.
+- **User input never fails a block.** An arithmetic overflow becomes an `OutOfGas` revert.
+  An op on a key that holds something other than an entity (an account, the fee schedule,
+  GolemDB's own records) reverts with `NotFound` or `AlreadyExists`.
 
-## 2. Main changes, in review order
+## 2. Changes
 
-| Area | Files | What to look at |
+Suggested reading order:
+
+| Area | Files | Look at |
 | --- | --- | --- |
-| Pricing (new crate, pure functions) | `crates/arkiv-tokenomics/src/{schedule,units,storage_time,meter,schedule_record}.rs`, `tests/worked_example.rs` | the size rule, storage time per op, rounding once, the schedule record. `rate.rs` is `$rate` math, unused until the target tokenomics. |
-| Interfaces | `crates/arkiv-interfaces/src/{store,statemanager,gas,execution,entity_records}.rs` | `Receipt` with cost and `WriteDetails`; `Metered` results and frames on the state traits; `get_entity_with_meta`; `ExecEnv` / `ExecOutput.gas`; `is_reserved_key` |
-| State layer | `crates/arkiv-golemdb-state/src/{view,entities,accounts}.rs`; backends `crates/arkiv-golemdb/src/{lib,convert}.rs`, `crates/arkiv-valkey/src/*` | receipts from every entity read and write and from the minting nonce; frames (`begin`/`merge`/`discard`); the schedule read at the base commit; reserved keys |
-| Executor: ops | `crates/arkiv-reth-executor/src/arkiv.rs` | `apply_with_effects` (one frame), `BatchMeter`, per-op compute and storage, `admit_lifetime`, the reserved-key create check |
-| Executor: settlement | `crates/arkiv-reth-executor/src/lib.rs` | `arkiv_entity_transact` (builds `ExecEnv`, settles the breakdown), `charge_sender`, `value_in`, `credit_pool`, sender checks and gas-limit guards on view calls and transfers |
-| Genesis and startup | `crates/arkiv-reth-chainspec/src/lib.rs`, `crates/arkiv-reth-statemanager/src/genesis.rs`, `bin/arkiv-reth/src/main.rs`, `genesis/{dev,example}.json` | parsing `config.arkiv.tokenomics`, seeding the schedule record, refusing a chain without one |
+| Pricing (new crate, no I/O) | `crates/arkiv-tokenomics/src/{schedule,units,storage_time,meter,schedule_record}.rs`, `tests/worked_example.rs` | size rule, storage time per op, rounding, the schedule record. `rate.rs` is not used yet. |
+| Interfaces | `crates/arkiv-interfaces/src/{store,statemanager,gas,execution,entity_records}.rs` | `Receipt` (cost and bytes), rollback frames on the state traits, `get_entity_with_meta`, `ExecEnv`, `ExecOutput.gas`, `is_reserved_key` |
+| State layer | `crates/arkiv-golemdb-state/src/{view,entities,accounts}.rs`; `crates/arkiv-golemdb/src/{lib,convert}.rs`; `crates/arkiv-valkey/src/*` | a receipt from every entity read and write, frames, reading the schedule |
+| Executor: ops | `crates/arkiv-reth-executor/src/arkiv.rs` | `apply_with_effects`, `BatchMeter`, compute and storage per op, `admit_lifetime` |
+| Executor: settlement | `crates/arkiv-reth-executor/src/lib.rs` | `arkiv_entity_transact`, `charge_sender`, `value_in`, `credit_pool`, the sender checks and gas-limit checks |
+| Genesis and startup | `crates/arkiv-reth-chainspec/src/lib.rs`, `crates/arkiv-reth-statemanager/src/genesis.rs`, `bin/arkiv-reth/src/main.rs`, `genesis/{dev,example}.json` | reading `config.arkiv.tokenomics`, storing the schedule, refusing to start without one |
 
-**Interplay with #239.** Entity transactions deliberately do not use `open_view` /
-`close_view`: frames do not nest, and the executor's own per-transaction frame already
-discards a probe's writes (comment in `arkiv_entity_transact`). Transfers and view calls do
-use #239's frame. #239's e2e test (estimating a delete does not delete) passes.
+**#239.** Entity transactions do not use #239's `open_view` / `close_view`: rollback frames
+cannot be nested, and the executor already opens one per transaction and rolls it back for
+`eth_call` and `eth_estimateGas` (see the comment in `arkiv_entity_transact`). Transfers and
+view calls do use #239's frame.
 
-**Where review is most valuable:** settlement and money conservation (`lib.rs`), probe
-isolation, anything that could turn user input into a store fault (a fault fails the
-block, and the pooled transaction then fails every block after it), and the overflow paths.
+**What users notice:**
 
-**Visible to users and operators:**
-
-- entity transactions use more gas, since storage is now charged;
-- `eth_getBalance(ARKIV_ADDRESS)` grows with storage fees and value sent;
-- value sent to `ARKIV_ADDRESS` is no longer ignored: it goes to the pool;
+- entity transactions cost more gas, because storage is charged;
+- the balance of `ARKIV_ADDRESS` grows;
+- value sent to `ARKIV_ADDRESS` goes to the pool; before, it was ignored;
 - a lifetime beyond six months reverts;
-- the genesis files change, so the genesis hash changes and existing dev chains do not
-  carry over.
+- the genesis files change, so existing dev chains cannot be reused.
 
-**Tests to read:**
+**Tests to read first:**
 
-- executor unit tests in `arkiv.rs` (each pricing rule, overflow, reserved keys);
-- host tests at the end of `lib.rs` (conservation, value, probes, sender checks);
-- e2e in `bin/arkiv-reth/tests/e2e.rs`, each on memory and GolemDB, printing a fee table
-  with `--no-capture`:
-  - `the_pool_receives_the_storage_share_and_the_value`
-  - `a_create_a_patch_and_an_extend_show_their_compute_and_storage_gas`
-  - `estimates_are_isolated_and_a_shrinking_patch_buys_no_storage`
-  - `storage_that_does_not_fit_runs_a_create_out_of_gas`
-  - `keys_that_hold_no_entity_find_none` (extended with the fee schedule's key)
+1. `golemdbs_work_reaches_settlement` (`crates/arkiv-reth-executor/src/lib.rs`): GolemDB's
+   cost (114 gas on a test store that charges per call) shows up in `gasUsed`, in what the
+   sender pays and in the tip.
+2. `a_create_buys_its_attributes_and_their_index_entries`
+   (`crates/arkiv-reth-executor/src/arkiv.rs`): storage gas worked out by hand from the size
+   rule, index entries included.
+3. `the_pool_gets_the_storage_share_and_the_value` (`lib.rs`): the sender pays the burned
+   fee + the tip + the pool's share + the value.
+4. `a_create_a_patch_and_an_extend_show_their_compute_and_storage_gas`
+   (`bin/arkiv-reth/tests/e2e.rs`): signed transactions against a running node, on memory and
+   on GolemDB; run with `--no-capture` to see each fee split.
+5. `keys_that_hold_no_entity_find_none` (`e2e.rs`, on GolemDB): an op on an account's key,
+   the fee schedule's key or a GolemDB record reverts, and the chain keeps producing blocks.
 
-**Also in this PR, separable:** a by-hand load test (`bin/arkiv-reth/tests/load/`, declared
-`test = false`, never in CI) with two harness additions (`NodeBuilder::log_file`,
-`ArkivClient::pool_hashes`). It tracks every transaction into a block and reports any lost
-or duplicated transaction; see the README's "Load test".
+Then:
 
-**Postponed by decision:** `arkiv_estimateFee` and receipt fields, `$rate`, the purge
-reserve, and pool payouts. The weights are placeholders.
+- the unit tests in `arkiv.rs`: each pricing rule, overflow, reserved keys;
+- the tests at the end of `lib.rs`: what the sender pays, value, `eth_call` and
+  `eth_estimateGas`, sender checks;
+- three more e2e tests, on memory and GolemDB:
+  `the_pool_receives_the_storage_share_and_the_value`,
+  `estimates_are_isolated_and_a_shrinking_patch_buys_no_storage`,
+  `storage_that_does_not_fit_runs_a_create_out_of_gas`.
 
-## 3. Size
+**Also in the PR:** a load test, run by hand and never in CI (`bin/arkiv-reth/tests/load/`),
+with two helpers in `arkiv-harness`. It checks that every transaction it sends lands in
+exactly one block. See the README's "Load test".
 
-+10,933 / −493 lines. Inline `#[cfg(test)]` modules count as tests; the harness, the store
-conformance suites and the priced test store count as test support.
+**Not in this iteration:** `arkiv_estimateFee`, the fee split in receipts, `$rate`, the
+purge reserve, paying validators from the pool. The weights are placeholders.
+
+## 3. How GolemDB's metering reaches the fee
+
+GolemDB's metering reaches the fee two ways: the cost it reports becomes compute gas, and
+the bytes it reports become storage gas.
+
+| Layer | Cost → compute gas | Bytes → storage gas |
+| --- | --- | --- |
+| Store | `crates/arkiv-interfaces/src/store/priced.rs`: a test store that charges a different amount per call kind, so each total shows which calls it includes. Real GolemDB reports 0 today. | `run_write_details`, `a_read_reports_the_records_size` (`store/conformance.rs`): MemStore, Valkey and GolemDB report the same bytes. |
+| State layer (`crates/arkiv-golemdb-state/src/metering_tests.rs`) | `a_create_reports_its_existence_read_and_its_write`, `an_update_reports_its_read_and_its_patch`, `advancing_the_minting_nonce_reports_one_read_and_one_write`, `a_discarded_frame_keeps_what_it_spent` | `pricing_metadata_survives_reads_writes_and_aggregation`, `no_op_and_attribute_removal_report_only_their_actual_effects` |
+| Executor (`crates/arkiv-reth-executor/src/arkiv.rs`) | `compute_adds_the_terms_the_ops_and_golemdbs_work`, `a_revert_pays_for_the_golemdb_work_it_undid`, `golemdbs_work_can_run_a_batch_out_of_gas` | `a_create_buys_its_size_until_expiry`, `a_patch_buys_only_its_growth`, `a_patch_that_grows_and_shrinks_buys_its_net_growth`, `an_extend_buys_only_the_added_blocks`, `storage_gas_is_rounded_once_per_batch` |
+| Settlement (`crates/arkiv-reth-executor/src/lib.rs`) | `golemdbs_work_reaches_settlement`, `a_reverted_transaction_pays_its_golemdb_work` | `the_pool_gets_the_storage_share_and_the_value` |
+| Running node (`bin/arkiv-reth/tests/e2e.rs`) | none: GolemDB charges 0 | `the_pool_receives_the_storage_share_and_the_value`, `a_create_a_patch_and_an_extend_show_their_compute_and_storage_gas`, `estimates_are_isolated_and_a_shrinking_patch_buys_no_storage`, `storage_that_does_not_fit_runs_a_create_out_of_gas` |
+
+Not covered yet: a non-zero GolemDB cost reaching the fee on a real GolemDB, because GolemDB
+does not charge yet. Cost is covered with the test store, bytes with real GolemDB.
+
+## 4. Size
+
++10,933 / −493 lines. Test modules inside `src/` count as tests; so do `arkiv-harness`, the
+store conformance suites and the test store that charges per call.
 
 | | Added | Removed | Share of added |
 | --- | ---: | ---: | ---: |
 | Production code | 2,065 | 369 | 19% |
-| Tests and test support | 7,027 | 120 | 64% |
-| Docs (plan, spec, API, load-test design, README) | 1,758 | 3 | 16% |
+| Tests | 7,027 | 120 | 64% |
+| Docs | 1,758 | 3 | 16% |
 | Config (Cargo, genesis files) | 83 | 1 | 1% |
 
 Production code by crate:
@@ -105,8 +170,8 @@ Production code by crate:
 | `arkiv-interfaces` | 466 | 37 |
 | `arkiv-golemdb-state` | 181 | 58 |
 | `arkiv-valkey`, `arkiv-golemdb` | 138 | 60 |
-| `arkiv-reth-statemanager`, `arkiv-reth-chainspec`, `bin/arkiv-reth`, other | 131 | 18 |
+| others | 131 | 18 |
 
-The largest test files are the load test (`run.rs` 909, `plan.rs` 523), the executor's unit
-tests (`arkiv.rs` 818 inline), `e2e.rs` (638), the host tests in `lib.rs` (533) and the store
-conformance suite (441).
+The largest test files: the load test (`run.rs` 909, `plan.rs` 523), the unit tests in
+`arkiv.rs` (818), `e2e.rs` (638), the tests in `lib.rs` (533), and the store conformance
+suite (441).
