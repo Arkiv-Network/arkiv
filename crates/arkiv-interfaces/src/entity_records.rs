@@ -105,13 +105,40 @@ pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
 }
 
 /// The record key for an entity: its address, which is already 32 bytes. `None`
-/// for an account's key, where no entity is read or written.
+/// for a reserved key, where no entity is read or written.
 pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
-    if is_account_key(key) {
+    if is_reserved_key(key) {
         None
     } else {
         Some(RecordKey::from_entity(key))
     }
+}
+
+/// The fee schedule's record, `keccak256("arkiv.fee_schedule")`, written at
+/// genesis beside the entities (`arkiv_tokenomics::schedule_record`).
+pub const FEE_SCHEDULE_KEY: EntityAddress = [
+    0x7b, 0x44, 0x05, 0x01, 0xee, 0x56, 0x13, 0x2d, 0x54, 0xca, 0x22, 0x03, 0x8e, 0xb0, 0xc5, 0x9f,
+    0xb6, 0xad, 0x16, 0x89, 0xe8, 0xc2, 0xd1, 0xd1, 0xad, 0xa8, 0x88, 0xe1, 0x17, 0xc7, 0xfe, 0x5e,
+];
+
+/// Whether `key` names a record that is not an entity's: an account's, or the
+/// fee schedule's. A caller can name any key; at a reserved one there is no
+/// entity, and reading its record as one would fail the block, not the
+/// transaction.
+pub const fn is_reserved_key(key: EntityAddress) -> bool {
+    is_account_key(key) || same_key(&key, &FEE_SCHEDULE_KEY)
+}
+
+/// `a == b`, usable in a `const fn`.
+const fn same_key(a: &EntityAddress, b: &EntityAddress) -> bool {
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Whether `key` is an account's: an address left-padded with twelve zero bytes.
@@ -476,5 +503,23 @@ mod tests {
         let level = record.cell("level").unwrap();
         assert_eq!(level.value, AttributeValue::Int(-7).encode());
         assert_ne!(level.value, AttributeValue::Int(-7).index_bytes());
+    }
+
+    /// No entity is read or written at a reserved key: an account's, or the fee
+    /// schedule's. Any other key is an entity's own.
+    #[test]
+    fn reserved_keys_have_no_entity_record() {
+        let mut account = [0u8; 32];
+        account[12..].copy_from_slice(&[0xaa; 20]);
+        for key in [account, FEE_SCHEDULE_KEY] {
+            assert!(is_reserved_key(key));
+            assert_eq!(record_key(key), None);
+        }
+        let mut near = FEE_SCHEDULE_KEY;
+        near[31] ^= 1;
+        for key in [[0x11; 32], near] {
+            assert!(!is_reserved_key(key));
+            assert_eq!(record_key(key), Some(RecordKey::from_entity(key)));
+        }
     }
 }

@@ -1619,8 +1619,9 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
 }
 
 /// Keys a caller can name where GolemDB holds a record that is not an entity:
-/// an account's and GolemDB's own. An operation there reverts and a view call is
-/// mined; a store fault instead fails every block built while it is pooled.
+/// an account's, the fee schedule's and GolemDB's own. An operation there
+/// reverts and a view call is mined; a store fault instead fails every block
+/// built while it is pooled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_that_hold_no_entity_find_none() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
@@ -1640,15 +1641,20 @@ async fn keys_that_hold_no_entity_find_none() {
     let nonce = transactions().await;
 
     let account = B256::left_padding_from(caller.as_slice());
+    // Written at genesis, beside the entities.
+    let schedule = B256::from(arkiv_interfaces::entity_records::FEE_SCHEDULE_KEY);
     // `#recordKeys` holds a cell for every record in the store.
     let golemdb = [b"#params".as_slice(), b"#recordKeys"].map(B256::right_padding_from);
-    let keys = [account, golemdb[0], golemdb[1]];
+    let keys = [account, schedule, golemdb[0], golemdb[1]];
 
-    let mut ops = vec![
-        patch_payload(account, Bytes::from_static(b"x")),
-        Operation::extend_expiry(account, 0, 5000),
-        Operation::transfer_ownership(account, Address::repeat_byte(0xbb)),
-    ];
+    let mut ops = Vec::new();
+    for key in [account, schedule] {
+        ops.extend([
+            patch_payload(key, Bytes::from_static(b"x")),
+            Operation::extend_expiry(key, 0, 5000),
+            Operation::transfer_ownership(key, Address::repeat_byte(0xbb)),
+        ]);
+    }
     ops.extend(keys.map(Operation::delete));
     for op in &ops {
         assert!(

@@ -32,7 +32,8 @@ pub enum EntityError {
     Store(StoreError),
     /// A record could not be mapped to or from an entity.
     Record(RecordError),
-    /// The key is in the account namespace, where no entity is written.
+    /// The key is reserved, an account's or the fee schedule's, where no
+    /// entity is written.
     AccountKey(EntityAddress),
 }
 
@@ -85,8 +86,8 @@ fn merge(base: &mut EntityUpdates, next: EntityUpdates) {
 impl<S: Store> GolemStateView<S> {
     /// Read an entity with its record's size, or `None` if it does not exist
     /// at that read mode. The receipt is kept either way. A full read always
-    /// carries the size, so a record without one is a store fault. An
-    /// account's key holds no entity, so it reads as `None` without a read.
+    /// carries the size, so a record without one is a store fault. A reserved
+    /// key holds no entity, so it reads as `None` without a read.
     fn get_stored(
         &self,
         address: EntityAddress,
@@ -126,7 +127,7 @@ impl<S: Store> GolemStateView<S> {
     /// Errors do not roll back writes; the caller owns the transaction frame.
     fn update(&mut self, updates: EntityUpdates) -> Result<Metered<()>, EntityError> {
         let address = updates.entity;
-        // A write there would land on the account's record.
+        // A write there would land on the account's or the schedule's record.
         let Some(key) = entity_records::record_key(address) else {
             return Err(EntityError::AccountKey(address));
         };
@@ -397,6 +398,45 @@ mod tests {
                 .expect("balance"),
             UserBalance::from_u64(500)
         );
+    }
+
+    /// The fee schedule's record is there, but it is not an entity's: it reads
+    /// as no entity without being read, and no entity write reaches it.
+    #[test]
+    fn the_fee_schedule_key_holds_no_entity() {
+        use arkiv_tokenomics::schedule_record;
+
+        let mut view = view();
+        let schedule = arkiv_tokenomics::FeeSchedule::with_placeholder_weights(1_000);
+        view.store
+            .create(
+                view.branch,
+                schedule_record::RECORD_KEY,
+                schedule_record::to_cells(&schedule),
+                None,
+            )
+            .expect("the genesis schedule");
+        let key = entity_records::FEE_SCHEDULE_KEY;
+
+        let read = view.get(key, ReadMode::ViewWithOverlay).expect("read");
+        assert_eq!(read.value, None);
+        assert_eq!(read.receipt, Receipt::default());
+        assert_eq!(
+            view.update(EntityUpdates::deletion(key)),
+            Err(EntityError::AccountKey(key))
+        );
+        let record = view
+            .store
+            .get(
+                ReadTarget::Branch(view.branch),
+                schedule_record::RECORD_KEY,
+                None,
+                None,
+            )
+            .expect("read the schedule")
+            .value
+            .expect("still there");
+        assert_eq!(schedule_record::from_record(&record), Ok(schedule));
     }
 
     #[test]

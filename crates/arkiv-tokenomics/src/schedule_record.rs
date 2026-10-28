@@ -10,17 +10,17 @@
 
 use alloc::vec::Vec;
 
+use arkiv_interfaces::entity_records;
 use arkiv_interfaces::store::{Cell, CellKind, CellName, Record, RecordKey, TypeId};
 
 use crate::FeeSchedule;
 
 /// The record the schedule is kept in: `keccak256("arkiv.fee_schedule")`.
 /// Account keys start with 12 zero bytes and entity keys hash other inputs, so
-/// neither can be this one.
-pub const RECORD_KEY: RecordKey = RecordKey([
-    0x7b, 0x44, 0x05, 0x01, 0xee, 0x56, 0x13, 0x2d, 0x54, 0xca, 0x22, 0x03, 0x8e, 0xb0, 0xc5, 0x9f,
-    0xb6, 0xad, 0x16, 0x89, 0xe8, 0xc2, 0xd1, 0xd1, 0xad, 0xa8, 0x88, 0xe1, 0x17, 0xc7, 0xfe, 0x5e,
-]);
+/// neither can be this one. A caller can still name it in an operation, so it is
+/// a reserved key, where no entity is read or written
+/// ([`entity_records::is_reserved_key`]).
+pub const RECORD_KEY: RecordKey = RecordKey(entity_records::FEE_SCHEDULE_KEY);
 
 pub const CAPACITY_RATE: &str = "host.arkiv.capacity_rate";
 pub const CELL_BYTE_UNITS: &str = "host.arkiv.cell_byte_units";

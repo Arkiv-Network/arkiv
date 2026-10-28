@@ -250,9 +250,10 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                 creation_flags,
                 attributes,
             } => {
-                // An account's key is taken by the account, though it holds no
-                // entity. A derived key lands there only by a hash collision.
-                if entity_records::is_account_key(*key)
+                // A reserved key is taken by its record (an account's, the fee
+                // schedule's), though it holds no entity. A derived key lands
+                // there only by a hash collision.
+                if entity_records::is_reserved_key(*key)
                     || self.current(state, meter, *key)?.is_some()
                 {
                     return Ok(Err(RevertReason::AlreadyExists { key: *key }));
@@ -1556,6 +1557,80 @@ mod tests {
                 .expect("balance"),
             UserBalance::from_u64(500)
         );
+    }
+
+    /// The fee schedule's record sits beside the entities, at a key a caller can
+    /// name. An op there must revert like one on an account's key: reading the
+    /// schedule as an entity fails, and a fault fails the whole block.
+    #[test]
+    fn an_op_on_the_fee_schedule_key_reverts() {
+        use arkiv_tokenomics::{FeeScheduleSource, schedule_record};
+
+        let store = Arc::new(MemStore::new());
+        let branch = store.begin(None).expect("begin");
+        store
+            .create(
+                branch,
+                schedule_record::RECORD_KEY,
+                schedule_record::to_cells(&DEFAULT_SCHEDULE),
+                None,
+            )
+            .expect("the genesis schedule");
+        let base = store
+            .commit_tagged(branch, GENESIS.hash)
+            .expect("commit base");
+        let branch = store.begin(Some(base)).expect("begin");
+        let mut view = GolemStateView::new(
+            store,
+            branch,
+            base,
+            GENESIS,
+            arkiv_interfaces::statemanager::SessionId([1; 16]),
+        );
+        let exec = ArkivExecutor::<View>::new();
+        let key = entity_records::FEE_SCHEDULE_KEY;
+
+        let not_found = RevertReason::NotFound { key };
+        for (op, reason) in [
+            (
+                Op::Create {
+                    key,
+                    expires_at: 50,
+                    creation_flags: CreationFlags::NONE,
+                    attributes: Vec::new(),
+                },
+                RevertReason::AlreadyExists { key },
+            ),
+            (
+                Op::Patch {
+                    key,
+                    mutations: Vec::new(),
+                },
+                not_found.clone(),
+            ),
+            (
+                Op::ExtendExpiry {
+                    key,
+                    new_expires_at: 50,
+                },
+                not_found.clone(),
+            ),
+            (
+                Op::Transfer {
+                    key,
+                    new_owner: [0xBB; 20],
+                },
+                not_found.clone(),
+            ),
+            (Op::Delete { key }, not_found.clone()),
+        ] {
+            let out = exec
+                .apply(&env([0xAA; 20], 10), &mut view, &[op])
+                .expect("a revert, not a fault");
+            assert_eq!(out.status, ExecStatus::Reverted);
+            assert_eq!(out.revert, Some(reason));
+        }
+        assert_eq!(view.fee_schedule(), Ok(DEFAULT_SCHEDULE), "untouched");
     }
 
     #[test]
