@@ -40,11 +40,15 @@ bun test
   sequencer, so the two nodes are peers over reth's p2p network.
 - `test/follower-restart.test.ts` — the follower, stopped while the sequencer
   makes blocks and started again, catches up with the same blocks, serves
-  state at `latest` and keeps following. Four cases, one per way it can catch
-  up: 10 blocks behind, within Lighthouse's 32-slot sync tolerance, where
-  Lighthouse feeds reth the missed blocks (also with only reth restarted); 40
-  blocks, past that tolerance, where reth downloads the gap itself; and past
-  reth's backfill threshold, where reth runs its pipeline. They stop and start
+  state at `latest` and keeps following, without refusing a block or running
+  reth's pipeline. Four cases: 10 blocks behind, within Lighthouse's 32-slot
+  sync tolerance, where Lighthouse fetches the missed blocks one by one (also
+  with only reth restarted); 40 blocks, past that tolerance, where Lighthouse
+  batch-syncs; and further behind the finalized block than reth syncs on its
+  own. In production that last one is an outage of more than about 37 minutes;
+  `kurtosis/arkiv-chain.yaml` lowers the follower's limit from 1024 blocks
+  (`--engine.backfill-threshold`) so it takes minutes here. In all of them Lighthouse feeds reth every
+  block (`--disable-optimistic-finalized-sync`). They stop and start
   Kurtosis services, so they run only with `ARKIV_RESTART_TESTS=1` inside the
   enclave (`ARKIV_ENCLAVE`, default `arkiv-harness`), after the other tests:
 
