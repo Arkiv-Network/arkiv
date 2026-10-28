@@ -36,6 +36,7 @@ use arkiv_reth_executor::ArkivEvmFactory;
 use arkiv_reth_golemdbprovider::{ArkivProvider, ArkivProviderBuilder};
 use arkiv_reth_statemanager::{BlockSeals, HostStore};
 use clap::Parser;
+use clap::builder::RangedU64ValueParser;
 use node::ArkivNode;
 use reth::builder::{DebugNodeLauncher, Node, NodeTypesWithDBAdapter};
 use reth_db::DatabaseEnv;
@@ -47,6 +48,7 @@ use reth_node_ethereum::EthEvmConfig;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 /// An example for the error messages.
@@ -266,6 +268,22 @@ fn download_gaps(engine: &mut reth::args::EngineArgs) {
     }
 }
 
+/// Arkiv's own `node` flags, next to reth's.
+#[derive(Debug, Clone, clap::Args)]
+struct ArkivArgs {
+    /// Maximum number of concurrent `arkiv_*` requests; further ones wait for a turn.
+    ///
+    /// Each holds one GolemDB read slot. The whole node shares a fixed number of
+    /// them with block import and `eth_*` reads, and with none left reads fail.
+    #[arg(
+        long = "rpc.max-arkiv-requests",
+        value_name = "COUNT",
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..=Semaphore::MAX_PERMITS as u64),
+        default_value_t = arkiv_reth_rpc::DEFAULT_MAX_CONCURRENT_READS
+    )]
+    rpc_max_arkiv_requests: usize,
+}
+
 fn main() {
     // Enable backtraces unless the caller already set a preference.
     if std::env::var_os("RUST_BACKTRACE").is_none() {
@@ -313,7 +331,7 @@ fn main() {
     // `ChainSpec`. The components closure gives the non-`node` subcommands
     // (`import`, `stage`, `re-execute`) the same executor and consensus the node
     // uses.
-    let mut cli = Cli::<genesis::NodeChainSpecParser>::parse();
+    let mut cli = Cli::<genesis::NodeChainSpecParser, ArkivArgs>::parse();
     if on_golemdb {
         cli.apply_node_command(|node| download_gaps(&mut node.engine));
     }
@@ -327,7 +345,7 @@ fn main() {
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
         },
-        async move |builder, _| {
+        async move |builder, arkiv_args| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
             let store = open(&builder.config().chain);
             let rpc_store = store.clone();
@@ -344,8 +362,11 @@ fn main() {
                 .with_add_ons(node.add_ons())
                 // Register the arkiv_* JSON-RPC namespace over reth's rpc modules.
                 .extend_rpc_modules(move |ctx| {
-                    let module =
-                        arkiv_reth_rpc::arkiv_module(ctx.provider().clone(), rpc_store.clone())?;
+                    let module = arkiv_reth_rpc::arkiv_module(
+                        ctx.provider().clone(),
+                        rpc_store.clone(),
+                        arkiv_args.rpc_max_arkiv_requests,
+                    )?;
                     ctx.modules.merge_configured(module)?;
                     info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                     Ok(())
@@ -402,6 +423,28 @@ mod tests {
         };
         download_gaps(&mut engine);
         assert_eq!(engine.tree_config().backfill_run_threshold(), 100);
+    }
+
+    /// `--rpc.max-arkiv-requests` as the `node` command parses `flags`.
+    fn arkiv_requests(flags: &[&str]) -> Result<usize, clap::Error> {
+        let args = ["arkiv-reth", "node"].iter().chain(flags).copied();
+        let mut cli = Cli::<genesis::NodeChainSpecParser, ArkivArgs>::try_parse_from(args)?;
+        let mut requests = None;
+        cli.apply_node_command(|node| requests = Some(node.ext.rpc_max_arkiv_requests));
+        Ok(requests.expect("a node command"))
+    }
+
+    #[test]
+    fn the_arkiv_request_limit_has_a_default_and_refuses_zero() {
+        let default = arkiv_reth_rpc::DEFAULT_MAX_CONCURRENT_READS;
+        assert_eq!(arkiv_requests(&[]).unwrap(), default);
+        assert_eq!(
+            arkiv_requests(&["--rpc.max-arkiv-requests", "64"]).unwrap(),
+            64
+        );
+        assert!(arkiv_requests(&["--rpc.max-arkiv-requests", "0"]).is_err());
+        let too_many = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert!(arkiv_requests(&["--rpc.max-arkiv-requests", &too_many]).is_err());
     }
 
     /// A chain spec whose genesis has `config.arkiv.golemdb` set to `golemdb`,
