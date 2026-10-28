@@ -64,7 +64,12 @@ fn store_with(dir: &TempDir, entities: &[Entity]) -> GolemDbStore {
     for entity in entities {
         let cells = entity_records::to_cells(entity).unwrap();
         store
-            .create(branch, entity_records::record_key(entity.key), cells, None)
+            .create(
+                branch,
+                entity_records::record_key(entity.key).unwrap(),
+                cells,
+                None,
+            )
             .unwrap();
     }
     store.commit(branch).unwrap();

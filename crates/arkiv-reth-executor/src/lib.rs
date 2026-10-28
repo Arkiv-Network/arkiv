@@ -123,7 +123,8 @@ use arkiv_interfaces::statemanager::{
 };
 use arkiv_interfaces::store::BranchId;
 use arkiv_reth_statemanager::{
-    BlockSeals, ExecutionKey, HostStore, host_manager, open_block_branch,
+    BlockSeals, ExecutionKey, HostStateView, HostStore, WriteOverlay, host_manager,
+    open_block_branch,
 };
 use std::sync::Arc;
 
@@ -178,6 +179,47 @@ fn state_fault<T: core::fmt::Debug, DBError>(
 /// label on the view rather than a choice of base.
 fn parent_ref(block_number: u64) -> BlockRef {
     BlockRef::new(block_number.saturating_sub(1), Hash::default())
+}
+
+/// Open the write view a transaction stages into.
+///
+/// A speculative run -- fee charging off: `eth_call`, `eth_estimateGas` -- also
+/// opens a frame, which [`close_view`] rolls back. The view writes through to the
+/// block's branch, and reth runs every probe of an estimate on one EVM, hence one
+/// branch, expecting `transact` to leave state alone. Without the frame, a delete
+/// estimated at the cap removes the entity, every lower probe then reverts with
+/// `EntityNotFound`, and the estimate comes back as the cap.
+fn open_view<'a, DB: Database>(
+    store: &HostStore,
+    branch: BranchId,
+    db: &'a mut DB,
+    block_number: u64,
+    fees: &FeeEnv,
+) -> Result<HostStateView<WriteOverlay<'a, DB>>, EVMError<DB::Error>> {
+    let mut view = host_manager(store, branch, db, parent_ref(block_number))
+        .map_err(state_fault("open view"))?;
+    if !fees.charge {
+        view.golem_mut()
+            .begin_frame()
+            .map_err(state_fault("open speculative frame"))?;
+    }
+    Ok(view)
+}
+
+/// Commit what `view` staged and hand back reth's account diff -- then, for a
+/// speculative run, roll the branch back to where [`open_view`] found it.
+fn close_view<DB: Database>(
+    mut view: HostStateView<WriteOverlay<'_, DB>>,
+    fees: &FeeEnv,
+    context: &'static str,
+) -> Result<EvmState, EVMError<DB::Error>> {
+    StateView::commit(&mut view).map_err(state_fault(context))?;
+    if !fees.charge {
+        view.golem_mut()
+            .discard_frame()
+            .map_err(state_fault("discard speculative frame"))?;
+    }
+    view.finish().map_err(state_fault("close view"))
 }
 
 /// The block-level inputs of a transaction's fee accounting, read off the
@@ -698,16 +740,14 @@ fn arkiv_transact<DB: Database>(
 
     // Sender debit + nonce bump and recipient credit, through one view — a
     // transfer stages the same way every other state change does.
-    let mut view = host_manager(store, branch, db, parent_ref(block_number))
-        .map_err(state_fault("open view"))?;
+    let mut view = open_view(store, branch, db, block_number, &fees)?;
     check_sender(&view, checks, &fees, &tx)?;
     charge_sender(&mut view, &fees, tx.caller, value_out, gas_used, &tx)?;
     if to != tx.caller {
         view.fetch_add_balance(to.into_array(), as_balance(tx.value))
             .map_err(state_fault("credit recipient"))?;
     }
-    StateView::commit(&mut view).map_err(state_fault("commit transfer"))?;
-    let state = view.finish().map_err(state_fault("close view"))?;
+    let state = close_view(view, &fees, "commit transfer")?;
 
     let result = ExecutionResult::Success {
         reason: SuccessReason::Stop,
@@ -840,8 +880,7 @@ fn arkiv_entity_transact<DB: Database>(
     // One view for the whole transaction: the entity phase and the sender
     // phase stage into the same overlay; a revert stages no entity changes, so
     // the one commit at the end flushes exactly what should land.
-    let mut view = host_manager(store, branch, db, parent_ref(block_number))
-        .map_err(state_fault("open view"))?;
+    let mut view = open_view(store, branch, db, block_number, fees)?;
     check_sender(&view, checks, fees, tx)?;
     let start_nonce = view
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
@@ -863,8 +902,7 @@ fn arkiv_entity_transact<DB: Database>(
     // estimates to a pool-acceptable gas limit.
     let gas_used = outcome.gas_used.max(floor);
     charge_sender(&mut view, fees, caller, U256::ZERO, gas_used, tx)?;
-    StateView::commit(&mut view).map_err(state_fault("commit transaction"))?;
-    let evm_state = view.finish().map_err(state_fault("close view"))?;
+    let evm_state = close_view(view, fees, "commit transaction")?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match outcome.revert {
@@ -904,11 +942,9 @@ fn arkiv_view_call<DB: Database>(
     let output = answer(db)?;
 
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    let mut view = host_manager(store, branch, db, parent_ref(block_number))
-        .map_err(state_fault("open view"))?;
+    let mut view = open_view(store, branch, db, block_number, fees)?;
     charge_sender(&mut view, fees, tx.caller, U256::ZERO, gas_used, tx)?;
-    StateView::commit(&mut view).map_err(state_fault("commit view call"))?;
-    let state = view.finish().map_err(state_fault("close view"))?;
+    let state = close_view(view, fees, "commit view call")?;
 
     let gas = ResultGas::default().with_total_gas_spent(gas_used);
     let result = match output {

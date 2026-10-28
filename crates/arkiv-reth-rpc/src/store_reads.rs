@@ -39,25 +39,19 @@ impl From<StoreError> for ReadError {
     }
 }
 
+impl From<arkiv_interfaces::entity_records::RecordError> for ReadError {
+    fn from(error: arkiv_interfaces::entity_records::RecordError) -> Self {
+        Self::Record(error)
+    }
+}
+
 /// One entity by key, as of `at`.
 pub fn entity<S: Store + ?Sized>(
     store: &S,
     at: CommitId,
     key: EntityAddress,
 ) -> Result<Option<Entity>, ReadError> {
-    let record = store
-        .get(
-            ReadTarget::Commit(at),
-            entity_records::record_key(key),
-            None,
-            None,
-        )?
-        .into_value();
-    record
-        .as_ref()
-        .map(entity_records::from_record)
-        .transpose()
-        .map_err(ReadError::Record)
+    entity_records::read(store, ReadTarget::Commit(at), key)
 }
 
 /// One page of [`query`]: its entities, and the size of the whole match set

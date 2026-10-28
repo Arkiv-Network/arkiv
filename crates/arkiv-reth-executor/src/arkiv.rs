@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use arkiv_interfaces::constants::ENTITY_MAX_ATTRIBUTES;
 use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity};
+use arkiv_interfaces::entity_records;
 use arkiv_interfaces::execution::{
     AttributeMutation, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
     TransactionExecutor,
@@ -173,7 +174,11 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                 creation_flags,
                 attributes,
             } => {
-                if self.current(state, overlay, *key)?.is_some() {
+                // An account's key is taken by the account, though it holds no
+                // entity. A derived key lands there only by a hash collision.
+                if entity_records::is_account_key(*key)
+                    || self.current(state, overlay, *key)?.is_some()
+                {
                     return Ok(Err(RevertReason::AlreadyExists { key: *key }));
                 }
                 let entity = Entity {
@@ -487,10 +492,11 @@ mod tests {
     use arkiv_golemdb_state::GolemStateView;
     use arkiv_interfaces::constants::OP_MAX_ATTRIBUTES;
     use arkiv_interfaces::entity::AttributeValue;
-    use arkiv_interfaces::statemanager::{BlockRef, EntityStore};
+    use arkiv_interfaces::primitives::UserBalance;
+    use arkiv_interfaces::statemanager::{AccountBalancesStore, BlockRef, EntityStore};
 
     use arkiv_interfaces::store::reference::MemStore;
-    use arkiv_interfaces::store::{Store, StoreExt};
+    use arkiv_interfaces::store::{RecordKey, Store, StoreExt};
     use std::sync::Arc;
 
     type View = GolemStateView<Arc<MemStore>>;
@@ -632,6 +638,64 @@ mod tests {
         assert_eq!(out.status, ExecStatus::Reverted);
         assert!(out.revert.is_some());
         assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+    }
+
+    /// An op can name an account's key, whose record is not an entity's. It must
+    /// revert: a fault fails the whole block built around it.
+    #[test]
+    fn an_op_on_an_account_key_reverts() {
+        let exec = ArkivExecutor::<View>::new();
+        let mut view = fresh_view();
+        let alice = [0xAA; 20];
+        view.set_balance(alice, UserBalance::from_u64(500))
+            .expect("fund");
+        let key = RecordKey::from_address(alice).0;
+
+        let not_found = RevertReason::NotFound { key };
+        for (op, reason) in [
+            (
+                Op::Create {
+                    key,
+                    expires_at: 50,
+                    creation_flags: CreationFlags::NONE,
+                    attributes: Vec::new(),
+                },
+                RevertReason::AlreadyExists { key },
+            ),
+            (
+                Op::Patch {
+                    key,
+                    mutations: Vec::new(),
+                },
+                not_found.clone(),
+            ),
+            (
+                Op::ExtendExpiry {
+                    key,
+                    new_expires_at: 50,
+                },
+                not_found.clone(),
+            ),
+            (
+                Op::Transfer {
+                    key,
+                    new_owner: [0xBB; 20],
+                },
+                not_found.clone(),
+            ),
+            (Op::Delete { key }, not_found.clone()),
+        ] {
+            let out = exec
+                .apply(&env(alice, 10), &mut view, &[op])
+                .expect("a revert, not a fault");
+            assert_eq!(out.status, ExecStatus::Reverted);
+            assert_eq!(out.revert, Some(reason));
+        }
+        assert_eq!(
+            view.get_balance(alice, ReadMode::ViewWithOverlay)
+                .expect("balance"),
+            UserBalance::from_u64(500)
+        );
     }
 
     #[test]
