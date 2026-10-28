@@ -19,4 +19,9 @@ arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-query.workspace = true
 # `MAX_PAGE_SIZE`, the largest page `arkiv_query` asks GolemDB for.
 arkiv-rpc-types.workspace = true
+# `MAX_WAIT_COMMITS`, how long GolemDB lets old data wait before it prunes.
+golemdb-pruning.workspace = true
+# Opening a database's MDBX directly, to read how much space it takes.
+golemdb-storage.workspace = true
+golemdb-storage-mdbx.workspace = true
 tempfile.workspace = true

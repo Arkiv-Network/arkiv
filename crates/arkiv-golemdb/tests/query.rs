@@ -59,7 +59,7 @@ fn entity_with(n: u8, attributes: Vec<Attribute>) -> Entity {
 
 /// A store holding `entities`, committed.
 fn store_with(dir: &TempDir, entities: &[Entity]) -> GolemDbStore {
-    let store = GolemDbStore::open(dir.path(), &config()).unwrap();
+    let store = GolemDbStore::open(dir.path(), &config(), None).unwrap();
     let branch = store.begin(None).unwrap();
     for entity in entities {
         let cells = entity_records::to_cells(entity).unwrap();

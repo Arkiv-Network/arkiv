@@ -1931,7 +1931,7 @@ async fn a_golemdb_store_with_another_genesis_root_is_refused() {
             .collect(),
     };
     let store: HostStore =
-        std::sync::Arc::new(arkiv_golemdb::GolemDbStore::open(&directory, &config).unwrap());
+        std::sync::Arc::new(arkiv_golemdb::GolemDbStore::open(&directory, &config, None).unwrap());
     let other = GenesisAccount {
         address: Address::repeat_byte(0x33),
         balance: U256::from(1),

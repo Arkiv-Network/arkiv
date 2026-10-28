@@ -31,7 +31,7 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, RecordLimits};
+pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, PruningConfig, RecordLimits};
 
 use convert::{
     arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
@@ -103,10 +103,18 @@ impl core::fmt::Debug for GolemDbStore {
 
 impl GolemDbStore {
     /// Open `directory`, creating it with `config` if it is new. Only one
-    /// process may open a directory.
-    pub fn open(directory: &Path, config: &GolemDbConfig) -> Result<Self, OpenError> {
-        let database =
-            golemdb::Database::open(directory, &golemdb::OpenConfig::new(config.full_genesis()?))?;
+    /// process may open a directory. `pruning` is how many past commits to
+    /// keep, `None` all; it may change between opens.
+    pub fn open(
+        directory: &Path,
+        config: &GolemDbConfig,
+        pruning: Option<PruningConfig>,
+    ) -> Result<Self, OpenError> {
+        let mut open = golemdb::OpenConfig::new(config.full_genesis()?);
+        if let Some(pruning) = pruning {
+            open = open.with_pruning(pruning);
+        }
+        let database = golemdb::Database::open(directory, &open)?;
         Ok(Self { database })
     }
 

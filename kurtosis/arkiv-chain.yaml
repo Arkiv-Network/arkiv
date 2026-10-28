@@ -10,10 +10,13 @@ participants:
   # Participant 1 is the sole sequencer: its validator client proposes blocks.
   - el_type: reth
     el_image: arkiv-reth:dev
-    # The node needs a store named. This devnet runs on GolemDB, inside the
-    # datadir the package gives reth.
     el_extra_env_vars:
+      # The node needs a store named. This devnet runs on GolemDB, inside the
+      # datadir the package gives reth.
       ARKIV_STORE_PATH: /data/reth/execution-data/golemdb
+      # How much history GolemDB keeps: `head-only` (the default), a number of
+      # past blocks besides the head, or `archive` for every block.
+      ARKIV_STORE_HISTORY: head-only
     cl_type: lighthouse
     # Lighthouse hands reth every block it syncs, in order. By default it skips
     # that for finalized blocks and leaves reth to sync them itself, which reth
@@ -28,6 +31,7 @@ participants:
     el_image: arkiv-reth:dev
     el_extra_env_vars:
       ARKIV_STORE_PATH: /data/reth/execution-data/golemdb
+      ARKIV_STORE_HISTORY: head-only
     # Test-only: how far behind the finalized block reth syncs on its own,
     # 1024 blocks (about 37 minutes) unless set. Lowered so the restart tests
     # reach "further behind than that" with an outage of minutes. 33 is the

@@ -34,10 +34,13 @@ services:
     image: arkiv-reth:dev
     ports:
       - "8545:8545"
-    # The node needs a store named. This dev stack runs on GolemDB, kept in the
-    # node-data volume next to the datadir.
     environment:
+      # The node needs a store named. This dev stack runs on GolemDB, kept in
+      # the node-data volume next to the datadir.
       ARKIV_STORE_PATH: /data/golemdb
+      # How much history GolemDB keeps: `head-only` (the default), a number of
+      # past blocks besides the head, or `archive` for every block.
+      ARKIV_STORE_HISTORY: head-only
     command:
       - node
       - --dev
