@@ -238,7 +238,7 @@ mod tests {
     use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use arkiv_interfaces::store::{Page, RecordKey, Store};
     use golemdb_api::marker::{Bool, Bytes20, Bytes32, I32, Str, U64};
-    use golemdb_api::{Api, CellLimits, Genesis, HashAlgorithm, RecordLimits};
+    use golemdb_api::{Api, CellLimits, Genesis, HashAlgorithm, PricingConfig, RecordLimits};
     use std::ops::Bound;
     use tempfile::TempDir;
 
@@ -706,7 +706,13 @@ mod tests {
             max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
         };
         let config = GolemDbConfig {
-            genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
+            genesis: Genesis::new(
+                HashAlgorithm::Keccak256,
+                limits,
+                record_limits,
+                None,
+                PricingConfig::zero(),
+            ),
             segments: vec![],
         };
         let store = GolemDbStore::open(dir.path(), &config, None).unwrap();

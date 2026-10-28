@@ -1792,7 +1792,8 @@ fn genesis_json() -> serde_json::Value {
     })
 }
 
-/// `config.arkiv` giving GolemDB `hash_function` and Arkiv's limits.
+/// `config.arkiv` giving GolemDB `hash_function`, Arkiv's limits and free
+/// metering prices.
 fn arkiv_section(hash_function: &str) -> serde_json::Value {
     serde_json::json!({ "golemdb": {
         "hash_function": hash_function,
@@ -1804,7 +1805,8 @@ fn arkiv_section(hash_function: &str) -> serde_json::Value {
         "record_limits": {
             "max_cells": MAX_RECORD_CELLS,
             "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-        }
+        },
+        "metering": arkiv_golemdb::PricingConfig::zero()
     } })
 }
 

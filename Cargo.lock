@@ -4030,7 +4030,7 @@ dependencies = [
 [[package]]
 name = "golemdb-api"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4051,7 +4051,7 @@ dependencies = [
 [[package]]
 name = "golemdb-branch"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-cells",
  "golemdb-immutable-data",
@@ -4065,7 +4065,7 @@ dependencies = [
 [[package]]
 name = "golemdb-cells"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-merkle",
  "golemdb-storage",
@@ -4076,7 +4076,7 @@ dependencies = [
 [[package]]
 name = "golemdb-immutable-data"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-cells",
  "golemdb-storage",
@@ -4088,7 +4088,7 @@ dependencies = [
 [[package]]
 name = "golemdb-index"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-cells",
  "golemdb-merkle",
@@ -4100,7 +4100,7 @@ dependencies = [
 [[package]]
 name = "golemdb-merkle"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "blake3",
  "golemdb-storage",
@@ -4113,15 +4113,19 @@ dependencies = [
 [[package]]
 name = "golemdb-metering"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
+ "golemdb-cells",
+ "golemdb-storage",
+ "serde",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
 name = "golemdb-pruning"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-cells",
  "golemdb-index",
@@ -4132,7 +4136,7 @@ dependencies = [
 [[package]]
 name = "golemdb-query"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4147,7 +4151,7 @@ dependencies = [
 [[package]]
 name = "golemdb-record"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-branch",
  "golemdb-cells",
@@ -4161,12 +4165,12 @@ dependencies = [
 [[package]]
 name = "golemdb-storage"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 
 [[package]]
 name = "golemdb-storage-mdbx"
 version = "0.1.0"
-source = "git+https://github.com/Arkiv-Network/golemdb?branch=francesco%2Fquery_sort#ad73f7a8fb124d53ecbcb2b76b02d9e698dc3366"
+source = "git+https://github.com/Arkiv-Network/golemdb?branch=main#aa20dbee0feb4228d7bf2ac33bbf3956d0ba00c3"
 dependencies = [
  "golemdb-storage",
  "libmdbx",

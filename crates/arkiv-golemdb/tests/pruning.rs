@@ -2,7 +2,8 @@
 //! commits through [`GolemDbStore`] follows how much history it keeps.
 
 use arkiv_golemdb::{
-    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PruningConfig, RecordLimits,
+    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PricingConfig, PruningConfig,
+    RecordLimits,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
@@ -32,7 +33,13 @@ fn config() -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
+        genesis: Genesis::new(
+            HashAlgorithm::Keccak256,
+            limits,
+            record_limits,
+            None,
+            PricingConfig::zero(),
+        ),
         segments: vec![],
     }
 }

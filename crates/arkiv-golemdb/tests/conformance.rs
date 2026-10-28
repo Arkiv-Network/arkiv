@@ -5,7 +5,8 @@
 //! they land, their assertions move to part one and so start running here.
 
 use arkiv_golemdb::{
-    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, RecordLimits, SegmentSpec,
+    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PricingConfig, RecordLimits,
+    SegmentSpec,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
@@ -25,7 +26,13 @@ fn config() -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
+        genesis: Genesis::new(
+            HashAlgorithm::Keccak256,
+            limits,
+            record_limits,
+            None,
+            PricingConfig::zero(),
+        ),
         segments: ["blocks", "receipts", "transactions"]
             .into_iter()
             .map(|name| SegmentSpec {

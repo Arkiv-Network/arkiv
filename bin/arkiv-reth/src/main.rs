@@ -439,7 +439,8 @@ mod tests {
         golemdb_config(&spec(golemdb))
     }
 
-    /// `config.arkiv.golemdb` with `hash_function` and Arkiv's limits.
+    /// `config.arkiv.golemdb` with `hash_function`, Arkiv's limits and free
+    /// metering prices.
     fn golemdb(hash_function: &str) -> Value {
         json!({
             "hash_function": hash_function,
@@ -451,7 +452,8 @@ mod tests {
             "record_limits": {
                 "max_cells": MAX_RECORD_CELLS,
                 "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-            }
+            },
+            "metering": arkiv_golemdb::PricingConfig::zero()
         })
     }
 
