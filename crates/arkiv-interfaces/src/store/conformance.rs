@@ -1,9 +1,15 @@
 //! The store contract, as executable assertions.
 //!
 //! Every [`Store`] implementation — the in-memory reference, a mock over some
-//! other engine, the real store — must pass [`run_all`] unchanged. That is the
-//! whole point of the seam: if two implementations both pass, a host cannot
-//! tell them apart, and swapping one for the other cannot move consensus.
+//! other engine, the real store — must pass [`run_part_one`] and
+//! [`run_part_two`] unchanged. That is the whole point of the seam: if two
+//! implementations both pass, a host cannot tell them apart, and swapping one
+//! for the other cannot move consensus.
+//!
+//! The suite is in two parts only while GolemDB catches up. Part two asserts
+//! what GolemDB does not implement yet, so GolemDB runs part one alone. As
+//! GolemDB implements a feature, its assertions move to part one, until part
+//! two is empty and goes.
 //!
 //! Written against `alloc` only, so it runs wherever the trait does.
 //!
@@ -11,8 +17,13 @@
 //!
 //! ```ignore
 //! #[test]
-//! fn conformance() {
-//!     arkiv_interfaces::store::conformance::run_all(&MyStore::new);
+//! fn conformance_part_one() {
+//!     arkiv_interfaces::store::conformance::run_part_one(&MyStore::new);
+//! }
+//!
+//! #[test]
+//! fn conformance_part_two() {
+//!     arkiv_interfaces::store::conformance::run_part_two(&MyStore::new);
 //! }
 //! ```
 //!
@@ -29,12 +40,13 @@ use alloc::vec::Vec;
 
 use super::*;
 
-/// Run every [`Store`] assertion against stores built by `new_store`.
+/// Run the assertions every store passes, GolemDB included, against stores
+/// built by `new_store`.
 ///
 /// Panics on the first violation, naming the rule that broke.
-pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
+pub fn run_part_one<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    // The `Store` contract.
     new_store_starts_at_commit_zero(store_generator);
-    read_write_on_branch_without_commit_works(store_generator);
     read_patch_write_on_branch_without_commit_works(store_generator);
     absent_record_read_returns_none(store_generator);
     create_recordid_collision_is_failure(store_generator);
@@ -48,71 +60,36 @@ pub fn run_all<S: Store>(store_generator: &dyn Fn() -> S) {
     seal_computes_roots_without_persisting(store_generator);
     seal_is_idempotent(store_generator);
     a_sealed_branch_refuses_writes(store_generator);
-    two_branches_over_one_head_seal_independently(store_generator);
     commit_seals_if_the_host_did_not(store_generator);
-    commit_guard_rejects_second_branch_committal(store_generator);
     committed_branchid_becomes_invalid(store_generator);
     concurrent_branches_have_independent_views(store_generator);
-    patch_bumps_record_version(store_generator);
-    patch_version_guard_rejects_patch_on_state_view(store_generator);
-    recordversion_zero_version_guard_always_fails(store_generator);
-    patch_may_not_remove_last_cell(store_generator); // I do not understand this
     patch_set_adds_cells_and_takes_their_kind(store_generator);
     delete_removes_record(store_generator);
     reserved_cell_name_rejected(store_generator);
     field_only_type_cannot_be_attribute(store_generator); // I do not understand this
     invalid_type_id_rejected(store_generator);
     branch_hash_doesnt_include_record_version(store_generator);
-    branch_hash_tracks_content(store_generator);
     query_sees_committed_state(store_generator);
     query_or_unions_and_dedups(store_generator);
     query_without_a_sort_pages_in_a_fixed_order(store_generator);
-    query_range_on_eq_only_type_is_invalid(store_generator);
+    query_range_follows_each_types_order(store_generator);
+    query_prefix_on_a_type_without_one_is_invalid(store_generator);
+    query_between_includes_both_bounds(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
-    genesis_is_readable_at_its_commit(store_generator);
     genesis_is_all_or_nothing(store_generator);
     block_lifecycle_in_frames(store_generator);
-    branch_reads_its_origin_not_the_head(store_generator);
     projection_limits_returned_cells(store_generator);
     query_and_intersects_its_children(store_generator);
-    query_not_excludes_matches(store_generator);
-    query_presence_matches_records_carrying_the_attribute(store_generator);
-    query_pages_with_offset_and_limit(store_generator);
-    query_reports_total_matched_beyond_the_page(store_generator);
-    query_sorts_ascending_and_descending(store_generator);
-    query_sort_puts_records_without_the_cell_last(store_generator);
-    failed_commit_changes_nothing(store_generator);
-    failed_commit_leaves_the_branch_usable(store_generator);
     commit_applies_every_record_or_none(store_generator);
-}
 
-/// Run every [`StoreExt`] assertion against stores built by `new_store`.
-///
-/// Separate from [`run_all`] because the extensions are additions to
-/// `golem-db-api.md`, not part of it — an implementation may legitimately
-/// conform to the spec and not yet implement these.
-pub fn run_all_ext<S: StoreExt>(store_generator: &dyn Fn() -> S) {
-    changes_account_for_the_whole_difference(store_generator);
-    failed_commit_writes_no_changeset(store_generator);
+    // The `StoreExt` extensions: additions to `golem-db-api.md`, not part of it.
     commits_are_resolvable_by_their_committag(store_generator);
     a_commits_tag_is_readable_from_the_commit(store_generator);
     an_untagged_commit_has_no_tag(store_generator);
-    digest_same_on_branch_committal(store_generator);
-    changeset_report_all_crud_ops(store_generator);
-    apply_batch_matches_individual_writes(store_generator);
-    batch_ops_and_individual_ops_are_indistinguishable(store_generator);
     retention_window_always_covers_HEAD(store_generator);
-}
 
-/// Run every segment assertion against stores built by `new_store`.
-///
-/// Separate again, and for a different reason from [`run_all_ext`]: segment
-/// storage *is* specified upstream, but it is unimplemented there today and
-/// the trait methods default to [`StoreError::NotImplemented`]. A store that
-/// has not built the tier yet is still a conforming store; one that has is
-/// held to all of this.
-pub fn run_all_segments<S: Store>(store_generator: &dyn Fn() -> S) {
+    // Segments: specified upstream, and `NotImplemented` by default in the trait.
     appending_before_seal_is_refused(store_generator);
     an_appended_row_is_invisible_until_commit(store_generator);
     a_committed_row_reads_back_by_ordinal(store_generator);
@@ -120,13 +97,69 @@ pub fn run_all_segments<S: Store>(store_generator: &dyn Fn() -> S) {
     ordinals_are_dense_and_in_append_order(store_generator);
     a_duplicate_key_is_refused_and_overwrites_nothing(store_generator);
     a_discarded_branchs_rows_never_appear(store_generator);
-    range_of_reports_what_one_commit_appended(store_generator);
     rows_of_returns_that_commits_rows_in_order(store_generator);
-    an_untouched_segment_is_empty_not_an_error(store_generator);
     segments_are_independent_of_each_other(store_generator);
-    a_row_needs_no_key(store_generator);
     a_batch_append_matches_one_at_a_time(store_generator);
     a_batch_with_a_duplicate_name_is_refused(store_generator);
+}
+
+/// Run the assertions on features **not yet implemented on GolemDB**, against
+/// stores built by `new_store`.
+///
+/// GolemDB does not run these; every other store does. When GolemDB
+/// implements one of the features below, its assertions move to
+/// [`run_part_one`].
+///
+/// Panics on the first violation, naming the rule that broke.
+pub fn run_part_two<S: StoreExt>(store_generator: &dyn Fn() -> S) {
+    // Record versions: GolemDB has none, so every record is at version 0 and
+    // a version guard is `NotImplemented`.
+    read_write_on_branch_without_commit_works(store_generator);
+    patch_bumps_record_version(store_generator);
+    patch_version_guard_rejects_patch_on_state_view(store_generator);
+    recordversion_zero_version_guard_always_fails(store_generator);
+
+    // A branch outliving a commit over its head: on GolemDB it is dead
+    // (`HandleInvalid`), not usable until its own commit is refused
+    // (`Conflict`).
+    two_branches_over_one_head_seal_independently(store_generator);
+    commit_guard_rejects_second_branch_committal(store_generator);
+    failed_commit_changes_nothing(store_generator);
+    failed_commit_leaves_the_branch_usable(store_generator);
+    failed_commit_writes_no_changeset(store_generator);
+
+    // History: GolemDB reads at the head only.
+    genesis_is_readable_at_its_commit(store_generator);
+    branch_reads_its_origin_not_the_head(store_generator);
+
+    // `branch_hash`: a constant on GolemDB.
+    branch_hash_tracks_content(store_generator);
+    digest_same_on_branch_committal(store_generator);
+
+    // A patch that leaves a record with no cells: GolemDB applies it rather
+    // than refusing it.
+    patch_may_not_remove_last_cell(store_generator); // I do not understand this
+
+    // Queries: GolemDB has no `Filter::Not` and no `Filter::All`, and sorts
+    // only by a cell the filter holds to one type.
+    query_not_excludes_matches(store_generator);
+    query_presence_matches_records_carrying_the_attribute(store_generator);
+    query_pages_with_offset_and_limit(store_generator);
+    query_reports_total_matched_beyond_the_page(store_generator);
+    query_sorts_ascending_and_descending(store_generator);
+    query_sort_puts_records_without_the_cell_last(store_generator);
+
+    // `StoreExt::changes` and `StoreExt::apply`.
+    changes_account_for_the_whole_difference(store_generator);
+    changeset_report_all_crud_ops(store_generator);
+    apply_batch_matches_individual_writes(store_generator);
+    batch_ops_and_individual_ops_are_indistinguishable(store_generator);
+
+    // Segments: a commit's range of ordinals (`segment_range_of`) and a row's
+    // ordinal by its key (`segment_ordinal_of`).
+    range_of_reports_what_one_commit_appended(store_generator);
+    an_untouched_segment_is_empty_not_an_error(store_generator);
+    a_row_needs_no_key(store_generator);
     a_name_resolves_to_the_ordinal_it_was_appended_at(store_generator);
     an_empty_range_still_says_where_the_commit_stood(store_generator);
 }
@@ -1049,9 +1082,83 @@ fn query_without_a_sort_pages_in_a_fixed_order<S: Store>(store_generator: &dyn F
     assert_eq!(walked, all, "pages partition the matches, in that order");
 }
 
-/// A range predicate against an equality-only type is refused, rather than
+/// A range predicate follows its type's order: `false < true` for a `bool`,
+/// and unsigned byte order for a `str`, `bytes32`, `addr` or `key`, where a
+/// shorter `str` sorts before a longer one it is a prefix of.
+fn query_range_follows_each_types_order<S: Store>(store_generator: &dyn Fn() -> S) {
+    // A fixed-width value starting with `first`: `0x80` must sort above
+    // `0x7f`, which no sign bias would leave it.
+    let word = |first: u8, len: usize| {
+        let mut bytes = vec![0u8; len];
+        bytes[0] = first;
+        bytes
+    };
+
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    for (ordinal, (flag, text, first)) in [
+        (1u8, (0u8, "a", 0x00u8)),
+        (2, (1, "ab", 0x7f)),
+        (3, (1, "b", 0x80)),
+    ] {
+        create_record(
+            &mut store,
+            branch,
+            record_key(ordinal),
+            &[
+                ("f", Cell::attribute(TypeId::BOOL, vec![flag])),
+                ("s", str_attribute(text)),
+                ("h", Cell::attribute(TypeId::BYTES32, word(first, 32))),
+                ("a", Cell::attribute(TypeId::ADDR, word(first, 20))),
+                ("k", Cell::attribute(TypeId::KEY, word(first, 32))),
+            ],
+        );
+    }
+    let at = store.commit(branch).unwrap();
+
+    let compare = |cell: &str, op, type_id, value: Vec<u8>| {
+        let filter = Filter::Predicate(Predicate {
+            cell: cell.to_string(),
+            test: Test::Compare { op, type_id, value },
+        });
+        matched_keys(&store, at, &paged_query(filter, 0, 10))
+    };
+
+    assert_eq!(
+        compare("f", CompareOp::Gt, TypeId::BOOL, vec![0]),
+        vec![record_key(2), record_key(3)],
+        "false < true"
+    );
+    assert_eq!(
+        compare("s", CompareOp::Gt, TypeId::STR, b"a".to_vec()),
+        vec![record_key(2), record_key(3)],
+        "a prefix sorts before the strings it starts"
+    );
+    assert_eq!(
+        compare("s", CompareOp::Lte, TypeId::STR, b"ab".to_vec()),
+        vec![record_key(1), record_key(2)],
+    );
+    for (cell, type_id, len) in [
+        ("h", TypeId::BYTES32, 32),
+        ("a", TypeId::ADDR, 20),
+        ("k", TypeId::KEY, 32),
+    ] {
+        assert_eq!(
+            compare(cell, CompareOp::Gte, type_id, word(0x7f, len)),
+            vec![record_key(2), record_key(3)],
+            "{type_id:?} orders as unsigned bytes"
+        );
+        assert_eq!(
+            compare(cell, CompareOp::Lt, type_id, word(0x80, len)),
+            vec![record_key(1), record_key(2)],
+            "{type_id:?} orders as unsigned bytes"
+        );
+    }
+}
+
+/// A prefix predicate against any type but `str` is refused, rather than
 /// silently answered from an index that cannot support it.
-fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -> S) {
+fn query_prefix_on_a_type_without_one_is_invalid<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
     create_record(
@@ -1065,16 +1172,69 @@ fn query_range_on_eq_only_type_is_invalid<S: Store>(store_generator: &dyn Fn() -
     let filter = Filter::Predicate(Predicate {
         cell: "h".to_string(),
         test: Test::Compare {
-            op: CompareOp::Gt,
+            op: CompareOp::Prefix,
             type_id: TypeId::BYTES32,
-            value: vec![0u8; 32],
+            value: vec![0u8; 4],
         },
     });
 
     assert_eq!(
         store.count(Some(committed), &filter, None).unwrap_err(),
         StoreError::InvalidQuery,
-        "bytes32 indexes equality only"
+        "only str has a prefix match"
+    );
+}
+
+/// A `Between` includes both of its bounds, follows its type's order, and
+/// matches nothing when its low bound is above its high one.
+fn query_between_includes_both_bounds<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    for (ordinal, level) in [(1u8, -2i32), (2, 0), (3, 2)] {
+        create_record(
+            &mut store,
+            branch,
+            record_key(ordinal),
+            &[(
+                "level",
+                Cell::attribute(TypeId::I32, level.to_be_bytes().to_vec()),
+            )],
+        );
+    }
+    let at = store.commit(branch).unwrap();
+
+    let between = |type_id, low: Vec<u8>, high: Vec<u8>| {
+        Filter::Predicate(Predicate {
+            cell: "level".to_string(),
+            test: Test::Between { type_id, low, high },
+        })
+    };
+    let levels = |low: i32, high: i32| {
+        let filter = between(
+            TypeId::I32,
+            low.to_be_bytes().to_vec(),
+            high.to_be_bytes().to_vec(),
+        );
+        matched_keys(&store, at, &paged_query(filter, 0, 10))
+    };
+
+    assert_eq!(
+        levels(-2, 0),
+        vec![record_key(1), record_key(2)],
+        "both bounds are included, and -2 sorts below 0"
+    );
+    assert_eq!(
+        levels(0, 0),
+        vec![record_key(2)],
+        "a bound may be the value"
+    );
+    assert_eq!(levels(2, -2), Vec::<RecordKey>::new(), "an inverted range");
+    assert_eq!(
+        store
+            .count(Some(at), &between(TypeId::BYTES, vec![0], vec![1]), None)
+            .unwrap_err(),
+        StoreError::InvalidQuery,
+        "a type without a range has no between"
     );
 }
 
@@ -1405,8 +1565,8 @@ fn query_presence_matches_records_carrying_the_attribute<S: Store>(
         "negated: the records not carrying it at all"
     );
 
-    // A type that is never indexed cannot be asked for, as a range on an
-    // equality-only type cannot: invalid, not empty.
+    // A type that is never indexed cannot be asked for, as a prefix on a type
+    // without one cannot: invalid, not empty.
     assert_eq!(
         store
             .query(

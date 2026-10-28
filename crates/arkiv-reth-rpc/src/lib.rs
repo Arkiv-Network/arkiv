@@ -343,14 +343,28 @@ where
                 }
             };
 
-            let limit = page_size;
             let live = live_at(query.clone(), block_number);
-            let entities = store_reads::query(&**store, at, &live, offset, limit)
+            // `count` alone selects no entity, so there is no page to read:
+            // the count is the whole answer, with no cursor to a next page.
+            if projection.is_count_only() {
+                let count =
+                    store_reads::count(&**store, at, &live).map_err(store_failure("count"))?;
+                return Ok(QueryResponse {
+                    data: Vec::new(),
+                    block_number,
+                    cursor: None,
+                    count: Some(count),
+                });
+            }
+
+            let limit = page_size;
+            let page = store_reads::query(&**store, at, &live, offset, limit, projection.count)
                 .map_err(store_failure("query"))?;
 
             // A full page may have more behind it; a short one is the end.
-            let more = entities.len() as u64 == limit;
-            let data: Vec<_> = entities
+            let more = page.entities.len() as u64 == limit;
+            let data: Vec<_> = page
+                .entities
                 .into_iter()
                 .map(|e| entity_data_from(e, &projection))
                 .collect();
@@ -359,6 +373,7 @@ where
                 data,
                 block_number,
                 cursor: more.then(|| cursor::encode(offset + limit, binding)),
+                count: page.total_matched,
             })
         },
     )

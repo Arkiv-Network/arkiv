@@ -15,6 +15,7 @@ golemdb-api.workspace = true
 golemdb-cells.workspace = true
 
 [dev-dependencies]
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-query.workspace = true
 # `MAX_PAGE_SIZE`, the largest page `arkiv_query` asks GolemDB for.
 arkiv-rpc-types.workspace = true

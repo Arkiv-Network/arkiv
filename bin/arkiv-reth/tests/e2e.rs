@@ -414,6 +414,25 @@ async fn estimated_gas_is_accepted_by_the_pool() {
         .await
         .expect("update receipt");
     assert!(receipt.status(), "update must succeed");
+
+    // Delete: reth runs every estimate probe on one EVM. If a probe's delete
+    // stuck, the next would revert EntityNotFound and the estimate would climb
+    // to the block gas cap.
+    let delete = registry.execute(vec![Operation::delete(key)]);
+    let estimate = delete.estimate_gas().await.expect("delete estimates");
+    assert!(estimate < 1_000_000, "delete estimated at {estimate}");
+    assert!(
+        !client.get_entity(key).await.is_null(),
+        "estimating a delete must not delete"
+    );
+    let receipt = delete
+        .send()
+        .await
+        .expect("delete with estimated gas accepted by the pool")
+        .get_receipt()
+        .await
+        .expect("delete receipt");
+    assert!(receipt.status(), "delete must succeed");
 }
 
 /// Every query-operator class — eq, IN, ranges, glob, boolean, negation, built-in
@@ -482,6 +501,57 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(
         result_keys(&client.query("team STARTSWITH str('re')", 100, None).await),
         expect(&[0, 1])
+    );
+    // Every type ranges, a `str` in raw byte order: blue < green < re < red.
+    assert_eq!(
+        result_keys(&client.query("team > str('blue')", 100, None).await),
+        expect(&[0, 1, 4])
+    );
+    assert_eq!(
+        result_keys(&client.query("team < str('re')", 100, None).await),
+        expect(&[2, 3, 4])
+    );
+    // A `key` ranges as unsigned bytes, which is the order of its fixed-width
+    // lowercase hex.
+    let mut by_key = k.clone();
+    by_key.sort();
+    assert_eq!(
+        result_keys(
+            &client
+                .query(&format!("$key >= key({})", by_key[2]), 100, None)
+                .await
+        ),
+        by_key[2..].iter().cloned().collect::<BTreeSet<_>>()
+    );
+    // BETWEEN includes both bounds, and its AND is its own.
+    assert_eq!(
+        result_keys(
+            &client
+                .query("rank BETWEEN u256(20) AND u256(40)", 100, None)
+                .await
+        ),
+        expect(&[1, 2, 3])
+    );
+    assert_eq!(
+        result_keys(
+            &client
+                .query(
+                    "team BETWEEN str('blue') AND str('green') AND rank > u256(30)",
+                    100,
+                    None
+                )
+                .await
+        ),
+        expect(&[3, 4])
+    );
+    assert!(
+        result_keys(
+            &client
+                .query("rank BETWEEN u256(40) AND u256(20)", 100, None)
+                .await
+        )
+        .is_empty(),
+        "an inverted BETWEEN matches nothing"
     );
     assert_eq!(
         result_keys(
@@ -623,7 +693,9 @@ async fn query_operator_classes_over_a_live_node() {
         ("$expiresAt >= 1", "-32002"),                        // system u64 needs its tag
         ("$createdAt >= u64(1)", "-32002"),                   // returned, never queried
         ("rank != u256(30)", "-32002"),                       // != is not in the language
-        ("team >= str('blue')", "-32002"),                    // range on an unordered type
+        ("rank STARTSWITH u256(1)", "-32002"),                // a prefix needs a str
+        ("rank BETWEEN u256(1) AND i32(5)", "-32002"),        // bounds of two types
+        ("between = true", "-32001"),                         // a reserved word
         ("exists($owner)", "-32002"),                         // presence takes a user attribute
         ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
         ("rank = i32(2147483648)", "-32003"), // literal out of range
@@ -795,6 +867,41 @@ async fn query_operator_classes_over_a_live_node() {
             .is_err(),
         "a malformed cursor must be refused",
     );
+
+    // `select.count` is the size of the whole match set. Unselected, it is
+    // absent; selected alone, it is the entire answer: no entities, no cursor.
+    assert!(first.get("count").is_none(), "count only when selected");
+    let count_only = client
+        .query_raw(
+            "rank >= u256(20)",
+            serde_json::json!({ "select": { "count": true } }),
+        )
+        .await
+        .expect("count alone");
+    assert_eq!(count_only["count"], "0x4", "four ranks of 20 and up");
+    assert_eq!(count_only["data"], serde_json::json!([]));
+    assert!(
+        count_only.get("cursor").is_none(),
+        "no page, so no next one"
+    );
+
+    // Beside a field, it comes with every page, unchanged by the paging.
+    let counted = serde_json::json!({ "select": { "key": true, "count": true }, "limit": 3 });
+    let counted_page = client
+        .query_raw("rank >= u256(20)", counted.clone())
+        .await
+        .expect("first counted page");
+    assert_eq!(counted_page["count"], "0x4");
+    assert_eq!(result_keys(&counted_page).len(), 3);
+    let mut rest = counted;
+    rest["cursor"] = counted_page["cursor"].clone();
+    let counted_rest = client
+        .query_raw("rank >= u256(20)", rest)
+        .await
+        .expect("second counted page");
+    assert_eq!(counted_rest["count"], "0x4", "the match set, not the page");
+    assert_eq!(result_keys(&counted_rest).len(), 1);
+    assert!(counted_rest.get("cursor").is_none());
 }
 
 /// Every mutating op — update, extend, transfer, delete — driven over a live node

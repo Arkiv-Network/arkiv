@@ -60,6 +60,16 @@ impl From<&Query> for Filter {
             Query::Gte { key, value } => compare(key, CompareOp::Gte, value),
             Query::Lt { key, value } => compare(key, CompareOp::Lt, value),
             Query::Lte { key, value } => compare(key, CompareOp::Lte, value),
+            // One test holding both bounds, not a pair of comparisons, so a
+            // store with ranges of its own answers it as one range.
+            Query::Between { key, bounds } => Self::Predicate(Predicate {
+                cell: key.cell_name(),
+                test: Test::Between {
+                    type_id: type_id_of(bounds.low()),
+                    low: bounds.low().encode(),
+                    high: bounds.high().encode(),
+                },
+            }),
             Query::StartsWith { key, value } => compare(key, CompareOp::Prefix, value),
             Query::Exists { name, attr_type } => Self::Predicate(Predicate {
                 cell: name.clone(),
@@ -78,6 +88,7 @@ impl From<&Query> for Filter {
 mod tests {
     use super::*;
     use crate::entity::{AttributeType, AttributeValue};
+    use crate::query::ValueRange;
     use crate::store::{Cell, Record, RecordKey, RecordVersion, StoreError, TypeId};
     use alloc::string::String;
     use alloc::vec;
@@ -206,6 +217,53 @@ mod tests {
             value: AttributeValue::Int(5)
         }));
         assert!(!at(eq("a", 4)));
+    }
+
+    /// `a BETWEEN lo AND hi`, of `i32` bounds.
+    fn between(name: &str, low: i32, high: i32) -> Query {
+        Query::Between {
+            key: user(name),
+            bounds: ValueRange::new(AttributeValue::Int(low), AttributeValue::Int(high))
+                .expect("one type"),
+        }
+    }
+
+    #[test]
+    fn between_is_one_test_with_both_bounds() {
+        assert_eq!(
+            Filter::from(&between("a", -1, 7)),
+            Filter::Predicate(Predicate {
+                cell: CellName::from("a"),
+                test: Test::Between {
+                    type_id: TypeId::I32,
+                    low: AttributeValue::Int(-1).encode(),
+                    high: AttributeValue::Int(7).encode(),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn between_includes_both_ends_and_orders_negatives() {
+        let at = |n| matches(&between("a", -5, 5), &record(&[("a", n)]));
+        assert!(at(-5) && at(0) && at(5), "both ends are included");
+        assert!(!at(-6) && !at(6));
+        assert!(
+            !matches(&between("a", 5, -5), &record(&[("a", 0)])),
+            "a low above the high admits nothing"
+        );
+        assert!(
+            !matches(&between("a", -5, 5), &record(&[])),
+            "an absent attribute is not between anything"
+        );
+    }
+
+    #[test]
+    fn bounds_of_two_types_cannot_be_built() {
+        assert_eq!(
+            ValueRange::new(AttributeValue::Int(1), AttributeValue::U64(5)),
+            None
+        );
     }
 
     #[test]

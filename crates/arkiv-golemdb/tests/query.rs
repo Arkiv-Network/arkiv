@@ -376,6 +376,98 @@ fn typeof_key_is_not_implemented_and_typeof_bytes32_finds_both() {
     assert_eq!(matched(&store, filter("typeof(parent) = bytes32")), [1, 2]);
 }
 
+/// A range follows its type's order for the types that are not numbers:
+/// `false < true`, and unsigned byte order for a `str`, a `bytes32` and an
+/// `addr`, the system `$owner` and `$key` included.
+#[test]
+fn a_range_follows_the_order_of_every_type() {
+    /// `N` bytes starting with `first`: `0x80` must sort above `0x7f`, which
+    /// a sign bias would invert.
+    fn starting_with<const N: usize>(first: u8) -> [u8; N] {
+        let mut bytes = [0u8; N];
+        bytes[0] = first;
+        bytes
+    }
+    let hex = |first: u8, len: usize| format!("0x{first:02x}{}", "00".repeat(len - 1));
+
+    let entities: Vec<Entity> = [
+        (1, false, "a", 0x00),
+        (2, true, "ab", 0x7f),
+        (3, true, "b", 0x80),
+    ]
+    .into_iter()
+    .map(|(n, flag, team, first)| {
+        entity_with(
+            n,
+            vec![
+                Attribute::new("flag", AttributeValue::Bool(flag)),
+                Attribute::new("hash", AttributeValue::Bytes32(starting_with(first))),
+                Attribute::new("team", AttributeValue::Str(team.into())),
+                Attribute::new("who", AttributeValue::EthereumAddress(starting_with(first))),
+            ],
+        )
+    })
+    .collect();
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, &entities);
+
+    for (query, expected) in [
+        ("flag > false".to_string(), [2, 3]),
+        // A prefix sorts before the strings it starts.
+        ("team > str('a')".to_string(), [2, 3]),
+        ("team <= str('ab')".to_string(), [1, 2]),
+        (format!("hash >= bytes32({})", hex(0x7f, 32)), [2, 3]),
+        (format!("hash < bytes32({})", hex(0x80, 32)), [1, 2]),
+        (format!("who >= addr({})", hex(0x7f, 20)), [2, 3]),
+        (format!("$owner > addr(0x{})", "01".repeat(20)), [2, 3]),
+        (format!("$key <= key(0x{})", "02".repeat(32)), [1, 2]),
+    ] {
+        assert_eq!(matched(&store, filter(&query)), expected, "{query}");
+    }
+}
+
+/// `BETWEEN` includes both bounds, in the type's order, and matches nothing
+/// when its low bound is above its high one. It counts as it queries, and
+/// combines with the live-entity bound the RPC adds.
+#[test]
+fn a_between_includes_both_bounds() {
+    let entities: Vec<Entity> = [(1, -5, "a"), (2, 0, "ab"), (3, 5, "b")]
+        .into_iter()
+        .map(|(n, level, team)| {
+            entity_with(
+                n,
+                vec![
+                    Attribute::new("level", AttributeValue::Int(level)),
+                    Attribute::new("team", AttributeValue::Str(team.into())),
+                ],
+            )
+        })
+        .collect();
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, &entities);
+
+    for (query, expected) in [
+        ("level BETWEEN -5 AND 0", vec![1, 2]),
+        ("level BETWEEN 0 AND 0", vec![2]),
+        ("level BETWEEN -6 AND 6", vec![1, 2, 3]),
+        ("level BETWEEN 1 AND 4", vec![]),
+        ("level BETWEEN 5 AND -5", vec![]),
+        ("team BETWEEN str('a') AND str('ab')", vec![1, 2]),
+        (
+            "level BETWEEN -5 AND 5 AND $expiresAt > u64(999)",
+            vec![1, 2, 3],
+        ),
+        ("level BETWEEN 0 AND 5 OR team = str('a')", vec![1, 2, 3]),
+    ] {
+        assert_eq!(matched(&store, filter(query)), expected, "{query}");
+        let count = store
+            .count(None, &filter(query), None)
+            .expect("GolemDB counts the query")
+            .into_value();
+        assert_eq!(count, expected.len() as u64, "{query}");
+    }
+}
+
 /// The shapes `arkiv_query` sends: bounded to live entities by an AND, and
 /// ORs. A NOT has no GolemDB counterpart.
 #[test]
