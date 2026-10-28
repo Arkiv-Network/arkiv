@@ -137,7 +137,7 @@ pub struct Statement {
     pub order: Option<OrderBy>,
 }
 
-/// `ORDER BY key AS attr_type [ASC | DESC]`: by one attribute, read as one
+/// `ORDER BY key:attr_type [ASC | DESC]`: by one attribute, read as one
 /// type.
 ///
 /// An entity without the attribute, or holding another type there, has no

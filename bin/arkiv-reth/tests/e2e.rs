@@ -915,16 +915,13 @@ async fn query_operator_classes_over_a_live_node() {
     };
     let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
     let ascending = client
-        .query_raw(
-            "rank >= u256(20) ORDER BY rank AS u256",
-            serde_json::json!({}),
-        )
+        .query_raw("rank >= u256(20) ORDER BY rank:u256", serde_json::json!({}))
         .await
         .expect("ascending by rank");
     assert_eq!(in_order(&ascending), keys(&[1, 2, 3, 4]), "ASC by default");
 
     // A cursor carries on through the sorted matches.
-    let by_rank_desc = "rank >= u256(20) ORDER BY rank AS u256 DESC";
+    let by_rank_desc = "rank >= u256(20) ORDER BY rank:u256 DESC";
     let sorted_page = client
         .query_raw(by_rank_desc, serde_json::json!({ "limit": 3 }))
         .await
@@ -945,7 +942,7 @@ async fn query_operator_classes_over_a_live_node() {
     let untyped = client
         .query_raw("* ORDER BY rank", serde_json::json!({}))
         .await
-        .expect_err("a user attribute needs AS <tag>")
+        .expect_err("a user attribute needs :<tag>")
         .to_string();
     assert!(untyped.contains("-32002"), "a type error: {untyped}");
     assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);

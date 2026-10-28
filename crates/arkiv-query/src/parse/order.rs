@@ -1,17 +1,17 @@
 //! The `ORDER BY` clause, which may end a query:
 //!
 //! ```text
-//! orderBy → ORDER BY attrRef [ AS typeTag ] [ ASC | DESC ]
+//! orderBy → ORDER BY attrRef [ ':' typeTag ] [ ASC | DESC ]
 //! ```
 //!
 //! Its words are read where the clause stands, not reserved, so `order`,
-//! `by`, `as`, `asc` and `desc` stay attribute names, as `desc` is in the
-//! spec's example query. After the predicates the only other thing that may
-//! follow is `AND` or `OR`, so an `order` there can only open the clause.
+//! `by`, `asc` and `desc` stay attribute names, as `desc` is in the spec's
+//! example query. After the predicates the only other thing that may follow
+//! is `AND` or `OR`, so an `order` there can only open the clause.
 //!
 //! The clause sorts by one attribute read as one type. A user attribute can
-//! hold any type, so it names the one with `AS`; a system attribute holds one,
-//! which an `AS` may repeat but not contradict.
+//! hold any type, so it names the one after a `:`, as in `rank:u256`; a system
+//! attribute holds one, which a `:` may repeat but not contradict.
 
 use alloc::format;
 
@@ -20,6 +20,7 @@ use arkiv_interfaces::query::{AnnotKey, Direction, OrderBy};
 
 use super::{Parser, TagSite, builtin_type};
 use crate::error::ParseError;
+use crate::lexer::Token;
 
 impl Parser {
     /// The clause, from its `ORDER` to the end of the query.
@@ -29,7 +30,7 @@ impl Parser {
         if self.word_at("by").is_none() {
             return Err(ParseError::syntax(
                 order_at,
-                "ORDER must be followed by BY, as in ORDER BY name AS str — to test an \
+                "ORDER must be followed by BY, as in ORDER BY name:str — to test an \
                  attribute named order, join it with AND or OR",
             ));
         }
@@ -52,20 +53,20 @@ impl Parser {
         })
     }
 
-    /// The type `key` is sorted as: the one `AS` names, or the one a system
+    /// The type `key` is sorted as: the one after its `:`, or the one a system
     /// attribute holds.
     fn parse_sort_type(
         &mut self,
         key: &AnnotKey,
         key_at: usize,
     ) -> Result<AttributeType, ParseError> {
-        let named = match self.word_at("as") {
-            Some(_) => {
+        let named = match self.peek_token() {
+            Some(Token::Colon) => {
                 self.advance();
                 let tag_at = self.next_position();
                 Some((self.parse_type_tag(TagSite::OrderBy)?, tag_at))
             }
-            None => None,
+            _ => None,
         };
         match key {
             AnnotKey::User(name) => named.map(|(attr_type, _)| attr_type).ok_or_else(|| {
@@ -73,7 +74,7 @@ impl Parser {
                     key_at,
                     format!(
                         "{name} can hold any type, so ORDER BY names the one to sort it \
-                         as — write ORDER BY {name} AS str, or another tag"
+                         as — write ORDER BY {name}:str, or another tag"
                     ),
                 )
             }),
@@ -147,7 +148,7 @@ mod tests {
     #[test]
     fn a_query_ends_with_its_order() {
         assert_eq!(
-            parse_statement("rank >= u256(10) ORDER BY rank AS u256 DESC").unwrap(),
+            parse_statement("rank >= u256(10) ORDER BY rank:u256 DESC").unwrap(),
             Statement {
                 filter: Query::Gte {
                     key: user("rank"),
@@ -158,7 +159,7 @@ mod tests {
         );
         // `*` takes an order too.
         assert_eq!(
-            parse_statement("* ORDER BY name AS str").unwrap(),
+            parse_statement("* ORDER BY name:str").unwrap(),
             Statement {
                 filter: Query::All,
                 order: order(user("name"), AttributeType::Str, Direction::Ascending),
@@ -166,13 +167,15 @@ mod tests {
         );
     }
 
+    /// Whitespace around the `:` is insignificant, as everywhere else.
     #[test]
     fn ascending_unless_desc_and_every_word_in_any_case() {
         for (text, direction) in [
-            ("* ORDER BY n AS u64", Direction::Ascending),
-            ("* ORDER BY n AS u64 ASC", Direction::Ascending),
-            ("* order by n as u64 desc", Direction::Descending),
-            ("* Order By n As U64 Desc", Direction::Descending),
+            ("* ORDER BY n:u64", Direction::Ascending),
+            ("* ORDER BY n:u64 ASC", Direction::Ascending),
+            ("* ORDER BY n : u64", Direction::Ascending),
+            ("* order by n:u64 desc", Direction::Descending),
+            ("* Order By n:U64 Desc", Direction::Descending),
         ] {
             assert_eq!(
                 order_of(text),
@@ -187,16 +190,16 @@ mod tests {
     #[test]
     fn the_clause_reserves_none_of_its_words() {
         let statement =
-            parse_statement("desc STARTSWITH str('a') AND order = 1 ORDER BY desc AS str DESC")
+            parse_statement("desc STARTSWITH str('a') AND order = 1 ORDER BY desc:str DESC")
                 .unwrap();
         assert!(matches!(statement.filter, Query::And(_)));
         assert_eq!(
             statement.order,
             order(user("desc"), AttributeType::Str, Direction::Descending)
         );
-        for name in ["order", "by", "as", "asc"] {
+        for name in ["order", "by", "asc", "desc"] {
             assert_eq!(
-                order_of(&alloc::format!("* ORDER BY {name} AS i32")),
+                order_of(&alloc::format!("* ORDER BY {name}:i32")),
                 order(user(name), AttributeType::Int, Direction::Ascending),
                 "{name}"
             );
@@ -206,13 +209,15 @@ mod tests {
     /// A user attribute can hold any type, so the clause names the one.
     #[test]
     fn a_user_attribute_needs_its_type() {
-        let err = err_of("* ORDER BY rank");
-        assert_eq!(err.kind, ParseErrorKind::TypeError);
-        assert!(err.message.contains("ORDER BY rank AS"), "{err}");
-        assert_eq!(err.failure_position, Some("* ORDER BY ".len()));
+        for text in ["* ORDER BY rank", "* ORDER BY rank AS str"] {
+            let err = err_of(text);
+            assert_eq!(err.kind, ParseErrorKind::TypeError, "{text}");
+            assert!(err.message.contains("ORDER BY rank:str"), "{err}");
+            assert_eq!(err.failure_position, Some("* ORDER BY ".len()), "{text}");
+        }
     }
 
-    /// A system attribute holds one type, which `AS` may repeat but not
+    /// A system attribute holds one type, which a `:` may repeat but not
     /// contradict.
     #[test]
     fn a_system_attribute_sorts_as_the_type_it_holds() {
@@ -223,7 +228,7 @@ mod tests {
                 AttributeType::U64,
             ),
             (
-                "* ORDER BY $expiresAt AS u64",
+                "* ORDER BY $expiresAt:u64",
                 BuiltIn::ExpiresAt,
                 AttributeType::U64,
             ),
@@ -233,7 +238,7 @@ mod tests {
                 AttributeType::EthereumAddress,
             ),
             (
-                "* ORDER BY $creator AS addr",
+                "* ORDER BY $creator:addr",
                 BuiltIn::Creator,
                 AttributeType::EthereumAddress,
             ),
@@ -245,10 +250,10 @@ mod tests {
                 "{text}"
             );
         }
-        let err = err_of("* ORDER BY $owner AS u64");
+        let err = err_of("* ORDER BY $owner:u64");
         assert_eq!(err.kind, ParseErrorKind::TypeError);
         assert!(err.message.contains("$owner holds addr"), "{err}");
-        assert_eq!(err.failure_position, Some("* ORDER BY $owner AS ".len()));
+        assert_eq!(err.failure_position, Some("* ORDER BY $owner:".len()));
         // One that is not queryable cannot be sorted by either.
         assert_eq!(
             err_of("* ORDER BY $createdAt").kind,
@@ -257,28 +262,31 @@ mod tests {
     }
 
     #[test]
-    fn as_takes_a_bare_type_tag() {
-        let err = err_of("* ORDER BY a AS bytes");
+    fn the_colon_takes_a_bare_type_tag() {
+        let err = err_of("* ORDER BY a:bytes");
         assert_eq!(err.kind, ParseErrorKind::TypeError);
         assert!(err.message.contains("not a type tag"), "{err}");
 
-        let err = err_of("* ORDER BY a AS str('x')");
+        let err = err_of("* ORDER BY a:str('x')");
         assert_eq!(err.kind, ParseErrorKind::TypeError);
-        assert!(err.message.contains("ORDER BY name AS str"), "{err}");
+        assert!(err.message.contains("ORDER BY name:str"), "{err}");
     }
 
     #[test]
     fn the_clause_needs_its_full_shape_and_ends_the_query() {
         for text in [
             "* ORDER",
-            "* ORDER rank AS str",
+            "* ORDER rank:str",
             "* ORDER BY",
-            "* ORDER BY 5 AS i32",
-            "* ORDER BY rank AS",
-            "* ORDER BY rank AS str sideways",
-            "* ORDER BY rank AS str DESC rank",
-            "* ORDER BY rank AS str AND a = 1",
-            "(a = 1 ORDER BY a AS i32)",
+            "* ORDER BY 5:i32",
+            "* ORDER BY rank:",
+            "* ORDER BY rank::str",
+            "* ORDER BY rank:str:u64",
+            "* ORDER BY rank:str sideways",
+            "* ORDER BY rank:str DESC rank",
+            "* ORDER BY rank:str AND a = 1",
+            "* ORDER BY $expiresAt AS u64",
+            "(a = 1 ORDER BY a:i32)",
         ] {
             assert_eq!(
                 err_of(text).kind,
@@ -291,7 +299,7 @@ mod tests {
     /// `parse` reads the predicates alone, and says so of an order.
     #[test]
     fn parse_refuses_an_order_and_parse_statement_takes_none() {
-        let err = parse("* ORDER BY name AS str").unwrap_err();
+        let err = parse("* ORDER BY name:str").unwrap_err();
         assert_eq!(err.kind, ParseErrorKind::MalformedInputError);
         assert_eq!(err.failure_position, Some("* ".len()));
 

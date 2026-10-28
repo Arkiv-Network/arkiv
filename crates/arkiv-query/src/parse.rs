@@ -412,8 +412,8 @@ impl Parser {
         }
     }
 
-    /// A bare type tag, not a literal: `typeof`'s right-hand side, or what an
-    /// `ORDER BY` sorts `AS`.
+    /// A bare type tag, not a literal: `typeof`'s right-hand side, or the type
+    /// after an `ORDER BY` attribute's `:`.
     ///
     /// Tags are positional rather than reserved, so one arrives as a plain
     /// name; `bytes` is not among them, which is what keeps the one type that
@@ -531,7 +531,7 @@ impl Parser {
 enum TagSite {
     /// `typeof(name) = tag`.
     TypeOf,
-    /// `ORDER BY name AS tag`.
+    /// `ORDER BY name:tag`.
     OrderBy,
 }
 
@@ -540,7 +540,7 @@ impl TagSite {
     fn operator(self) -> &'static str {
         match self {
             Self::TypeOf => "typeof",
-            Self::OrderBy => "ORDER BY … AS",
+            Self::OrderBy => "ORDER BY",
         }
     }
 
@@ -548,7 +548,7 @@ impl TagSite {
     fn form(self, tag: &str) -> String {
         match self {
             Self::TypeOf => alloc::format!("typeof(name) = {tag}"),
-            Self::OrderBy => alloc::format!("ORDER BY name AS {tag}"),
+            Self::OrderBy => alloc::format!("ORDER BY name:{tag}"),
         }
     }
 }

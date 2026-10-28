@@ -49,7 +49,7 @@
 //!
 //! ## Sorting
 //!
-//! A query may end with `ORDER BY attr [AS tag] [ASC | DESC]`, which sorts its
+//! A query may end with `ORDER BY attr[:tag] [ASC | DESC]`, which sorts its
 //! matches by one attribute read as one type: a user attribute names the
 //! type, as every value does, and a system attribute sorts as the one it
 //! holds. `ASC` is the default. [`parse_statement`] reads a whole query
@@ -61,7 +61,7 @@
 //! use arkiv_query::parse_statement;
 //! use arkiv_interfaces::query::Direction;
 //!
-//! let statement = parse_statement("rank >= u256(10) ORDER BY rank AS u256 DESC").unwrap();
+//! let statement = parse_statement("rank >= u256(10) ORDER BY rank:u256 DESC").unwrap();
 //! assert_eq!(statement.order.unwrap().direction, Direction::Descending);
 //!
 //! // A user attribute can hold any type, so the clause has to name one.

@@ -567,22 +567,22 @@ fn order_by_sorts_by_one_attribute_read_as_one_type() {
     let red = |order: &str| format!("team = str('red') ORDER BY {order}");
 
     assert_eq!(
-        sorted_page(&store, &red("rank AS u64"), 0, 10),
+        sorted_page(&store, &red("rank:u64"), 0, 10),
         [3, 4, 2, 5, 1, 6]
     );
     assert_eq!(
-        sorted_page(&store, &red("rank AS u64 DESC"), 0, 10),
+        sorted_page(&store, &red("rank:u64 DESC"), 0, 10),
         [6, 1, 2, 5, 3, 4]
     );
     // Read as an `i32`, only 4 has a value, and the rest keep creation order.
     assert_eq!(
-        sorted_page(&store, &red("rank AS i32 DESC"), 0, 10),
+        sorted_page(&store, &red("rank:i32 DESC"), 0, 10),
         [4, 1, 2, 3, 5, 6]
     );
     // Pages partition the sorted matches.
     for (offset, page) in [(0, [6, 1]), (2, [2, 5]), (4, [3, 4])] {
         assert_eq!(
-            sorted_page(&store, &red("rank AS u64 DESC"), offset, 2),
+            sorted_page(&store, &red("rank:u64 DESC"), offset, 2),
             page,
             "page at {offset}"
         );

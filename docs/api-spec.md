@@ -276,15 +276,15 @@ typeTag     = "i32" | "u64" | "u256" | "dec" | "str" | "addr" | "key" | "bytes32
 boolLit     = TRUE | FALSE ;
 strLit      = "'" , { utf8Char | "''" } , "'" ;
 
-orderBy     = ORDER , BY , attrRef , [ AS , typeTag ] , [ ASC | DESC ] ;
+orderBy     = ORDER , BY , attrRef , [ ":" , typeTag ] , [ ASC | DESC ] ;
 ```
 
 Precedence, tightest first: `NOT`, `AND`, `OR` (a `BETWEEN`'s own `AND` is part
 of the predicate). Reserved words:
 `AND OR NOT TRUE FALSE BETWEEN STARTSWITH EXISTS TYPEOF`. Type tags are recognized
-positionally (before `(`, as `TYPEOF`'s RHS and after `AS`), not globally
-reserved, and so are `ORDER BY AS ASC DESC`, which are words only where the
-clause stands: `desc` stays a valid attribute name. `bytes` has no literal,
+positionally (before `(`, as `TYPEOF`'s RHS and after an `ORDER BY`
+attribute's `:`), not globally reserved, and so are `ORDER BY ASC DESC`, which
+are words only where the clause stands: `desc` stays a valid attribute name. `bytes` has no literal,
 since it can never be indexed.
 
 ### Operator × type matrix
@@ -333,16 +333,16 @@ A query may end with `ORDER BY`, which returns its matches sorted by **one**
 attribute, read as **one** type:
 
 ```sql
-rank >= u256(10) ORDER BY rank AS u256 DESC
-* ORDER BY name AS str
+rank >= u256(10) ORDER BY rank:u256 DESC
+* ORDER BY name:str
 team = str('red') ORDER BY $expiresAt
 ```
 
 - **The type is part of the clause.** A user attribute can hold different
-  types on different entities, so it names the one to sort by with
-  `AS typeTag`; `ORDER BY rank` alone is a type error. A queryable system
-  attribute has one type, which `AS` may repeat but not contradict
-  (`ORDER BY $owner AS u64` is a type error).
+  types on different entities, so it names the one to sort by after a `:`,
+  as in `rank:u256`; `ORDER BY rank` alone is a type error. A queryable system
+  attribute has one type, which a `:` may repeat but not contradict
+  (`ORDER BY $owner:u64` is a type error).
 - `ASC` is the default; `DESC` reverses the values' order.
 - Values sort in the order of their type, as for range comparisons (see the
   operator × type matrix).
