@@ -50,8 +50,14 @@ pub(crate) fn store_error(error: ApiError) -> StoreError {
 /// Running out of budget reports what was spent by then, which GolemDB puts on
 /// the receipt rather than in the error. Other failures carry no receipt:
 /// Arkiv's errors have no room for one.
-pub(crate) fn metered_result<T>(metered: golemdb::Metered<T>) -> Result<Metered<T>, StoreError> {
+pub(crate) fn metered_result<T>(
+    operation: &'static str,
+    metered: golemdb::Metered<T>,
+) -> Result<Metered<T>, StoreError> {
     let golemdb::Metered { result, receipt } = metered;
+    if matches!(operation, "create" | "patch" | "delete") {
+        log_write_receipt(operation, &receipt, result.as_ref().err());
+    }
     match result {
         Ok(value) => Ok(Metered::new(value, arkiv_receipt(&receipt))),
         Err(ApiError::OutOfBudget { .. }) => Err(StoreError::OutOfBudget {
@@ -61,8 +67,27 @@ pub(crate) fn metered_result<T>(metered: golemdb::Metered<T>) -> Result<Metered<
     }
 }
 
+/// Log writes before conversion drops the ledger or maps an error without a receipt.
+/// Debug formatting is only performed when this tracing target is enabled.
+fn log_write_receipt(
+    operation: &'static str,
+    receipt: &golemdb::Receipt,
+    error: Option<&ApiError>,
+) {
+    tracing::debug!(
+        target: "arkiv::golemdb::metering",
+        operation,
+        cost = receipt.cost,
+        priced_at = ?receipt.priced_at,
+        ledger = ?receipt.ledger,
+        details = ?receipt.details,
+        ?error,
+        "GolemDB receipt"
+    );
+}
+
 /// GolemDB's receipt as Arkiv's. GolemDB names no schedule version, so
-/// `schedule` stays 0; its per-weight ledger is not carried yet.
+/// `schedule` stays 0; write ledgers are logged but not carried.
 pub(crate) fn arkiv_receipt(receipt: &golemdb::Receipt) -> Receipt {
     let details = &receipt.details;
     Receipt {

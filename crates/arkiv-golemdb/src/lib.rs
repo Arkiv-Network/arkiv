@@ -21,6 +21,7 @@ mod convert;
 mod tags;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellKind, CellName, CommitId,
@@ -31,7 +32,15 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, RecordLimits};
+pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, PricingConfig, RecordLimits};
+
+pub fn host_metering_schema() -> golemdb::HostMeteringSchema {
+    use arkiv_tokenomics::schedule::{HOST_CODE_VERSION, HOST_WEIGHT_NAMES};
+    golemdb::HostMeteringSchema {
+        code_version: HOST_CODE_VERSION,
+        weight_names: HOST_WEIGHT_NAMES.into_iter().map(str::to_owned).collect(),
+    }
+}
 
 use convert::{
     arkiv_query_result, arkiv_receipt, arkiv_record, branch_id, commit_id, count_op,
@@ -61,6 +70,11 @@ pub struct SegmentSpec {
 const SHARD_SPAN: u64 = 500_000;
 
 impl GolemDbConfig {
+    fn open_config(&self) -> Result<golemdb::OpenConfig, OpenError> {
+        Ok(golemdb::OpenConfig::new(self.full_genesis()?)
+            .with_host_schemas(vec![host_metering_schema()]))
+    }
+
     /// [`genesis`](Self::genesis) with the host's segments, as LZ4-compressed
     /// byte columns, and the adapter's own.
     fn full_genesis(&self) -> Result<Genesis, OpenError> {
@@ -93,6 +107,9 @@ impl GolemDbConfig {
 #[derive(Clone)]
 pub struct GolemDbStore {
     database: golemdb::Database,
+    // Immutable segments need a temporary directory even with MemoryStore.
+    // Drop it after the database and only after the last clone is gone.
+    _memory_directory: Option<Arc<tempfile::TempDir>>,
 }
 
 impl core::fmt::Debug for GolemDbStore {
@@ -105,16 +122,25 @@ impl GolemDbStore {
     /// Open `directory`, creating it with `config` if it is new. Only one
     /// process may open a directory.
     pub fn open(directory: &Path, config: &GolemDbConfig) -> Result<Self, OpenError> {
-        let database =
-            golemdb::Database::open(directory, &golemdb::OpenConfig::new(config.full_genesis()?))?;
-        Ok(Self { database })
+        let database = golemdb::Database::open(directory, &config.open_config()?)?;
+        Ok(Self {
+            database,
+            _memory_directory: None,
+        })
     }
 
     /// A new database in memory, created with `config`; gone when the last
     /// clone drops. It computes the same roots as one on disk.
     pub fn open_memory(config: &GolemDbConfig) -> Result<Self, OpenError> {
-        let database = golemdb::Database::open_memory(&config.full_genesis()?)?;
-        Ok(Self { database })
+        let directory = Arc::new(tempfile::TempDir::new().map_err(OpenError::Io)?);
+        let config = config
+            .open_config()?
+            .with_immutable_data_directory(directory.path());
+        let database = golemdb::Database::from_store(golemdb_storage::MemoryStore::new(), &config)?;
+        Ok(Self {
+            database,
+            _memory_directory: Some(directory),
+        })
     }
 
     /// Seal `branch`, stage its commit's `commit_tags` row and commit. If the
@@ -223,6 +249,31 @@ impl GolemDbStore {
 }
 
 impl Store for GolemDbStore {
+    fn pricing_snapshot(
+        &self,
+        at: CommitId,
+    ) -> Result<arkiv_interfaces::store::PricingSnapshot, StoreError> {
+        use arkiv_interfaces::store::{PricingModel, PricingSnapshot};
+        let commit = Some(golemdb_commit(at));
+        let model = self.database.metering_model(commit).map_err(store_error)?;
+        let weights = self
+            .database
+            .model_weights(commit, Some(model.active.version))
+            .map_err(store_error)?;
+        if model.commit_id != weights.commit_id || model.active.version != weights.version {
+            return Err(StoreError::Internal);
+        }
+        Ok(PricingSnapshot {
+            commit_id: commit_id(model.commit_id),
+            model: PricingModel {
+                version: weights.version,
+                golemdb_code_version: model.active.golemdb_code_version,
+                host_code_version: model.active.host_code_version,
+                weights: weights.weights,
+            },
+        })
+    }
+
     /// Panics if the head cannot be read: an I/O failure, where stopping is
     /// the only safe answer.
     fn head(&self) -> CommitId {
@@ -304,7 +355,7 @@ impl Store for GolemDbStore {
                 CellKind::Field => operation.field(name, value),
             };
         }
-        metered_result(self.database.create(branch_id(branch), operation))
+        metered_result("create", self.database.create(branch_id(branch), operation))
             .map(|metered| metered.map(|key| RecordKey(key.0)))
     }
 
@@ -336,7 +387,7 @@ impl Store for GolemDbStore {
                 Ok(Metered::new(None, arkiv_receipt(&receipt)))
             }
             result => {
-                let read = metered_result(golemdb::Metered::new(result, receipt))?;
+                let read = metered_result("get", golemdb::Metered::new(result, receipt))?;
                 Ok(Metered::new(Some(arkiv_record(&read.value)?), read.receipt))
             }
         }
@@ -372,7 +423,7 @@ impl Store for GolemDbStore {
                 CellChange::Remove => operation.remove(name),
             };
         }
-        metered_result(self.database.patch(branch_id(branch), operation))
+        metered_result("patch", self.database.patch(branch_id(branch), operation))
             .map(|metered| metered.map(|()| RecordVersion(0)))
     }
 
@@ -386,10 +437,13 @@ impl Store for GolemDbStore {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
         }
-        metered_result(self.database.delete(
-            branch_id(branch),
-            golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
-        ))
+        metered_result(
+            "delete",
+            self.database.delete(
+                branch_id(branch),
+                golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
+            ),
+        )
     }
 
     /// The query runs as written, so what GolemDB cannot run yet is
@@ -404,6 +458,7 @@ impl Store for GolemDbStore {
         budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
         let page = metered_result(
+            "query",
             self.database
                 .query(at.map(golemdb_commit), query_op(query, budget)?),
         )?;
@@ -419,6 +474,7 @@ impl Store for GolemDbStore {
         budget: Option<Budget>,
     ) -> Result<Metered<u64>, StoreError> {
         metered_result(
+            "count",
             self.database
                 .count(at.map(golemdb_commit), count_op(filter, budget)?),
         )

@@ -11,8 +11,6 @@ arkiv-interfaces.workspace = true
 # Block headers come out of the append-only tier as consensus RLP.
 alloy-rlp.workspace = true
 arkiv-reth-statemanager.workspace = true
-# The genesis fee schedule the builder seeds.
-arkiv-tokenomics.workspace = true
 reth-provider.workspace = true
 reth-storage-api.workspace = true
 reth-storage-errors.workspace = true

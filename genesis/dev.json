@@ -30,15 +30,51 @@
         "record_limits": {
           "max_cells": 39,
           "max_indexed_cells": 36
+        },
+        "metering": {
+          "golemdb_code_version": 1,
+          "host_code_version": 1,
+          "weights": {
+            "write.admission.base": 1,
+            "write.admission.entry": 1,
+            "write.admission.byte": 1,
+            "write.record.create": 1,
+            "write.record.patch": 1,
+            "write.record.delete": 1,
+            "write.cell.create": 1,
+            "write.cell.update": 1,
+            "write.cell.delete": 1,
+            "write.cell_trie_update": 1,
+            "write.cell_byte": 1,
+            "write.index.join": 1,
+            "write.index.leave": 1,
+            "write.index_term_create": 1,
+            "write.index_trie_update": 1,
+            "write.index_byte": 1,
+            "read.key": 1,
+            "read.cell": 1,
+            "read.cell_scan": 1,
+            "read.byte": 1,
+            "read.term": 1,
+            "read.base": 1,
+            "read.admission.base": 1,
+            "read.admission.entry": 1,
+            "read.admission.byte": 1,
+            "read.term_step": 1,
+            "read.container": 1,
+            "read.set_container": 1,
+            "read.sort_compare": 1,
+            "write.log_append.base": 1,
+            "write.log_append.byte": 1,
+            "read.log_row": 1,
+            "host.arkiv.capacity_rate": 14,
+            "host.arkiv.cell_byte_units": 1,
+            "host.arkiv.index_byte_units": 1,
+            "host.arkiv.c_cell": 64,
+            "host.arkiv.c_idx": 64,
+            "host.arkiv.max_lifetime": 7884000
+          }
         }
-      },
-      "tokenomics": {
-        "capacity_rate": 14,
-        "cell_byte_units": 1,
-        "index_byte_units": 1,
-        "c_cell": 64,
-        "c_idx": 64,
-        "max_lifetime": 7884000
       }
     }
   },

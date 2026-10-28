@@ -12,7 +12,3 @@ license.workspace = true
 
 [dependencies]
 arkiv-interfaces.workspace = true
-
-[dev-dependencies]
-# keccak256, to prove the schedule's record key is the hash it says it is.
-alloy-primitives.workspace = true
