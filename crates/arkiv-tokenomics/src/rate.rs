@@ -97,7 +97,14 @@ mod tests {
     const GWEI: u64 = 1_000_000_000;
 
     fn schedule() -> FeeSchedule {
-        FeeSchedule::with_placeholder_weights(10_000_000)
+        FeeSchedule {
+            capacity_rate: 14,
+            cell_byte_units: 1,
+            index_byte_units: 1,
+            c_cell: 64,
+            c_idx: 64,
+            max_lifetime: 10_000_000,
+        }
     }
 
     /// A create spreads its purchase over its lifetime: at 10 gwei and a

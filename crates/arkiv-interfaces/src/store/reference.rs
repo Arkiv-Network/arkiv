@@ -141,7 +141,7 @@ struct BranchState {
 ///
 /// ponytail: one global lock. Shard it if a single node ever contends.
 #[derive(Debug)]
-pub struct MemStore(Mutex<Inner>);
+pub struct MemStore(Mutex<Inner>, Option<super::PricingModel>);
 
 /// The state itself. Every method here is the plain `&mut self` logic; the
 /// trait impls below are the borrow.
@@ -163,9 +163,15 @@ impl Default for MemStore {
 }
 
 impl MemStore {
+    /// Explicit test/experimental model; reference roots do not commit to it.
+    pub fn with_pricing(mut self, model: super::PricingModel) -> Self {
+        self.1 = Some(model);
+        self
+    }
+
     /// A store at genesis: commit 0, empty state, no open branches.
     pub fn new() -> Self {
-        Self(Mutex::new(Inner::new()))
+        Self(Mutex::new(Inner::new()), None)
     }
 }
 
@@ -828,6 +834,17 @@ impl Inner {
 // re-entrantly and deadlock.
 
 impl Store for MemStore {
+    fn pricing_snapshot(&self, at: CommitId) -> Result<super::PricingSnapshot, StoreError> {
+        let inner = self.0.lock().unwrap();
+        if at != inner.head() {
+            return Err(StoreError::HandleInvalid);
+        }
+        Ok(super::PricingSnapshot {
+            commit_id: at,
+            model: self.1.clone().ok_or(StoreError::PricingUnavailable)?,
+        })
+    }
+
     fn head(&self) -> CommitId {
         self.0
             .lock()

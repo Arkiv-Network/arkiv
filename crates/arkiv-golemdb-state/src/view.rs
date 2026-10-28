@@ -23,7 +23,7 @@ use arkiv_interfaces::statemanager::{
 };
 use arkiv_interfaces::store::{BranchId, CommitId, ReadTarget, Store, StoreError};
 use arkiv_reth_uncommitted_store::MemPruningStore;
-use arkiv_tokenomics::schedule_record::{self, ScheduleError};
+use arkiv_tokenomics::ScheduleError;
 use arkiv_tokenomics::{FeeSchedule, FeeScheduleSource};
 
 use crate::accounts::AccountError;
@@ -261,28 +261,13 @@ impl<S: Store> PruningStore for GolemStateView<S> {
     }
 }
 
-/// The fee schedule at the view's base commit, never through its branch: every
-/// transaction a block runs over the same base prices with the same snapshot,
-/// and a schedule written during the block cannot change it.
-///
-/// Interim: once GolemDB's pricing snapshot carries Arkiv's weights, this reads
-/// the snapshot instead of a record. The read is host overhead, not charged to
-/// the transaction.
+/// Host inspection at the execution base, unmetered and explicitly selected.
 impl<S: Store> FeeScheduleSource for GolemStateView<S> {
     type Error = ViewError;
 
     fn fee_schedule(&self) -> Result<FeeSchedule, ViewError> {
-        let record = self
-            .store
-            .get(
-                ReadTarget::Commit(self.origin),
-                schedule_record::RECORD_KEY,
-                None,
-                None,
-            )?
-            .into_value()
-            .ok_or(ViewError::Schedule(ScheduleError::Absent))?;
-        schedule_record::from_record(&record).map_err(ViewError::Schedule)
+        let snapshot = self.store.pricing_snapshot(self.origin)?;
+        FeeSchedule::from_model(&snapshot.model).map_err(ViewError::Schedule)
     }
 }
 
@@ -492,56 +477,51 @@ pub(crate) mod tests {
         assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
     }
 
-    /// The schedule is the base commit's: a write to the record on the view's
-    /// own branch, as a block's transaction might make, does not change what
-    /// the block prices with.
     #[test]
-    fn the_fee_schedule_is_read_at_the_base_commit() {
-        use alloc::vec;
-        use arkiv_interfaces::store::{Cell, CellChange, TypeId};
-
-        let configured = FeeSchedule::with_placeholder_weights(7_884_000);
-        let store = MemStore::new();
-        let genesis = store.begin(None).unwrap();
-        store
-            .create(
-                genesis,
-                schedule_record::RECORD_KEY,
-                schedule_record::to_cells(&configured),
-                None,
-            )
-            .unwrap();
-        let origin = store.commit(genesis).unwrap();
-
-        let branch = store.begin(Some(origin)).unwrap();
+    fn the_schedule_comes_from_the_model_without_a_user_record() {
+        use alloc::sync::Arc;
+        use arkiv_interfaces::store::PricingModel;
+        let weights = arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
+            .into_iter()
+            .zip([21, 2, 3, 64, 65, 1000])
+            .map(|(name, value)| (alloc::string::String::from(name), value))
+            .collect();
+        let store = MemStore::new().with_pricing(PricingModel {
+            version: 2,
+            golemdb_code_version: 1,
+            host_code_version: 1,
+            weights: Arc::new(weights),
+        });
+        let branch = store.begin(None).unwrap();
         let view = GolemStateView::new(
             store,
             branch,
-            origin,
-            BlockRef::new(10, [0xBB; 32]),
-            SessionId([7; 16]),
+            CommitId::GENESIS,
+            BlockRef::new(0, [0; 32]),
+            SessionId([0; 16]),
         );
-        view.store()
-            .patch(
-                branch,
-                schedule_record::RECORD_KEY,
-                None,
-                vec![(
-                    schedule_record::CAPACITY_RATE.into(),
-                    CellChange::Set(Cell::field(TypeId::U64, 99u64.to_be_bytes().to_vec())),
-                )],
-                None,
-            )
-            .unwrap();
-
-        assert_eq!(view.fee_schedule(), Ok(configured));
+        let schedule = view.fee_schedule().unwrap();
+        assert_eq!(
+            (
+                schedule.capacity_rate,
+                schedule.cell_byte_units,
+                schedule.c_idx,
+                schedule.max_lifetime
+            ),
+            (21, 2, 65, 1000)
+        );
+        view.store().commit(branch).unwrap();
+        assert_eq!(
+            view.fee_schedule(),
+            Err(ViewError::Store(StoreError::HandleInvalid))
+        );
     }
 
     #[test]
-    fn a_base_without_a_fee_schedule_prices_nothing() {
+    fn an_unconfigured_store_has_no_fee_schedule() {
         assert_eq!(
             view().fee_schedule(),
-            Err(ViewError::Schedule(ScheduleError::Absent))
+            Err(ViewError::Store(StoreError::PricingUnavailable))
         );
     }
 

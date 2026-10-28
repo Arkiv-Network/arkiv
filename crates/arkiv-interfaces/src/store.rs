@@ -46,6 +46,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
@@ -918,12 +919,30 @@ pub enum StoreError {
     /// live one, and a host should treat it as fatal: a second block reaching
     /// a committed height means the store and the ledger have diverged.
     Conflict,
+    /// No pricing model was explicitly configured for this store.
+    PricingUnavailable,
     Internal,
 }
 
 // ---------------------------------------------------------------------------
 // The seam
 // ---------------------------------------------------------------------------
+
+/// Immutable model values. The engine and host interpret their own weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PricingModel {
+    pub version: u64,
+    pub golemdb_code_version: u64,
+    pub host_code_version: u64,
+    pub weights: Arc<BTreeMap<String, u64>>,
+}
+
+/// The active pricing model at one explicitly selected committed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PricingSnapshot {
+    pub commit_id: CommitId,
+    pub model: PricingModel,
+}
 
 /// The backing store, as `golem-db-api.md` specifies it.
 ///
@@ -960,6 +979,10 @@ pub enum StoreError {
 ///
 /// [`Arc<T>`]: alloc::sync::Arc
 pub trait Store: core::fmt::Debug {
+    /// Unmetered pricing inspection. Never substitute current-head prices for
+    /// an unavailable commit, or zero weights for missing configuration.
+    fn pricing_snapshot(&self, at: CommitId) -> Result<PricingSnapshot, StoreError>;
+
     // -- commits and branches (unmetered) ----------------------------------
 
     /// The current canonical head.
@@ -1312,6 +1335,10 @@ pub trait StoreExt: Store {
 /// A shared handle is a store. This is the point of the `&self` seam: a host
 /// opens one store and gives every view an `Arc` of it.
 impl<T: Store + ?Sized> Store for alloc::sync::Arc<T> {
+    fn pricing_snapshot(&self, at: CommitId) -> Result<PricingSnapshot, StoreError> {
+        (**self).pricing_snapshot(at)
+    }
+
     fn head(&self) -> CommitId {
         (**self).head()
     }

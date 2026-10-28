@@ -102,6 +102,10 @@ fn priced(receipt: Receipt, cost: u64) -> Receipt {
 
 /// Only the four CRUD calls change anything; everything else forwards.
 impl<S: Store> Store for Priced<S> {
+    fn pricing_snapshot(&self, at: CommitId) -> Result<super::PricingSnapshot, StoreError> {
+        self.inner.pricing_snapshot(at)
+    }
+
     fn head(&self) -> CommitId {
         self.inner.head()
     }

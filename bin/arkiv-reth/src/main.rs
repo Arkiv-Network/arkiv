@@ -83,7 +83,11 @@ fn open_store(
         (None, Some(store)) => match store.to_str() {
             Some("memory") => {
                 info!(target: "arkiv-reth", "Arkiv state in-process, lost when the node stops");
-                Ok(Arc::new(arkiv_interfaces::store::reference::MemStore::new()))
+                let mut store = arkiv_interfaces::store::reference::MemStore::new();
+                if let Some(model) = experimental_pricing(spec) {
+                    store = store.with_pricing(model);
+                }
+                Ok(Arc::new(store))
             }
             // Every scheme Valkey's client takes: plain, TLS, cluster, sentinel, socket.
             Some(url)
@@ -91,7 +95,7 @@ fn open_store(
                     scheme.starts_with("redis") || scheme.starts_with("valkey")
                 }) =>
             {
-                open_valkey(url)
+                open_valkey(url, spec)
             }
             _ => eyre::bail!(
                 "ARKIV_EXPERIMENTAL_STORE={}: use memory, or a Valkey URL such as \
@@ -139,12 +143,26 @@ fn open_golemdb(directory: &Path, spec: &ArkivChainSpec) -> eyre::Result<HostSto
     Ok(Arc::new(store))
 }
 
+/// Reference backends have no engine model; inject the chain's explicit values.
+fn experimental_pricing(spec: &ArkivChainSpec) -> Option<arkiv_interfaces::store::PricingModel> {
+    let pricing = &spec.golemdb()?.metering;
+    Some(arkiv_interfaces::store::PricingModel {
+        version: 1,
+        golemdb_code_version: pricing.golemdb_code_version,
+        host_code_version: pricing.host_code_version,
+        weights: Arc::new(pricing.weights.clone()),
+    })
+}
+
 /// Connect to the Valkey server at `url`, in the namespace
 /// `ARKIV_STORE_NAMESPACE` names (`arkiv` if unset).
-fn open_valkey(url: &str) -> eyre::Result<HostStore> {
+fn open_valkey(url: &str, spec: &ArkivChainSpec) -> eyre::Result<HostStore> {
     let namespace = std::env::var("ARKIV_STORE_NAMESPACE").unwrap_or_else(|_| "arkiv".to_owned());
-    let store = arkiv_valkey::ValkeyStore::connect(url, &namespace)
+    let mut store = arkiv_valkey::ValkeyStore::connect(url, &namespace)
         .map_err(|e| eyre::eyre!("connect to the Arkiv store at {url}: {e:?}"))?;
+    if let Some(model) = experimental_pricing(spec) {
+        store = store.with_pricing(model);
+    }
     info!(target: "arkiv-reth", %url, %namespace, "Arkiv state on Valkey");
     Ok(Arc::new(store))
 }
@@ -280,20 +298,13 @@ fn main() {
         async move |builder, _| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
             let store = open(&builder.config().chain);
-            // A chain without a fee schedule could price nothing, so it does
-            // not start, whatever store it runs on.
-            let fee_schedule = builder
-                .config()
-                .chain
-                .fee_schedule()
-                .copied()
-                .ok_or_else(|| {
-                    eyre::eyre!(
-                        "the genesis file has no config.arkiv.tokenomics, the fee schedule every \
-                     Arkiv chain needs; `arkiv-reth dump-genesis --chain dev` prints a genesis \
-                     that has one"
-                    )
-                })?;
+            let pricing = store.pricing_snapshot(store.head()).map_err(|e| {
+                eyre::eyre!(
+                    "the store has no usable pricing model (config.arkiv.golemdb.metering): {e:?}"
+                )
+            })?;
+            arkiv_tokenomics::FeeSchedule::from_model(&pricing.model)
+                .map_err(|e| eyre::eyre!("invalid host pricing: {e:?}"))?;
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone());
@@ -315,7 +326,7 @@ fn main() {
                     Ok(())
                 });
             let launcher = builder.engine_api_launcher().with_provider_builder(
-                ArkivProviderBuilder::new(store.clone(), seals.clone(), fee_schedule)
+                ArkivProviderBuilder::new(store.clone(), seals.clone())
                     .check_genesis_root(on_golemdb),
             );
             let handle = builder
@@ -338,10 +349,6 @@ fn exit_with(err: &eyre::Report) -> ! {
 mod tests {
     use super::*;
     use arkiv_golemdb::HashAlgorithm;
-    use arkiv_interfaces::constants::{
-        MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
-    };
-    use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use serde_json::{Value, json};
 
     fn set(value: impl Into<OsString>) -> Option<OsString> {
@@ -373,13 +380,7 @@ mod tests {
     fn spec(golemdb: Option<Value>) -> ArkivChainSpec {
         let mut genesis = json!({ "config": { "chainId": 424242 } });
         if let Some(golemdb) = golemdb {
-            genesis["config"]["arkiv"] = json!({
-                "golemdb": golemdb,
-                "tokenomics": {
-                    "capacity_rate": 14, "cell_byte_units": 1, "index_byte_units": 1,
-                    "c_cell": 64, "c_idx": 64, "max_lifetime": 7_884_000
-                }
-            });
+            genesis["config"]["arkiv"] = json!({ "golemdb": golemdb });
         }
         ArkivChainSpec::from_genesis(serde_json::from_value(genesis).unwrap()).unwrap()
     }
@@ -411,18 +412,11 @@ mod tests {
 
     /// `config.arkiv.golemdb` with `hash_function` and Arkiv's limits.
     fn golemdb(hash_function: &str) -> Value {
-        json!({
-            "hash_function": hash_function,
-            "cell_limits": {
-                "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
-                "max_str_len": MAX_STR_BYTES,
-                "max_bytes_len": MAX_BYTES_VALUE_LEN
-            },
-            "record_limits": {
-                "max_cells": MAX_RECORD_CELLS,
-                "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-            }
-        })
+        let mut genesis: Value =
+            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+        let mut golemdb = genesis["config"]["arkiv"]["golemdb"].take();
+        golemdb["hash_function"] = json!(hash_function);
+        golemdb
     }
 
     /// GolemDB has no settings of its own: they come from the genesis file.

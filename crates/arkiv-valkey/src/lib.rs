@@ -67,9 +67,16 @@ pub struct ValkeyStore {
     /// Whether dropping this store should erase its namespace — true only for
     /// [`ephemeral`](Self::ephemeral). See the [`Drop`] impl.
     owns_namespace: bool,
+    pricing: Option<arkiv_interfaces::store::PricingModel>,
 }
 
 impl ValkeyStore {
+    /// Explicit experimental model. Model updates are only supported by GolemDB.
+    pub fn with_pricing(mut self, model: arkiv_interfaces::store::PricingModel) -> Self {
+        self.pricing = Some(model);
+        self
+    }
+
     /// Connect to `url` and claim `namespace` for this store's keys.
     ///
     /// Existing data under that namespace is adopted as committed state, so
@@ -91,6 +98,7 @@ impl ValkeyStore {
             bridge,
             backend: Backend::new(client, namespace),
             owns_namespace: false,
+            pricing: None,
         };
         store.clear_branches()?;
         Ok(store)
@@ -213,6 +221,20 @@ const _: () = {
 };
 
 impl Store for ValkeyStore {
+    fn pricing_snapshot(
+        &self,
+        at: CommitId,
+    ) -> Result<arkiv_interfaces::store::PricingSnapshot, StoreError> {
+        let head = self.call(|backend| async move { backend.head().await })?;
+        if at != CommitId(head) {
+            return Err(StoreError::HandleInvalid);
+        }
+        Ok(arkiv_interfaces::store::PricingSnapshot {
+            commit_id: at,
+            model: self.pricing.clone().ok_or(StoreError::PricingUnavailable)?,
+        })
+    }
+
     fn head(&self) -> CommitId {
         // The trait's one infallible method. A server that cannot answer is
         // not a state this store can represent, so it reports genesis and the

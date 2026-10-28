@@ -438,46 +438,27 @@ tests) and is its own commit.
    extend before a shrink buys twice the storage of the reverse. `units_delta` is checked
    against the effects GolemDB's write-details tests pin.
 
-5. **Fee schedule as cells.**
-   `config.arkiv.tokenomics` in the chain spec; seeded at genesis into a
-   fee-schedule record with one cell per `host.arkiv.*` name; the executor
-   reads it from the block's base state behind a small `FeeScheduleSource`
-   trait, so GolemDB's pricing snapshot can replace it later.
-   **Interim until GolemDB carries host weights** (decided 2026-10-26). GolemDB's design (D9)
-   has `host.*` weights stored, validated and activated in its cost schedule and returned in
-   the pricing snapshot each call is priced with; GolemDB never prices with them. At
-   `d910d14` only the in-memory `Schedule` exists: persisting it (GolemDB iteration 5), runtime
-   changes (iteration 8) and an API that returns the snapshot's weights are still to come.
-   Arkiv's own record mirrors D9 meanwhile: the same names, `u64` values, missing means
-   unavailable, read once from the base commit. **To adjust once the values can be read from
-   GolemDB's schedule:** `FeeScheduleSource` reads the pricing snapshot instead, the
-   fee-schedule record leaves genesis (a genesis change), and `config.arkiv.tokenomics` moves
-   into GolemDB's genesis model. Arkiv needs from GolemDB: an initial model with a host code
-   version and the `host.arkiv.*` weights in its genesis config, opening the database with that
-   host code version and weight names, and a call returning the snapshot's weights for a branch
-   or commit, mirrored in Arkiv's `Store` adapter. Placeholder
-  values in `genesis/dev.json` and `genesis/example.json`, including the
-  `host.arkiv.max_lifetime` admission limit, fixed by the same block-base snapshot.
-   *Done when:* the genesis hash changes with the values, the executor reads the configured
-   schedule from the block's base commit (a test proves it), and it admits entity operations
-   using the configured `max_lifetime`. Pricing with the configured `capacity_rate` is checked
-   in step 6, where storage is first charged.
-   Split in two commits:
-   - **5a, the schedule in chain state.** *Done (2026-10-26).* `config.arkiv.tokenomics`
-     (required) in the chain spec and both genesis files; the record layout and
-     `FeeScheduleSource` in `arkiv-tokenomics` (`schedule_record`); `seed_genesis` writes the
-     record on both paths (the node's genesis root and the provider's start-up seeding), so
-     the genesis hash covers every value; `GolemStateView` reads it at its base commit, and
-     `HostStateView` passes it through. A chain whose genesis has no `config.arkiv`, possible
-     on the experimental stores, has no schedule: 5b makes priced operations unavailable
-     there, never free.
-   - **5b, the lifetime check.** *Done (2026-10-26).* The executor reads the schedule at the
-     block's base and passes `max_lifetime` in `ExecEnv`; create and an extend that moves the
-     expiry refuse an expiry beyond it, or permanent, with `ExpiryBeyondMaxLifetime(uint64
-     target, uint64 currentBlock, uint64 maxLifetime)`, a business-rule revert. A node whose
-     genesis has no fee schedule does not start. The end-to-end test
-     `the_lifetime_bound_follows_the_genesis_file` proves the executor uses the genesis file's
-     value.
+5. **Fee schedule from GolemDB's model.**
+   *Updated (2026-10-28).* `config.arkiv.golemdb.metering` supplies code versions,
+   engine weights and all six `host.arkiv.*` weights. GolemDB owns their persisted
+   model records. Arkiv declares its host schema when opening the database and
+   validates that every host value is present and positive, without default or fallback prices.
+
+   `Store::pricing_snapshot` reads metadata and weights at the same explicit
+   committed base. `FeeSchedule` converts the host portion into typed values;
+   the executor captures that schedule and its model identity once per block
+   execution and reuses it for every transaction or estimation probe. Stale bases
+   and missing weights fail. GolemDB currently exposes head inspection only;
+   historical pricing and runtime activation remain upstream work.
+
+   This replaces the former `config.arkiv.tokenomics` section and
+   `keccak256("arkiv.fee_schedule")` user record. Genesis seeds accounts only;
+   prices already belong to the engine's model and genesis root. Test and
+   experimental stores receive explicitly supplied model fixtures.
+
+   The lifetime check continues to use `FeeSchedule.max_lifetime`. Creates and
+   extensions beyond the bound revert with `ExpiryBeyondMaxLifetime`; the
+   end-to-end genesis test exercises the configured limit on GolemDB.
 
 6. **Charging and the pool.**
    Split in five substeps (decided 2026-10-27), each its own commit with CI green. The first
@@ -763,18 +744,15 @@ Decided (2026-10-26):
   extensions beyond the total remaining-lifetime bound revert; permanent expiry has no
   exemption and is explicitly rejected.
 - **Minting-nonce traffic is entity cost** (`golemdb_cost`).
-- **`max_lifetime` is a field of `FeeSchedule`,** with no default: the five weights have
-  placeholder defaults, but a schedule cannot be built without choosing a lifetime, and step 5
-  stores and reads one record.
+- **Every `FeeSchedule` field comes from the active model,** including
+  `max_lifetime`; production has no placeholder constructor.
 - **A patch pays for its net growth:** `units_after − units_before` from the write's
   `WriteDetails`, 0 when negative, not per grown cell, so swapping an attribute for another of
   the same size buys nothing.
-- **`config.arkiv.tokenomics` is required** wherever `config.arkiv` is present: a chain
-  without a fee schedule could price nothing, so it does not start. That holds on every
-  store: a genesis without `config.arkiv` stops the node too, so at runtime a missing
-  schedule is a store fault, never an operation priced as free.
+- **`config.arkiv.golemdb.metering` is required** wherever `config.arkiv` is present.
+  Missing host values prevent startup or execution, never imply free pricing.
 - **Compute keeps `PlaceholderCost` until GolemDB reports real costs** (decided 2026-10-27).
-  GolemDB's metering is progressing in parallel but still reports 0, so compute is
+  GolemDB now uses configured prices; the development genesis sets every engine weight to 1. Compute remains
   `tx_gas + PlaceholderCost + golemdb_cost` as in the pricing rules. Once GolemDB's costs
   are real, `PlaceholderCost` is dropped or recalibrated, so the same work is not charged
   twice.
@@ -802,10 +780,7 @@ does not imply full pool accounting.
 Still open:
 
 6. **`$rate`'s spelling** (postponed with 6d)**:** `$rate` as a field (not queryable), added to `annotations` and
-   to the API spec's system attributes and reserved-name rules. The fee-schedule record key
-   is decided (2026-10-26): `keccak256("arkiv.fee_schedule")`, for the interim record of
-   step 5. Account keys start with 12 zero bytes and entity keys are hashes of other inputs,
-   so neither can collide with it.
+   to the API spec's system attributes and reserved-name rules.
 7. **Placeholder values,** chiefly `capacity_rate`, starting at the spec's `min_base_fee`
    10 gwei and `capacity_rate` 14: storage gas must fit the
    dev chain's 30M block gas limit and the EIP-7825 per-transaction cap for

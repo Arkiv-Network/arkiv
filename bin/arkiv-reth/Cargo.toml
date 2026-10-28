@@ -51,6 +51,7 @@ reth-db.workspace = true
 # names.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-golemdb.workspace = true
+arkiv-tokenomics.workspace = true
 arkiv-valkey.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.

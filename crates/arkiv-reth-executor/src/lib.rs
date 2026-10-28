@@ -129,7 +129,7 @@ use arkiv_reth_statemanager::{
     BlockSeals, ExecutionKey, HostStateView, HostStore, WriteOverlay, host_manager,
     open_block_branch,
 };
-use arkiv_tokenomics::{FeeSchedule, FeeScheduleSource};
+use arkiv_tokenomics::FeeSchedule;
 use std::sync::Arc;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
@@ -467,6 +467,8 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     /// This block's branch. Every transaction in the block runs on it, in
     /// order, so each sees the last one's writes.
     branch: BranchId,
+    /// Captured once for this execution, including eth_call/estimate probes.
+    pricing: Result<BlockPricing, String>,
     /// Whether any charged transaction ran. A speculative execution —
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
     /// is abandoned rather than sealed.
@@ -478,6 +480,34 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     /// one height race on separate threads, and the payload builder has to be
     /// told the root of *its* execution, not of whichever sealed last.
     executed: core::cell::RefCell<Vec<(UserAddress, u64)>>,
+}
+
+/// Retain model identity with the host schedule for the block's entire life.
+#[derive(Debug, Clone)]
+struct BlockPricing {
+    snapshot: arkiv_interfaces::store::PricingSnapshot,
+    schedule: FeeSchedule,
+}
+
+impl BlockPricing {
+    fn load(store: &HostStore, branch: BranchId) -> Result<Self, String> {
+        let origin = store
+            .branch_info(branch)
+            .map_err(|e| format!("pricing branch: {e:?}"))?
+            .origin;
+        let arkiv_interfaces::store::Origin::Commit(at) = origin else {
+            return Err("pricing requires a block branch over a commit".into());
+        };
+        let snapshot = store
+            .pricing_snapshot(at)
+            .map_err(|e| format!("pricing snapshot: {e:?}"))?;
+        if snapshot.commit_id != at {
+            return Err("pricing snapshot does not match the block base".into());
+        }
+        let schedule =
+            FeeSchedule::from_model(&snapshot.model).map_err(|e| format!("host pricing: {e:?}"))?;
+        Ok(Self { snapshot, schedule })
+    }
 }
 
 impl<DB, I> Evm for ArkivEvm<DB, I>
@@ -515,6 +545,17 @@ where
         &mut self,
         tx: TxEnv,
     ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
+        let pricing = self
+            .pricing
+            .as_ref()
+            .map_err(|e| EVMError::Custom(e.clone()))?;
+        let schedule = pricing.schedule;
+        // Advancing head invalidates the branch too; never refresh its prices.
+        if self.store.head() != pricing.snapshot.commit_id {
+            return Err(EVMError::Custom(
+                "pricing base is no longer the store head".into(),
+            ));
+        }
         let block_number = self.inner.block().number.saturating_to::<u64>();
         // Read the flags before taking the mutable database borrow. reth sets
         // `disable_nonce_check` for `eth_simulateV1` without `validation` and for
@@ -551,7 +592,7 @@ where
             nonce: nonce_check,
             fees: fee_checks,
         });
-        arkiv_transact(store, branch, db, block_number, fees, checks, tx)
+        arkiv_transact(store, branch, &schedule, db, block_number, fees, checks, tx)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -761,9 +802,11 @@ fn validate_fees<DBE>(
 /// accounting, and returns a `ResultAndState` (execution result + the account
 /// diff). The caller (`EthBlockExecutor::commit_transaction`) commits the diff
 /// into the `State`, producing the `BundleState` reth hashes into the state root.
+#[allow(clippy::too_many_arguments)] // Explicit block pricing alongside state, fees and sender checks.
 fn arkiv_transact<DB: Database>(
     store: &HostStore,
     branch: BranchId,
+    schedule: &FeeSchedule,
     db: &mut DB,
     block_number: u64,
     fees: FeeEnv,
@@ -818,7 +861,16 @@ fn arkiv_transact<DB: Database>(
         if selector == purgeExpiredCall::SELECTOR {
             return arkiv_purge_expired(store, branch, db, block_number, &tx);
         }
-        return arkiv_entity_transact(store, branch, db, block_number, &fees, checks, &tx);
+        return arkiv_entity_transact(
+            store,
+            branch,
+            schedule,
+            db,
+            block_number,
+            &fees,
+            checks,
+            &tx,
+        );
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
@@ -941,9 +993,11 @@ fn out_of_gas() -> ResultAndState<HaltReason> {
 /// batch over a diff-backed store, and returns the `EvmState` reth commits — plus
 /// the sender's gas charge and nonce bump. A business-rule revert charges gas but
 /// stages no entity changes; a decode fault reverts likewise.
+#[allow(clippy::too_many_arguments)] // Same execution context as arkiv_transact.
 fn arkiv_entity_transact<DB: Database>(
     store: &HostStore,
     branch: BranchId,
+    schedule: &FeeSchedule,
     db: &mut DB,
     block_number: u64,
     fees: &FeeEnv,
@@ -978,11 +1032,6 @@ fn arkiv_entity_transact<DB: Database>(
     // phase moves nothing with fee charging off.
     let mut view = host_manager(store, branch, db, parent_ref(block_number))
         .map_err(state_fault("open view"))?;
-    // The schedule at the block's base, the same for every transaction in it.
-    // A chain without one does not start, so its absence here is a fault.
-    let schedule = view
-        .fee_schedule()
-        .map_err(state_fault("read fee schedule"))?;
     check_sender(&view, checks, fees, tx)?;
     // The keys the batch creates are derived from this nonce. Reading it is
     // entity cost, so its receipt starts the batch's meter.
@@ -1006,7 +1055,7 @@ fn arkiv_entity_transact<DB: Database>(
     let outcome = match decode_ops(&env, &tx.data, start_nonce.value) {
         Ok(ops) => {
             let costs = *view.cost_model();
-            run_ops(&mut view, costs, &schedule, &env, ops)
+            run_ops(&mut view, costs, schedule, &env, ops)
                 .map_err(|e| EVMError::Custom(e.to_string()))?
         }
         // Calldata that does not decode runs no op: it pays its own terms and
@@ -1300,8 +1349,7 @@ fn run_ops<V: StateView, C: CostModel>(
     ops: Vec<Op>,
 ) -> Result<Outcome, eyre::Report> {
     let mut effects = Vec::new();
-    let out = ArkivExecutor::with_cost(costs)
-        .with_schedule(*schedule)
+    let out = ArkivExecutor::with_cost(costs, *schedule)
         .apply_with_effects(env, view, &ops, &mut effects)
         .map_err(|e| eyre::eyre!("apply: {e:?}"))?;
 
@@ -1417,10 +1465,13 @@ impl EvmFactory for ArkivEvmFactory {
             .build_mainnet_with_inspector(NoOpInspector {})
             .with_precompiles(PrecompilesMap::from_static(Precompiles::prague()));
 
+        let branch = open_block_branch(&self.store)
+            .expect("the Arkiv store refused to open a branch for this block");
+        let pricing = BlockPricing::load(&self.store, branch);
         ArkivEvm {
             inner: EthEvm::new(inner, false),
-            branch: open_block_branch(&self.store)
-                .expect("the Arkiv store refused to open a branch for this block"),
+            branch,
+            pricing,
             store: self.store.clone(),
             seals: self.seals.clone(),
             charged: core::cell::Cell::new(false),
@@ -1445,6 +1496,7 @@ impl EvmFactory for ArkivEvmFactory {
             store: self.store.clone(),
             seals: self.seals.clone(),
             branch,
+            pricing: base.pricing,
             charged,
             executed,
         }
@@ -1634,20 +1686,69 @@ mod tests {
     const HOST_BASE_FEE: u64 = 7;
     const HOST_GAS_PRICE: u128 = 10;
 
-    /// A store under the host's view, priced at `prices`, with genesis: a
-    /// funded sender and a fee schedule.
+    /// Explicit host pricing for the executor fixtures.
+    fn test_pricing_model() -> arkiv_interfaces::store::PricingModel {
+        arkiv_interfaces::store::PricingModel {
+            version: 1,
+            golemdb_code_version: 1,
+            host_code_version: 1,
+            weights: std::sync::Arc::new(
+                arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
+                    .into_iter()
+                    .zip([14, 1, 1, 64, 64, 1_000_000])
+                    .map(|(name, value)| (name.to_owned(), value))
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn block_pricing_captures_the_model_and_rejects_a_stale_base() {
+        let store = host_store(arkiv_interfaces::store::priced::Prices::DISTINCT);
+        let branch = store.begin(None).unwrap();
+        let pricing = BlockPricing::load(&store, branch).unwrap();
+        assert_eq!(pricing.snapshot.commit_id, store.head());
+        assert_eq!(pricing.snapshot.model, test_pricing_model());
+        assert_eq!(pricing.schedule.capacity_rate, 14);
+        let advanced = store.begin(None).unwrap();
+        store.commit(advanced).unwrap();
+        assert!(BlockPricing::load(&store, branch).is_err());
+        assert_eq!(
+            pricing.schedule.capacity_rate, 14,
+            "an acquired snapshot stays immutable"
+        );
+        store.discard(branch).unwrap();
+    }
+
+    #[test]
+    fn a_missing_host_weight_never_gets_a_placeholder_schedule() {
+        let mut model = test_pricing_model();
+        std::sync::Arc::make_mut(&mut model.weights)
+            .remove(arkiv_tokenomics::schedule::CAPACITY_RATE);
+        let store: HostStore = std::sync::Arc::new(
+            arkiv_interfaces::store::reference::MemStore::new().with_pricing(model),
+        );
+        let branch = store.begin(None).unwrap();
+        assert!(
+            BlockPricing::load(&store, branch)
+                .unwrap_err()
+                .contains("host.arkiv.capacity_rate")
+        );
+        store.discard(branch).unwrap();
+    }
+
+    /// A store with explicit pricing and a funded sender at genesis.
     fn host_store(prices: arkiv_interfaces::store::priced::Prices) -> HostStore {
         use arkiv_interfaces::store::priced::Priced;
         use arkiv_reth_statemanager::{GenesisAccount, seed_genesis};
 
         let store: HostStore = std::sync::Arc::new(Priced::new(
-            arkiv_interfaces::store::reference::MemStore::new(),
+            arkiv_interfaces::store::reference::MemStore::new().with_pricing(test_pricing_model()),
             prices,
         ));
         seed_genesis(
             &store,
             [0x11; 32],
-            &FeeSchedule::with_placeholder_weights(1_000_000),
             [GenesisAccount {
                 address: HOST_SENDER,
                 balance: U256::from(HOST_FUNDS),
@@ -1781,7 +1882,16 @@ mod tests {
         };
         (
             branch,
-            arkiv_transact(store, branch, &mut db, 1, fees, checks, tx),
+            arkiv_transact(
+                store,
+                branch,
+                &BlockPricing::load(store, branch).unwrap().schedule,
+                &mut db,
+                1,
+                fees,
+                checks,
+                tx,
+            ),
         )
     }
 

@@ -25,7 +25,13 @@ fn config() -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
+        genesis: Genesis::new(
+            HashAlgorithm::Keccak256,
+            limits,
+            record_limits,
+            None,
+            arkiv_golemdb::PricingConfig::zero(),
+        ),
         segments: ["blocks", "receipts", "transactions"]
             .into_iter()
             .map(|name| SegmentSpec {

@@ -136,7 +136,14 @@ mod tests {
     use arkiv_interfaces::store::CostUnits;
 
     fn schedule() -> FeeSchedule {
-        FeeSchedule::with_placeholder_weights(10_000_000)
+        FeeSchedule {
+            capacity_rate: 14,
+            cell_byte_units: 1,
+            index_byte_units: 1,
+            c_cell: 64,
+            c_idx: 64,
+            max_lifetime: 10_000_000,
+        }
     }
 
     #[test]

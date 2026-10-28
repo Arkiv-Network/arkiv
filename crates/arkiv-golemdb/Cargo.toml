@@ -11,6 +11,10 @@ license.workspace = true
 [dependencies]
 arkiv-interfaces.workspace = true
 golemdb-api.workspace = true
+golemdb-storage.workspace = true
+arkiv-tokenomics.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
 # The keys GolemDB keeps its own records at.
 golemdb-cells.workspace = true
 
@@ -21,4 +25,3 @@ arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-query.workspace = true
 # `MAX_PAGE_SIZE`, the largest page `arkiv_query` asks GolemDB for.
 arkiv-rpc-types.workspace = true
-tempfile.workspace = true

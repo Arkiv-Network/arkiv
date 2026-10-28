@@ -15,8 +15,7 @@ license.workspace = true
 # reth's stock `ChainSpec` and the traits (`EthChainSpec`, `Hardforks`,
 # `EthereumHardforks`) the wrapper delegates to.
 reth-ethereum.workspace = true
-# The `ChainSpecParser` trait the `--chain` value parser implements, and
-# `parse_genesis`, reth's reader for a genesis file or inline JSON.
+# The `ChainSpecParser` trait implemented by the genesis JSON/file reader.
 reth-cli.workspace = true
 # `NodeRecord`, the bootnode type in `EthChainSpec::bootnodes`.
 reth-network-peers.workspace = true
@@ -33,7 +32,8 @@ serde.workspace = true
 serde_json.workspace = true
 # GolemDB's genesis format, which `config.arkiv.golemdb` is in.
 golemdb-api.workspace = true
-# `FeeSchedule`, which `config.arkiv.tokenomics` is read into.
+arkiv-golemdb.workspace = true
+# Validate the host weights required by FeeSchedule.
 arkiv-tokenomics.workspace = true
 
 [dev-dependencies]

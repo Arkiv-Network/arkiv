@@ -43,45 +43,42 @@ pub struct ArkivExecutor<V, C = PlaceholderCost> {
     _state: PhantomData<fn() -> V>,
 }
 
-/// The schedule an executor prices with until it is given the block's: the
-/// placeholder weights. Its `max_lifetime` is not consulted; the lifetime
-/// bound comes in [`ExecEnv::max_lifetime`].
-const DEFAULT_SCHEDULE: FeeSchedule = FeeSchedule::with_placeholder_weights(BlockNumber::MAX);
-
 impl<V> ArkivExecutor<V, PlaceholderCost> {
-    pub const fn new() -> Self {
-        Self::with_cost(PlaceholderCost)
+    pub const fn new(schedule: FeeSchedule) -> Self {
+        Self::with_cost(PlaceholderCost, schedule)
     }
 }
 
 impl<V, C> ArkivExecutor<V, C> {
-    pub const fn with_cost(cost: C) -> Self {
+    pub const fn with_cost(cost: C, schedule: FeeSchedule) -> Self {
         Self {
             cost,
-            schedule: DEFAULT_SCHEDULE,
+            schedule,
             _state: PhantomData,
         }
     }
 
-    /// Price with the block's schedule, read at its base. Interim until
-    /// GolemDB's pricing snapshot carries it.
     pub const fn with_schedule(mut self, schedule: FeeSchedule) -> Self {
         self.schedule = schedule;
         self
     }
 }
 
-impl<V> Default for ArkivExecutor<V, PlaceholderCost> {
-    fn default() -> Self {
-        Self::new()
+impl<V, C: Clone> Clone for ArkivExecutor<V, C> {
+    fn clone(&self) -> Self {
+        Self::with_cost(self.cost.clone(), self.schedule)
     }
 }
 
-impl<V, C: Clone> Clone for ArkivExecutor<V, C> {
-    fn clone(&self) -> Self {
-        Self::with_cost(self.cost.clone()).with_schedule(self.schedule)
-    }
-}
+#[cfg(test)]
+const TEST_SCHEDULE: FeeSchedule = FeeSchedule {
+    capacity_rate: 14,
+    cell_byte_units: 1,
+    index_byte_units: 1,
+    c_cell: 64,
+    c_idx: 64,
+    max_lifetime: BlockNumber::MAX,
+};
 
 impl<V, C: fmt::Debug> fmt::Debug for ArkivExecutor<V, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -816,7 +813,7 @@ mod tests {
     /// [`EMPTY_RECORD_UNITS`], round up to 1.
     #[test]
     fn compute_adds_the_terms_the_ops_and_golemdbs_work() {
-        let exec = ArkivExecutor::<PricedView>::new();
+        let exec = ArkivExecutor::<PricedView>::new(TEST_SCHEDULE);
         let create = create_until(1, 50);
         let op = PlaceholderCost.op_cost(&create);
 
@@ -897,7 +894,7 @@ mod tests {
     /// up. No purge is charged.
     #[test]
     fn a_create_buys_its_size_until_expiry() {
-        let exec = ArkivExecutor::<PricedView>::new();
+        let exec = ArkivExecutor::<PricedView>::new(TEST_SCHEDULE);
         let create = create_until(1, 10 + LIFETIME);
         let op = PlaceholderCost.op_cost(&create);
 
@@ -926,7 +923,7 @@ mod tests {
     /// note again buys nothing and refunds nothing.
     #[test]
     fn a_patch_buys_only_its_growth() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let mut view = seeded_view(&[owned_until(1, alice, 10 + LIFETIME)]);
         let grow = Op::Patch {
@@ -956,7 +953,7 @@ mod tests {
     /// 319,600,000 unit-blocks, 4,474.4 gas, rounded up once.
     #[test]
     fn an_extend_buys_only_the_added_blocks() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let expires_at = 10 + LIFETIME;
         let extend = |new_expires_at| Op::ExtendExpiry {
@@ -1001,7 +998,7 @@ mod tests {
     /// A transfer and a delete buy no storage.
     #[test]
     fn a_transfer_and_a_delete_buy_nothing() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let mut view = seeded_view(&[
             owned_until(1, alice, 10 + LIFETIME),
@@ -1029,7 +1026,7 @@ mod tests {
     /// 1 each.
     #[test]
     fn storage_gas_is_rounded_once_per_batch() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let out = exec
             .apply(
@@ -1047,7 +1044,7 @@ mod tests {
     /// supplied, and leaves nothing behind. One gas more and it succeeds.
     #[test]
     fn storage_can_run_a_batch_out_of_gas() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let create = create_until(1, 10 + LIFETIME);
         let needed = PlaceholderCost.op_cost(&create) + 1_459;
@@ -1081,7 +1078,7 @@ mod tests {
     /// blocks.
     #[test]
     fn a_patch_that_grows_and_shrinks_buys_its_net_growth() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let mut view = seeded_view(&[owned_until(1, alice, 10 + LIFETIME)]);
         let patch = |mutations| Op::Patch {
@@ -1120,7 +1117,7 @@ mod tests {
     /// 2,272 units for 100,000 blocks: 3,180.8 gas, rounded up.
     #[test]
     fn a_create_buys_its_attributes_and_their_index_entries() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let create = Op::Create {
             key: [1; 32],
@@ -1144,9 +1141,9 @@ mod tests {
     /// and the create is undone.
     #[test]
     fn storage_gas_that_does_not_fit_is_out_of_gas() {
-        let exec = ArkivExecutor::<View>::new().with_schedule(FeeSchedule {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE).with_schedule(FeeSchedule {
             capacity_rate: u64::MAX,
-            ..DEFAULT_SCHEDULE
+            ..TEST_SCHEDULE
         });
         let mut view = fresh_view();
         let out = exec
@@ -1175,7 +1172,7 @@ mod tests {
     /// read (1) adds to the first create's 23.
     #[test]
     fn a_revert_pays_for_the_golemdb_work_it_undid() {
-        let exec = ArkivExecutor::<PricedView>::new();
+        let exec = ArkivExecutor::<PricedView>::new(TEST_SCHEDULE);
         let ops = [create_until(1, 50), create_until(1, 50)];
         let op = PlaceholderCost.op_cost(&ops[0]);
 
@@ -1202,7 +1199,7 @@ mod tests {
     /// costs fit but whose store calls do not runs out of gas, paying it all.
     #[test]
     fn golemdbs_work_can_run_a_batch_out_of_gas() {
-        let exec = ArkivExecutor::<PricedView>::new();
+        let exec = ArkivExecutor::<PricedView>::new(TEST_SCHEDULE);
         let create = create_until(1, 50);
         let op = PlaceholderCost.op_cost(&create);
         let supplied = op + CREATE_ON_EMPTY - 1;
@@ -1221,7 +1218,7 @@ mod tests {
     /// read and the write's own read together pass `u64::MAX`.
     #[test]
     fn a_cost_that_does_not_fit_runs_out_of_gas() {
-        let exec = ArkivExecutor::<PricedView>::new();
+        let exec = ArkivExecutor::<PricedView>::new(TEST_SCHEDULE);
         let prices = Prices {
             get: u64::MAX / 2 + 1,
             ..Prices::DISTINCT
@@ -1241,7 +1238,7 @@ mod tests {
     /// its new account; write 2, the second create, fails.
     #[test]
     fn a_store_fault_mid_batch_closes_the_frame() {
-        let exec = ArkivExecutor::<PricedView>::new();
+        let exec = ArkivExecutor::<PricedView>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let mut view = priced_view(Priced::new(MemStore::new(), Prices::DISTINCT).failing_write(2));
 
@@ -1326,7 +1323,7 @@ mod tests {
     /// fields: the caller is creator and owner, the block stamps creation.
     #[test]
     fn create_stages_into_the_view() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
 
@@ -1370,7 +1367,7 @@ mod tests {
     /// whole batch, as does permanent expiry, which is not sold.
     #[test]
     fn a_create_is_bounded_by_max_lifetime() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let alice = [0xAA; 20];
         let beyond = |target| RevertReason::ExpiryBeyondMaxLifetime {
             target,
@@ -1418,7 +1415,7 @@ mod tests {
     /// single added block would fit on its own.
     #[test]
     fn an_extend_is_bounded_by_what_remains() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]); // expires_at 100
         let owner = [2u8; 20];
         let extend = |new_expires_at| Op::ExtendExpiry {
@@ -1455,7 +1452,7 @@ mod tests {
     /// entity that already lives longer than today's bound allows.
     #[test]
     fn a_no_op_extend_is_not_bounded() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let long_lived = Entity {
             expires_at: 20 + MAX_LIFETIME + 1_000,
             ..sample_entity()
@@ -1477,7 +1474,7 @@ mod tests {
     /// A revert is all-or-nothing: nothing reaches the view.
     #[test]
     fn create_on_existing_reverts_and_stages_nothing() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[Entity {
             key: [1u8; 32],
             ..sample_entity()
@@ -1505,7 +1502,7 @@ mod tests {
     /// revert: a fault fails the whole block built around it.
     #[test]
     fn an_op_on_an_account_key_reverts() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
         view.set_balance(alice, UserBalance::from_u64(500))
@@ -1559,83 +1556,9 @@ mod tests {
         );
     }
 
-    /// The fee schedule's record sits beside the entities, at a key a caller can
-    /// name. An op there must revert like one on an account's key: reading the
-    /// schedule as an entity fails, and a fault fails the whole block.
-    #[test]
-    fn an_op_on_the_fee_schedule_key_reverts() {
-        use arkiv_tokenomics::{FeeScheduleSource, schedule_record};
-
-        let store = Arc::new(MemStore::new());
-        let branch = store.begin(None).expect("begin");
-        store
-            .create(
-                branch,
-                schedule_record::RECORD_KEY,
-                schedule_record::to_cells(&DEFAULT_SCHEDULE),
-                None,
-            )
-            .expect("the genesis schedule");
-        let base = store
-            .commit_tagged(branch, GENESIS.hash)
-            .expect("commit base");
-        let branch = store.begin(Some(base)).expect("begin");
-        let mut view = GolemStateView::new(
-            store,
-            branch,
-            base,
-            GENESIS,
-            arkiv_interfaces::statemanager::SessionId([1; 16]),
-        );
-        let exec = ArkivExecutor::<View>::new();
-        let key = entity_records::FEE_SCHEDULE_KEY;
-
-        let not_found = RevertReason::NotFound { key };
-        for (op, reason) in [
-            (
-                Op::Create {
-                    key,
-                    expires_at: 50,
-                    creation_flags: CreationFlags::NONE,
-                    attributes: Vec::new(),
-                },
-                RevertReason::AlreadyExists { key },
-            ),
-            (
-                Op::Patch {
-                    key,
-                    mutations: Vec::new(),
-                },
-                not_found.clone(),
-            ),
-            (
-                Op::ExtendExpiry {
-                    key,
-                    new_expires_at: 50,
-                },
-                not_found.clone(),
-            ),
-            (
-                Op::Transfer {
-                    key,
-                    new_owner: [0xBB; 20],
-                },
-                not_found.clone(),
-            ),
-            (Op::Delete { key }, not_found.clone()),
-        ] {
-            let out = exec
-                .apply(&env([0xAA; 20], 10), &mut view, &[op])
-                .expect("a revert, not a fault");
-            assert_eq!(out.status, ExecStatus::Reverted);
-            assert_eq!(out.revert, Some(reason));
-        }
-        assert_eq!(view.fee_schedule(), Ok(DEFAULT_SCHEDULE), "untouched");
-    }
-
     #[test]
     fn transfer_requires_ownership_then_moves_owner() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
         let owner = [2u8; 20];
 
@@ -1675,7 +1598,7 @@ mod tests {
 
     #[test]
     fn transfer_to_current_owner_reverts() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
         let owner = [2u8; 20];
 
@@ -1700,7 +1623,7 @@ mod tests {
     /// "> extends, == no-op, < reverts."
     #[test]
     fn extend_never_shortens_and_equal_is_a_no_op() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]); // expires_at 100
         let owner = [2u8; 20];
 
@@ -1757,7 +1680,7 @@ mod tests {
     /// never had, which every consumer treats as nothing to remove.
     #[test]
     fn create_then_delete_in_one_tx_leaves_nothing_behind() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
 
         let out = exec
@@ -1795,7 +1718,7 @@ mod tests {
     /// that reverts advances it not at all.
     #[test]
     fn each_create_advances_the_minting_nonce() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
 
@@ -1832,7 +1755,7 @@ mod tests {
     /// entities, not its minting-nonce steps.
     #[test]
     fn a_batch_that_does_not_keep_its_writes_leaves_nothing() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
         let probe = ExecEnv {
@@ -1861,7 +1784,7 @@ mod tests {
     /// A delete stages a tombstone the index derivation turns into all-removes.
     #[test]
     fn delete_stages_a_tombstone() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
 
         let out = exec
@@ -1883,7 +1806,7 @@ mod tests {
     /// changed fields.
     #[test]
     fn patch_merges_content_and_stamps_modified() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
 
         let out = exec
@@ -1936,7 +1859,7 @@ mod tests {
     /// A patch explicitly unsetting an attribute drops it from the staged set.
     #[test]
     fn patch_unset_drops_the_attribute() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
 
         exec.apply(
@@ -1958,7 +1881,7 @@ mod tests {
     /// value can be moved out of (and back into) the index.
     #[test]
     fn patch_can_flip_the_indexed_flag() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
         let blue = AttributeValue::Str("blue".into());
 
@@ -1983,7 +1906,7 @@ mod tests {
 
     #[test]
     fn patches_cannot_exceed_the_entity_attribute_limit() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let owner = [0xAA; 20];
         let key = [8u8; 32];
@@ -2048,7 +1971,7 @@ mod tests {
     /// cannot resurrect by extending after the fact.
     #[test]
     fn cannot_mutate_after_expiry() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let owner = [2u8; 20];
 
         let expired_ops = [
@@ -2089,7 +2012,7 @@ mod tests {
     /// staging nothing.
     #[test]
     fn reverts_out_of_gas_when_cost_exceeds_supplied() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let create = Op::Create {
             key: [1u8; 32],
@@ -2119,7 +2042,7 @@ mod tests {
     /// reported, and no frame is left open.
     #[test]
     fn out_of_gas_after_a_write_undoes_it() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
         let ops = [create_until(1, 50), create_until(2, 50)];
@@ -2144,7 +2067,7 @@ mod tests {
 
     #[test]
     fn succeeds_when_gas_exactly_covers_cost() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let create = Op::Create {
             key: [1u8; 32],
@@ -2171,7 +2094,7 @@ mod tests {
     /// Undecodable calldata surfaces as a host fault, not a silent success.
     #[test]
     fn execute_rejects_undecodable_calldata() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         assert!(matches!(
             exec.execute(&env([0u8; 20], 1), &mut view, &[0xDE, 0xAD]),

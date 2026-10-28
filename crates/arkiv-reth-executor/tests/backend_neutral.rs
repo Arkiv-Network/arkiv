@@ -70,9 +70,19 @@ fn a_batch_runs_against_golemdb_and_lands_in_the_store() {
     };
 
     let ops = vec![create(1), create(2)];
-    let out = ArkivExecutor::with_cost(PlaceholderCost)
-        .apply(&env, &mut view, &ops)
-        .expect("apply");
+    let out = ArkivExecutor::with_cost(
+        PlaceholderCost,
+        arkiv_tokenomics::FeeSchedule {
+            capacity_rate: 14,
+            cell_byte_units: 1,
+            index_byte_units: 1,
+            c_cell: 64,
+            c_idx: 64,
+            max_lifetime: u64::MAX,
+        },
+    )
+    .apply(&env, &mut view, &ops)
+    .expect("apply");
 
     assert_eq!(out.status, ExecStatus::Ok);
     assert!(out.gas_used() > 0, "a create is not free");

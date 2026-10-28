@@ -23,8 +23,7 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
-use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
-use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
+use arkiv_interfaces::constants::MAX_STR_BYTES;
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -1619,7 +1618,7 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
 }
 
 /// Keys a caller can name where GolemDB holds a record that is not an entity:
-/// an account's, the fee schedule's and GolemDB's own. An operation there
+/// an account's and GolemDB's own model/system records. An operation there
 /// reverts and a view call is mined; a store fault instead fails every block
 /// built while it is pooled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1642,13 +1641,18 @@ async fn keys_that_hold_no_entity_find_none() {
 
     let account = B256::left_padding_from(caller.as_slice());
     // Written at genesis, beside the entities.
-    let schedule = B256::from(arkiv_interfaces::entity_records::FEE_SCHEDULE_KEY);
     // `#recordKeys` holds a cell for every record in the store.
-    let golemdb = [b"#params".as_slice(), b"#recordKeys"].map(B256::right_padding_from);
-    let keys = [account, schedule, golemdb[0], golemdb[1]];
+    let golemdb = [
+        b"#params".as_slice(),
+        b"#recordKeys",
+        b"@meteringModel",
+        b"@modelWeight",
+    ]
+    .map(B256::right_padding_from);
+    let keys = [account, golemdb[0], golemdb[1], golemdb[2], golemdb[3]];
 
     let mut ops = Vec::new();
-    for key in [account, schedule] {
+    for key in [account] {
         ops.extend([
             patch_payload(key, Bytes::from_static(b"x")),
             Operation::extend_expiry(key, 0, 5000),
@@ -1753,28 +1757,11 @@ fn genesis_json() -> serde_json::Value {
 
 /// `config.arkiv` giving GolemDB `hash_function` and Arkiv's limits.
 fn arkiv_section(hash_function: &str) -> serde_json::Value {
-    serde_json::json!({
-        "golemdb": {
-            "hash_function": hash_function,
-            "cell_limits": {
-                "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
-                "max_str_len": MAX_STR_BYTES,
-                "max_bytes_len": MAX_BYTES_VALUE_LEN
-            },
-            "record_limits": {
-                "max_cells": MAX_RECORD_CELLS,
-                "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-            }
-        },
-        "tokenomics": {
-            "capacity_rate": 14,
-            "cell_byte_units": 1,
-            "index_byte_units": 1,
-            "c_cell": 64,
-            "c_idx": 64,
-            "max_lifetime": 7_884_000
-        }
-    })
+    let mut genesis: serde_json::Value =
+        serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+    let mut arkiv = genesis["config"]["arkiv"].take();
+    arkiv["golemdb"]["hash_function"] = hash_function.into();
+    arkiv
 }
 
 /// Write `genesis` to a file of this test's own and return its path.
@@ -1830,10 +1817,12 @@ async fn the_lifetime_bound_follows_the_genesis_file() {
 
     let mut genesis = genesis_json();
     genesis["config"]["arkiv"] = arkiv_section("keccak-256");
-    genesis["config"]["arkiv"]["tokenomics"]["max_lifetime"] = 1_000.into();
+    genesis["config"]["arkiv"]["golemdb"]["metering"]["weights"]["host.arkiv.max_lifetime"] =
+        1_000.into();
     let genesis_path = genesis_file(&genesis);
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .chain(&genesis_path)
+        .golemdb_store()
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
@@ -1895,6 +1884,8 @@ async fn golemdb_settings_follow_the_genesis_file() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .chain(&genesis_path)
         .golemdb_store()
+        .arg("--log.stdout.filter")
+        .arg("arkiv-reth=info")
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
@@ -1953,7 +1944,8 @@ async fn a_bad_arkiv_section_stops_the_node() {
     limits["config"]["arkiv"]["golemdb"]["cell_limits"]["max_str_len"] = (MAX_STR_BYTES / 2).into();
     let mut no_lifetime = genesis_json();
     no_lifetime["config"]["arkiv"] = arkiv_section("keccak-256");
-    no_lifetime["config"]["arkiv"]["tokenomics"]["max_lifetime"] = 0.into();
+    no_lifetime["config"]["arkiv"]["golemdb"]["metering"]["weights"]["host.arkiv.max_lifetime"] =
+        0.into();
     let mut segments = genesis_json();
     segments["config"]["arkiv"] = arkiv_section("keccak-256");
     segments["config"]["arkiv"]["golemdb"]["immutable_data"] =
@@ -1965,7 +1957,7 @@ async fn a_bad_arkiv_section_stops_the_node() {
         (limits, "must be Arkiv's limits"),
         (
             no_lifetime,
-            "config.arkiv.tokenomics.max_lifetime must be positive",
+            "config.arkiv.golemdb.metering: Zero(\"host.arkiv.max_lifetime\")",
         ),
         (segments, "the node declares its own segments"),
     ] {
@@ -1980,11 +1972,11 @@ async fn a_bad_arkiv_section_stops_the_node() {
     }
 }
 
-/// A chain without a fee schedule stops at startup on any store, not only on
+/// A chain without a pricing model stops at startup on any store, not only on
 /// GolemDB, which needs `config.arkiv` for its own settings first: here the
 /// node runs in memory and only the schedule is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chain_without_a_fee_schedule_stops_the_node() {
+async fn a_chain_without_a_pricing_model_stops_the_node() {
     let genesis_path = genesis_file(&genesis_json());
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .chain(&genesis_path)
@@ -1992,8 +1984,8 @@ async fn a_chain_without_a_fee_schedule_stops_the_node() {
     let log = refusal(&mut node).await;
     let _ = std::fs::remove_file(&genesis_path);
     assert!(
-        log.contains("no config.arkiv.tokenomics"),
-        "the node names the missing fee schedule: {log}"
+        log.contains("no usable pricing model"),
+        "the node names the missing pricing model: {log}"
     );
 }
 
@@ -2041,15 +2033,7 @@ async fn a_golemdb_store_with_another_genesis_root_is_refused() {
         balance: U256::from(1),
         nonce: 0,
     };
-    let spec = <arkiv_reth_chainspec::ArkivChainSpecParser as reth_cli::chainspec::ChainSpecParser>::parse(example).unwrap();
-    seed_genesis(
-        &store,
-        genesis_hash.0,
-        spec.fee_schedule()
-            .expect("the example genesis has a fee schedule"),
-        [other],
-    )
-    .unwrap();
+    seed_genesis(&store, genesis_hash.0, [other]).unwrap();
     drop(store);
 
     node.restart();

@@ -24,12 +24,11 @@ pub mod error;
 pub mod meter;
 pub mod rate;
 pub mod schedule;
-pub mod schedule_record;
+
 pub mod storage_time;
 pub mod units;
 
 pub use error::Overflow;
 pub use meter::GasMeter;
 pub use rate::RateUpdate;
-pub use schedule::FeeSchedule;
-pub use schedule_record::{FeeScheduleSource, ScheduleError};
+pub use schedule::{FeeSchedule, FeeScheduleSource, ScheduleError};
