@@ -22,3 +22,6 @@ jwt.hex
 
 # Python bytecode, from running the scripts.
 __pycache__/
+
+# JavaScript dependencies, from `bun install`.
+node_modules/
