@@ -17,15 +17,19 @@ const FOLLOWER_EL = "el-2-reth-lighthouse"
 const FOLLOWER = [FOLLOWER_EL, "cl-2-lighthouse-reth"]
 // What the node logs when it refuses a block whose parent is not in its store.
 const REFUSAL = "is not in the Arkiv store"
+// What reth logs when it starts its pipeline, which never writes GolemDB.
+const PIPELINE = "Preparing stage pipeline_stages=1/"
 const SLOT_MS = 2_000
 const MAX_LAG = 2n
 // Lighthouse's `SLOT_IMPORT_TOLERANCE`: within this many slots of its peers it
 // fetches the blocks it missed one by one and feeds them to reth; further behind
-// it batch-syncs, and reth downloads the gap itself. One slot is one block here.
+// it batch-syncs, and with --disable-optimistic-finalized-sync it feeds those
+// blocks to reth too. One slot is one block here.
 const LIGHTHOUSE_SYNC_TOLERANCE = 32n
-// reth's default `--engine.backfill-threshold`: a node more than this many
-// blocks behind the finalized block closes the gap with its pipeline.
-const BACKFILL_THRESHOLD = 32n
+// A node more than this many blocks behind the finalized block is past what
+// reth syncs on its own: the follower's `--engine.backfill-threshold`, which
+// kurtosis/arkiv-chain.yaml lowers from 1024 and says why.
+const RETH_SYNC_LIMIT = await followerSyncLimit()
 // Blocks per epoch in the `minimal` preset; finality moves one epoch at a time.
 const EPOCH = 8n
 // Well within Lighthouse's tolerance, with the few blocks made while the
@@ -36,6 +40,17 @@ function kurtosis(...args: string[]): string {
   const run = Bun.spawnSync(["kurtosis", ...args])
   if (run.exitCode !== 0) throw new Error(`kurtosis ${args.join(" ")}: ${run.stderr.toString()}`)
   return run.stdout.toString()
+}
+
+// Read from the chain's args file, so the value is written in one place.
+async function followerSyncLimit(): Promise<bigint> {
+  const chain = Bun.YAML.parse(await Bun.file(`${import.meta.dir}/../../arkiv-chain.yaml`).text()) as {
+    participants: { el_extra_params?: string[] }[]
+  }
+  const flag = "--engine.backfill-threshold="
+  const param = chain.participants[1]?.el_extra_params?.find((p) => p.startsWith(flag))
+  if (param === undefined) throw new Error(`kurtosis/arkiv-chain.yaml sets no ${flag} for the follower`)
+  return BigInt(param.slice(flag.length))
 }
 
 function inEnclave(): boolean {
@@ -56,10 +71,10 @@ async function head(url: string): Promise<bigint | undefined> {
   }
 }
 
-// A gap that leaves the follower past the backfill threshold behind the
-// finalized block. Finality trails the head by up to an epoch more than it does
-// now, so one epoch on top keeps the gap past the threshold whenever it restarts.
-async function gapPastBackfill(): Promise<bigint> {
+// A gap that leaves the follower past reth's sync limit behind the finalized
+// block. Finality trails the head by up to an epoch more than it does now, so
+// one epoch on top keeps the gap past the limit whenever it restarts.
+async function gapPastRethSync(): Promise<bigint> {
   // A young chain has finalized nothing yet, and the node then has no block to
   // answer "finalized" with.
   const finalized = await until("the chain finalizes a block", 120_000, async () => {
@@ -71,7 +86,7 @@ async function gapPastBackfill(): Promise<bigint> {
     }
   })
   const latest = await rpc<{ number: string }>("eth_getBlockByNumber", ["latest", false])
-  return BACKFILL_THRESHOLD + BigInt(latest.number) - finalized + EPOCH
+  return RETH_SYNC_LIMIT + BigInt(latest.number) - finalized + EPOCH
 }
 
 async function hashAt(url: string, height: bigint): Promise<string> {
@@ -90,12 +105,13 @@ async function until<T>(what: string, ms: number, check: () => Promise<T | undef
   }
 }
 
-// The follower's log lines refusing a block, without Kurtosis's colours.
-function refusals(): string[] {
+// The follower's log lines that contain `text`. Colours come off first: reth
+// colours field names, so `pipeline_stages=` is not contiguous until then.
+function followerLines(text: string): string[] {
   return kurtosis("service", "logs", "--all", ENCLAVE, FOLLOWER_EL)
     .split("\n")
-    .filter((line) => line.includes(REFUSAL))
     .map((line) => line.replace(/\x1b\[[0-9;]*m/g, ""))
+    .filter((line) => line.includes(text))
 }
 
 // Stop `services` while the sequencer makes `gap` blocks, start them again, and
@@ -125,8 +141,11 @@ async function restartAfter(gap: bigint, services = FOLLOWER) {
         : undefined
     })
   } catch (error) {
-    const refused = refusals()
-    const detail = refused.length > 0 ? `; it refused ${refused.length} block(s): ${refused.at(-1)}` : ""
+    const refused = followerLines(REFUSAL)
+    const pipelines = followerLines(PIPELINE)
+    const detail =
+      (refused.length > 0 ? `; it refused ${refused.length} block(s): ${refused.at(-1)}` : "") +
+      (pipelines.length > 0 ? `; reth ran its pipeline ${pipelines.length} time(s)` : "")
     throw new Error(`${(error as Error).message}${detail}`)
   }
 
@@ -137,7 +156,8 @@ async function restartAfter(gap: bigint, services = FOLLOWER) {
   // A node that has caught up but cannot read its state is not caught up.
   const read = rpc("eth_getBalance", [`0x${"00".repeat(20)}`, "latest"], FOLLOWER_RPC_URL)
   expect(await Promise.race([read.then(() => "answered"), Bun.sleep(10_000).then(() => "hung")])).toBe("answered")
-  expect(refusals()).toEqual([])
+  expect(followerLines(REFUSAL)).toEqual([])
+  expect(followerLines(PIPELINE)).toEqual([])
 
   // And it keeps following.
   const next = caughtUp + 3n
@@ -161,20 +181,21 @@ describe.skipIf(!enabled)("a restarted follower catches up", () => {
     300_000,
   )
 
-  // Past Lighthouse's tolerance, so reth downloads the gap from its peer and
-  // executes it block by block, but within the backfill threshold of the
-  // finalized block, so without the pipeline.
+  // Past Lighthouse's tolerance, so Lighthouse batch-syncs the gap and feeds it
+  // to reth block by block.
   test(
     "past Lighthouse's sync tolerance",
     () => restartAfter(LIGHTHOUSE_SYNC_TOLERANCE + EPOCH),
     400_000,
   )
 
-  // Past the backfill threshold of the finalized block, where reth runs its
-  // pipeline.
+  // Further behind the finalized block than reth syncs on its own: in
+  // production, an outage of more than about 37 minutes. Only Lighthouse
+  // feeding reth every block closes this gap; reth on its own runs its pipeline
+  // and the node stalls.
   test(
-    "past reth's backfill threshold",
-    async () => restartAfter(await gapPastBackfill()),
+    "past what reth syncs on its own",
+    async () => restartAfter(await gapPastRethSync()),
     600_000,
   )
 })
