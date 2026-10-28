@@ -1,7 +1,7 @@
 # A light dev container for arkiv: the pinned Rust toolchain plus the system
 # packages the full workspace build needs (reth's bindgen and C deps), plus
-# what CI's tests run with: cargo-nextest and a Valkey server. Nothing else —
-# no Docker socket, no Kurtosis, no Foundry. See devcontainer.json.
+# what CI's tests run with: cargo-nextest, a Valkey server and bun. Nothing
+# else — no Docker socket, no Kurtosis, no Foundry. See devcontainer.json.
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
 # lld is the linker on aarch64; devcontainer.json explains why.
@@ -23,6 +23,11 @@ RUN case "$(dpkg --print-architecture)" in \
         *) echo "no cargo-nextest build for $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
     && curl -LsSf "https://get.nexte.st/latest/$platform" | tar zxf - -C "$CARGO_HOME/bin"
+
+# bun, which runs kurtosis/integration's SDK tests (`bun test`). The latest
+# release, as CI's setup-bun step takes it. Into /usr/local so it is on PATH
+# for every user, not only root.
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
 
 # Install the toolchain rust-toolchain.toml pins (channel and components) into
 # the image, so the first `cargo` call in the container does not download it.
