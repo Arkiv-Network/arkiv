@@ -535,6 +535,10 @@ impl Backend {
     }
 
     async fn drop_branch(&self, branch: BranchId) -> Result<(), StoreError> {
+        // A frame merged rather than rolled back keeps its saved diff, so the
+        // branch holds frames 1 to `depth - 1`; they go with it. Read before
+        // the meta that holds the depth is deleted.
+        let depth = self.frame_depth(branch).await?;
         // Staged segment rows go with the branch. On the commit path they have
         // already been flushed; on the discard path they are what makes a
         // losing candidate's rows -- and the keys it claimed -- disappear.
@@ -552,6 +556,7 @@ impl Backend {
             doomed.push(self.namespace.branch_segment(branch.0, segment));
             doomed.push(self.namespace.branch_segment_names(branch.0, segment));
         }
+        doomed.extend((1..depth).map(|frame| self.namespace.branch_frame(branch.0, frame)));
         let _: u64 = self.client.del(doomed).await.map_err(internal)?;
         let _: u64 = self
             .client

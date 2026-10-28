@@ -43,9 +43,14 @@ fn genesis_root(spec: &ArkivChainSpec) -> eyre::Result<B256> {
         .map_err(|e| eyre::eyre!("compute GolemDB's genesis root: {e}"))?;
     let store: HostStore = Arc::new(store);
     let accounts = GenesisAccount::from_alloc(&spec.genesis().alloc);
+    // `config.arkiv` carries both sections, so a chain with GolemDB's settings
+    // has a fee schedule too.
+    let schedule = spec.fee_schedule().ok_or_else(|| {
+        eyre::eyre!("compute GolemDB's genesis root: config.arkiv has no tokenomics section")
+    })?;
     // The commit's tag sits outside the state root, so any tag gives the same
     // root.
-    let commit = seed_genesis(&store, [0; 32], spec.fee_schedule(), accounts)
+    let commit = seed_genesis(&store, [0; 32], schedule, accounts)
         .map_err(|e| eyre::eyre!("compute GolemDB's genesis root: {e:?}"))?
         .ok_or_else(|| eyre::eyre!("compute GolemDB's genesis root: the store has a genesis"))?;
     let root = store

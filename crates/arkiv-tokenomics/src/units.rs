@@ -76,6 +76,34 @@ mod tests {
         FeeSchedule::with_placeholder_weights(1_000_000)
     }
 
+    /// A write's change weighs each count with its own weight, on both sides.
+    /// Every count and every weight differs, so a count paired with another's
+    /// weight, or a written count taken for a deleted one, changes the result.
+    #[test]
+    fn a_writes_change_weighs_every_count_with_its_own_weight() {
+        let weights = FeeSchedule {
+            cell_byte_units: 2,
+            index_byte_units: 3,
+            c_cell: 5,
+            c_idx: 7,
+            ..schedule()
+        };
+        let details = WriteDetails {
+            cells_created: 11,
+            index_joins: 13,
+            cell_bytes_written: 17,
+            index_bytes_written: 19,
+            cells_deleted: 1,
+            index_leaves: 4,
+            cell_bytes_deleted: 6,
+            index_bytes_deleted: 9,
+            ..WriteDetails::ZERO
+        };
+        let grown = 17 * 2 + 19 * 3 + 11 * 5 + 13 * 7;
+        let shrunk = 6 * 2 + 9 * 3 + 5 + 4 * 7;
+        assert_eq!(units_delta(&details, &weights), Ok(grown - shrunk));
+    }
+
     /// Every count, each with its own weight: 60 + 31 + 3 × 64 + 2 × 64.
     #[test]
     fn units_weigh_every_count() {

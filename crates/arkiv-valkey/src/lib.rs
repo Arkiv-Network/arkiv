@@ -119,17 +119,25 @@ impl ValkeyStore {
     /// Uses `KEYS`, which scans the whole keyspace — fine for tearing down a
     /// test namespace, and not something to run against a busy server.
     pub fn drop_namespace(&self) -> Result<(), StoreError> {
+        let found = self.namespace_keys()?;
         let client = self.backend.client().clone();
-        let pattern = self.backend.namespace().wildcard();
         self.bridge.run(async move {
-            let found: Vec<String> = client
-                .custom(fred::cmd!("KEYS"), vec![pattern])
-                .await
-                .map_err(|_| StoreError::Internal)?;
             if !found.is_empty() {
                 let _: u64 = client.del(found).await.map_err(|_| StoreError::Internal)?;
             }
             Ok(())
+        })
+    }
+
+    /// Every key in this store's namespace, by `KEYS`: see [`Self::drop_namespace`].
+    fn namespace_keys(&self) -> Result<Vec<String>, StoreError> {
+        let client = self.backend.client().clone();
+        let pattern = self.backend.namespace().wildcard();
+        self.bridge.run(async move {
+            client
+                .custom(fred::cmd!("KEYS"), vec![pattern])
+                .await
+                .map_err(|_| StoreError::Internal)
         })
     }
 
@@ -566,4 +574,54 @@ fn sort_records(records: &mut [Record], sort: &Sort) {
             SortDirection::Descending => ordering.reverse(),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arkiv_interfaces::store::{Cell, CellName, RecordKey, TypeId};
+
+    /// Every checkpoint copies the branch's diff under a frame key, and a frame
+    /// that is merged rather than rolled back keeps it. A committed or
+    /// discarded branch must take all of them along; otherwise every block
+    /// leaves one copy per transaction behind, for good.
+    #[test]
+    #[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+    fn a_finished_branch_leaves_no_frames() {
+        let url = std::env::var("VALKEY_URL").expect("set VALKEY_URL, e.g. redis://127.0.0.1:6379");
+        let store = ValkeyStore::ephemeral(&url).expect("connect");
+        let frames = || {
+            store
+                .namespace_keys()
+                .expect("list keys")
+                .into_iter()
+                .filter(|key| key.contains(":frame:"))
+                .count()
+        };
+        for commit in [true, false] {
+            let branch = store.begin(Some(store.head())).expect("begin");
+            for i in 0..3u8 {
+                store.checkpoint(branch).expect("checkpoint");
+                store
+                    .create(
+                        branch,
+                        RecordKey([i + if commit { 0 } else { 10 }; 32]),
+                        vec![(CellName::from("n"), Cell::field(TypeId::U64, vec![i; 8]))],
+                        None,
+                    )
+                    .expect("write");
+            }
+            assert!(frames() > 0, "the checkpoints saved frames");
+            if commit {
+                store.commit(branch).expect("commit");
+            } else {
+                store.discard(branch).expect("discard");
+            }
+            assert_eq!(
+                frames(),
+                0,
+                "no frame survives its branch (commit: {commit})"
+            );
+        }
+    }
 }

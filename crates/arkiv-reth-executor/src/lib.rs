@@ -170,13 +170,13 @@ fn calldata_tokens(data: &[u8]) -> u64 {
 /// entity transaction adds them to its compute rather than taking the larger
 /// of them and the ops.
 fn tx_gas(data: &[u8]) -> u64 {
-    21_000 + 4 * calldata_tokens(data)
+    ARKIV_TX_GAS + 4 * calldata_tokens(data)
 }
 
 /// The least a transaction pays for its calldata (EIP-7623: 21,000 plus 10
 /// per token), applied once to an entity transaction's compute.
 fn floor_gas(data: &[u8]) -> u64 {
-    21_000 + 10 * calldata_tokens(data)
+    ARKIV_TX_GAS + 10 * calldata_tokens(data)
 }
 
 /// An alloy `U256` as the spec's [`UserBalance`] bytes.
@@ -1647,7 +1647,7 @@ mod tests {
         seed_genesis(
             &store,
             [0x11; 32],
-            Some(&FeeSchedule::with_placeholder_weights(1_000_000)),
+            &FeeSchedule::with_placeholder_weights(1_000_000),
             [GenesisAccount {
                 address: HOST_SENDER,
                 balance: U256::from(HOST_FUNDS),
@@ -2077,6 +2077,32 @@ mod tests {
         );
     }
 
+    /// Calldata that does not decode runs no op and pays its terms plus the
+    /// start-nonce read, but at least the EIP-7623 floor. With the read free,
+    /// the floor (10 per token) is above the terms (4 per token), so it is what
+    /// is paid; with a read of 1,000,000, the terms and the read are.
+    #[test]
+    fn undecodable_calldata_pays_its_terms_and_read_but_at_least_the_floor() {
+        use arkiv_interfaces::store::priced::Prices;
+
+        let data = IEntityRegistry::executeCall::SELECTOR.to_vec();
+        assert!(floor_gas(&data) > tx_gas(&data));
+
+        let free = run_call(&host_store(FREE), data.clone(), U256::ZERO, true);
+        assert!(!free.success);
+        assert_eq!(free.gas_used, floor_gas(&data), "the floor");
+
+        let read = 1_000_000;
+        let prices = Prices { get: read, ..FREE };
+        let priced = run_call(&host_store(prices), data.clone(), U256::ZERO, true);
+        assert!(!priced.success);
+        assert_eq!(
+            priced.gas_used,
+            tx_gas(&data) + read,
+            "the terms and the read, above the floor"
+        );
+    }
+
     /// Calldata that does not decode pays its terms and the start-nonce read;
     /// when those do not fit `u64` together, the transaction is out of gas,
     /// pays all it supplied, and says so rather than naming the decode error.
@@ -2111,6 +2137,52 @@ mod tests {
         assert_eq!(probe.sender_paid, U256::ZERO);
         assert_eq!(probe.beneficiary_got, U256::ZERO);
         assert_eq!(probe.pool_got, U256::ZERO);
+    }
+
+    /// `eth_call` and `eth_estimateGas` run on the block's branch, one probe
+    /// after another. A probe's writes must not outlive it: a create and a
+    /// delete of an entity at genesis both succeed and leave the branch exactly
+    /// as they found it, so the next probe sees what the first one did.
+    #[test]
+    fn a_probe_leaves_the_branch_untouched() {
+        use alloy_sol_types::SolCall;
+        use arkiv_bindings::Operation;
+
+        let store = host_store(FREE);
+        let created = arkiv_interfaces::statemanager::EntityUpdates::create(
+            arkiv_interfaces::entity::Entity {
+                key: [0x42; 32],
+                owner: HOST_SENDER.into_array(),
+                expires_at: 1_000,
+                ..Default::default()
+            },
+        );
+        {
+            use arkiv_interfaces::statemanager::{EntityStore, StateView};
+            use arkiv_interfaces::store::Store;
+            let branch = store.begin(Some(store.head())).expect("begin");
+            let mut view = branch_view(&store, branch);
+            view.update_entity(created).expect("stage the entity");
+            StateView::commit(&mut view).expect("commit the view");
+            store.commit(branch).expect("commit the branch");
+        }
+
+        for ops in [
+            vec![create()],
+            vec![Operation::delete(B256::repeat_byte(0x42))],
+        ] {
+            let (branch, out) = transact(
+                &store,
+                call_tx(
+                    IEntityRegistry::executeCall { ops }.abi_encode(),
+                    U256::ZERO,
+                ),
+                false,
+                None,
+            );
+            assert!(out.expect("the probe runs").result.is_success());
+            assert!(untouched(&store, branch), "the probe left no trace");
+        }
     }
 
     /// The ordinary path still just moves money.

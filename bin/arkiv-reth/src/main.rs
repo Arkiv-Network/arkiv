@@ -315,9 +315,8 @@ fn main() {
                     Ok(())
                 });
             let launcher = builder.engine_api_launcher().with_provider_builder(
-                ArkivProviderBuilder::new(store.clone(), seals.clone())
-                    .check_genesis_root(on_golemdb)
-                    .fee_schedule(Some(fee_schedule)),
+                ArkivProviderBuilder::new(store.clone(), seals.clone(), fee_schedule)
+                    .check_genesis_root(on_golemdb),
             );
             let handle = builder
                 .launch_with(DebugNodeLauncher::new(launcher))

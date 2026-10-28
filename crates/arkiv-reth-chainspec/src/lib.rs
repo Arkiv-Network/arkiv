@@ -81,16 +81,33 @@ struct TokenomicsConfig {
     max_lifetime: u64,
 }
 
-impl From<TokenomicsConfig> for FeeSchedule {
-    fn from(config: TokenomicsConfig) -> Self {
-        Self {
+/// Every value must be positive: a zero `max_lifetime` makes every create and
+/// extend revert, and a zero weight or rate prices part of storage as free.
+impl TryFrom<TokenomicsConfig> for FeeSchedule {
+    type Error = eyre::Report;
+
+    fn try_from(config: TokenomicsConfig) -> eyre::Result<Self> {
+        for (name, value) in [
+            ("capacity_rate", config.capacity_rate),
+            ("cell_byte_units", config.cell_byte_units),
+            ("index_byte_units", config.index_byte_units),
+            ("c_cell", config.c_cell),
+            ("c_idx", config.c_idx),
+            ("max_lifetime", config.max_lifetime),
+        ] {
+            eyre::ensure!(
+                value > 0,
+                "genesis config.arkiv.tokenomics.{name} must be positive, not 0"
+            );
+        }
+        Ok(Self {
             capacity_rate: config.capacity_rate,
             cell_byte_units: config.cell_byte_units,
             index_byte_units: config.index_byte_units,
             c_cell: config.c_cell,
             c_idx: config.c_idx,
             max_lifetime: config.max_lifetime,
-        }
+        })
     }
 }
 
@@ -106,7 +123,8 @@ impl ArkivChainSpec {
             .get_deserialized::<ArkivConfig>("arkiv")
             .transpose()
             .map_err(|e| eyre::eyre!("genesis config.arkiv: {e}"))?
-            .map(|config| (config.golemdb, config.tokenomics.into()))
+            .map(|config| eyre::Ok((config.golemdb, FeeSchedule::try_from(config.tokenomics)?)))
+            .transpose()?
             .unzip();
         Ok(Self {
             inner,
@@ -477,6 +495,84 @@ mod tests {
                 max_lifetime: 7_884_000,
             })
         );
+    }
+
+    /// A zero makes the schedule useless or prices part of storage as free, so
+    /// every value must be positive, and the error names the one that is not.
+    #[test]
+    fn a_zero_schedule_value_is_refused() {
+        for name in [
+            "capacity_rate",
+            "cell_byte_units",
+            "index_byte_units",
+            "c_cell",
+            "c_idx",
+            "max_lifetime",
+        ] {
+            let mut zero = arkiv(|_| {});
+            zero["tokenomics"][name] = json!(0);
+            let error = with_arkiv(zero).expect_err(name).to_string();
+            assert_eq!(
+                error,
+                format!("genesis config.arkiv.tokenomics.{name} must be positive, not 0")
+            );
+        }
+    }
+
+    /// The genesis files price a typical entity sensibly: a create of a 1 KiB
+    /// entity for the whole `max_lifetime` buys storage gas well within one
+    /// transaction, under a tenth of the per-transaction gas cap (EIP-7825,
+    /// 2^24) and of the block gas limit. Today that is about 237,000 gas against
+    /// 1,677,721, seven times headroom: a `capacity_rate` ten times too high
+    /// fails this.
+    ///
+    /// Not a rule for every entity: a record at the size limits cannot be
+    /// bought for `max_lifetime` in one transaction, but its calldata alone
+    /// would not fit one either. It is bought for less and extended.
+    #[test]
+    fn a_typical_entity_fits_comfortably_in_one_transaction() {
+        use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
+        use arkiv_interfaces::entity_records;
+        use arkiv_interfaces::store::RecordMeta;
+        use arkiv_tokenomics::{meter, storage_time, units};
+        use reth_cli::chainspec::ChainSpecParser;
+
+        const PER_TRANSACTION_CAP: u64 = 1 << 24;
+        let entity = Entity {
+            key: [0x11; 32],
+            creator: [0x22; 20],
+            owner: [0x22; 20],
+            attributes: vec![Attribute::unindexed(
+                b"payload".to_vec(),
+                AttributeValue::Bytes(vec![0xab; 1024]),
+            )],
+            ..Entity::default()
+        };
+        let cells = entity_records::to_cells(&entity).unwrap();
+        let meta = RecordMeta::from_cells(cells.iter().map(|(name, cell)| (name, cell))).unwrap();
+
+        let dev = crate::parser::ArkivChainSpecParser::parse("dev").unwrap();
+        let example = ArkivChainSpec::from_genesis(
+            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap(),
+        )
+        .unwrap();
+        for (file, spec) in [("dev", &*dev), ("example", &example)] {
+            let schedule = spec.fee_schedule().expect(file);
+            let time = storage_time::create(
+                units::storage_units(&meta, schedule).unwrap(),
+                schedule.max_lifetime,
+                0,
+            )
+            .unwrap();
+            let gas = meter::storage_gas(time, schedule).unwrap();
+            let limit = PER_TRANSACTION_CAP.min(spec.inner().genesis().gas_limit);
+            assert!(
+                gas <= limit / 10,
+                "{file}: a 1 KiB entity for {} blocks buys {gas} storage gas, above {}",
+                schedule.max_lifetime,
+                limit / 10
+            );
+        }
     }
 
     #[test]

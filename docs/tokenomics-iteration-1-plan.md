@@ -810,6 +810,14 @@ Still open:
    10 gwei and `capacity_rate` 14: storage gas must fit the
    dev chain's 30M block gas limit and the EIP-7825 per-transaction cap for
    realistic entities and lifetimes.
+   Partly settled 2026-10-28 (review of #230): every schedule value must be positive, checked
+   when the genesis file is read. A typical entity must fit comfortably, as a test, not a
+   rule the node enforces: `a_typical_entity_fits_comfortably_in_one_transaction` requires a
+   1 KiB entity for the whole `max_lifetime` to buy under a tenth of the per-transaction cap
+   and the block gas limit, about 237,000 gas against 1,677,721 at today's values. A record
+   at the size limits cannot be bought for `max_lifetime` in one transaction, but its
+   calldata would not fit one either: it is bought for less and extended. The values
+   themselves remain placeholders.
 
 ## Coordination
 

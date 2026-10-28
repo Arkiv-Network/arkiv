@@ -38,3 +38,5 @@ arkiv-tokenomics.workspace = true
 
 [dev-dependencies]
 alloy-rlp.workspace = true
+# The entity record layout, to size a typical entity in the genesis files' pricing test.
+arkiv-interfaces.workspace = true

@@ -65,14 +65,14 @@ impl GenesisAccount {
 /// account funded with zero still exists.
 ///
 /// The fee schedule is a record of its own, so the genesis root, and with it
-/// the genesis hash, covers its values. A chain whose genesis has no
-/// `config.arkiv` has none, and no operation that needs pricing is available
-/// on it. The record is interim: once GolemDB's pricing snapshot carries
-/// Arkiv's weights, the schedule moves there.
+/// the genesis hash, covers its values. Every chain has one: a node refuses to
+/// start on a genesis without it, and a store seeded without it would fail
+/// every block that prices an entity operation. The record is interim: once
+/// GolemDB's pricing snapshot carries Arkiv's weights, the schedule moves there.
 pub fn seed_genesis(
     store: &HostStore,
     genesis_hash: [u8; 32],
-    fee_schedule: Option<&FeeSchedule>,
+    fee_schedule: &FeeSchedule,
     alloc: impl IntoIterator<Item = GenesisAccount>,
 ) -> Result<Option<CommitId>, StoreError> {
     if store.head() != CommitId::GENESIS {
@@ -80,14 +80,12 @@ pub fn seed_genesis(
     }
 
     let branch = store.begin(None)?;
-    if let Some(schedule) = fee_schedule
-        && let Err(error) = store.create(
-            branch,
-            schedule_record::RECORD_KEY,
-            schedule_record::to_cells(schedule),
-            None,
-        )
-    {
+    if let Err(error) = store.create(
+        branch,
+        schedule_record::RECORD_KEY,
+        schedule_record::to_cells(fee_schedule),
+        None,
+    ) {
         let _ = store.discard(branch);
         return Err(error);
     }
@@ -220,7 +218,7 @@ mod tests {
     #[test]
     fn the_genesis_root_must_be_block_0s() {
         let store = store();
-        let commit = seed_genesis(&store, HASH, Some(&SCHEDULE), alice(5))
+        let commit = seed_genesis(&store, HASH, &SCHEDULE, alice(5))
             .unwrap()
             .unwrap();
         let root = store.commit_hash(commit).unwrap();
@@ -237,7 +235,7 @@ mod tests {
     #[test]
     fn a_funded_account_is_readable_at_the_genesis_commit() {
         let store = store();
-        let commit = seed_genesis(&store, HASH, Some(&SCHEDULE), alice(1_000))
+        let commit = seed_genesis(&store, HASH, &SCHEDULE, alice(1_000))
             .expect("seed")
             .expect("fresh");
 
@@ -256,7 +254,7 @@ mod tests {
             c_idx: 65,
             ..SCHEDULE
         };
-        let commit = seed_genesis(&store, HASH, Some(&schedule), alice(1))
+        let commit = seed_genesis(&store, HASH, &schedule, alice(1))
             .expect("seed")
             .expect("fresh");
         let record = store
@@ -278,7 +276,7 @@ mod tests {
     fn the_genesis_root_covers_the_fee_schedule() {
         let root = |schedule: &FeeSchedule| {
             let store = store();
-            let commit = seed_genesis(&store, HASH, Some(schedule), alice(1))
+            let commit = seed_genesis(&store, HASH, schedule, alice(1))
                 .unwrap()
                 .unwrap();
             store.commit_hash(commit).unwrap()
@@ -297,7 +295,7 @@ mod tests {
     #[test]
     fn the_genesis_commit_is_reachable_by_the_block_hash() {
         let store = store();
-        let commit = seed_genesis(&store, HASH, Some(&SCHEDULE), alice(1))
+        let commit = seed_genesis(&store, HASH, &SCHEDULE, alice(1))
             .expect("seed")
             .expect("fresh");
         assert_eq!(store.commit_by_tag(HASH).expect("by tag"), Some(commit));
@@ -307,12 +305,12 @@ mod tests {
     #[test]
     fn a_store_that_already_has_a_commit_is_left_alone() {
         let store = store();
-        seed_genesis(&store, HASH, Some(&SCHEDULE), alice(1_000))
+        seed_genesis(&store, HASH, &SCHEDULE, alice(1_000))
             .expect("seed")
             .expect("fresh");
 
         assert_eq!(
-            seed_genesis(&store, HASH, Some(&SCHEDULE), alice(9_999)).expect("second seed"),
+            seed_genesis(&store, HASH, &SCHEDULE, alice(9_999)).expect("second seed"),
             None,
             "the second call is a no-op",
         );
@@ -337,7 +335,7 @@ mod tests {
             check_chain(&store, HASH).is_ok(),
             "a fresh store holds no chain yet",
         );
-        seed_genesis(&store, HASH, Some(&SCHEDULE), alice(1))
+        seed_genesis(&store, HASH, &SCHEDULE, alice(1))
             .expect("seed")
             .expect("fresh");
         assert!(check_chain(&store, HASH).is_ok(), "this chain");
@@ -349,7 +347,7 @@ mod tests {
     #[test]
     fn an_account_allocated_zero_still_exists() {
         let store = store();
-        let commit = seed_genesis(&store, HASH, Some(&SCHEDULE), alice(0))
+        let commit = seed_genesis(&store, HASH, &SCHEDULE, alice(0))
             .expect("seed")
             .expect("fresh");
 
@@ -383,7 +381,7 @@ mod root_tests {
         seed_genesis(
             &store,
             [9; 32],
-            Some(&FeeSchedule::with_placeholder_weights(7_884_000)),
+            &FeeSchedule::with_placeholder_weights(7_884_000),
             vec![GenesisAccount {
                 address: Address::repeat_byte(0xaa),
                 balance: U256::from(1_000),

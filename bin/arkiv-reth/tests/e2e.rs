@@ -1951,6 +1951,9 @@ async fn a_bad_arkiv_section_stops_the_node() {
     let mut limits = genesis_json();
     limits["config"]["arkiv"] = arkiv_section("keccak-256");
     limits["config"]["arkiv"]["golemdb"]["cell_limits"]["max_str_len"] = (MAX_STR_BYTES / 2).into();
+    let mut no_lifetime = genesis_json();
+    no_lifetime["config"]["arkiv"] = arkiv_section("keccak-256");
+    no_lifetime["config"]["arkiv"]["tokenomics"]["max_lifetime"] = 0.into();
     let mut segments = genesis_json();
     segments["config"]["arkiv"] = arkiv_section("keccak-256");
     segments["config"]["arkiv"]["golemdb"]["immutable_data"] =
@@ -1960,6 +1963,10 @@ async fn a_bad_arkiv_section_stops_the_node() {
         (top_level, "no config.arkiv.golemdb"),
         (misnamed, "unknown field `hash_fn`"),
         (limits, "must be Arkiv's limits"),
+        (
+            no_lifetime,
+            "config.arkiv.tokenomics.max_lifetime must be positive",
+        ),
         (segments, "the node declares its own segments"),
     ] {
         let genesis_path = genesis_file(&genesis);
@@ -2035,7 +2042,14 @@ async fn a_golemdb_store_with_another_genesis_root_is_refused() {
         nonce: 0,
     };
     let spec = <arkiv_reth_chainspec::ArkivChainSpecParser as reth_cli::chainspec::ChainSpecParser>::parse(example).unwrap();
-    seed_genesis(&store, genesis_hash.0, spec.fee_schedule(), [other]).unwrap();
+    seed_genesis(
+        &store,
+        genesis_hash.0,
+        spec.fee_schedule()
+            .expect("the example genesis has a fee schedule"),
+        [other],
+    )
+    .unwrap();
     drop(store);
 
     node.restart();

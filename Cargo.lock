@@ -1606,6 +1606,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "arkiv-interfaces",
  "arkiv-tokenomics",
  "eyre",
  "golemdb-api",
