@@ -29,6 +29,8 @@ use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, Query
 use jsonrpsee::RpcModule;
 use jsonrpsee::types::ErrorObjectOwned;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::error::{block_unavailable, cursor_error, internal_error, invalid_params, query_error};
 use crate::store_reads::ReadError;
@@ -36,20 +38,30 @@ use crate::store_reads::ReadError;
 /// Why a past block cannot be read: the store no longer holds its state.
 const NOT_RETAINED: &str = "state for this block is not retained";
 
+/// How many `arkiv_*` reads run at once unless the node is told otherwise.
+/// Each read holds one GolemDB read slot at a time. The node shares a fixed
+/// number of slots, block import included, and with none left every read fails.
+pub const DEFAULT_MAX_CONCURRENT_READS: usize = 32;
+
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
 ///
 /// `provider` hands out a fresh state snapshot per call (`StateProviderFactory`) and
-/// answers block-header/number reads for `arkiv_getBlockTiming`.
-pub fn arkiv_module<Provider>(provider: Provider, store: HostStore) -> eyre::Result<RpcModule<()>>
+/// answers block-header/number reads for `arkiv_getBlockTiming`. At most
+/// `max_concurrent_reads` reads run at once; further calls wait for a turn.
+pub fn arkiv_module<Provider>(
+    provider: Provider,
+    store: HostStore,
+    max_concurrent_reads: usize,
+) -> eyre::Result<RpcModule<Semaphore>>
 where
     Provider:
         StateProviderFactory + HeaderProvider + BlockNumReader + Clone + Send + Sync + 'static,
 {
-    let mut module = RpcModule::new(());
+    let mut module = RpcModule::new(Semaphore::new(max_concurrent_reads));
 
     let p = provider.clone();
     let st = store.clone();
-    module.register_async_method("arkiv_getEntity", move |params, _ctx, _ext| {
+    module.register_async_method("arkiv_getEntity", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
         async move {
@@ -61,16 +73,13 @@ where
             let block: Option<u64> = seq
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
-            // The read hits MDBX, so run it off the async runtime.
-            tokio::task::spawn_blocking(move || read_entity(&provider, &store, key, block))
-                .await
-                .map_err(|e| internal_error(format!("task join: {e}")))?
+            run_read(permits, move || read_entity(&provider, &store, key, block)).await
         }
     })?;
 
     let p = provider.clone();
     let st = store.clone();
-    module.register_async_method("arkiv_debugEntityExists", move |params, _ctx, _ext| {
+    module.register_async_method("arkiv_debugEntityExists", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
         async move {
@@ -81,17 +90,16 @@ where
             let block: Option<u64> = seq
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
-            tokio::task::spawn_blocking(move || {
+            run_read(permits, move || {
                 entity_exists_unfiltered(&provider, &store, key, block)
             })
             .await
-            .map_err(|e| internal_error(format!("task join: {e}")))?
         }
     })?;
 
     let p = provider.clone();
     let st = store.clone();
-    module.register_async_method("arkiv_query", move |params, _ctx, _ext| {
+    module.register_async_method("arkiv_query", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
         async move {
@@ -104,17 +112,13 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid options param: {e}")))?
                 .unwrap_or_default();
-            // The parse is pure, but the evaluation hits MDBX — run it off the
-            // async runtime.
-            tokio::task::spawn_blocking(move || run_query(&provider, &store, &q, &options))
-                .await
-                .map_err(|e| internal_error(format!("task join: {e}")))?
+            run_read(permits, move || run_query(&provider, &store, &q, &options)).await
         }
     })?;
 
     let p = provider.clone();
     let st = store.clone();
-    module.register_async_method("arkiv_getEntityCount", move |params, _ctx, _ext| {
+    module.register_async_method("arkiv_getEntityCount", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
         async move {
@@ -124,23 +128,37 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?
                 .unwrap_or_default();
-            tokio::task::spawn_blocking(move || entity_count(&provider, &store, request))
-                .await
-                .map_err(|e| internal_error(format!("task join: {e}")))?
+            run_read(permits, move || entity_count(&provider, &store, request)).await
         }
     })?;
 
     let p = provider;
-    module.register_async_method("arkiv_getBlockTiming", move |_params, _ctx, _ext| {
+    module.register_async_method("arkiv_getBlockTiming", move |_params, permits, _ext| {
         let provider = p.clone();
-        async move {
-            tokio::task::spawn_blocking(move || block_timing(&provider))
-                .await
-                .map_err(|e| internal_error(format!("task join: {e}")))?
-        }
+        async move { run_read(permits, move || block_timing(&provider)).await }
     })?;
 
     Ok(module)
+}
+
+/// Run `read` off the async runtime once one of `permits` is free. Reads hit
+/// MDBX, so they block. The permit lives as long as the read, even when the
+/// caller goes away first.
+async fn run_read<T, F>(permits: Arc<Semaphore>, read: F) -> Result<T, ErrorObjectOwned>
+where
+    F: FnOnce() -> Result<T, ErrorObjectOwned> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = permits
+        .acquire_owned()
+        .await
+        .map_err(|e| internal_error(format!("read permit: {e}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    })
+    .await
+    .map_err(|e| internal_error(format!("task join: {e}")))?
 }
 
 /// The block a read answers for and the store commit that holds its state:
@@ -493,5 +511,30 @@ mod tests {
         assert!(matches!(dropped, ReadFailure::StateDropped));
         let other = store_failure("get entity")(ReadError::Store(StoreError::NotFound));
         assert!(matches!(other, ReadFailure::Other(_)));
+    }
+
+    /// No more reads run at once than there are permits; the rest wait their turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_beyond_the_permits_wait() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let permits = Arc::new(Semaphore::new(2));
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let (running, most) = (running.clone(), most.clone());
+                tokio::spawn(run_read(permits.clone(), move || {
+                    most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }))
+            })
+            .collect();
+        for read in reads {
+            read.await.unwrap().unwrap();
+        }
+        assert_eq!(most.load(Ordering::SeqCst), 2);
     }
 }
