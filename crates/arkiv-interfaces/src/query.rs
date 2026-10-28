@@ -39,6 +39,9 @@ pub enum Query {
     Lt { key: AnnotKey, value: AnnotVal },
     /// Matches entities whose `key` is less than or equal to `value`.
     Lte { key: AnnotKey, value: AnnotVal },
+    /// Matches entities whose `key` lies within `bounds`, inclusive at both
+    /// ends — the `BETWEEN` operator.
+    Between { key: AnnotKey, bounds: ValueRange },
     /// Matches entities whose `key` starts with `value` — the `STARTSWITH`
     /// operator, a raw UTF-8 byte prefix with no normalization.
     StartsWith { key: AnnotKey, value: AnnotVal },
@@ -95,6 +98,34 @@ pub enum BuiltIn {
 /// writer derived the index's ([`AttributeValue::index_bytes`]), and a value of one
 /// type never matches an attribute of another.
 pub type AnnotVal = AttributeValue;
+
+/// The bounds of a [`Query::Between`]: a low and a high value of one type,
+/// both included. A `low` above `high` admits no value, and matches nothing.
+///
+/// The fields are private, so bounds of two types cannot be built: the
+/// language makes them a type error, and no attribute could hold both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRange {
+    low: AnnotVal,
+    high: AnnotVal,
+}
+
+impl ValueRange {
+    /// `low` to `high`, or `None` when the two are not of one type.
+    pub fn new(low: AnnotVal, high: AnnotVal) -> Option<Self> {
+        (low.attr_type() == high.attr_type()).then_some(Self { low, high })
+    }
+
+    /// The lower bound, included.
+    pub fn low(&self) -> &AnnotVal {
+        &self.low
+    }
+
+    /// The upper bound, included.
+    pub fn high(&self) -> &AnnotVal {
+        &self.high
+    }
+}
 
 /// Where to start and how many to return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

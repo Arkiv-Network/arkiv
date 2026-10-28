@@ -15,7 +15,7 @@
 //! ```text
 //!     level       >= i32(10)
 //! AND balance     >  u256(1000000)
-//! AND score       >= dec(3.5)
+//! AND score       BETWEEN dec(3.5) AND dec(5)
 //! AND name        =  str('Bob')
 //! AND desc        STARTSWITH str('ab')
 //! AND parent      =  key(0x123…)
@@ -35,9 +35,17 @@
 //! deliberate — if a bare number meant different types in different places, you
 //! could not read a predicate and know what it asserts.
 //!
-//! Ordering is only defined for the numeric types, so `< <= > >=` on anything
-//! else is a parse error rather than an empty result. `STARTSWITH` is the only
-//! pattern operator: a raw UTF-8 byte prefix, no normalization.
+//! Every type the language can write is ordered, so `< <= > >=` take any of
+//! them: numerically for `i32`, `u64`, `u256` and `dec`, `false < true` for a
+//! `bool`, and unsigned byte order for `str`, `bytes32`, `addr` and `key`.
+//! `STARTSWITH` is the only pattern operator: a raw UTF-8 byte prefix, no
+//! normalization, and on anything but a `str` a parse error rather than an
+//! empty result.
+//!
+//! `a BETWEEN lo AND hi` matches what `a >= lo AND a <= hi` does: both bounds
+//! included, of one type, and nothing at all when `lo` is above `hi`. The
+//! `AND` inside it is its own, so `a BETWEEN 1 AND 5 AND b = 2` is
+//! `(a BETWEEN 1 AND 5) AND b = 2`.
 //!
 //! ## What this version leaves out
 //!
@@ -57,8 +65,8 @@
 //! assert_eq!(parse("*").unwrap(), Query::All);
 //! assert!(parse("level >= i32(10) AND name = str('Bob')").is_ok());
 //!
-//! // A range operator on an unordered type is rejected, not answered emptily.
-//! assert!(parse("owner.tag >= str('x')").is_err());
+//! // A prefix on anything but a string is rejected, not answered emptily.
+//! assert!(parse("level STARTSWITH i32(1)").is_err());
 //! ```
 
 #![no_std]

@@ -1228,21 +1228,15 @@ mod tests {
     use super::*;
     use crate::store::TypeId;
 
-    /// The reference implementation satisfies the whole spec contract.
+    /// The reference implementation satisfies the whole contract: both parts.
     #[test]
-    fn store_conformance() {
-        crate::store::conformance::run_all(&MemStore::new);
-    }
-
-    /// And the host-facing extensions on top of it.
-    #[test]
-    fn store_ext_conformance() {
-        crate::store::conformance::run_all_ext(&MemStore::new);
+    fn conformance_part_one() {
+        crate::store::conformance::run_part_one(&MemStore::new);
     }
 
     #[test]
-    fn segment_conformance() {
-        crate::store::conformance::run_all_segments(&MemStore::new);
+    fn conformance_part_two() {
+        crate::store::conformance::run_part_two(&MemStore::new);
     }
 
     /// A 20-byte address survives the trip into the 32-byte key space, and an

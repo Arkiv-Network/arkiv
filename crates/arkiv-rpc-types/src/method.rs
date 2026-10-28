@@ -7,7 +7,7 @@
 use alloy_eips::BlockNumberOrTag;
 use serde::{Deserialize, Serialize};
 
-use crate::entity::{EntityData, Select, de_u64_flexible, ser_u64_hex};
+use crate::entity::{EntityData, Select, de_u64_flexible, ser_opt_u64_hex, ser_u64_hex};
 
 /// Page size served when an `arkiv_query` request omits `limit`.
 pub const DEFAULT_PAGE_SIZE: u64 = 100;
@@ -64,8 +64,9 @@ pub struct CountRequest {
 }
 
 /// The `arkiv_query` response: one page of matched entities, the block the
-/// query evaluated against (hex), and an opaque continuation cursor (absent on
-/// the last page).
+/// query evaluated against (hex), an opaque continuation cursor (absent on
+/// the last page), and the size of the whole match set (hex, present only
+/// when `select.count` asked for it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryResponse {
@@ -74,6 +75,13 @@ pub struct QueryResponse {
     pub block_number: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_u64_hex",
+        deserialize_with = "de_u64_flexible"
+    )]
+    pub count: Option<u64>,
 }
 
 /// The `arkiv_getBlockTiming` response.
@@ -122,26 +130,33 @@ mod tests {
             data: vec![],
             block_number: 0x8e1ff,
             cursor: Some("b64:abc".to_string()),
+            count: Some(0x2a),
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["blockNumber"], "0x8e1ff", "quantities go over as hex");
+        assert_eq!(json["count"], "0x2a", "the count is a quantity too");
         let back: QueryResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back.block_number, 0x8e1ff);
         assert_eq!(back.cursor.as_deref(), Some("b64:abc"));
+        assert_eq!(back.count, Some(0x2a));
     }
 
-    /// The last page omits `cursor` entirely rather than sending null.
+    /// The last page omits `cursor` entirely rather than sending null, and an
+    /// unselected `count` is omitted the same way.
     #[test]
     fn a_final_page_carries_no_cursor_field() {
         let json = serde_json::to_value(QueryResponse {
             data: vec![],
             block_number: 1,
             cursor: None,
+            count: None,
         })
         .unwrap();
         assert!(json.get("cursor").is_none());
+        assert!(json.get("count").is_none());
         let back: QueryResponse = serde_json::from_value(json).unwrap();
         assert!(back.cursor.is_none());
+        assert!(back.count.is_none());
     }
 
     #[test]

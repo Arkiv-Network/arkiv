@@ -17,8 +17,9 @@ pub mod rpc_error_codes {
     /// junk.
     pub const MALFORMED_INPUT: i32 = -32001;
 
-    /// Well-formed but not well-typed: a range operator on an equality-only
-    /// type, an unknown type tag, a value whose type doesn't fit the attribute.
+    /// Well-formed but not well-typed: `STARTSWITH` on a type other than
+    /// `str`, `BETWEEN` bounds of two types, an unknown type tag, a value whose
+    /// type doesn't fit the attribute.
     pub const TYPE_ERROR: i32 = -32002;
 
     /// A literal that doesn't fit its tag: `i32` out of range, a bad EIP-55

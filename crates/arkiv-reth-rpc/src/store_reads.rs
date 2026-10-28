@@ -54,14 +54,24 @@ pub fn entity<S: Store + ?Sized>(
     entity_records::read(store, ReadTarget::Commit(at), key)
 }
 
-/// Entities matching `query`, as of `at`, one page at a time.
+/// One page of [`query`]: its entities, and the size of the whole match set
+/// when it was asked for.
+pub struct EntityPage {
+    pub entities: Vec<Entity>,
+    pub total_matched: Option<u64>,
+}
+
+/// Entities matching `query`, as of `at`, one page at a time. With
+/// `total_matched`, the page also counts the whole match set, which runs the
+/// filter to completion rather than stopping once the page is full.
 pub fn query<S: Store + ?Sized>(
     store: &S,
     at: CommitId,
     query: &ArkivQuery,
     offset: u64,
     limit: u64,
-) -> Result<Vec<Entity>, ReadError> {
+    total_matched: bool,
+) -> Result<EntityPage, ReadError> {
     let result = store
         .query(
             Some(at),
@@ -71,17 +81,21 @@ pub fn query<S: Store + ?Sized>(
                 page: Page { offset, limit },
                 // The whole record: an entity is reconstructed from all of it.
                 projection: None,
-                total_matched: false,
+                total_matched,
             },
             None,
         )?
         .into_value();
-    result
+    let entities = result
         .records
         .iter()
         .map(entity_records::from_record)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(ReadError::Record)
+        .map_err(ReadError::Record)?;
+    Ok(EntityPage {
+        entities,
+        total_matched: result.total_matched,
+    })
 }
 
 /// How many entities match, as of `at`.

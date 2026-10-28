@@ -50,6 +50,7 @@ pub struct Select {
     pub creation_flags: Option<bool>,
     pub attribute_schema: Option<bool>,
     pub attributes: Option<AttributeSelect>,
+    pub count: Option<bool>,
 }
 
 /// `attributes` is either a bare `true` (all of them) or a `{name: true}` map
@@ -85,6 +86,9 @@ pub struct Projection {
     pub creation_flags: bool,
     pub attribute_schema: bool,
     pub attributes: AttributeProjection,
+    /// The size of the whole match set, independent of the page: an aggregate
+    /// beside the entities, not a field of any of them.
+    pub count: bool,
 }
 
 impl Default for Projection {
@@ -100,6 +104,7 @@ impl Default for Projection {
             creation_flags: false,
             attribute_schema: false,
             attributes: AttributeProjection::Off,
+            count: false,
         }
     }
 }
@@ -122,6 +127,7 @@ impl Projection {
             creation_flags: true,
             attribute_schema: false,
             attributes: AttributeProjection::All,
+            count: false,
         }
     }
 
@@ -150,7 +156,35 @@ impl Projection {
                         .collect(),
                 ),
             },
+            count: select.count.unwrap_or(false),
         })
+    }
+
+    /// Whether `count` is all this asks for. The answer is then the count
+    /// alone: no entities, so no page to read and no cursor to a next one.
+    pub fn is_count_only(&self) -> bool {
+        let Self {
+            key,
+            owner,
+            creator,
+            created_at,
+            updated_at,
+            expires_at,
+            creation_flags,
+            attribute_schema,
+            attributes,
+            count,
+        } = self;
+        let any_field = *key
+            || *owner
+            || *creator
+            || *created_at
+            || *updated_at
+            || *expires_at
+            || *creation_flags
+            || *attribute_schema
+            || *attributes != AttributeProjection::Off;
+        *count && !any_field
     }
 
     /// A stable byte encoding of this projection, for binding a cursor to the
@@ -166,6 +200,7 @@ impl Projection {
             u8::from(self.expires_at),
             u8::from(self.creation_flags),
             u8::from(self.attribute_schema),
+            u8::from(self.count),
         ];
         match &self.attributes {
             AttributeProjection::Off => out.push(0),
@@ -657,6 +692,10 @@ mod tests {
             select(serde_json::json!({ "key": true, "owner": true })).fingerprint()
         );
         assert_ne!(
+            base,
+            select(serde_json::json!({ "key": true, "count": true })).fingerprint()
+        );
+        assert_ne!(
             select(serde_json::json!({ "attributes": true })).fingerprint(),
             select(serde_json::json!({ "attributes": { "a": true } })).fingerprint(),
         );
@@ -669,5 +708,20 @@ mod tests {
             select(serde_json::json!({ "attributes": { "a": true, "b": true } })).fingerprint(),
             select(serde_json::json!({ "attributes": { "b": true, "a": true } })).fingerprint(),
         );
+    }
+
+    /// `count` with no entity field is the count alone; beside one, it rides
+    /// along with the page.
+    #[test]
+    fn count_without_an_entity_field_is_count_only() {
+        assert!(select(serde_json::json!({ "count": true })).is_count_only());
+        assert!(select(serde_json::json!({ "key": false, "count": true })).is_count_only());
+        assert!(!select(serde_json::json!({ "key": true, "count": true })).is_count_only());
+        assert!(
+            !select(serde_json::json!({ "attributes": { "a": true }, "count": true }))
+                .is_count_only()
+        );
+        assert!(!select(serde_json::json!({ "count": false })).is_count_only());
+        assert!(!Projection::default().is_count_only());
     }
 }
