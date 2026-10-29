@@ -133,6 +133,7 @@ mod tests {
                     )
                 }))
                 .collect(),
+            meta: None,
         }
     }
 
