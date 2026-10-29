@@ -31,7 +31,9 @@ use arkiv_interfaces::store::{
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
-pub use golemdb_api::{CellLimits, Genesis, HashAlgorithm, OpenError, PruningConfig, RecordLimits};
+pub use golemdb_api::{
+    CellLimits, Genesis, HashAlgorithm, OpenError, PricingConfig, PruningConfig, RecordLimits,
+};
 
 use convert::{
     arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
@@ -394,11 +396,11 @@ impl Store for GolemDbStore {
         .map(metered)
     }
 
-    /// The query runs as written, so what GolemDB cannot run yet is
-    /// `NotImplemented`: a `Not`, a presence test for `key`, and a sort.
-    /// Matches come in GolemDB's own order, the order the records were
-    /// created in, and paging runs over that order within GolemDB's own query
-    /// limit, over which a page is `LimitExceeded`.
+    /// The query runs as written, so what GolemDB cannot run yet, a `Not`, is
+    /// `NotImplemented`. Matches come in the sort's order, or with no sort in
+    /// GolemDB's own order, the order the records were created in, which also
+    /// orders the ties of a sort. Paging runs over that order within GolemDB's
+    /// own query limit, over which a page is `LimitExceeded`.
     fn query(
         &self,
         at: Option<CommitId>,

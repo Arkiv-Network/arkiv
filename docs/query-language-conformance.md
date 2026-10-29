@@ -85,18 +85,20 @@ so the adapter cannot tell them apart:
 - `parent = key(X)` also matches a `bytes32`-typed `parent` holding `X`, and
   the reverse. The same holds for the range comparisons Q3 enabled:
   `parent > key(X)` also matches `bytes32`-typed `parent` values above `X`.
-- `typeof(x) = bytes32` also finds `key`-typed attributes.
-- `typeof(x) = key` returns `NotImplemented`, which the RPC reports as
-  `-32603`.
+- `typeof(x) = bytes32` also finds `key`-typed attributes, and for now
+  `typeof(x) = key` is mapped to the same `bytes32` presence test, so it also
+  finds `bytes32`-typed attributes.
 
 **Where:**
-- [`leaf`, crates/arkiv-golemdb/src/convert/query.rs:139-153](../crates/arkiv-golemdb/src/convert/query.rs#L139-L153)
-- Adapter test asserting the refusal: [crates/arkiv-golemdb/tests/query.rs:351-371](../crates/arkiv-golemdb/tests/query.rs#L351-L371)
+- [`leaf`, crates/arkiv-golemdb/src/convert/query.rs:137-157](../crates/arkiv-golemdb/src/convert/query.rs#L137-L157)
+- Adapter test asserting both `typeof`s find both types: `typeof_key_and_typeof_bytes32_both_find_both` in
+  [crates/arkiv-golemdb/tests/query.rs](../crates/arkiv-golemdb/tests/query.rs)
 
 **Tasks:**
 - [ ] Give `key` its own type in GolemDB, or carry the Arkiv type alongside
       the value so the adapter can filter on it.
-- [ ] Make `typeof(x) = key` answerable.
+- [x] Make `typeof(x) = key` answerable. For now it is the `bytes32` presence
+      test, so it is answered but also matches `bytes32`-typed attributes.
 - [ ] Add a GolemDB test: an entity with a `bytes32` attribute and one with a
       `key` attribute holding the same bytes; each typed query finds only its
       own.
@@ -405,7 +407,7 @@ takes 40 hex digits, and `key` and `bytes32` take 64.
 | `h < bytes32(0x…)` | OK | OK (was `-32002`) | tests | Q3 ✓ |
 | `NOT (rank = u256(30))`, GolemDB node | complement | `-32603` | code | Q1 |
 | `parent = key(X)` against a `bytes32` `parent` = X, GolemDB node | no match | match | code | Q2 |
-| `typeof(x) = key`, GolemDB node | OK | `-32603` | code | Q2 |
+| `typeof(x) = key`, GolemDB node | `key`-typed `x` only | also finds `bytes32`-typed `x` (was `-32603`) | code | Q2 |
 | `$owner = '0x…'` | error (must be tagged) | OK | parser | Q6 |
 | `level = I32(10)` | unspecified | OK | parser | Q7 |
 | `Key = true` | OK (names are case-sensitive) | `-32001` | parser | Q7 |

@@ -18,7 +18,13 @@ fn config() -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
+        genesis: Genesis::new(
+            HashAlgorithm::Keccak256,
+            limits,
+            record_limits,
+            None,
+            PricingConfig::zero(),
+        ),
         segments: vec![SegmentSpec {
             name: SEGMENT.into(),
             columns: 2,

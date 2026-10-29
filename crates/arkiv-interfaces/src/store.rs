@@ -535,16 +535,22 @@ pub enum SortDirection {
     Descending,
 }
 
-/// One sort key. Under a sort, ties break on ascending [`RecordKey`].
+/// One sort key: the cell `cell`, read as `type_id`, in `direction`.
 ///
-/// Absent, results follow the store's own order over its records at the
-/// commit: fixed for that commit, so the same query lists the same records in
-/// the same order and pages taken by offset partition the matches, but not
-/// necessarily key order. GolemDB's is the order the records were created in;
-/// the reference store's is key order.
+/// A record without the cell, or whose cell holds another type, has no value
+/// to sort by: it sorts below every value, so first ascending and last
+/// descending. Records that tie, those without a value included, come in the
+/// store's own order, in either direction.
+///
+/// The store's own order is also what results follow with no sort: the order
+/// over its records at the commit, fixed for that commit, so the same query
+/// lists the same records in the same order and pages taken by offset
+/// partition the matches, but not necessarily key order. GolemDB's is the
+/// order the records were created in; the reference store's is key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sort {
     pub cell: CellName,
+    pub type_id: TypeId,
     pub direction: SortDirection,
 }
 
@@ -1453,10 +1459,12 @@ impl Filter {
 }
 
 impl Record {
-    /// This record's value for a sort key, in [`order_encoding`] form.
-    /// `None` when the record has no such cell, which sorts it last.
-    pub fn sort_key(&self, cell: &str) -> Option<Vec<u8>> {
-        self.cell(cell)
+    /// This record's value for `sort`, in [`order_encoding`] form. `None` when
+    /// the record has no such cell, or holds another type there, which sorts
+    /// it below every value.
+    pub fn sort_key(&self, sort: &Sort) -> Option<Vec<u8>> {
+        self.cell(&sort.cell)
+            .filter(|cell| cell.type_id == sort.type_id)
             .map(|cell| order_encoding(&cell.value, cell.type_id))
     }
 }

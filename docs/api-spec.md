@@ -191,8 +191,9 @@ Purge emits **no** event; clients track the indexed `$expiresAt`.
 ## 4. Read path — the `arkiv_query` language
 
 The `arkiv_query` string is a bare boolean expression — **no `WHERE`** — or the
-**match-all** query `*`. Keywords are case-insensitive; `--` comments to end of
-line.
+**match-all** query `*`, optionally followed by an `ORDER BY` clause (see
+[Sorting](#sorting--order-by)). Keywords are case-insensitive; `--` comments to
+end of line.
 
 Queries see only **indexed** user attributes and the queryable system
 attributes. Unindexed attributes are stored and returned in results, but no
@@ -243,11 +244,13 @@ AND typeof(age) =  i32
   `typeof(name) = tag` likewise only sees indexed attributes.
 - **Match-all:** the query string `*` matches **every active entity** at
   `atBlock`, still paged by `limit`/`cursor`. `*` is only valid as the
-  **entire** query (`* AND level > 10`, `NOT *` are parse errors).
+  **entire** predicate part (`* AND level > 10`, `NOT *` are parse errors;
+  `* ORDER BY …` is fine).
 
 ### Grammar
 
 ```ebnf
+statement   = query , [ orderBy ] ;
 query       = matchAll | expr ;
 matchAll    = "*" ;
 expr        = andExpr , { OR , andExpr } ;
@@ -272,13 +275,17 @@ taggedLit   = typeTag , "(" , literalBody , ")" ;
 typeTag     = "i32" | "u64" | "u256" | "dec" | "str" | "addr" | "key" | "bytes32" | "bool" ;
 boolLit     = TRUE | FALSE ;
 strLit      = "'" , { utf8Char | "''" } , "'" ;
+
+orderBy     = ORDER , BY , attrRef , [ ":" , typeTag ] , [ ASC | DESC ] ;
 ```
 
 Precedence, tightest first: `NOT`, `AND`, `OR` (a `BETWEEN`'s own `AND` is part
 of the predicate). Reserved words:
 `AND OR NOT TRUE FALSE BETWEEN STARTSWITH EXISTS TYPEOF`. Type tags are recognized
-positionally (before `(` and as `TYPEOF`'s RHS), not globally reserved. `bytes`
-has no literal, since it can never be indexed.
+positionally (before `(`, as `TYPEOF`'s RHS and after an `ORDER BY`
+attribute's `:`), not globally reserved, and so are `ORDER BY ASC DESC`, which
+are words only where the clause stands: `desc` stays a valid attribute name. `bytes` has no literal,
+since it can never be indexed.
 
 ### Operator × type matrix
 
@@ -319,6 +326,36 @@ Queryable:
 
 Returned in results only, not queryable: `$createdAt` (`u64`, block height),
 `$updatedAt` (`u64`, block height), `$creationFlags`.
+
+### Sorting — `ORDER BY`
+
+A query may end with `ORDER BY`, which returns its matches sorted by **one**
+attribute, read as **one** type:
+
+```sql
+rank >= u256(10) ORDER BY rank:u256 DESC
+* ORDER BY name:str
+team = str('red') ORDER BY $expiresAt
+```
+
+- **The type is part of the clause.** A user attribute can hold different
+  types on different entities, so it names the one to sort by after a `:`,
+  as in `rank:u256`; `ORDER BY rank` alone is a type error. A queryable system
+  attribute has one type, which a `:` may repeat but not contradict
+  (`ORDER BY $owner:u64` is a type error).
+- `ASC` is the default; `DESC` reverses the values' order.
+- Values sort in the order of their type, as for range comparisons (see the
+  operator × type matrix).
+- An entity **without the attribute, or holding another type there**, has no
+  value to sort by: it sorts **below every value** — first with `ASC`, last
+  with `DESC`. Unlike a predicate, the sort reads the attribute whether or not
+  it is indexed.
+- **Ties**, including the entities without a value, come in **creation
+  order**, in either direction: by the transaction that created them, oldest
+  first, and by entity key among those one transaction created. The order is
+  therefore total, so cursor pages partition the matches.
+- One attribute only: there is no secondary sort key.
+- `arkiv_getEntityCount` reads the clause and ignores it.
 
 ## 5. Read path — JSON-RPC methods
 
@@ -414,8 +451,11 @@ selected field, `data` is `[]` and no `cursor` is returned. `"*"` +
 - `count` present only when selected.
 - `type` is always the bare tag; the indexed flag is reported by
   `attributeSchema`.
-- **Result ordering (open):** cursor pagination needs a deterministic total
-  order across pages; the ordering key is not yet pinned.
+- **Result ordering:** the query's `ORDER BY` order (§4), its ties in creation
+  order; with no `ORDER BY`, creation order alone: by creating transaction,
+  oldest first, and by entity key within one transaction. Either way the
+  order is total and fixed at `atBlock`, so cursor pages partition the
+  matches.
 
 ### Account & nonce reads
 

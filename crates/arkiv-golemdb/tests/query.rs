@@ -6,14 +6,14 @@
 //! block`: `a_count_combines_predicates` counts in that shape.
 
 use arkiv_golemdb::{
-    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, RecordLimits,
+    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PricingConfig, RecordLimits,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::query::Query as ArkivQuery;
-use arkiv_interfaces::store::{Filter, Page, Query, Store, StoreError};
+use arkiv_interfaces::store::{Filter, Page, Query, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
 
@@ -30,7 +30,13 @@ fn config() -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
-        genesis: Genesis::new(HashAlgorithm::Keccak256, limits, record_limits, None),
+        genesis: Genesis::new(
+            HashAlgorithm::Keccak256,
+            limits,
+            record_limits,
+            None,
+            PricingConfig::zero(),
+        ),
         segments: vec![],
     }
 }
@@ -327,11 +333,10 @@ fn a_query_with_the_typeof_operator_matches_the_records_whose_attribute_has_that
 }
 
 /// GolemDB stores a `key` as the 32 fixed bytes a `bytes32` is, so it cannot
-/// tell the two apart. `typeof(attr) = key` is not implemented rather than
-/// also answering the `bytes32` holders; `typeof(attr) = bytes32` finds both,
-/// as a `key` attribute reads back from GolemDB as a `bytes32` anyway.
+/// tell the two apart. For now `typeof(attr) = key` is the `bytes32` presence
+/// test, so it and `typeof(attr) = bytes32` both find both.
 #[test]
-fn typeof_key_is_not_implemented_and_typeof_bytes32_finds_both() {
+fn typeof_key_and_typeof_bytes32_both_find_both() {
     let dir = TempDir::new().unwrap();
     let store = store_with(
         &dir,
@@ -353,27 +358,16 @@ fn typeof_key_is_not_implemented_and_typeof_bytes32_finds_both() {
         ],
     );
 
-    let typeof_key = Query {
-        filter: filter("typeof(parent) = key"),
-        page: Page {
-            offset: 0,
-            limit: 10,
-        },
-        ..Query::default()
-    };
-    assert_eq!(
-        store
-            .query(None, &typeof_key, None)
-            .map(|page| page.into_value()),
-        Err(StoreError::NotImplemented)
-    );
-    assert_eq!(
-        store
-            .count(None, &typeof_key.filter, None)
-            .map(|count| count.into_value()),
-        Err(StoreError::NotImplemented)
-    );
-    assert_eq!(matched(&store, filter("typeof(parent) = bytes32")), [1, 2]);
+    for text in ["typeof(parent) = key", "typeof(parent) = bytes32"] {
+        assert_eq!(matched(&store, filter(text)), [1, 2], "{text}");
+        assert_eq!(
+            store
+                .count(None, &filter(text), None)
+                .map(|count| count.into_value()),
+            Ok(2),
+            "{text}"
+        );
+    }
 }
 
 /// A range follows its type's order for the types that are not numbers:
@@ -517,4 +511,85 @@ fn star_matches_every_entity() {
     assert_eq!(count(&live_at(500)), Ok(3));
     assert_eq!(count(&live_at(1_000)), Ok(0), "every entity has expired");
     assert_eq!(matched(&store, live_at(500)), [1, 2, 3]);
+}
+
+/// `text`, a whole query string, as the store query `arkiv_query` runs: its
+/// filter, its `ORDER BY` as the sort, and one page of `limit` from `offset`.
+/// The entity numbers of that page, in page order.
+fn sorted_page(store: &GolemDbStore, text: &str, offset: u64, limit: u64) -> Vec<u8> {
+    let statement = arkiv_query::parse_statement(text).unwrap();
+    let query = Query {
+        filter: Filter::from(&statement.filter),
+        sort: statement.order.as_ref().map(Sort::from),
+        page: Page { offset, limit },
+        ..Query::default()
+    };
+    store
+        .query(None, &query, None)
+        .expect("GolemDB answers the sorted query")
+        .into_value()
+        .records
+        .iter()
+        .map(|record| record.key.0[0])
+        .collect()
+}
+
+/// `ORDER BY` through the parser: the attribute read as the type it names,
+/// an entity without a value of that type below every value, so first
+/// ascending and last descending, and ties in creation order either way. The
+/// entities are created in key order, so creation order is key order here.
+/// Pages take the sorted matches in turn.
+#[test]
+fn order_by_sorts_by_one_attribute_read_as_one_type() {
+    let ranked = |n, rank: AttributeValue| {
+        entity_with(
+            n,
+            vec![
+                Attribute::new("rank", rank),
+                Attribute::new("team", AttributeValue::Str("red".into())),
+            ],
+        )
+    };
+    let dir = TempDir::new().unwrap();
+    let store = store_with(
+        &dir,
+        &[
+            ranked(1, AttributeValue::U64(20)),
+            ranked(2, AttributeValue::U64(10)),
+            // No rank at all, and a rank that is not a `u64`.
+            entity(3, "red"),
+            ranked(4, AttributeValue::Int(5)),
+            // Ties with 2.
+            ranked(5, AttributeValue::U64(10)),
+            ranked(6, AttributeValue::U64(30)),
+        ],
+    );
+    let red = |order: &str| format!("team = str('red') ORDER BY {order}");
+
+    assert_eq!(
+        sorted_page(&store, &red("rank:u64"), 0, 10),
+        [3, 4, 2, 5, 1, 6]
+    );
+    assert_eq!(
+        sorted_page(&store, &red("rank:u64 DESC"), 0, 10),
+        [6, 1, 2, 5, 3, 4]
+    );
+    // Read as an `i32`, only 4 has a value, and the rest keep creation order.
+    assert_eq!(
+        sorted_page(&store, &red("rank:i32 DESC"), 0, 10),
+        [4, 1, 2, 3, 5, 6]
+    );
+    // Pages partition the sorted matches.
+    for (offset, page) in [(0, [6, 1]), (2, [2, 5]), (4, [3, 4])] {
+        assert_eq!(
+            sorted_page(&store, &red("rank:u64 DESC"), offset, 2),
+            page,
+            "page at {offset}"
+        );
+    }
+    // A system attribute sorts as the type it holds: each owner is `[n; 20]`.
+    assert_eq!(
+        sorted_page(&store, &red("$owner DESC"), 0, 10),
+        [6, 5, 4, 3, 2, 1]
+    );
 }

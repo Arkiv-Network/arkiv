@@ -1,6 +1,7 @@
-//! Recursive-descent parser: tokens → [`Query`].
+//! Recursive-descent parser: tokens → [`Query`], or a whole [`Statement`].
 //!
 //! ```text
+//! statement  → top [ orderBy ]          -- orderBy: see `order`
 //! top        → '*' | expr
 //! expr       → andExpr { OR andExpr }
 //! andExpr    → unary { AND unary }
@@ -32,24 +33,45 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+mod order;
+
 use arkiv_interfaces::entity::{AttributeType, AttributeValue};
-use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, ValueRange};
+use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, Statement, ValueRange};
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
 use crate::limits;
 use crate::literal;
 
-/// Parse a query string into a [`Query`] AST. See the [module docs](self).
+/// Parse a query's predicates into a [`Query`] AST, refusing an `ORDER BY`.
+/// See [`parse_statement`] for a whole query string, and the
+/// [module docs](self).
 pub fn parse(input: &str) -> Result<Query, ParseError> {
-    if input.len() > limits::MAX_QUERY_BYTES {
-        return Err(ParseError::whole(
-            ParseErrorKind::QueryLimitError,
-            "query is too long",
+    let mut parser = Parser::new(input)?;
+    let filter = parser.parse_filter()?;
+    if let Some(position) = parser.word_at("order") {
+        return Err(ParseError::syntax(
+            position,
+            "ORDER BY is not taken here — this reads a query's predicates only",
         ));
     }
-    let tokens = tokenize(input)?;
-    Parser::new(tokens, input.len()).parse_top_level()
+    parser.expect_end()?;
+    Ok(filter)
+}
+
+/// Parse a whole query string, its predicates and the `ORDER BY` it may end
+/// with, into a [`Statement`].
+pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
+    let mut parser = Parser::new(input)?;
+    let filter = parser.parse_filter()?;
+    let order = match parser.word_at("order") {
+        Some(_) => Some(parser.parse_order_by()?),
+        None => {
+            parser.expect_end()?;
+            None
+        }
+    };
+    Ok(Statement { filter, order })
 }
 
 struct Parser {
@@ -62,14 +84,21 @@ struct Parser {
 }
 
 impl Parser {
-    fn new(tokens: Vec<SpannedToken>, end: usize) -> Self {
-        Self {
-            tokens,
+    /// A parser over `input`'s tokens, once it is within the length cap.
+    fn new(input: &str) -> Result<Self, ParseError> {
+        if input.len() > limits::MAX_QUERY_BYTES {
+            return Err(ParseError::whole(
+                ParseErrorKind::QueryLimitError,
+                "query is too long",
+            ));
+        }
+        Ok(Self {
+            tokens: tokenize(input)?,
             pos: 0,
-            end,
+            end: input.len(),
             depth: 0,
             predicates: 0,
-        }
+        })
     }
 
     fn peek(&self) -> Option<&SpannedToken> {
@@ -91,7 +120,9 @@ impl Parser {
         self.peek().map_or(self.end, |spanned| spanned.start)
     }
 
-    fn parse_top_level(&mut self) -> Result<Query, ParseError> {
+    /// The predicates: `*`, or an expression. What may follow them, an
+    /// `ORDER BY` or nothing, is the caller's to check.
+    fn parse_filter(&mut self) -> Result<Query, ParseError> {
         if self.tokens.is_empty() {
             return Err(ParseError::syntax(
                 0,
@@ -100,22 +131,40 @@ impl Parser {
         }
         if matches!(self.peek_token(), Some(Token::Star)) {
             self.advance();
-            if let Some(spanned) = self.peek() {
+            let stands_alone = self.peek().is_none() || self.word_at("order").is_some();
+            if !stands_alone {
                 return Err(ParseError::syntax(
-                    spanned.start,
+                    self.next_position(),
                     "* matches every entity and cannot be combined with other predicates",
                 ));
             }
             return Ok(Query::All);
         }
-        let query = self.parse_expr()?;
-        if let Some(spanned) = self.peek() {
-            return Err(ParseError::syntax(
+        self.parse_expr()
+    }
+
+    /// Nothing left to read.
+    fn expect_end(&self) -> Result<(), ParseError> {
+        match self.peek() {
+            Some(spanned) => Err(ParseError::syntax(
                 spanned.start,
                 "unexpected trailing input — did you mean to join these with AND or OR?",
-            ));
+            )),
+            None => Ok(()),
         }
-        Ok(query)
+    }
+
+    /// Where the next token starts, when it is the bare word `word`, in any
+    /// case. The words of `ORDER BY` are read this way, where the clause
+    /// stands, so none of them is reserved.
+    fn word_at(&self, word: &str) -> Option<usize> {
+        match self.peek() {
+            Some(SpannedToken {
+                token: Token::Name(name),
+                start,
+            }) if name.eq_ignore_ascii_case(word) => Some(*start),
+            _ => None,
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Query, ParseError> {
@@ -333,7 +382,7 @@ impl Parser {
                     self.next_position(),
                     "typeof names the type it asks for — typeof(name) = tag",
                 )?;
-                Some(self.parse_type_tag()?)
+                Some(self.parse_type_tag(TagSite::TypeOf)?)
             }
         };
         Ok(Query::Exists { name, attr_type })
@@ -363,16 +412,17 @@ impl Parser {
         }
     }
 
-    /// `typeof`'s right-hand side: a bare type tag, not a literal.
+    /// A bare type tag, not a literal: `typeof`'s right-hand side, or the type
+    /// after an `ORDER BY` attribute's `:`.
     ///
     /// Tags are positional rather than reserved, so one arrives as a plain
     /// name; `bytes` is not among them, which is what keeps the one type that
-    /// is never indexed out of the operator.
-    fn parse_type_tag(&mut self) -> Result<AttributeType, ParseError> {
+    /// is never indexed out of both.
+    fn parse_type_tag(&mut self, site: TagSite) -> Result<AttributeType, ParseError> {
         let Some(spanned) = self.advance() else {
             return Err(ParseError::syntax(
                 self.end,
-                "expected a type tag, e.g. typeof(name) = i32",
+                alloc::format!("expected a type tag, e.g. {}", site.form("i32")),
             ));
         };
         match spanned.token {
@@ -389,14 +439,14 @@ impl Parser {
             Token::Tagged { tag, .. } => Err(ParseError::type_error(
                 spanned.start,
                 alloc::format!(
-                    "typeof asks for a bare type tag, not a value — write \
-                     typeof(name) = {}",
-                    tag.name()
+                    "{} asks for a bare type tag, not a value — write {}",
+                    site.operator(),
+                    site.form(tag.name())
                 ),
             )),
             _ => Err(ParseError::syntax(
                 spanned.start,
-                "expected a type tag, e.g. typeof(name) = i32",
+                alloc::format!("expected a type tag, e.g. {}", site.form("i32")),
             )),
         }
     }
@@ -473,6 +523,33 @@ impl Parser {
         };
         check_value_type(key, &value, position)?;
         Ok((value, position))
+    }
+}
+
+/// Where a bare type tag stands, which its errors show the form of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagSite {
+    /// `typeof(name) = tag`.
+    TypeOf,
+    /// `ORDER BY name:tag`.
+    OrderBy,
+}
+
+impl TagSite {
+    /// The construct the tag belongs to, as an error names it.
+    fn operator(self) -> &'static str {
+        match self {
+            Self::TypeOf => "typeof",
+            Self::OrderBy => "ORDER BY",
+        }
+    }
+
+    /// The construct written out with `tag`.
+    fn form(self, tag: &str) -> String {
+        match self {
+            Self::TypeOf => alloc::format!("typeof(name) = {tag}"),
+            Self::OrderBy => alloc::format!("ORDER BY name:{tag}"),
+        }
     }
 }
 

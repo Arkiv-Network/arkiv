@@ -2,6 +2,7 @@
 //!
 //! Tokens:
 //! - grouping and comparison: `(` `)` `=` `!=` `<` `<=` `>` `>=`
+//! - `:`, which joins an `ORDER BY` attribute to the type it sorts as
 //! - keywords, case-insensitive: `AND` `OR` `NOT` `TRUE` `FALSE` `BETWEEN`
 //!   `STARTSWITH` `EXISTS` `TYPEOF`. A keyword is never an attribute name.
 //! - typed literals: a [`TypeTag`] immediately followed by `(`, whose body is
@@ -97,6 +98,8 @@ pub(crate) enum Token {
     Gte,
     /// `*` — matches every live entity.
     Star,
+    /// `:` — `ORDER BY name:tag`.
+    Colon,
     True,
     False,
     /// A user attribute name.
@@ -234,6 +237,10 @@ impl<'a> Lexer<'a> {
             '*' => {
                 self.read_char();
                 Token::Star
+            }
+            ':' => {
+                self.read_char();
+                Token::Colon
             }
             '=' => {
                 self.read_char();
@@ -547,6 +554,27 @@ mod tests {
         );
         // A name may not start with a digit or a dash.
         assert!(tokenize("-name").is_err());
+    }
+
+    /// A name takes no `:`, so `rank:u256` is the name, the colon and the tag.
+    #[test]
+    fn a_colon_ends_a_name() {
+        assert_eq!(
+            kinds("rank:u256"),
+            vec![
+                Token::Name("rank".into()),
+                Token::Colon,
+                Token::Name("u256".into())
+            ]
+        );
+        assert_eq!(
+            kinds("$owner:addr"),
+            vec![
+                Token::SysName("owner".into()),
+                Token::Colon,
+                Token::Name("addr".into())
+            ]
+        );
     }
 
     #[test]

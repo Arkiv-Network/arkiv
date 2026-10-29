@@ -81,6 +81,8 @@ pub fn run_part_one<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     block_lifecycle_in_frames(store_generator);
     projection_limits_returned_cells(store_generator);
     query_and_intersects_its_children(store_generator);
+    query_sorts_ascending_and_descending(store_generator);
+    query_sort_puts_records_without_a_value_below_every_value(store_generator);
     commit_applies_every_record_or_none(store_generator);
 
     // The `StoreExt` extensions: additions to `golem-db-api.md`, not part of it.
@@ -140,14 +142,11 @@ pub fn run_part_two<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     // than refusing it.
     patch_may_not_remove_last_cell(store_generator); // I do not understand this
 
-    // Queries: GolemDB has no `Filter::Not` and no `Filter::All`, and sorts
-    // only by a cell the filter holds to one type.
+    // Queries: GolemDB has no `Filter::Not` and no `Filter::All`.
     query_not_excludes_matches(store_generator);
     query_presence_matches_records_carrying_the_attribute(store_generator);
     query_pages_with_offset_and_limit(store_generator);
     query_reports_total_matched_beyond_the_page(store_generator);
-    query_sorts_ascending_and_descending(store_generator);
-    query_sort_puts_records_without_the_cell_last(store_generator);
 
     // `StoreExt::changes` and `StoreExt::apply`.
     changes_account_for_the_whole_difference(store_generator);
@@ -227,6 +226,28 @@ fn equals_filter(cell: &str, type_id: TypeId, value: Vec<u8>) -> Filter {
             value,
         },
     })
+}
+
+/// The records carrying `cell`, whatever its type. A check about something
+/// other than matching names every record it writes this way rather than with
+/// [`Filter::All`], which not every store can run.
+fn carrying(cell: &str) -> Filter {
+    Filter::Predicate(Predicate {
+        cell: cell.to_string(),
+        test: Test::Exists { type_id: None },
+    })
+}
+
+/// A query for `filter`'s matches, sorted by the `u64` cell `n`.
+fn sorted_by_n(filter: Filter, direction: SortDirection) -> Query {
+    Query {
+        sort: Some(Sort {
+            cell: "n".to_string(),
+            type_id: TypeId::U64,
+            direction,
+        }),
+        ..paged_query(filter, 0, 10)
+    }
 }
 
 /// The digest of committed state, using only [`Store`].
@@ -1647,64 +1668,62 @@ fn query_reports_total_matched_beyond_the_page<S: Store>(store_generator: &dyn F
 fn query_sorts_ascending_and_descending<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
     let at = committed_fixture(&mut store);
-
-    let sorted = |direction| Query {
-        sort: Some(Sort {
-            cell: "n".to_string(),
-            direction,
-        }),
-        ..paged_query(Filter::default(), 0, 10)
-    };
+    let every = || carrying("kind");
 
     assert_eq!(
-        matched_keys(&store, at, &sorted(SortDirection::Ascending)),
+        matched_keys(&store, at, &sorted_by_n(every(), SortDirection::Ascending)),
         vec![record_key(1), record_key(2), record_key(3)]
     );
     assert_eq!(
-        matched_keys(&store, at, &sorted(SortDirection::Descending)),
+        matched_keys(&store, at, &sorted_by_n(every(), SortDirection::Descending)),
         vec![record_key(3), record_key(2), record_key(1)]
     );
 }
 
-/// A record lacking the sort cell sorts last, and ties break on key order — so
-/// the ordering is total and two implementations agreeing on the match set also
-/// agree on the page.
-fn query_sort_puts_records_without_the_cell_last<S: Store>(store_generator: &dyn Fn() -> S) {
+/// A record without the sort cell, or holding another type there, has no
+/// value to sort by: it sorts below every value, first ascending and last
+/// descending. Ties, the records without a value among them, keep the store's
+/// own order in either direction. The records are written in key order, so
+/// that order is the same in every store: key order in the reference store,
+/// creation order in GolemDB.
+fn query_sort_puts_records_without_a_value_below_every_value<S: Store>(
+    store_generator: &dyn Fn() -> S,
+) {
     let mut store = store_generator();
     let branch = store.begin(None).unwrap();
-    // Two records share a sort value, and one has no sort cell at all.
-    create_record(
-        &mut store,
-        branch,
-        record_key(1),
-        &[("n", u64_attribute(1))],
-    );
-    create_record(
-        &mut store,
-        branch,
-        record_key(2),
-        &[("n", u64_attribute(1))],
-    );
-    create_record(
-        &mut store,
-        branch,
-        record_key(3),
-        &[("other", u64_attribute(9))],
-    );
+    for (ordinal, n) in [
+        (1u8, Some(u64_attribute(2))),
+        (2, Some(u64_attribute(1))),
+        // No `n` at all, and an `n` that is not a `u64`.
+        (3, None),
+        (4, Some(str_attribute("1"))),
+        // Ties with 2.
+        (5, Some(u64_attribute(1))),
+    ] {
+        let mut cells = vec![("tag", str_attribute("t"))];
+        cells.extend(n.map(|cell| ("n", cell)));
+        create_record(&mut store, branch, record_key(ordinal), &cells);
+    }
     let at = store.commit(branch).unwrap();
-
-    let query = Query {
-        sort: Some(Sort {
-            cell: "n".to_string(),
-            direction: SortDirection::Ascending,
-        }),
-        ..paged_query(Filter::default(), 0, 10)
-    };
+    let keys = |ordinals: [u8; 5]| ordinals.map(record_key).to_vec();
 
     assert_eq!(
-        matched_keys(&store, at, &query),
-        vec![record_key(1), record_key(2), record_key(3)],
-        "tie broken by key, and the record without the cell last"
+        matched_keys(
+            &store,
+            at,
+            &sorted_by_n(carrying("tag"), SortDirection::Ascending)
+        ),
+        keys([3, 4, 2, 5, 1]),
+        "no value first, then the values, the tie in the store's order"
+    );
+    assert_eq!(
+        matched_keys(
+            &store,
+            at,
+            &sorted_by_n(carrying("tag"), SortDirection::Descending)
+        ),
+        keys([1, 2, 5, 3, 4]),
+        "the tie and the records without a value keep the store's order"
     );
 }
 
