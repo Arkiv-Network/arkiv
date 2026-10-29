@@ -11,9 +11,8 @@
 //! - [`GasMeter`]: one transaction's inputs, summed exactly, finished into a
 //!   [`GasBreakdown`](arkiv_interfaces::gas::GasBreakdown) with the floor and
 //!   the rounding applied once.
-//! - [`rate`]: an entity's `$rate`, the wei per block its storage was bought at.
 //!
-//! Gas is `u64`, storage time and wei `u128`; nothing saturates. An
+//! Gas is `u64`, storage time `u128`; nothing saturates. An
 //! [`Overflow`] fails the transaction, identically on every node. Balances are
 //! `U256` and stay with the executor, which widens these amounts losslessly.
 #![no_std]
@@ -22,7 +21,6 @@ extern crate alloc;
 
 pub mod error;
 pub mod meter;
-pub mod rate;
 pub mod schedule;
 
 pub mod storage_time;
@@ -30,5 +28,4 @@ pub mod units;
 
 pub use error::Overflow;
 pub use meter::GasMeter;
-pub use rate::RateUpdate;
 pub use schedule::{FeeSchedule, FeeScheduleSource, ScheduleError};

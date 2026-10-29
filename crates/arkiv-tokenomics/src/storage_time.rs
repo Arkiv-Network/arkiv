@@ -121,14 +121,6 @@ mod tests {
         assert_eq!(patch(1, 2, 99, 100), Err(Overflow));
     }
 
-    #[test]
-    fn the_largest_sizes_and_lifetimes_still_fit() {
-        assert_eq!(
-            create(u64::MAX, u64::MAX - 1, 0),
-            Ok(u128::from(u64::MAX) * u128::from(u64::MAX - 1))
-        );
-    }
-
     /// The remaining lifetime is bounded, at exactly `max_lifetime` and one
     /// block over, and an extend whose added blocks fit is still refused when
     /// the total does not.

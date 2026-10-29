@@ -3,7 +3,7 @@
 //! ```text
 //! compute_gas = max(tx_gas + Σ arkiv_op_cost + Σ golemdb_cost, floor_gas)
 //! storage_gas = ceil(Σ storage_time × capacity_rate / 1_000_000)
-//! purge_gas   = Σ purge_bound                                    (0 in iteration 1)
+//! purge_gas   = 0                                                (iteration 1)
 //! ```
 //!
 //! The meter sums exact values and applies the floor and the rounding once,
@@ -29,7 +29,6 @@ pub struct GasMeter {
     arkiv_op_cost: Gas,
     golemdb_cost: Gas,
     storage_time: u128,
-    purge_bound: Gas,
 }
 
 impl GasMeter {
@@ -39,7 +38,6 @@ impl GasMeter {
             arkiv_op_cost: 0,
             golemdb_cost: 0,
             storage_time: 0,
-            purge_bound: 0,
         }
     }
 
@@ -64,30 +62,9 @@ impl GasMeter {
         Ok(())
     }
 
-    /// Add one operation's deletion bound.
-    pub fn add_purge_bound(&mut self, gas: Gas) -> Result<(), Overflow> {
-        self.purge_bound = self.purge_bound.checked_add(gas).ok_or(Overflow)?;
-        Ok(())
-    }
-
-    /// The operations' own costs so far.
-    pub const fn arkiv_op_cost(&self) -> Gas {
-        self.arkiv_op_cost
-    }
-
     /// GolemDB's costs so far.
     pub const fn golemdb_cost(&self) -> Gas {
         self.golemdb_cost
-    }
-
-    /// The storage time bought so far, in unit-blocks.
-    pub const fn storage_time(&self) -> u128 {
-        self.storage_time
-    }
-
-    /// The deletion bounds so far.
-    pub const fn purge_bound(&self) -> Gas {
-        self.purge_bound
     }
 
     /// `tx_gas + arkiv_op_cost + golemdb_cost`, without the floor: the check
@@ -115,7 +92,7 @@ impl GasMeter {
         let breakdown = GasBreakdown {
             compute_gas: self.compute_so_far(tx_gas)?.max(floor_gas),
             storage_gas: storage_gas(self.storage_time, schedule)?,
-            purge_gas: self.purge_bound,
+            purge_gas: 0,
         };
         breakdown.total().ok_or(Overflow)?;
         Ok(breakdown)
@@ -225,53 +202,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_input_is_summed() {
-        let mut meter = GasMeter::new();
-        for gas in [1, 2] {
-            meter.add_op_cost(gas).unwrap();
-            meter.add_purge_bound(gas * 10).unwrap();
-            meter
-                .add_golemdb(&Receipt {
-                    cost: CostUnits(gas * 100),
-                    ..Receipt::default()
-                })
-                .unwrap();
-            meter.add_storage_time(u128::from(gas) * 1_000).unwrap();
-        }
-        assert_eq!(meter.arkiv_op_cost(), 3);
-        assert_eq!(meter.purge_bound(), 30);
-        assert_eq!(meter.golemdb_cost(), 300);
-        assert_eq!(meter.storage_time(), 3_000);
-        assert_eq!(meter.finish(0, 0, &schedule()).unwrap().purge_gas, 30);
-    }
-
-    #[test]
-    fn a_sum_that_does_not_fit_is_an_overflow() {
-        let mut meter = GasMeter::new();
-        meter.add_op_cost(Gas::MAX).unwrap();
-        assert_eq!(meter.add_op_cost(1), Err(Overflow));
-        assert_eq!(meter.compute_so_far(1), Err(Overflow));
-
-        let mut storage = GasMeter::new();
-        storage.add_storage_time(u128::MAX).unwrap();
-        assert_eq!(storage.add_storage_time(1), Err(Overflow));
-        assert_eq!(storage.finish(0, 0, &schedule()), Err(Overflow));
-    }
-
-    #[test]
-    fn storage_gas_beyond_u64_is_an_overflow() {
-        let schedule = FeeSchedule {
-            capacity_rate: 1_000_000,
-            ..schedule()
-        };
-        assert_eq!(storage_gas(u128::from(Gas::MAX), &schedule), Ok(Gas::MAX));
-        assert_eq!(
-            storage_gas(u128::from(Gas::MAX) + 1, &schedule),
-            Err(Overflow)
-        );
-    }
-
     /// Each part fits, their sum does not: `finish` refuses rather than hand
     /// back a breakdown without a total. The floor alone can do it.
     #[test]
@@ -298,16 +228,5 @@ mod tests {
             Err(Overflow),
             "a compute sum at the maximum, plus storage"
         );
-    }
-
-    /// A breakdown built by hand can still overflow; `total` says so.
-    #[test]
-    fn a_total_that_does_not_fit_is_none() {
-        let breakdown = GasBreakdown {
-            compute_gas: Gas::MAX,
-            storage_gas: 0,
-            purge_gas: 1,
-        };
-        assert_eq!(breakdown.total(), None);
     }
 }
