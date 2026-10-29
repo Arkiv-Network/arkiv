@@ -17,6 +17,7 @@
 //! [`EvmState`]: reth_ethereum::evm::revm::state::EvmState
 
 pub mod accounts;
+pub mod branch;
 pub mod genesis;
 pub mod host;
 pub mod overlay;
@@ -25,10 +26,10 @@ pub mod provider;
 pub mod segments;
 
 pub use accounts::{BalanceAccess, NonceAccess};
+pub use branch::OwnedBranch;
 pub use genesis::{GenesisAccount, check_chain, check_genesis_root, seed_genesis};
 pub use host::{
     BlockSeals, CommitWaitError, ExecutionKey, HostError, HostStateView, HostStore, host_manager,
-    open_block_branch,
 };
 pub use overlay::WriteOverlay;
 pub use provider::{AccountReadError, GolemAccounts, StoredAccount};

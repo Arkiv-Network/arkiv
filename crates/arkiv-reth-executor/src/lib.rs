@@ -123,8 +123,7 @@ use arkiv_interfaces::statemanager::{
 };
 use arkiv_interfaces::store::BranchId;
 use arkiv_reth_statemanager::{
-    BlockSeals, ExecutionKey, HostStateView, HostStore, WriteOverlay, host_manager,
-    open_block_branch,
+    BlockSeals, ExecutionKey, HostStateView, HostStore, OwnedBranch, WriteOverlay, host_manager,
 };
 use std::sync::Arc;
 
@@ -388,12 +387,15 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     store: HostStore,
     /// The sealed candidates, shared with the node that adopts one of them.
     seals: Arc<BlockSeals>,
-    /// This block's branch. Every transaction in the block runs on it, in
-    /// order, so each sees the last one's writes.
-    branch: BranchId,
+    /// This block's branch, opened by the first transaction. Every transaction
+    /// in the block runs on it, in order, so each sees the last one's writes.
+    ///
+    /// Owned, so an EVM dropped without [`finish`](Evm::finish) -- an RPC call,
+    /// payload prewarming, a build reth aborts -- discards it.
+    branch: Option<OwnedBranch>,
     /// Whether any charged transaction ran. A speculative execution —
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
-    /// is abandoned rather than sealed.
+    /// is discarded rather than sealed.
     charged: core::cell::Cell<bool>,
     /// `(signer, nonce)` of each charged transaction, in order — the half of
     /// [`ExecutionKey`] only the EVM sees.
@@ -402,6 +404,29 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     /// one height race on separate threads, and the payload builder has to be
     /// told the root of *its* execution, not of whichever sealed last.
     executed: core::cell::RefCell<Vec<(UserAddress, u64)>>,
+}
+
+impl<DB: Database, I> ArkivEvm<DB, I> {
+    fn new(inner: EthEvm<DB, I, PrecompilesMap>, store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self {
+            inner,
+            store,
+            seals,
+            branch: None,
+            charged: core::cell::Cell::new(false),
+            executed: core::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The block's branch, opened on first use.
+    fn branch(&mut self) -> Result<BranchId, EVMError<DB::Error>> {
+        if let Some(branch) = &self.branch {
+            return Ok(branch.id());
+        }
+        let branch =
+            OwnedBranch::begin(&self.store).map_err(state_fault("open the block's branch"))?;
+        Ok(self.branch.insert(branch).id())
+    }
 }
 
 impl<DB, I> Evm for ArkivEvm<DB, I>
@@ -454,7 +479,7 @@ where
         let chain_id = self.inner.chain_id();
         let sender = (tx.caller.into_array(), tx.nonce);
         let store = self.store.clone();
-        let branch = self.branch;
+        let branch = self.branch()?;
         let db = self.inner.db_mut();
         let store = &store;
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
@@ -504,20 +529,20 @@ where
     }
 
     /// Block execution is over. Seal the branch as a candidate at this height
-    /// if a real block ran on it, and abandon it otherwise.
+    /// if a real block ran on it; otherwise it is dropped, and discarded.
     ///
     /// Sealing computes the roots and writes nothing, so reth can execute this
     /// block again — to validate what it just built — and get the same answer.
     /// Only adoption commits.
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         let height = self.inner.block().number.saturating_to::<u64>();
-        if self.charged.get() {
-            let key = ExecutionKey::new(height, self.executed.borrow().clone());
-            if let Err(error) = self.seals.seal(&self.store, key, self.branch) {
+        if self.charged.get()
+            && let Some(branch) = self.branch
+        {
+            let key = ExecutionKey::new(height, self.executed.into_inner());
+            if let Err(error) = self.seals.seal(key, branch) {
                 tracing::error!(target: "arkiv::executor", ?error, height, "failed to seal the block's Arkiv state");
             }
-        } else {
-            BlockSeals::abandon(&self.store, self.branch);
         }
         self.inner.finish()
     }
@@ -1263,15 +1288,11 @@ impl EvmFactory for ArkivEvmFactory {
             .build_mainnet_with_inspector(NoOpInspector {})
             .with_precompiles(PrecompilesMap::from_static(Precompiles::prague()));
 
-        ArkivEvm {
-            inner: EthEvm::new(inner, false),
-            branch: open_block_branch(&self.store)
-                .expect("the Arkiv store refused to open a branch for this block"),
-            store: self.store.clone(),
-            seals: self.seals.clone(),
-            charged: core::cell::Cell::new(false),
-            executed: core::cell::RefCell::new(Vec::new()),
-        }
+        ArkivEvm::new(
+            EthEvm::new(inner, false),
+            self.store.clone(),
+            self.seals.clone(),
+        )
     }
 
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>, EthInterpreter>>(
@@ -1280,20 +1301,16 @@ impl EvmFactory for ArkivEvmFactory {
         input: EvmEnv,
         inspector: I,
     ) -> Self::Evm<DB, I> {
-        let base = self.create_evm(db, input);
-        // The base EVM never executes anything; it is taken apart for its
-        // branch. Its empty `executed` list moves across with the branch, so
-        // the two stay the one record of what ran on it.
-        let (branch, charged, executed) = (base.branch, base.charged.clone(), base.executed);
-        let inner = base.inner.into_inner().with_inspector(inspector);
-        ArkivEvm {
-            inner: EthEvm::new(inner, true),
-            store: self.store.clone(),
-            seals: self.seals.clone(),
-            branch,
-            charged,
-            executed,
-        }
+        let inner = self
+            .create_evm(db, input)
+            .inner
+            .into_inner()
+            .with_inspector(inspector);
+        ArkivEvm::new(
+            EthEvm::new(inner, true),
+            self.store.clone(),
+            self.seals.clone(),
+        )
     }
 }
 
@@ -1498,5 +1515,42 @@ mod tests {
             seals.root_of(&included).is_some(),
             "the seal is keyed by the block's transactions"
         );
+    }
+
+    /// An RPC call, payload prewarming or an aborted build drops its EVM
+    /// without `finish`. The branch has to go with it, or the store keeps it.
+    #[test]
+    fn an_evm_dropped_without_finishing_discards_its_branch() {
+        use arkiv_interfaces::store::{Store, StoreError, StoreExt, reference::MemStore};
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+        let store: HostStore = Arc::new(MemStore::new());
+        store
+            .commit_tagged(store.begin(None).expect("begin"), [0; 32])
+            .expect("tag genesis");
+        let mut evm = ArkivEvmFactory::new(store.clone(), Arc::new(BlockSeals::default()))
+            .create_evm(
+                EmptyDB::default(),
+                EvmEnv {
+                    cfg_env: CfgEnv::default(),
+                    block_env: BlockEnv {
+                        number: U256::from(1),
+                        basefee: 0,
+                        ..Default::default()
+                    },
+                },
+            );
+        evm.transact(TxEnv {
+            caller: Address::repeat_byte(0xbb),
+            kind: TxKind::Call(Address::repeat_byte(0xde)),
+            gas_limit: ARKIV_TX_GAS,
+            ..Default::default()
+        })
+        .expect("transfer");
+        let branch = evm.branch.as_ref().expect("opened by the transfer").id();
+
+        drop(evm);
+
+        assert_eq!(store.discard(branch), Err(StoreError::HandleInvalid));
     }
 }
