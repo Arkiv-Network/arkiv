@@ -191,7 +191,7 @@ where
                     // On a blocking thread, not this one. Adoption is now a
                     // write per transaction and receipt rather than a couple
                     // of calls, and the store's seam is synchronous -- against
-                    // Valkey that is thousands of round trips. Blocking this
+                    // an out-of-process store that is thousands of round trips. Blocking this
                     // worker for them stalls the payload builder sharing the
                     // runtime, which costs transactions per block rather than
                     // correctness, and so does not show up in any in-process

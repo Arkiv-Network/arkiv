@@ -22,10 +22,6 @@ arkiv-bindings.workspace = true
 # calldata and predict minted keys.
 arkiv-reth-executor.workspace = true
 arkiv-interfaces.workspace = true
-# Only to erase a node's store namespace when the node drops, the way the
-# datadir is erased: a restart test needs a store that outlives the process,
-# and whatever outlives the process has to be cleaned up deliberately.
-arkiv-valkey.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 eyre.workspace = true

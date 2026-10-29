@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
-"""Run arkiv-reth against a throwaway store for a few seconds, then tidy up.
+"""Run arkiv-reth against a throwaway GolemDB for a few seconds, then tidy up.
 
-The store is GolemDB, in-process in the node (the default), or a Valkey
-server. Everything this starts is its own: a Valkey server on a free port with
-its own data directory, or a GolemDB directory, and a dev chain with its own
-datadir. Nothing touches a Valkey you already run, and the namespace is unique
-per run, so two of these can overlap without colliding.
+Everything this starts is its own: a GolemDB directory and a dev chain with
+its own datadir, so two of these can overlap without colliding.
 
 The point is the evidence, not the uptime. Every run leaves one directory
-holding both logs, the chain's progress, and what actually landed in the store
--- the keys, and one account record decoded far enough to show that Arkiv's
-cells carry the `$` prefix the GolemDB spec reserves for a host.
+holding the node's log, the chain's progress, and what landed in the store.
 
 Processes and the scratch data are removed on the way out, including after a
 failure or a Ctrl-C. The log directory is what survives.
 
-Usage: scripts/demo/run.py [seconds] [--store S] [--keep] [--restart] [--out DIR]
+Usage: scripts/demo/run.py [seconds] [--keep] [--restart] [--out DIR]
 
   seconds     how long to let the chain run (default 30)
-  --store S   golemdb (default) or valkey
   --keep      leave the store and the chain running, and say how to reach them
   --restart   stop the node and start it again, against the same store, and
               check it comes back where the store says the chain is -- the
@@ -67,8 +61,7 @@ def free_port():
 
     Racy in principle. In practice the kernel does not hand the same ephemeral
     port out twice in the microseconds before the server binds it, and the
-    alternative -- a fixed port -- collides with the Valkey most developers
-    already have running on 6379.
+    alternative -- a fixed port -- collides with whatever else is running.
     """
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -101,17 +94,6 @@ def rpc(port, method, params=None):
             return json.load(response).get("result")
     except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError):
         return None
-
-
-def valkey(port, *args):
-    """Run one valkey-cli command against our own server."""
-    out = subprocess.run(
-        ["valkey-cli", "-p", str(port), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return out.stdout.strip()
 
 
 def find_binary(name, variable):
@@ -235,52 +217,6 @@ def spend_something(rpc_port, out):
     return "sent 1 ETH from the dev account"
 
 
-def dump_store(port, namespace, out, spend):
-    """Write what the run left in Valkey: the keys, and one account record.
-
-    The account record is the interesting one. Its cell names are what carries
-    the host/engine prefix split, and reading them back off the wire is the
-    only check that does not trust our own code to report what it wrote.
-    """
-    keys = sorted(valkey(port, "--scan", "--pattern", f"{namespace}:*").splitlines())
-    (out / "valkey-keys.txt").write_text("\n".join(keys) + "\n")
-
-    kinds = {}
-    for key in keys:
-        parts = key.split(":")
-        kinds[parts[1] if len(parts) > 1 else key] = (
-            kinds.get(parts[1] if len(parts) > 1 else key, 0) + 1
-        )
-
-    lines = [f"total keys: {len(keys)}", f"transfer: {spend}", ""]
-    lines += ["by kind:"] + [f"  {n:>4}  {k}" for k, n in sorted(kinds.items())]
-
-    records = [key for key in keys if ":rec:" in key]
-    lines.append("")
-    if records:
-        # HKEYS, not HGETALL: the values are raw bytes and would garble the
-        # file. The names carry the prefix split, which is what to look at.
-        sample = records[0]
-        fields = sorted(valkey(port, "hkeys", sample).splitlines())
-        lines += [
-            f"{len(records)} record(s); cells of {sample}:",
-            "  " + ", ".join(fields),
-            "",
-            "  $-prefixed cells are Arkiv's, under the one prefix GolemDB's",
-            "  grammar leaves to a host protocol. #-prefixed cells are the",
-            "  engine's own.",
-        ]
-    else:
-        lines += [
-            "no entity records: this run only moved money, and Ethereum",
-            "balances and nonces live on reth, not in the Arkiv store (see",
-            "HostStateView). The store holds entity records and the commit",
-            "lineage; records appear once something creates an entity.",
-        ]
-    (out / "store-summary.txt").write_text("\n".join(lines) + "\n")
-    return keys
-
-
 def dump_golemdb(directory, out, spend, entity_key, entity):
     """Write what the run left in GolemDB: its files, and the entity it holds.
 
@@ -301,7 +237,6 @@ def dump_golemdb(directory, out, spend, entity_key, entity):
 def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("seconds", nargs="?", type=int, default=30)
-    parser.add_argument("--store", choices=["golemdb", "valkey"], default="golemdb")
     parser.add_argument("--keep", action="store_true")
     parser.add_argument(
         "--restart",
@@ -316,20 +251,12 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     node_bin = binary()
-    golemdb = args.store == "golemdb"
-    valkey_port, rpc_port = free_port(), free_port()
-    namespace = f"demo{stamp}"
+    rpc_port = free_port()
     scratch = out / "scratch"
     golemdb_dir = scratch / "golemdb"
-    (scratch / "valkey").mkdir(parents=True, exist_ok=True)
-    if golemdb:
-        # The node takes an absolute path, which `out` already is.
-        store_env = {"ARKIV_STORE_PATH": str(golemdb_dir)}
-    else:
-        store_env = {
-            "ARKIV_EXPERIMENTAL_STORE": f"redis://127.0.0.1:{valkey_port}",
-            "ARKIV_STORE_NAMESPACE": namespace,
-        }
+    scratch.mkdir(parents=True, exist_ok=True)
+    # The node takes an absolute path, which `out` already is.
+    store_env = {"ARKIV_STORE_PATH": str(golemdb_dir)}
 
     processes = []
 
@@ -345,14 +272,14 @@ def main():
         shutil.rmtree(scratch, ignore_errors=True)
 
     # Ctrl-C and SIGTERM have to reach cleanup too, or a cancelled run leaves a
-    # Valkey and a chain behind.
+    # chain behind.
     def on_signal(signum, _frame):
         raise KeyboardInterrupt(f"signal {signum}")
 
     def start_node(log_name):
         """Launch the node against this run's store, and wait for its RPC.
 
-        Same datadir, store and namespace every time, which is what makes
+        Same datadir and store every time, which is what makes
         a restart a restart rather than a second chain.
         """
         handle = subprocess.Popen(
@@ -409,38 +336,7 @@ def main():
     try:
         log(f"logs will be in {out}")
 
-        if golemdb:
-            log(f"store: GolemDB in {golemdb_dir}")
-        else:
-            valkey_log = (out / "valkey.log").open("w")
-            processes.append(
-                (
-                    "valkey",
-                    subprocess.Popen(
-                        [
-                            "valkey-server",
-                            "--port",
-                            str(valkey_port),
-                            "--dir",
-                            str(scratch / "valkey"),
-                            # No snapshotting: this data is scrap and a stray
-                            # dump.rdb in the repo would be worse than useless.
-                            "--save",
-                            "",
-                            "--appendonly",
-                            "no",
-                        ],
-                        stdout=valkey_log,
-                        stderr=subprocess.STDOUT,
-                    ),
-                )
-            )
-            wait_for(
-                f"valkey on {valkey_port}",
-                lambda: valkey(valkey_port, "ping") == "PONG",
-                timeout=20,
-            )
-            log(f"valkey up on {valkey_port}, namespace {namespace}")
+        log(f"store: GolemDB in {golemdb_dir}")
 
         start_node("node.log")
         log(f"node up on {rpc_port}, running for {args.seconds}s")
@@ -463,12 +359,6 @@ def main():
                 "elapsed": round(time.monotonic() - started, 1),
                 "block": int(block, 16) if block else None,
             }
-            if not golemdb:
-                # GolemDB does not count entities yet, and has no keys to scan.
-                sample["entities"] = rpc(rpc_port, "arkiv_getEntityCount")
-                sample["keys"] = len(
-                    valkey(valkey_port, "--scan", "--pattern", f"{namespace}:*").splitlines()
-                )
             samples.append(sample)
             time.sleep(max(1, args.seconds // 10))
         (out / "progress.json").write_text(json.dumps(samples, indent=2) + "\n")
@@ -554,12 +444,8 @@ def main():
             )
 
         entity = read_entity()
-        if golemdb:
-            stored = dump_golemdb(golemdb_dir, out, spend, entity_key, entity)
-            store_note = f"{stored} files in the GolemDB directory"
-        else:
-            stored = len(dump_store(valkey_port, namespace, out, spend))
-            store_note = f"{stored} keys in the store"
+        stored = dump_golemdb(golemdb_dir, out, spend, entity_key, entity)
+        store_note = f"{stored} files in the GolemDB directory"
         first, last = samples[0]["block"], samples[-1]["block"]
         log(f"blocks {first} -> {last}, {store_note}")
 
@@ -573,8 +459,7 @@ def main():
             log(f"entity {entity_key} reads back: {json.dumps(entity)}")
 
         if args.keep:
-            where = f"GolemDB in {golemdb_dir}" if golemdb else f"valkey on {valkey_port}"
-            log(f"--keep: {where}, rpc on {rpc_port}, namespace {namespace}")
+            log(f"--keep: GolemDB in {golemdb_dir}, rpc on {rpc_port}")
             log("stop them yourself; scratch data is in " + str(scratch))
             processes.clear()
             return 0

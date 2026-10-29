@@ -9,14 +9,14 @@
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
 //! by default is the in-process one (`memory`) and so goes with the process —
 //! a test that wants to watch state survive a restart needs
-//! [`NodeBuilder::valkey_store`] or [`NodeBuilder::golemdb_store`].
+//! [`NodeBuilder::golemdb_store`].
 
 use std::fs::File;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use alloy_provider::Provider;
 
@@ -47,9 +47,6 @@ pub struct NodeBuilder {
     chain: Option<PathBuf>,
     extra_args: Vec<String>,
     env: Vec<(String, String)>,
-    /// The Valkey server and namespace holding this node's Arkiv state, when it
-    /// is not the default in-process store. Erased when the [`Node`] drops.
-    store: Option<(String, String)>,
     /// Whether this node's Arkiv state is in GolemDB, inside its datadir.
     golemdb: bool,
 }
@@ -66,7 +63,6 @@ impl NodeBuilder {
             chain: None,
             extra_args: Vec::new(),
             env: Vec::new(),
-            store: None,
             golemdb: false,
         }
     }
@@ -116,36 +112,10 @@ impl NodeBuilder {
         self
     }
 
-    /// Put the node's Arkiv state on the Valkey server at `url`, in a namespace
-    /// of this node's own, erased when the [`Node`] drops.
-    ///
-    /// The default in-process store is gone the moment the process is, so a
-    /// test that kills and restarts a node can only observe state surviving if
-    /// the store outlives the process. That is what this is for.
-    ///
-    /// The namespace carries the `arkiv-test:` prefix the store's own
-    /// conformance tests use, so a leaked one is recognisable as test debris.
-    pub fn valkey_store(mut self, url: impl Into<String>) -> Self {
-        // Wall-clock nanos plus the process id: unique per node on one machine,
-        // and it needs no dependency. Same scheme as `ValkeyStore::ephemeral`,
-        // which this cannot use directly — that store erases its namespace when
-        // *it* drops, and the node here is a separate process that has to find
-        // its state again after a restart.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after the unix epoch")
-            .as_nanos();
-        let namespace = format!("arkiv-test:node:{}:{nanos}", std::process::id());
-        let url = url.into();
-        self.store = Some((url.clone(), namespace.clone()));
-        self.env("ARKIV_EXPERIMENTAL_STORE", url)
-            .env("ARKIV_STORE_NAMESPACE", namespace)
-    }
-
     /// Put the node's Arkiv state in GolemDB, in a directory inside its datadir.
     ///
-    /// Like a Valkey store it survives a kill and a restart, but it needs no
-    /// server, and it goes with the datadir when the [`Node`] drops.
+    /// It survives a kill and a restart, and it goes with the datadir when the
+    /// [`Node`] drops.
     pub fn golemdb_store(mut self) -> Self {
         self.golemdb = true;
         self
@@ -249,9 +219,8 @@ impl Node {
         ]);
         cmd.args(&self.config.extra_args);
         // The node refuses to start without a store. Tests run on the
-        // in-process one unless the test process names another, as the suite
-        // pointed at a Valkey does. A node has one store, so a GolemDB path the
-        // test process carries is not passed on.
+        // in-process one unless the test process names another. A node has one
+        // store, so a GolemDB path the test process carries is not passed on.
         if std::env::var_os("ARKIV_EXPERIMENTAL_STORE").is_none() {
             cmd.env("ARKIV_EXPERIMENTAL_STORE", "memory");
         }
@@ -439,20 +408,5 @@ impl Drop for Node {
         self.kill();
         let _ = std::fs::remove_dir_all(&self.datadir);
         let _ = std::fs::remove_file(&self.log_path);
-        // The store outlives the process on purpose, so nothing else will clean
-        // it up. Best-effort: a server that has already gone away leaves keys
-        // behind under the recognisable `arkiv-test:` prefix.
-        //
-        // On its own thread because a `ValkeyStore` carries a tokio runtime, and
-        // tests drop their node from inside one — where building and dropping a
-        // second runtime panics.
-        if let Some((url, namespace)) = self.config.store.clone() {
-            let _ = std::thread::spawn(move || {
-                if let Ok(store) = arkiv_valkey::ValkeyStore::connect(&url, &namespace) {
-                    let _ = store.drop_namespace();
-                }
-            })
-            .join();
-        }
     }
 }

@@ -822,7 +822,7 @@ mod tests {
     };
 
     // MemStore is a RefCell, so this handle is not Send + Sync. That is the
-    // reference store's limitation; arkiv-valkey pins the real one as shareable.
+    // reference store's limitation, not the view's.
     #[allow(clippy::arc_with_non_send_sync)]
     fn view() -> HostStateView<MemAccounts> {
         let store: HostStore = Arc::new(MemStore::new());

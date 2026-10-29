@@ -111,7 +111,7 @@ jobs:
     with:
       artifact: arkiv-binaries-${{ inputs.profile || 'dev-fast' }}-${{ github.sha }}
 
-  # The cheap devnet check: one --dev node and a Valkey, no consensus layer and
+  # The cheap devnet check: one --dev node, no consensus layer and
   # no enclave. Covers docker/compose.yml and `check.py --no-enclave`, which the
   # Kurtosis lane does not touch. Runs at debug so the logs are readable.
   docker-stack:

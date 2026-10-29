@@ -142,8 +142,7 @@ mod tests {
     /// A manager whose genesis commit is tagged, so `view` has somewhere to start.
     ///
     /// `MemStore` is a `RefCell`, so this `Arc` is not `Send + Sync`. That is
-    /// the reference store's limitation, not the manager's — `arkiv-valkey`
-    /// pins the real store as shareable.
+    /// the reference store's limitation, not the manager's.
     #[allow(clippy::arc_with_non_send_sync)]
     fn manager() -> GolemStateManager<MemStore> {
         let store = Arc::new(MemStore::new());

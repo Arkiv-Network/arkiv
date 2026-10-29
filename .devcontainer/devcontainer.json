@@ -26,15 +26,10 @@
     // lld needs a fraction of the memory and is faster. x86_64 already uses
     // rust-lld by default, so this is scoped to the aarch64 target. It takes
     // precedence over any [build] rustflags in .cargo/config.toml.
-    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=lld",
-    // Where the `--ignored` store tests find Valkey, as in CI's valkey job:
-    // cargo test -p arkiv-valkey -p arkiv-golemdb-state -p arkiv-reth -- --ignored
-    "VALKEY_URL": "redis://127.0.0.1:6379"
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "-C link-arg=-fuse-ld=lld"
   },
   // New volumes are created root-owned; hand them to the container user.
   "postCreateCommand": "for dir in target /usr/local/cargo/registry /usr/local/cargo/git /home/vscode/.claude; do if [ \"$(stat -c %U \"$dir\")\" != vscode ]; then sudo chown -R vscode:vscode \"$dir\" || exit 1; fi; done && cargo --version",
-  // Valkey for the tests, on every start: in memory only, files under /tmp.
-  "postStartCommand": "valkey-server --daemonize yes --bind 127.0.0.1 --port 6379 --save '' --appendonly no --dir /tmp --pidfile /tmp/valkey.pid --logfile /tmp/valkey.log",
 
   "customizations": {
     "vscode": {

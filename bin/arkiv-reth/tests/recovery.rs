@@ -29,17 +29,6 @@ const READY: Duration = Duration::from_secs(90);
 /// persistence would have run, had this node not replaced it with its own.
 const PERSISTED: u64 = 60;
 
-/// Where the Valkey server is, or a clear explanation of why we cannot proceed.
-///
-/// Panics rather than silently passing: a green restart test that never had a
-/// store able to survive the restart is worse than no test.
-fn valkey_url() -> String {
-    std::env::var("VALKEY_URL").expect(
-        "this test needs a store that outlives the node process: set VALKEY_URL \
-         (for example redis://127.0.0.1:6379)",
-    )
-}
-
 /// A create carrying `payload` under `text/plain`, with a purely relative
 /// lifetime. Both are ordinary **unindexed** user attributes: stored and
 /// returned, never queryable.
@@ -144,7 +133,7 @@ async fn wait_for_physical_purge(
 /// * **A store that outlives the process.** Arkiv's state is not in the
 ///   datadir; by default it is in-process, so after a restart there is simply
 ///   nothing to find and the question the test asks is unanswerable. Hence
-///   Valkey, which is also what a real deployment runs.
+///   GolemDB on disk, which is also what a real deployment runs.
 /// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50. Below
 ///   it reth has written nothing to its own database, and a restart therefore
 ///   never reaches the startup checks or the catch-up this is here to cover —
@@ -154,18 +143,16 @@ async fn wait_for_physical_purge(
 ///
 /// This is the graceful restart — SIGTERM, the one an operator performs.
 ///
-/// Ignored by default because it needs a server, like the store's own
-/// conformance tests:
+/// Ignored by default because it is slow: it waits out more than 50 blocks.
 ///
 /// ```sh
-/// VALKEY_URL=redis://127.0.0.1:6379 \
-///   cargo nextest run -p arkiv-reth --run-ignored only -- restart
+/// cargo nextest run -p arkiv-reth --run-ignored only -- restart
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+#[ignore = "slow: waits out reth's persistence threshold; run with --ignored"]
 async fn state_and_index_survive_shutdown_and_restart() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
-        .valkey_store(valkey_url())
+        .golemdb_store()
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
