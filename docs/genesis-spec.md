@@ -52,8 +52,10 @@ format under `config.arkiv.golemdb`, with a required `metering` object:
 ```
 
 This excerpt omits other engine weights: both shipped files explicitly list all
-32 GolemDB weights and all six host weights. Engine prices are all 1 as an
-initial nonzero baseline; host values preserve existing storage charges.
+32 GolemDB weights and all six host weights. In `dev.json` engine prices are all
+1 as an initial nonzero baseline, and host values preserve existing storage
+charges. In `example.json` every value differs from every other, so a test can
+tell that each one reaches the node under its own name; they are illustrative.
 These prices are not calibrated for production. Missing engine weights remain
 unpriced; missing or zero host values fail startup. Neither omission implies zero.
 
