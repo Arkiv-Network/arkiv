@@ -26,6 +26,8 @@
 //! - **Index lookups.** They answer from committed state, and nothing here can
 //!   commit: the suite holds a view, not the store behind it. Covered by each
 //!   implementation's own tests instead.
+//! - **Costs and write effects.** Only GolemDB reports them; the mock stores
+//!   report zero. GolemDB's own tests cover them.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -63,6 +65,12 @@ pub fn run_all<V: StateView>(new_view: &dyn Fn() -> V) {
     a_dropped_attribute_leaves_the_entity(new_view);
     two_writes_to_one_entity_collapse_into_one_delta(new_view);
     deltas_come_back_in_ascending_entity_order(new_view);
+
+    // frames
+    a_discarded_frame_rolls_back_entities_and_the_minting_nonce(new_view);
+    a_merged_frame_keeps_its_writes(new_view);
+    frames_do_not_nest(new_view);
+    closing_a_frame_that_was_never_opened_fails(new_view);
 
     // pruning
     the_pruning_set_stages_then_commits(new_view);
@@ -123,7 +131,10 @@ fn an_unseen_account_is_zero<V: StateView>(new_view: &dyn Fn() -> V) {
             "and a zero transaction nonce"
         );
         assert_eq!(
-            view.get_entity_creation_nonce(ALICE, read).unwrap().get(),
+            view.get_entity_creation_nonce(ALICE, read)
+                .unwrap()
+                .value
+                .get(),
             0,
             "and a zero creation nonce"
         );
@@ -247,12 +258,14 @@ fn nonces_advance_by_one_and_report_the_value_before<V: StateView>(new_view: &dy
     assert_eq!(
         view.fetch_increment_entity_creation_nonce(ALICE)
             .unwrap()
+            .value
             .get(),
         0
     );
     assert_eq!(
         view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
             .unwrap()
+            .value
             .get(),
         1
     );
@@ -275,6 +288,7 @@ fn the_two_nonces_are_independent<V: StateView>(new_view: &dyn Fn() -> V) {
     assert_eq!(
         view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
             .unwrap()
+            .value
             .get(),
         1
     );
@@ -306,7 +320,8 @@ fn a_created_entity_reads_back_through_the_overlay<V: StateView>(new_view: &dyn 
         .unwrap();
     assert_eq!(
         view.get_entity(address(1), ReadMode::ViewWithOverlay)
-            .unwrap(),
+            .unwrap()
+            .value,
         Some(entity(1)),
         "every field of a created entity survives the round trip"
     );
@@ -317,7 +332,9 @@ fn the_base_does_not_see_staged_entity_writes<V: StateView>(new_view: &dyn Fn() 
     view.update_entity(EntityUpdates::create(entity(1)))
         .unwrap();
     assert_eq!(
-        view.get_entity(address(1), ReadMode::ViewOnBase).unwrap(),
+        view.get_entity(address(1), ReadMode::ViewOnBase)
+            .unwrap()
+            .value,
         None
     );
 }
@@ -330,7 +347,8 @@ fn a_deleted_entity_reads_as_absent<V: StateView>(new_view: &dyn Fn() -> V) {
         .unwrap();
     assert_eq!(
         view.get_entity(address(1), ReadMode::ViewWithOverlay)
-            .unwrap(),
+            .unwrap()
+            .value,
         None
     );
 }
@@ -350,6 +368,7 @@ fn a_dropped_attribute_leaves_the_entity<V: StateView>(new_view: &dyn Fn() -> V)
     let back = view
         .get_entity(address(1), ReadMode::ViewWithOverlay)
         .unwrap()
+        .value
         .expect("the entity is still there");
     assert!(back.attributes.is_empty(), "the attribute is gone");
 }
@@ -386,6 +405,107 @@ fn deltas_come_back_in_ascending_entity_order<V: StateView>(new_view: &dyn Fn() 
         .map(|d| d.entity)
         .collect();
     assert_eq!(seen, vec![address(1), address(2), address(3)]);
+}
+
+// ---------------------------------------------------------------------------
+// frames
+// ---------------------------------------------------------------------------
+
+/// A reverted transaction: the frame's entity and minting-nonce writes go,
+/// and so do their deltas, while what came before the frame stays.
+fn a_discarded_frame_rolls_back_entities_and_the_minting_nonce<V: StateView>(
+    new_view: &dyn Fn() -> V,
+) {
+    let mut view = new_view();
+    view.update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+
+    view.begin_frame().unwrap();
+    view.update_entity(EntityUpdates::create(entity(2)))
+        .unwrap();
+    view.fetch_increment_entity_creation_nonce(ALICE).unwrap();
+    view.discard_frame().unwrap();
+
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        Some(entity(1)),
+        "a write from before the frame survives"
+    );
+    assert_eq!(
+        view.get_entity(address(2), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        None,
+        "the frame's entity is gone"
+    );
+    assert_eq!(
+        view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+            .get(),
+        0,
+        "and so is its minting-nonce increment"
+    );
+    let deltas = view.get_uncommitted_deltas().unwrap();
+    assert_eq!(
+        deltas.len(),
+        1,
+        "the delta log is back to the one write outside the frame"
+    );
+    assert_eq!(deltas[0].entity, address(1));
+}
+
+fn a_merged_frame_keeps_its_writes<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    view.begin_frame().unwrap();
+    view.update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+    view.fetch_increment_entity_creation_nonce(ALICE).unwrap();
+    view.merge_frame().unwrap();
+
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        Some(entity(1))
+    );
+    assert_eq!(
+        view.get_entity_creation_nonce(ALICE, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+            .get(),
+        1
+    );
+    assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
+}
+
+/// One frame per transaction. A refused `begin_frame` leaves the open frame as
+/// it was, so the discard still reaches back to the one real begin.
+fn frames_do_not_nest<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    view.begin_frame().unwrap();
+    view.update_entity(EntityUpdates::create(entity(1)))
+        .unwrap();
+    assert!(
+        view.begin_frame().is_err(),
+        "a second frame while one is open is refused"
+    );
+    view.discard_frame().unwrap();
+    assert_eq!(
+        view.get_entity(address(1), ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value,
+        None
+    );
+    assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+}
+
+fn closing_a_frame_that_was_never_opened_fails<V: StateView>(new_view: &dyn Fn() -> V) {
+    let mut view = new_view();
+    assert!(view.merge_frame().is_err());
+    assert!(view.discard_frame().is_err());
 }
 
 // ---------------------------------------------------------------------------

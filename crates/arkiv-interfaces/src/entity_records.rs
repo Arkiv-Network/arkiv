@@ -105,13 +105,18 @@ pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
 }
 
 /// The record key for an entity: its address, which is already 32 bytes. `None`
-/// for an account's key, where no entity is read or written.
+/// for a reserved key, where no entity is read or written.
 pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
-    if is_account_key(key) {
+    if is_reserved_key(key) {
         None
     } else {
         Some(RecordKey::from_entity(key))
     }
+}
+
+/// Account records must never be interpreted as entities.
+pub const fn is_reserved_key(key: EntityAddress) -> bool {
+    is_account_key(key)
 }
 
 /// Whether `key` is an account's: an address left-padded with twelve zero bytes.
@@ -476,5 +481,23 @@ mod tests {
         let level = record.cell("level").unwrap();
         assert_eq!(level.value, AttributeValue::Int(-7).encode());
         assert_ne!(level.value, AttributeValue::Int(-7).index_bytes());
+    }
+
+    /// No entity is read or written at a reserved key: an account's, or the fee
+    /// schedule's. Any other key is an entity's own.
+    #[test]
+    fn reserved_keys_have_no_entity_record() {
+        let mut account = [0u8; 32];
+        account[12..].copy_from_slice(&[0xaa; 20]);
+        for key in [account] {
+            assert!(is_reserved_key(key));
+            assert_eq!(record_key(key), None);
+        }
+        let mut near = [0x7b; 32];
+        near[31] ^= 1;
+        for key in [[0x11; 32], near] {
+            assert!(!is_reserved_key(key));
+            assert_eq!(record_key(key), Some(RecordKey::from_entity(key)));
+        }
     }
 }

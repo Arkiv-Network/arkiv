@@ -1517,6 +1517,7 @@ dependencies = [
 name = "arkiv-golemdb-state"
 version = "0.5.1"
 dependencies = [
+ "arkiv-golemdb",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
 ]

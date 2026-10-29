@@ -790,6 +790,7 @@ fn arkiv_purge_expired<DB: Database>(
         let Some(entity) = view
             .get_entity(key_bytes, ReadMode::ViewWithOverlay)
             .map_err(state_fault("read purge entity"))?
+            .into_value()
         else {
             continue;
         };
@@ -886,7 +887,8 @@ fn arkiv_entity_transact<DB: Database>(
     check_sender(&view, checks, fees, tx)?;
     let start_nonce = view
         .get_entity_creation_nonce(env.caller, ReadMode::ViewWithOverlay)
-        .map_err(state_fault("read minting nonce"))?;
+        .map_err(state_fault("read minting nonce"))?
+        .into_value();
     let outcome = match decode_ops(&env, &tx.data, start_nonce) {
         Ok(ops) => {
             let costs = *view.cost_model();
@@ -982,7 +984,8 @@ fn view_entity<DB: Database>(
         .map_err(state_fault("open view"))?;
     let entity = view
         .get_entity(key.0, ReadMode::ViewOnBase)
-        .map_err(state_fault("read entity"))?;
+        .map_err(state_fault("read entity"))?
+        .into_value();
     view.finish().map_err(state_fault("close view"))?;
     Ok(entity)
 }
@@ -1008,7 +1011,8 @@ fn arkiv_entity_nonce_call<DB: Database>(
         let nonce = host_manager(store, branch, db, parent_ref(block_number))
             .map_err(state_fault("open view"))?
             .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
-            .map_err(state_fault("read minting nonce"))?;
+            .map_err(state_fault("read minting nonce"))?
+            .into_value();
         Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
             &nonce.get(),
         )))

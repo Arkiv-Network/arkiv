@@ -17,6 +17,7 @@ use crate::primitives::{
     BlockNumber, EntityAddress, EntityCreationNonce, Gas, Hash, UserAddress, UserBalance, UserNonce,
 };
 use crate::query::QueryStats;
+use crate::store::{Metered, RecordMeta};
 
 /// A 32-byte commitment over a store's contents.
 pub type Commitment = [u8; 32];
@@ -206,6 +207,10 @@ pub trait AccountNoncesStore {
 }
 
 /// The entity-creation nonces: an input to every minted [`EntityAddress`].
+///
+/// Reads and writes return what they cost: minting-nonce traffic is entity
+/// cost. A caller that does not charge for it says so with
+/// [`Metered::into_value`].
 pub trait EntityCreationNoncesStore {
     type Error: Debug;
 
@@ -213,28 +218,59 @@ pub trait EntityCreationNoncesStore {
         &self,
         owner: UserAddress,
         read: ReadMode,
-    ) -> Result<EntityCreationNonce, Self::Error>;
+    ) -> Result<Metered<EntityCreationNonce>, Self::Error>;
 
-    /// Returns the nonce **before** the increment.
+    /// Returns the nonce **before** the increment, and the cost of the read
+    /// and the write together.
     fn fetch_increment_entity_creation_nonce(
         &mut self,
         owner: UserAddress,
-    ) -> Result<EntityCreationNonce, Self::Error>;
+    ) -> Result<Metered<EntityCreationNonce>, Self::Error>;
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error>;
 }
 
+/// An entity as the store holds it, and the size its record takes there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEntity {
+    pub entity: Entity,
+    /// Not optional: an entity read fetches the whole record, so a missing
+    /// size is a store fault, never an unknown one.
+    pub meta: RecordMeta,
+}
+
 /// The entities: [`EntityAddress`] → [`Entity`].
+///
+/// Reads and writes return what they cost, a read that finds nothing
+/// included. A caller that does not charge for it says so with
+/// [`Metered::into_value`].
 pub trait EntityStore {
     type Error: Debug;
 
+    /// The entity with its record's size, in one store call: what pricing
+    /// needs as the size before a write.
+    fn get_entity_with_meta(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<StoredEntity>>, Self::Error>;
+
+    /// The same read, without the size. A caller that needs the size uses
+    /// [`get_entity_with_meta`](Self::get_entity_with_meta) rather than a
+    /// second read.
     fn get_entity(
         &self,
         address: EntityAddress,
         read: ReadMode,
-    ) -> Result<Option<Entity>, Self::Error>;
+    ) -> Result<Metered<Option<Entity>>, Self::Error> {
+        Ok(self
+            .get_entity_with_meta(address, read)?
+            .map(|found| found.map(|stored| stored.entity)))
+    }
 
-    fn update_entity(&mut self, updates: EntityUpdates) -> Result<(), Self::Error>;
+    /// The receipt covers every store call the update made, its own read
+    /// included. Errors do not roll back writes: that is what a frame is for.
+    fn update_entity(&mut self, updates: EntityUpdates) -> Result<Metered<()>, Self::Error>;
 
     /// One net-against-base entry per touched entity, ascending — what the
     /// index stores fold in.
@@ -348,6 +384,22 @@ pub trait StateView:
     /// The backend retains a bounded window of heights per store, so an old
     /// view may lack some.
     fn has_store(&self, store: StoreKind) -> bool;
+
+    /// Open the transaction's frame: a safe point that
+    /// [`discard_frame`](Self::discard_frame) rolls entity and minting-nonce
+    /// writes back to, delta log included.
+    ///
+    /// One frame per transaction, and frames do not nest: a second
+    /// `begin_frame` while one is open is an error. Account writes belong
+    /// outside the frame. Costs are not rolled back: receipts are return
+    /// values, so what a discarded frame spent stays with the caller.
+    fn begin_frame(&mut self) -> Result<(), <Self as StateView>::Error>;
+
+    /// Keep the open frame's writes.
+    fn merge_frame(&mut self) -> Result<(), <Self as StateView>::Error>;
+
+    /// Roll the open frame's writes back.
+    fn discard_frame(&mut self) -> Result<(), <Self as StateView>::Error>;
 
     // Each store, narrowed to its own trait — `_mut` for the write half. The
     // view *is* every store; these just present one at a time.

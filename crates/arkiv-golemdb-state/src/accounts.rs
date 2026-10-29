@@ -65,7 +65,7 @@ use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, Commitment, EntityCreationNoncesStore, ReadMode,
 };
 use arkiv_interfaces::store::{
-    Cell, CellChange, CellName, Record, RecordKey, Store, StoreError, TypeId,
+    Cell, CellChange, CellName, Metered, Record, RecordKey, Store, StoreError, TypeId,
 };
 
 use crate::view::{GolemStateView, ViewError};
@@ -109,16 +109,22 @@ fn u64_cell(record: Option<&Record>, name: &'static str) -> Result<u64, AccountE
 }
 
 impl<S: Store> GolemStateView<S> {
-    fn read(&self, account: UserAddress, read: ReadMode) -> Result<Option<Record>, AccountError> {
+    /// The account's record, with the read's receipt. Balance and
+    /// transaction-nonce reads are settlement and drop it; minting-nonce reads
+    /// are entity cost and keep it.
+    fn read(
+        &self,
+        account: UserAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<Record>>, AccountError> {
         Ok(self
             .store
-            .get(self.target(read), record_key(account), None, None)?
-            .into_value())
+            .get(self.target(read), record_key(account), None, None)?)
     }
 
     /// The account's balance. Absent is zero.
     fn balance(&self, account: UserAddress, read: ReadMode) -> Result<UserBalance, AccountError> {
-        let record = self.read(account, read)?;
+        let record = self.read(account, read)?.into_value();
         let Some(cell) = record.as_ref().and_then(|record| record.cell(CELL_BALANCE)) else {
             return Ok(UserBalance::from_u64(0));
         };
@@ -132,21 +138,21 @@ impl<S: Store> GolemStateView<S> {
     /// The account's transaction nonce. Absent is zero.
     fn nonce(&self, account: UserAddress, read: ReadMode) -> Result<UserNonce, AccountError> {
         Ok(UserNonce::new(u64_cell(
-            self.read(account, read)?.as_ref(),
+            self.read(account, read)?.value.as_ref(),
             CELL_NONCE,
         )?))
     }
 
-    /// The account's entity-creation nonce. Absent is zero.
+    /// The account's entity-creation nonce. Absent is zero; the read's receipt
+    /// is kept either way.
     fn minted(
         &self,
         account: UserAddress,
         read: ReadMode,
-    ) -> Result<EntityCreationNonce, AccountError> {
-        Ok(EntityCreationNonce::new(u64_cell(
-            self.read(account, read)?.as_ref(),
-            CELL_MINTED,
-        )?))
+    ) -> Result<Metered<EntityCreationNonce>, AccountError> {
+        let record = self.read(account, read)?;
+        let nonce = EntityCreationNonce::new(u64_cell(record.value.as_ref(), CELL_MINTED)?);
+        Ok(Metered::new(nonce, record.receipt))
     }
 
     /// Write one cell, creating the record if the account is new.
@@ -156,8 +162,20 @@ impl<S: Store> GolemStateView<S> {
         name: &str,
         cell: Cell,
     ) -> Result<(), AccountError> {
+        let existing = self.read(account, ReadMode::ViewWithOverlay)?;
+        self.write_cell_given(account, name, cell, existing)
+            .map(Metered::into_value)
+    }
+
+    fn write_cell_given(
+        &mut self,
+        account: UserAddress,
+        name: &str,
+        cell: Cell,
+        existing: Metered<Option<Record>>,
+    ) -> Result<Metered<()>, AccountError> {
         let key = record_key(account);
-        if self.read(account, ReadMode::ViewWithOverlay)?.is_none() {
+        let written = if existing.value.is_none() {
             // Only the cell being written. The other two are left absent rather
             // than zeroed: every reader here already treats absent as zero, so
             // writing them buys nothing, and a zero that looks like a value is
@@ -165,17 +183,22 @@ impl<S: Store> GolemStateView<S> {
             // `$nonce` is what makes a record an Ethereum account, and the
             // minting lane has no business claiming this address is one.
             self.store
-                .create(self.branch, key, vec![(CellName::from(name), cell)], None)?;
-            return Ok(());
-        }
-        self.store.patch(
-            self.branch,
-            key,
-            None,
-            vec![(CellName::from(name), CellChange::Set(cell))],
-            None,
-        )?;
-        Ok(())
+                .create(self.branch, key, vec![(CellName::from(name), cell)], None)?
+                .receipt
+        } else {
+            self.store
+                .patch(
+                    self.branch,
+                    key,
+                    None,
+                    vec![(CellName::from(name), CellChange::Set(cell))],
+                    None,
+                )?
+                .receipt
+        };
+        let mut receipt = existing.receipt;
+        receipt.accumulate(&written);
+        Ok(Metered::new((), receipt))
     }
 
     /// Set the balance outright.
@@ -236,18 +259,21 @@ impl<S: Store> GolemStateView<S> {
         Ok(before)
     }
 
-    /// Advance the entity-creation nonce, returning the value **before**.
+    /// Advance the entity-creation nonce, returning the value **before** and
+    /// the cost of the read and the write. Errors do not roll back writes; the
+    /// caller owns the transaction frame.
     fn fetch_increment_minted(
         &mut self,
         account: UserAddress,
-    ) -> Result<EntityCreationNonce, AccountError> {
-        let before = self.minted(account, ReadMode::ViewWithOverlay)?;
+    ) -> Result<Metered<EntityCreationNonce>, AccountError> {
+        let existing = self.read(account, ReadMode::ViewWithOverlay)?;
+        let before = EntityCreationNonce::new(u64_cell(existing.value.as_ref(), CELL_MINTED)?);
         let cell = Cell::field(
             TypeId::U64,
             before.advanced_by(1).get().to_be_bytes().to_vec(),
         );
-        self.write_cell(account, CELL_MINTED, cell)?;
-        Ok(before)
+        let written = self.write_cell_given(account, CELL_MINTED, cell, existing)?;
+        Ok(written.map(|()| before))
     }
 }
 
@@ -315,14 +341,14 @@ impl<S: Store> EntityCreationNoncesStore for GolemStateView<S> {
         &self,
         owner: UserAddress,
         read: ReadMode,
-    ) -> Result<EntityCreationNonce, ViewError> {
+    ) -> Result<Metered<EntityCreationNonce>, ViewError> {
         self.minted(owner, read).map_err(Into::into)
     }
 
     fn fetch_increment_entity_creation_nonce(
         &mut self,
         owner: UserAddress,
-    ) -> Result<EntityCreationNonce, ViewError> {
+    ) -> Result<Metered<EntityCreationNonce>, ViewError> {
         self.fetch_increment_minted(owner).map_err(Into::into)
     }
 
@@ -354,7 +380,7 @@ mod tests {
             UserNonce::new(0)
         );
         assert_eq!(
-            view.minted(ALICE, ReadMode::ViewWithOverlay).unwrap(),
+            view.minted(ALICE, ReadMode::ViewWithOverlay).unwrap().value,
             EntityCreationNonce::new(0)
         );
     }
@@ -400,7 +426,7 @@ mod tests {
             UserNonce::new(1)
         );
         assert_eq!(
-            view.minted(ALICE, ReadMode::ViewWithOverlay).unwrap(),
+            view.minted(ALICE, ReadMode::ViewWithOverlay).unwrap().value,
             EntityCreationNonce::new(2)
         );
     }
@@ -520,7 +546,7 @@ mod tests {
         view.fetch_increment_minted(ALICE).unwrap();
 
         let record = view.read(ALICE, ReadMode::ViewWithOverlay).unwrap();
-        let record = record.expect("the record exists");
+        let record = record.value.expect("the record exists");
         let present: Vec<_> = record.cells.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(present, [CELL_MINTED], "only the written cell is stored");
 
