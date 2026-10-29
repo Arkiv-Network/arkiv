@@ -452,15 +452,7 @@ where
             ..FeeEnv::from_block(self.inner.block())
         };
         let chain_id = self.inner.chain_id();
-        if fees.charge {
-            self.charged.set(true);
-            // Only charged transactions, and in arrival order: this is the list
-            // reth will hand back as the block's transactions, so the two have
-            // to agree exactly or the built header's root goes unanswered.
-            self.executed
-                .borrow_mut()
-                .push((tx.caller.into_array(), tx.nonce));
-        }
+        let sender = (tx.caller.into_array(), tx.nonce);
         let store = self.store.clone();
         let branch = self.branch;
         let db = self.inner.db_mut();
@@ -475,7 +467,17 @@ where
             nonce: nonce_check,
             fees: fee_checks,
         });
-        arkiv_transact(store, branch, db, block_number, fees, checks, tx)
+        let result = arkiv_transact(store, branch, db, block_number, fees, checks, tx)?;
+        // Only charged transactions, in arrival order, and only once executed:
+        // this is the list reth will hand back as the block's transactions, so
+        // the two have to agree exactly or the built header's root goes
+        // unanswered. One refused here is skipped by the builder, so it is not
+        // in the block either.
+        if fees.charge {
+            self.charged.set(true);
+            self.executed.borrow_mut().push(sender);
+        }
+        Ok(result)
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -1440,6 +1442,61 @@ mod tests {
             view.get_balance(CLAMP_ALICE, ReadMode::ViewWithOverlay)
                 .unwrap(),
             UserBalance::from_u64(6)
+        );
+    }
+
+    /// A transaction the executor refuses is one the payload builder skips, so
+    /// the seal must be keyed by the transactions that executed. Keyed by every
+    /// transaction tried, the resolver -- which asks by the block's
+    /// transactions -- finds no seal, and the node rejects its own block.
+    #[test]
+    fn seal_keyed_by_transactions_executed() {
+        use arkiv_interfaces::store::reference::MemStore;
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+        let store: HostStore = Arc::new(MemStore::new());
+        store
+            .commit_tagged(store.begin(None).expect("begin"), [0; 32])
+            .expect("tag genesis");
+        let seals = Arc::new(BlockSeals::default());
+        let block_env = BlockEnv {
+            number: U256::from(1),
+            basefee: 0,
+            ..Default::default()
+        };
+        let mut evm = ArkivEvmFactory::new(store, seals.clone()).create_evm(
+            EmptyDB::default(),
+            EvmEnv {
+                cfg_env: CfgEnv::default(),
+                block_env,
+            },
+        );
+
+        let refused = Address::repeat_byte(0xaa);
+        let sender = Address::repeat_byte(0xbb);
+        let deploy = TxEnv {
+            caller: refused,
+            kind: TxKind::Create,
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            evm.transact(deploy),
+            Err(EVMError::Transaction(_))
+        ));
+        let transfer = TxEnv {
+            caller: sender,
+            kind: TxKind::Call(Address::repeat_byte(0xde)),
+            gas_limit: ARKIV_TX_GAS,
+            ..Default::default()
+        };
+        evm.transact(transfer).expect("transfer");
+        evm.finish();
+
+        let included = ExecutionKey::new(1, vec![(sender.into_array(), 0)]);
+        assert!(
+            seals.root_of(&included).is_some(),
+            "the seal is keyed by the block's transactions"
         );
     }
 }
