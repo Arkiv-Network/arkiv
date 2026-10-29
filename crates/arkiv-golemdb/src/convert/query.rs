@@ -94,7 +94,7 @@ pub(crate) fn arkiv_query_result(page: &golemdb::QueryPage) -> Result<QueryResul
 /// The filter as GolemDB's, node for node. Both evaluate children in the
 /// written order.
 ///
-/// Every predicate in the tree is checked against its type's index first, as
+/// Every predicate in the tree is checked against its type's index before conversion.
 fn golemdb_filter(filter: &Filter) -> Result<golemdb::Filter, StoreError> {
     if !answerable(filter) {
         return Err(StoreError::InvalidQuery);

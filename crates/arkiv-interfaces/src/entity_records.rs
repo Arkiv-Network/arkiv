@@ -336,6 +336,7 @@ mod tests {
             key: record_key(entity.key).unwrap(),
             version: RecordVersion(1),
             cells: to_cells(entity).expect("maps"),
+            meta: None,
         }
     }
 

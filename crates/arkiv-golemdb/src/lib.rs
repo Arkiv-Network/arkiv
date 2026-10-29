@@ -36,9 +36,9 @@ pub use golemdb_api::{
 };
 
 use convert::{
-    arkiv_query_result, arkiv_record, branch_id, commit_id, count_op, golemdb_budget, golemdb_cell,
-    golemdb_commit, immutable_data_address, immutable_data_key, immutable_data_row, metered,
-    metered_result, query_op, record_key, segment_row, store_error,
+    arkiv_query_result, arkiv_receipt, arkiv_record, branch_id, commit_id, count_op,
+    golemdb_budget, golemdb_cell, golemdb_commit, immutable_data_address, immutable_data_key,
+    immutable_data_row, metered_result, query_op, record_key, segment_row, store_error,
 };
 use tags::TagRow;
 
@@ -233,6 +233,31 @@ impl GolemDbStore {
 }
 
 impl Store for GolemDbStore {
+    fn pricing_snapshot(
+        &self,
+        at: CommitId,
+    ) -> Result<arkiv_interfaces::store::PricingSnapshot, StoreError> {
+        use arkiv_interfaces::store::{PricingModel, PricingSnapshot};
+        let commit = Some(golemdb_commit(at));
+        let model = self.database.metering_model(commit).map_err(store_error)?;
+        let weights = self
+            .database
+            .model_weights(commit, Some(model.active.version))
+            .map_err(store_error)?;
+        if model.commit_id != weights.commit_id || model.active.version != weights.version {
+            return Err(StoreError::Internal);
+        }
+        Ok(PricingSnapshot {
+            commit_id: commit_id(model.commit_id),
+            model: PricingModel {
+                version: weights.version,
+                golemdb_code_version: model.active.golemdb_code_version,
+                host_code_version: model.active.host_code_version,
+                weights: weights.weights,
+            },
+        })
+    }
+
     /// Panics if the head cannot be read: an I/O failure, where stopping is
     /// the only safe answer.
     fn head(&self) -> CommitId {
@@ -314,8 +339,8 @@ impl Store for GolemDbStore {
                 CellKind::Field => operation.field(name, value),
             };
         }
-        metered_result(self.database.create(branch_id(branch), operation))
-            .map(|key| metered(RecordKey(key.0)))
+        metered_result("create", self.database.create(branch_id(branch), operation))
+            .map(|metered| metered.map(|key| RecordKey(key.0)))
     }
 
     fn get(
@@ -327,8 +352,9 @@ impl Store for GolemDbStore {
     ) -> Result<Metered<Option<Record>>, StoreError> {
         // GolemDB's own records sit at fixed keys a caller can name. None is
         // Arkiv's, and `#recordKeys` holds a cell for every record there is.
+        // Answered without asking GolemDB, so nothing is spent.
         if golemdb_cells::system::by_key(&key.0).is_some() {
-            return Ok(metered(None));
+            return Ok(Metered::new(None, Default::default()));
         }
         let target = match target {
             ReadTarget::Branch(branch) => golemdb::ReadTarget::Branch(branch_id(branch)),
@@ -338,10 +364,16 @@ impl Store for GolemDbStore {
         if let Some(names) = projection {
             operation = operation.only(names.iter().map(String::as_bytes));
         }
-        match metered_result(self.database.get(target, operation)) {
-            Ok(record) => Ok(metered(Some(arkiv_record(&record)?))),
-            Err(StoreError::NotFound) => Ok(metered(None)),
-            Err(error) => Err(error),
+        let golemdb::Metered { result, receipt } = self.database.get(target, operation);
+        match result {
+            // Absent is an answer, not a failure, and it was paid for.
+            Err(ApiError::NotFound | ApiError::CellNotFound { .. }) => {
+                Ok(Metered::new(None, arkiv_receipt(&receipt)))
+            }
+            result => {
+                let read = metered_result("get", golemdb::Metered::new(result, receipt))?;
+                Ok(Metered::new(Some(arkiv_record(&read.value)?), read.receipt))
+            }
         }
     }
 
@@ -375,8 +407,8 @@ impl Store for GolemDbStore {
                 CellChange::Remove => operation.remove(name),
             };
         }
-        metered_result(self.database.patch(branch_id(branch), operation))
-            .map(|()| metered(RecordVersion(0)))
+        metered_result("patch", self.database.patch(branch_id(branch), operation))
+            .map(|metered| metered.map(|()| RecordVersion(0)))
     }
 
     fn delete(
@@ -389,11 +421,13 @@ impl Store for GolemDbStore {
         if expected_version.is_some() {
             return Err(StoreError::NotImplemented);
         }
-        metered_result(self.database.delete(
-            branch_id(branch),
-            golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
-        ))
-        .map(metered)
+        metered_result(
+            "delete",
+            self.database.delete(
+                branch_id(branch),
+                golemdb::RecordOp::delete(record_key(key), golemdb_budget(budget)),
+            ),
+        )
     }
 
     /// The query runs as written, so what GolemDB cannot run yet, a `Not`, is
@@ -408,10 +442,11 @@ impl Store for GolemDbStore {
         budget: Option<Budget>,
     ) -> Result<Metered<QueryResult>, StoreError> {
         let page = metered_result(
+            "query",
             self.database
                 .query(at.map(golemdb_commit), query_op(query, budget)?),
         )?;
-        arkiv_query_result(&page).map(metered)
+        Ok(Metered::new(arkiv_query_result(&page.value)?, page.receipt))
     }
 
     /// A count does not page, so it runs whenever GolemDB can express the
@@ -423,10 +458,10 @@ impl Store for GolemDbStore {
         budget: Option<Budget>,
     ) -> Result<Metered<u64>, StoreError> {
         metered_result(
+            "count",
             self.database
                 .count(at.map(golemdb_commit), count_op(filter, budget)?),
         )
-        .map(metered)
     }
 
     /// A constant. The one production caller discards it, and GolemDB has no

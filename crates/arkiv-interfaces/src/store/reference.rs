@@ -29,9 +29,9 @@ use std::sync::Mutex;
 use super::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellName, CommitId, CostUnits,
     Filter, Metered, Origin, Query, QueryResult, ReadTarget, Receipt, Record, RecordChange,
-    RecordKey, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress, SegmentKey,
-    SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt, WriteOp,
-    WriteOutcome, validate_cell_name,
+    RecordKey, RecordMeta, RecordVersion, ScheduleVersion, SealedCommit, SegmentAddress,
+    SegmentKey, SegmentOrdinal, SegmentRow, Sort, SortDirection, Store, StoreError, StoreExt,
+    WriteDetails, WriteOp, WriteOutcome, validate_cell_name,
 };
 use alloc::string::{String, ToString};
 use core::ops::Range;
@@ -61,6 +61,7 @@ impl RecordData {
             key,
             version: self.version,
             cells,
+            meta: Some(RecordMeta::default()),
         }
     }
 }
@@ -239,6 +240,8 @@ const fn free_receipt() -> Receipt {
     Receipt {
         cost: CostUnits(0),
         schedule: ScheduleVersion(0),
+        priced_at: None,
+        details: WriteDetails::ZERO,
     }
 }
 
@@ -792,6 +795,10 @@ impl Inner {
 // re-entrantly and deadlock.
 
 impl Store for MemStore {
+    fn pricing_snapshot(&self, _at: CommitId) -> Result<super::PricingSnapshot, StoreError> {
+        Err(StoreError::PricingUnavailable)
+    }
+
     fn head(&self) -> CommitId {
         self.0
             .lock()
