@@ -700,9 +700,7 @@ pub enum StoreError {
 ///
 /// Every method takes `&self`, writes included. A `Store` value is a *handle
 /// to a database that lives elsewhere* — out of process, for the real one.
-/// Writing through it changes the database, not the handle: `ValkeyStore`
-/// holds no cell, lock or atomic, and a write leaves every one of its bytes
-/// untouched.
+/// Writing through it changes the database, not the handle.
 ///
 /// So `&mut self` on a write was never describing mutation of the receiver.
 /// It was claiming exclusive access to the database, which a handle does not

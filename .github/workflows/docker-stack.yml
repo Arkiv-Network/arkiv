@@ -1,8 +1,7 @@
 # Single-node docker stack smoke test.
 #
 # The cheap counterpart to `kurtosis`: no consensus layer, no second node, no
-# enclave — one auto-sealing `--dev` node plus the Valkey that arkiv-valkey's
-# conformance suite needs. It proves `docker/compose.yml` and
+# enclave — one auto-sealing `--dev` node. It proves `docker/compose.yml` and
 # `check.py --no-enclave` actually work, which the Kurtosis lane does not cover.
 #
 # Called by `pr-artifact` once the binaries exist, so it packages that
@@ -37,7 +36,7 @@ on:
 
 jobs:
   single-node-smoke:
-    name: single node + valkey
+    name: single node
     runs-on: ubuntu-latest
     # Packaging a prebuilt binary is a couple of minutes; a from-source dispatch
     # compiles reth, so the timeout has to cover the slow path.
@@ -48,7 +47,6 @@ jobs:
       ARTIFACT: ${{ inputs.artifact }}
       ARKIV_LOG_FILTER: ${{ inputs.log_filter || 'debug' }}
       COMPOSE: docker/compose.yml
-      VALKEY_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
 
@@ -134,21 +132,7 @@ jobs:
           # a count is the cheapest call that touches the index.
           rpc arkiv_getEntityCount '[{}]'
 
-      # Neither crate pulls in reth or the Solidity bindings, so this compiles
-      # a handful of crates rather than the workspace.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: docker-stack
-
-      - name: Run the live-store suites against the stack
-        run: |
-          set -euxo pipefail
-          # Same suites rust.yml runs against a service container; here they run
-          # against the compose Valkey, which also proves the compose service is
-          # reachable from the runner.
-          cargo test -p arkiv-valkey -p arkiv-golemdb-state --locked -- --ignored --nocapture
-
-      # Unconditional, and after the tests: the point is to see what happened,
+      # Unconditional, and after the checks: the point is to see what happened,
       # not only to debug failures.
       - name: Container logs
         if: always()
@@ -158,11 +142,6 @@ jobs:
           docker compose -f "$COMPOSE" ps -a
           echo '--- arkiv-reth ---'
           docker compose -f "$COMPOSE" logs --no-color --tail 400 arkiv-reth
-          echo '--- valkey ---'
-          docker compose -f "$COMPOSE" logs --no-color --tail 100 valkey
-          echo '--- valkey keyspace (should be empty: ephemeral stores erase on drop) ---'
-          docker compose -f "$COMPOSE" exec -T valkey valkey-cli --scan --pattern 'arkiv-test:*' | head -50
-          docker compose -f "$COMPOSE" exec -T valkey valkey-cli dbsize
 
       - name: Tear down
         if: always()

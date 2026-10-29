@@ -2073,29 +2073,22 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
 ///   transaction is always a cache hit.
 /// * **A store that outlives the process.** The default in-process store does
 ///   not, so after a restart the tier would be empty and the provider would
-///   fall back to reth. Hence Valkey.
+///   fall back to reth. Hence GolemDB on disk.
 /// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50.
 ///   Below it reth has written nothing to its own database, so a restart
 ///   loses the block entirely and there is nothing to read either way.
 ///
-/// Ignored by default because it needs a server, like the store's own
-/// conformance tests:
+/// Ignored by default because it is slow: it waits out more than 50 blocks.
 ///
 /// ```sh
-/// VALKEY_URL=redis://127.0.0.1:6379 \
-///   cargo nextest run -p arkiv-reth --run-ignored only -- tier
+/// cargo nextest run -p arkiv-reth --run-ignored only -- tier
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+#[ignore = "slow: waits out reth's persistence threshold; run with --ignored"]
 async fn a_transaction_and_receipt_are_read_from_the_tier() {
-    let url = std::env::var("VALKEY_URL").expect(
-        "this test needs the node on a store that survives a restart: \
-         set VALKEY_URL (for example redis://127.0.0.1:6379)",
-    );
-
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .block_time("50ms")
-        .valkey_store(url)
+        .golemdb_store()
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let client = connect(&node.http_url(), signer);

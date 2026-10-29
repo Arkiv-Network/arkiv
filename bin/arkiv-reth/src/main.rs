@@ -60,10 +60,9 @@ const PATH_EXAMPLE: &str = "ARKIV_STORE_PATH=/var/lib/arkiv/golemdb";
 /// Exactly one of two variables names it:
 /// - `ARKIV_STORE_PATH` (`path`) is GolemDB's directory. It must be absolute
 ///   or start with `~`, the home directory; otherwise it is taken as written.
-/// - `ARKIV_EXPERIMENTAL_STORE` (`experimental`) is for tests and experiments:
-///   `memory` is the in-process reference store, gone when the process is, and
-///   a Valkey URL, such as `redis://127.0.0.1:6379`, is a Valkey server.
-///   They do not use the genesis file's GolemDB settings.
+/// - `ARKIV_EXPERIMENTAL_STORE` (`experimental`) is for tests: `memory` is the
+///   in-process reference store, gone when the process is. It does not use the
+///   genesis file's GolemDB settings.
 ///
 /// GolemDB is created with the settings of the chain `spec` describes.
 fn open_store(
@@ -90,17 +89,8 @@ fn open_store(
                 info!(target: "arkiv-reth", "Arkiv state in-process, lost when the node stops");
                 Ok(Arc::new(arkiv_interfaces::store::reference::MemStore::new()))
             }
-            // Every scheme Valkey's client takes: plain, TLS, cluster, sentinel, socket.
-            Some(url)
-                if url.split_once("://").is_some_and(|(scheme, _)| {
-                    scheme.starts_with("redis") || scheme.starts_with("valkey")
-                }) =>
-            {
-                open_valkey(url)
-            }
             _ => eyre::bail!(
-                "ARKIV_EXPERIMENTAL_STORE={}: use memory, or a Valkey URL such as \
-                 redis://127.0.0.1:6379",
+                "ARKIV_EXPERIMENTAL_STORE={}: use memory",
                 store.to_string_lossy()
             ),
         },
@@ -149,16 +139,6 @@ fn open_golemdb(directory: &Path, spec: &ArkivChainSpec) -> eyre::Result<HostSto
         ?history,
         "Arkiv state on GolemDB"
     );
-    Ok(Arc::new(store))
-}
-
-/// Connect to the Valkey server at `url`, in the namespace
-/// `ARKIV_STORE_NAMESPACE` names (`arkiv` if unset).
-fn open_valkey(url: &str) -> eyre::Result<HostStore> {
-    let namespace = std::env::var("ARKIV_STORE_NAMESPACE").unwrap_or_else(|_| "arkiv".to_owned());
-    let store = arkiv_valkey::ValkeyStore::connect(url, &namespace)
-        .map_err(|e| eyre::eyre!("connect to the Arkiv store at {url}: {e:?}"))?;
-    info!(target: "arkiv-reth", %url, %namespace, "Arkiv state on Valkey");
     Ok(Arc::new(store))
 }
 
@@ -305,8 +285,8 @@ fn main() {
     // a node running on the same one.
     //
     // It opens in `block_in_place`, outside async code: a store may own a
-    // runtime of its own, as Valkey's does, and tokio refuses to drop one from
-    // async code, which a failed connect does.
+    // runtime of its own, and tokio refuses to drop one from async code, which
+    // a failed open would.
     let path = std::env::var_os("ARKIV_STORE_PATH");
     let experimental = std::env::var_os("ARKIV_EXPERIMENTAL_STORE");
     // GolemDB is the store whose genesis root block 0's header carries.
@@ -605,26 +585,20 @@ mod tests {
     }
 
     #[test]
-    fn an_experimental_store_is_memory_or_valkey() {
+    fn the_experimental_store_is_memory() {
         assert!(open_store(&spec(None), None, set("memory")).is_ok());
-        // Nothing listens on port 1, so this shows each was taken as Valkey.
-        for valkey in [
-            "redis://127.0.0.1:1",
-            "rediss://127.0.0.1:1",
-            "valkey://127.0.0.1:1",
-        ] {
-            let error = refusal(None, set(valkey));
-            assert!(
-                error.contains("connect to the Arkiv store"),
-                "{valkey}: {error}"
-            );
-        }
     }
 
     /// A typo is not taken for some other store.
     #[test]
     fn an_unknown_experimental_store_is_refused() {
-        for unknown in ["", "Memory", "valkey", "redis", "golemdb", "/srv/golemdb"] {
+        for unknown in [
+            "",
+            "Memory",
+            "redis://127.0.0.1:6379",
+            "golemdb",
+            "/srv/golemdb",
+        ] {
             let error = refusal(None, set(unknown));
             assert!(error.contains("use memory"), "{unknown}: {error}");
         }
