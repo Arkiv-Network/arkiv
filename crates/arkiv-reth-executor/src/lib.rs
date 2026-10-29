@@ -118,7 +118,7 @@ use reth_ethereum::{
 use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
-use arkiv_interfaces::gas::{CostModel, GasBreakdown};
+use arkiv_interfaces::gas::{CostModel, GasBreakdown, OpCost};
 use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
@@ -469,6 +469,8 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     branch: BranchId,
     /// Captured once for this execution, including eth_call/estimate probes.
     pricing: Result<BlockPricing, String>,
+    /// What an op costs beyond the store's receipts, by the kind of store.
+    op_cost: OpCost,
     /// Whether any charged transaction ran. A speculative execution —
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
     /// is abandoned rather than sealed.
@@ -592,7 +594,18 @@ where
             nonce: nonce_check,
             fees: fee_checks,
         });
-        arkiv_transact(store, branch, &schedule, db, block_number, fees, checks, tx)
+        let op_cost = self.op_cost;
+        arkiv_transact(
+            store,
+            branch,
+            &schedule,
+            op_cost,
+            db,
+            block_number,
+            fees,
+            checks,
+            tx,
+        )
     }
 
     /// System-contract calls (EIP-4788 / EIP-2935) are protocol housekeeping, not
@@ -807,6 +820,7 @@ fn arkiv_transact<DB: Database>(
     store: &HostStore,
     branch: BranchId,
     schedule: &FeeSchedule,
+    op_cost: OpCost,
     db: &mut DB,
     block_number: u64,
     fees: FeeEnv,
@@ -865,6 +879,7 @@ fn arkiv_transact<DB: Database>(
             store,
             branch,
             schedule,
+            op_cost,
             db,
             block_number,
             &fees,
@@ -998,6 +1013,7 @@ fn arkiv_entity_transact<DB: Database>(
     store: &HostStore,
     branch: BranchId,
     schedule: &FeeSchedule,
+    op_cost: OpCost,
     db: &mut DB,
     block_number: u64,
     fees: &FeeEnv,
@@ -1053,11 +1069,8 @@ fn arkiv_entity_transact<DB: Database>(
         keep_writes: fees.charge,
     };
     let outcome = match decode_ops(&env, &tx.data, start_nonce.value) {
-        Ok(ops) => {
-            let costs = *view.cost_model();
-            run_ops(&mut view, costs, schedule, &env, ops)
-                .map_err(|e| EVMError::Custom(e.to_string()))?
-        }
+        Ok(ops) => run_ops(&mut view, op_cost, schedule, &env, ops)
+            .map_err(|e| EVMError::Custom(e.to_string()))?,
         // Calldata that does not decode runs no op: it pays its own terms and
         // the nonce read before it, at least the floor, at most the gas
         // supplied. A sum that does not fit is out of gas, as everywhere.
@@ -1436,13 +1449,19 @@ fn entity_operation_log(effect: &OpEffect) -> Log {
 pub struct ArkivEvmFactory {
     store: HostStore,
     seals: Arc<BlockSeals>,
+    op_cost: OpCost,
 }
 
 impl ArkivEvmFactory {
     /// Build a factory over the store Arkiv's state lives in, parking each
-    /// block's sealed state in `seals` until one is adopted.
-    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
-        Self { store, seals }
+    /// block's sealed state in `seals` until one is adopted. `op_cost` is
+    /// what an op costs beyond that store's receipts.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>, op_cost: OpCost) -> Self {
+        Self {
+            store,
+            seals,
+            op_cost,
+        }
     }
 }
 
@@ -1472,6 +1491,7 @@ impl EvmFactory for ArkivEvmFactory {
             inner: EthEvm::new(inner, false),
             branch,
             pricing,
+            op_cost: self.op_cost,
             store: self.store.clone(),
             seals: self.seals.clone(),
             charged: core::cell::Cell::new(false),
@@ -1497,6 +1517,7 @@ impl EvmFactory for ArkivEvmFactory {
             seals: self.seals.clone(),
             branch,
             pricing: base.pricing,
+            op_cost: base.op_cost,
             charged,
             executed,
         }
@@ -1514,12 +1535,18 @@ impl EvmFactory for ArkivEvmFactory {
 pub struct ArkivExecutorBuilder {
     store: HostStore,
     seals: Arc<BlockSeals>,
+    op_cost: OpCost,
 }
 
 impl ArkivExecutorBuilder {
-    /// Build the executor over the store Arkiv's state lives in.
-    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
-        Self { store, seals }
+    /// Build the executor over the store Arkiv's state lives in, with what an
+    /// op costs beyond that store's receipts.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>, op_cost: OpCost) -> Self {
+        Self {
+            store,
+            seals,
+            op_cost,
+        }
     }
 }
 
@@ -1542,7 +1569,7 @@ where
         );
         Ok(EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec(),
-            ArkivEvmFactory::new(self.store.clone(), self.seals.clone()),
+            ArkivEvmFactory::new(self.store.clone(), self.seals.clone(), self.op_cost),
         ))
     }
 }
@@ -1886,6 +1913,7 @@ mod tests {
                 store,
                 branch,
                 &BlockPricing::load(store, branch).unwrap().schedule,
+                OpCost::Placeholder,
                 &mut db,
                 1,
                 fees,

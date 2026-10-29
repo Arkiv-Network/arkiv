@@ -31,6 +31,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 #[cfg(unix)]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
+use arkiv_interfaces::gas::OpCost;
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivEvmFactory;
 use arkiv_reth_golemdbprovider::{ArkivProvider, ArkivProviderBuilder};
@@ -261,6 +262,13 @@ fn main() {
     let experimental = std::env::var_os("ARKIV_EXPERIMENTAL_STORE");
     // GolemDB is the store whose genesis root block 0's header carries.
     let on_golemdb = path.is_some();
+    // GolemDB prices every call from its genesis weights; the experimental
+    // stores price nothing, and the placeholder stands in for them.
+    let op_cost = if on_golemdb {
+        OpCost::FromStore
+    } else {
+        OpCost::Placeholder
+    };
     let store = Arc::new(OnceLock::<HostStore>::new());
     let open = move |spec: &ArkivChainSpec| {
         store
@@ -290,7 +298,7 @@ fn main() {
             (
                 EthEvmConfig::new_with_evm_factory(
                     spec.clone(),
-                    ArkivEvmFactory::new(factory_open(&spec), factory_seals.clone()),
+                    ArkivEvmFactory::new(factory_open(&spec), factory_seals.clone(), op_cost),
                 ),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
@@ -307,7 +315,7 @@ fn main() {
                 .map_err(|e| eyre::eyre!("invalid host pricing: {e:?}"))?;
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
-            let node = ArkivNode::new(store.clone(), seals.clone());
+            let node = ArkivNode::new(store.clone(), seals.clone(), op_cost);
             // Spelt out rather than `.node(node)`: that convenience pins the
             // provider to reth's `BlockchainProvider`, and the whole point here
             // is to run on ours. `with_types_and_provider` names the provider
@@ -451,6 +459,46 @@ mod tests {
             golemdb_config(&spec).unwrap().genesis.hash_function,
             HashAlgorithm::Keccak256
         );
+    }
+
+    /// Every weight of the example genesis file reaches the store the node
+    /// opens on it, under its own name, and every host weight the field of the
+    /// fee schedule it names. The file's values all differ, so one that lands
+    /// under another name, or is left at a default, shows.
+    #[test]
+    fn every_weight_of_the_example_genesis_file_reaches_the_node() {
+        use arkiv_tokenomics::FeeSchedule;
+        use reth_cli::chainspec::ChainSpecParser;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/example.json");
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let metering = &file["config"]["arkiv"]["golemdb"]["metering"];
+        let weights: BTreeMap<String, u64> =
+            serde_json::from_value(metering["weights"].clone()).unwrap();
+        let distinct: BTreeSet<u64> = weights.values().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            weights.len(),
+            "the example's weights must all differ"
+        );
+
+        let spec = genesis::NodeChainSpecParser::parse(path).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = open_store(&spec, set(dir.path().join("golemdb")), None).unwrap();
+        let model = store.pricing_snapshot(store.head()).unwrap().model;
+        assert_eq!(*model.weights, weights);
+        assert_eq!(model.golemdb_code_version, metering["golemdb_code_version"]);
+        assert_eq!(model.host_code_version, metering["host_code_version"]);
+
+        let schedule = FeeSchedule::from_model(&model).unwrap();
+        let host = |name: &str| weights[&format!("host.arkiv.{name}")];
+        assert_eq!(schedule.capacity_rate, host("capacity_rate"));
+        assert_eq!(schedule.cell_byte_units, host("cell_byte_units"));
+        assert_eq!(schedule.index_byte_units, host("index_byte_units"));
+        assert_eq!(schedule.c_cell, host("c_cell"));
+        assert_eq!(schedule.c_idx, host("c_idx"));
+        assert_eq!(schedule.max_lifetime, host("max_lifetime"));
     }
 
     #[test]

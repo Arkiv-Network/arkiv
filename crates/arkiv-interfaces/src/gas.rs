@@ -140,6 +140,35 @@ impl CostModel for PlaceholderCost {
     }
 }
 
+/// The operation costs a node charges on top of its store's receipts.
+///
+/// [`PlaceholderCost`] stands in for stores that price nothing: the in-memory
+/// store and Valkey report a cost of 0 on every call. GolemDB prices every
+/// call with the weights of its genesis, so a node on it charges those alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpCost {
+    /// The provisional per-op schedule of [`PlaceholderCost`].
+    #[default]
+    Placeholder,
+    /// Nothing per op: the store's receipts carry the whole cost.
+    FromStore,
+}
+
+impl CostModel for OpCost {
+    fn op_cost(&self, op: &Op) -> Gas {
+        match self {
+            Self::Placeholder => PlaceholderCost.op_cost(op),
+            Self::FromStore => 0,
+        }
+    }
+
+    /// Queries serve RPC, not consensus, and keep the placeholder price
+    /// whatever the store.
+    fn query_cost(&self, stats: &QueryStats) -> Gas {
+        PlaceholderCost.query_cost(stats)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +233,26 @@ mod tests {
                 AttributeValue::Str("v".into()),
             )]),
             G_PATCH + G_BYTE
+        );
+    }
+
+    /// On a store that prices its calls, an op costs nothing beyond them; on
+    /// one that does not, the placeholder's price.
+    #[test]
+    fn op_costs_come_from_the_store_or_the_placeholder() {
+        let create = Op::Create {
+            key: [0u8; 32],
+            expires_at: 1,
+            creation_flags: CreationFlags::NONE,
+            attributes: vec![Attribute::new(
+                b"k".to_vec(),
+                AttributeValue::Str("ab".into()),
+            )],
+        };
+        assert_eq!(OpCost::FromStore.op_cost(&create), 0);
+        assert_eq!(
+            OpCost::Placeholder.op_cost(&create),
+            PlaceholderCost.op_cost(&create)
         );
     }
 
