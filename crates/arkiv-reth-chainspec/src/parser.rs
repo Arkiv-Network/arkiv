@@ -1,7 +1,8 @@
 //! The `--chain` value parser producing an [`ArkivChainSpec`].
 
 use crate::ArkivChainSpec;
-use reth_cli::chainspec::{ChainSpecParser, parse_genesis};
+use reth_cli::chainspec::ChainSpecParser;
+use serde::Deserialize;
 use std::sync::Arc;
 
 /// `--chain` values an Arkiv node accepts by name. Anything else is read as a
@@ -34,11 +35,28 @@ impl ChainSpecParser for ArkivChainSpecParser {
     const SUPPORTED_CHAINS: &'static [&'static str] = SUPPORTED_CHAINS;
 
     fn parse(s: &str) -> eyre::Result<Arc<ArkivChainSpec>> {
-        let genesis = if s == "dev" {
-            serde_json::from_str(DEV_GENESIS)?
+        let raw = if s == "dev" {
+            DEV_GENESIS.to_owned()
         } else {
-            parse_genesis(s)?
+            match std::fs::read_to_string(s) {
+                Ok(raw) => raw,
+                Err(_) if s.contains('{') => s.to_owned(),
+                Err(error) => return Err(error.into()),
+            }
         };
+        // Alloy's extra_fields would silently collapse duplicate weight names.
+        #[derive(Deserialize)]
+        struct Envelope {
+            #[serde(rename = "config")]
+            _config: Config,
+        }
+        #[derive(Deserialize)]
+        struct Config {
+            #[serde(rename = "arkiv")]
+            _arkiv: Option<crate::ArkivConfig>,
+        }
+        serde_json::from_str::<Envelope>(&raw)?;
+        let genesis = serde_json::from_str(&raw)?;
         Ok(Arc::new(ArkivChainSpec::from_genesis(genesis)?))
     }
 }
@@ -113,6 +131,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let inline = ArkivChainSpecParser::parse(GENESIS).unwrap();
         assert_eq!(from_file.genesis_hash(), inline.genesis_hash());
+    }
+
+    #[test]
+    fn duplicate_weights_are_rejected_in_files_and_inline_json() {
+        let duplicate = DEV_GENESIS.replace(
+            "\"host.arkiv.capacity_rate\": 14,",
+            "\"host.arkiv.capacity_rate\": 14, \"host.arkiv.capacity_rate\": 99,",
+        );
+        let path = std::env::temp_dir().join(format!(
+            "arkiv-duplicate-weight-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &duplicate).unwrap();
+        for input in [duplicate.as_str(), path.to_str().unwrap()] {
+            let error = ArkivChainSpecParser::parse(input).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("duplicate weight host.arkiv.capacity_rate"),
+                "{error}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -49,7 +49,8 @@ impl GenesisAccount {
     }
 }
 
-/// Write `alloc` as the store's genesis commit, tagged `genesis_hash`.
+/// Write `alloc` as the store's genesis commit,
+/// tagged `genesis_hash`.
 ///
 /// Returns `None` when the store already holds a commit: a restarted node must
 /// not re-apply genesis over live state, and `head() > GENESIS` is the only
@@ -61,6 +62,7 @@ impl GenesisAccount {
 /// exactly the presence of `$balance` or `$nonce`
 /// ([`GolemAccounts::account`](crate::GolemAccounts::account)) — and a genesis
 /// account funded with zero still exists.
+/// GolemDB has already persisted its pricing model before accounts are seeded.
 pub fn seed_genesis(
     store: &HostStore,
     genesis_hash: [u8; 32],

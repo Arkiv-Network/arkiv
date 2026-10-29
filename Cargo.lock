@@ -1504,6 +1504,7 @@ dependencies = [
  "arkiv-interfaces",
  "arkiv-query",
  "arkiv-rpc-types",
+ "arkiv-tokenomics",
  "golemdb-api",
  "golemdb-cells",
  "golemdb-pruning",
@@ -1520,6 +1521,7 @@ dependencies = [
  "arkiv-golemdb",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
+ "arkiv-tokenomics",
 ]
 
 [[package]]
@@ -1573,6 +1575,7 @@ dependencies = [
  "arkiv-reth-payload-builder",
  "arkiv-reth-rpc",
  "arkiv-reth-statemanager",
+ "arkiv-tokenomics",
  "clap",
  "eyre",
  "reth",
@@ -1605,6 +1608,9 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "arkiv-golemdb",
+ "arkiv-interfaces",
+ "arkiv-tokenomics",
  "eyre",
  "golemdb-api",
  "reth-cli",
@@ -1730,6 +1736,7 @@ dependencies = [
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
+ "arkiv-tokenomics",
  "eyre",
  "reth-engine-tree",
  "reth-ethereum",

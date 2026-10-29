@@ -42,6 +42,7 @@ reth-db.workspace = true
 # or the in-process reference store ARKIV_EXPERIMENTAL_STORE=memory names.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-golemdb.workspace = true
+arkiv-tokenomics.workspace = true
 arkiv-reth-payload-builder.workspace = true
 # The arkiv_* namespace merged into reth's rpc modules.
 arkiv-reth-rpc.workspace = true

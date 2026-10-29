@@ -23,8 +23,7 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
-use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
-use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
+use arkiv_interfaces::constants::MAX_STR_BYTES;
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -1826,22 +1825,14 @@ fn genesis_json() -> serde_json::Value {
     })
 }
 
-/// `config.arkiv` giving GolemDB `hash_function`, Arkiv's limits and free
-/// metering prices.
+/// `config.arkiv` of the example genesis file, with GolemDB's `hash_function`
+/// set to `hash_function`.
 fn arkiv_section(hash_function: &str) -> serde_json::Value {
-    serde_json::json!({ "golemdb": {
-        "hash_function": hash_function,
-        "cell_limits": {
-            "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
-            "max_str_len": MAX_STR_BYTES,
-            "max_bytes_len": MAX_BYTES_VALUE_LEN
-        },
-        "record_limits": {
-            "max_cells": MAX_RECORD_CELLS,
-            "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-        },
-        "metering": arkiv_golemdb::PricingConfig::zero()
-    } })
+    let mut genesis: serde_json::Value =
+        serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+    let mut arkiv = genesis["config"]["arkiv"].take();
+    arkiv["golemdb"]["hash_function"] = hash_function.into();
+    arkiv
 }
 
 /// Write `genesis` to a file of this test's own and return its path.
@@ -1954,6 +1945,10 @@ async fn a_bad_arkiv_section_stops_the_node() {
     let mut limits = genesis_json();
     limits["config"]["arkiv"] = arkiv_section("keccak-256");
     limits["config"]["arkiv"]["golemdb"]["cell_limits"]["max_str_len"] = (MAX_STR_BYTES / 2).into();
+    let mut no_lifetime = genesis_json();
+    no_lifetime["config"]["arkiv"] = arkiv_section("keccak-256");
+    no_lifetime["config"]["arkiv"]["golemdb"]["metering"]["weights"]["host.arkiv.max_lifetime"] =
+        0.into();
     let mut segments = genesis_json();
     segments["config"]["arkiv"] = arkiv_section("keccak-256");
     segments["config"]["arkiv"]["golemdb"]["immutable_data"] =
@@ -1963,6 +1958,10 @@ async fn a_bad_arkiv_section_stops_the_node() {
         (top_level, "no config.arkiv.golemdb"),
         (misnamed, "unknown field `hash_fn`"),
         (limits, "must be Arkiv's limits"),
+        (
+            no_lifetime,
+            "config.arkiv.golemdb.metering: Zero(\"host.arkiv.max_lifetime\")",
+        ),
         (segments, "the node declares its own segments"),
     ] {
         let genesis_path = genesis_file(&genesis);

@@ -34,6 +34,101 @@ fn config() -> GolemDbConfig {
     }
 }
 
+fn priced_config() -> GolemDbConfig {
+    let mut config = config();
+    config.genesis.metering.host_code_version = arkiv_tokenomics::schedule::HOST_CODE_VERSION;
+    config.genesis.metering.weights.extend(
+        arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
+            .into_iter()
+            .zip([14, 2, 3, 64, 65, 7_884_000])
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
+    config
+        .genesis
+        .metering
+        .weights
+        .insert("write.record.create".into(), 13);
+    config
+}
+
+#[test]
+fn both_backends_use_and_expose_the_persisted_pricing_model() {
+    use arkiv_tokenomics::FeeSchedule;
+    let config = priced_config();
+    let directory = TempDir::new().unwrap();
+    let memory = GolemDbStore::open_memory(&config).unwrap();
+    let disk = GolemDbStore::open(directory.path(), &config, None).unwrap();
+    let pricing_root = |config: &GolemDbConfig| {
+        let store = GolemDbStore::open_memory(config).unwrap();
+        let branch = store.begin(None).unwrap();
+        store.seal(branch).unwrap().state_root
+    };
+    let genesis_root = pricing_root(&config);
+    for store in [&memory, &disk] {
+        let snapshot = store.pricing_snapshot(CommitId::GENESIS).unwrap();
+        assert_eq!(snapshot.commit_id, CommitId::GENESIS);
+        assert_eq!(snapshot.model.version, 1);
+        assert_eq!(snapshot.model.host_code_version, 1);
+        assert_eq!(snapshot.model.golemdb_code_version, 1);
+        assert_eq!(*snapshot.model.weights, config.genesis.metering.weights);
+        assert_eq!(FeeSchedule::from_model(&snapshot.model).unwrap().c_idx, 65);
+        let branch = store.begin(None).unwrap();
+        let written = store
+            .create(
+                branch,
+                RecordKey([7; 32]),
+                vec![("n".into(), field(TypeId::U64, &7u64.to_be_bytes()))],
+                None,
+            )
+            .unwrap();
+        assert_eq!(written.receipt.cost, CostUnits(13));
+        assert_eq!(written.receipt.priced_at, Some(snapshot.commit_id));
+        let commit = store.commit(branch).unwrap();
+        let next = store.pricing_snapshot(commit).unwrap();
+        assert_eq!(next.commit_id, commit);
+        assert_eq!(next.model, snapshot.model);
+        assert!(Arc::ptr_eq(&snapshot.model.weights, &next.model.weights));
+        assert_eq!(
+            store.pricing_snapshot(CommitId::GENESIS),
+            Err(StoreError::HandleInvalid)
+        );
+        assert_eq!(
+            store.pricing_snapshot(CommitId(commit.0 + 1)),
+            Err(StoreError::HandleInvalid)
+        );
+    }
+    drop(disk);
+    let reopened = GolemDbStore::open(directory.path(), &config, None).unwrap();
+    assert_eq!(
+        *reopened
+            .pricing_snapshot(reopened.head())
+            .unwrap()
+            .model
+            .weights,
+        config.genesis.metering.weights
+    );
+    drop(reopened);
+    for name in [
+        "write.record.create",
+        "host.arkiv.capacity_rate",
+        "host.arkiv.max_lifetime",
+    ] {
+        let mut changed = config.clone();
+        *changed.genesis.metering.weights.get_mut(name).unwrap() += 1;
+        // Prices and the lifetime bound still change the genesis root now
+        // that GolemDB stores them in its model instead of a user record.
+        assert_ne!(
+            pricing_root(&changed),
+            genesis_root,
+            "genesis root must cover {name}",
+        );
+        assert!(matches!(
+            GolemDbStore::open(directory.path(), &changed, None),
+            Err(OpenError::GenesisMismatch)
+        ));
+    }
+}
+
 /// A row of [`SEGMENT`], told apart by `n`.
 fn row(n: u8) -> SegmentRow {
     vec![vec![n], Vec::new()]
@@ -693,6 +788,7 @@ fn a_failed_commit_leaves_no_tag_row() {
         ..Default::default()
     };
     let store = GolemDbStore {
+        _memory_directory: None,
         database: golemdb::Database::open_with_options(
             dir.path(),
             &golemdb::OpenConfig::new(config().full_genesis().unwrap()),

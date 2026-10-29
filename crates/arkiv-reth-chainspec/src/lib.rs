@@ -17,7 +17,8 @@
 //! under it, so every node on the chain must run it.
 //!
 //! The spec also carries GolemDB's settings for the chain, from the genesis
-//! file's `config.arkiv.golemdb` (see [`ArkivChainSpec::golemdb`]).
+//! file's `config.arkiv.golemdb` (see [`ArkivChainSpec::golemdb`]), and the
+//! pricing model from `config.arkiv.golemdb.metering`.
 
 mod parser;
 
@@ -29,6 +30,7 @@ use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256};
+use arkiv_tokenomics::FeeSchedule;
 use core::fmt::Display;
 use reth_ethereum::chainspec::{
     Chain, DepositContract, EthChainSpec, EthereumHardfork, EthereumHardforks, ForkCondition,
@@ -50,7 +52,7 @@ pub struct ArkivChainSpec {
     golemdb: Option<golemdb_api::Genesis>,
 }
 
-/// `config.arkiv` in the genesis file.
+/// GolemDB owns the model's persisted records and JSON schema.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, expecting = "an object with a `golemdb` section")]
 struct ArkivConfig {
@@ -69,7 +71,21 @@ impl ArkivChainSpec {
             .get_deserialized::<ArkivConfig>("arkiv")
             .transpose()
             .map_err(|e| eyre::eyre!("genesis config.arkiv: {e}"))?
-            .map(|config| config.golemdb);
+            .map(|config| -> eyre::Result<_> {
+                let pricing = &config.golemdb.metering;
+                eyre::ensure!(
+                    pricing.host_code_version == arkiv_tokenomics::schedule::HOST_CODE_VERSION,
+                    "genesis config.arkiv.golemdb.metering: unsupported Arkiv host code version {}",
+                    pricing.host_code_version
+                );
+                pricing
+                    .validate(&[arkiv_golemdb::host_metering_schema()])
+                    .map_err(|e| eyre::eyre!("genesis config.arkiv.golemdb.metering: {e}"))?;
+                FeeSchedule::from_weights(&pricing.weights)
+                    .map_err(|e| eyre::eyre!("genesis config.arkiv.golemdb.metering: {e:?}"))?;
+                Ok(config.golemdb)
+            })
+            .transpose()?;
         Ok(Self {
             inner,
             min_base_fee,
@@ -203,7 +219,7 @@ impl EthChainSpec for ArkivChainSpec {
 mod tests {
     use super::*;
     use alloy_eips::eip1559::{INITIAL_BASE_FEE, MIN_PROTOCOL_BASE_FEE};
-    use golemdb_api::{CellLimits, HashAlgorithm, PricingConfig, RecordLimits};
+    use golemdb_api::{CellLimits, HashAlgorithm, RecordLimits};
     use reth_ethereum::chainspec::DEV;
     use serde_json::{Value, json};
 
@@ -349,16 +365,13 @@ mod tests {
         assert_eq!(moved.min_base_fee(), spec.min_base_fee());
     }
 
-    /// `config.arkiv` with GolemDB's settings, then `edit`ed.
     fn arkiv(edit: impl FnOnce(&mut Value)) -> Value {
-        let mut golemdb = json!({
-            "hash_function": "blake3",
-            "cell_limits": { "max_cell_name_len": 32, "max_str_len": 128, "max_bytes_len": 131072 },
-            "record_limits": { "max_cells": 39, "max_indexed_cells": 36 },
-            "metering": serde_json::to_value(PricingConfig::zero()).expect("pricing json")
-        });
-        edit(&mut golemdb);
-        json!({ "golemdb": golemdb })
+        let mut genesis: Value =
+            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+        let golemdb = &mut genesis["config"]["arkiv"]["golemdb"];
+        golemdb["hash_function"] = json!("blake3");
+        edit(golemdb);
+        genesis["config"]["arkiv"].take()
     }
 
     /// The chain spec of a genesis whose `config.arkiv` is `arkiv`.
@@ -396,22 +409,170 @@ mod tests {
                 limits,
                 record_limits,
                 None,
-                PricingConfig::zero()
+                serde_json::from_value(arkiv(|_| {})["golemdb"]["metering"].clone()).unwrap()
             ))
         );
+    }
+
+    #[test]
+    fn every_host_weight_is_required() {
+        for name in arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES {
+            let error = with_arkiv(arkiv(|g| {
+                g["metering"]["weights"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(name);
+            }))
+            .unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
+    }
+
+    #[test]
+    fn both_shipped_geneses_price_all_declared_weights() {
+        for text in [
+            include_str!("../../../genesis/dev.json"),
+            include_str!("../../../genesis/example.json"),
+        ] {
+            let spec = ArkivChainSpec::from_genesis(serde_json::from_str(text).unwrap()).unwrap();
+            let pricing = &spec.golemdb().unwrap().metering;
+            let mut names = golemdb_api::PricingConfig::zero().weights;
+            names.extend(
+                arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES.map(|name| (name.to_owned(), 0)),
+            );
+            assert_eq!(
+                pricing.weights.keys().collect::<Vec<_>>(),
+                names.keys().collect::<Vec<_>>()
+            );
+            let schedule = FeeSchedule::from_weights(&pricing.weights).unwrap();
+            assert_eq!(
+                (
+                    schedule.capacity_rate,
+                    schedule.c_cell,
+                    schedule.max_lifetime
+                ),
+                (14, 64, 7_884_000)
+            );
+        }
+    }
+
+    /// A zero makes the schedule useless or prices part of storage as free, so
+    /// every value must be positive, and the error names the one that is not.
+    #[test]
+    fn a_zero_schedule_value_is_refused() {
+        for name in arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES {
+            let zero = arkiv(|g| g["metering"]["weights"][name] = json!(0));
+            let error = with_arkiv(zero).expect_err(name).to_string();
+            assert_eq!(
+                error,
+                format!("genesis config.arkiv.golemdb.metering: Zero({name:?})")
+            );
+        }
+    }
+
+    /// The genesis files price a typical entity sensibly: a create of a 1 KiB
+    /// entity for the whole `max_lifetime` buys storage gas well within one
+    /// transaction, under a tenth of the per-transaction gas cap (EIP-7825,
+    /// 2^24) and of the block gas limit. Today that is about 237,000 gas against
+    /// 1,677,721, seven times headroom: a `capacity_rate` ten times too high
+    /// fails this.
+    ///
+    /// Not a rule for every entity: a record at the size limits cannot be
+    /// bought for `max_lifetime` in one transaction, but its calldata alone
+    /// would not fit one either. It is bought for less and extended.
+    #[test]
+    fn a_typical_entity_fits_comfortably_in_one_transaction() {
+        use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
+        use arkiv_interfaces::entity_records;
+        use arkiv_interfaces::store::{ReadTarget, RecordKey, RecordMeta, Store};
+        use arkiv_tokenomics::{meter, storage_time, units};
+        use reth_cli::chainspec::ChainSpecParser;
+
+        const PER_TRANSACTION_CAP: u64 = 1 << 24;
+        let dev = crate::parser::ArkivChainSpecParser::parse("dev").unwrap();
+        let entity = Entity {
+            key: [0x11; 32],
+            creator: [0x22; 20],
+            owner: [0x22; 20],
+            attributes: vec![Attribute::unindexed(
+                b"payload".to_vec(),
+                AttributeValue::Bytes(vec![0xab; 1024]),
+            )],
+            ..Entity::default()
+        };
+        // The entity's size as GolemDB reports it after a create.
+        let cells = entity_records::to_cells(&entity).unwrap();
+        let golemdb = arkiv_golemdb::GolemDbStore::open_memory(&arkiv_golemdb::GolemDbConfig {
+            genesis: dev.golemdb().unwrap().clone(),
+            segments: vec![],
+        })
+        .unwrap();
+        let branch = golemdb.begin(None).unwrap();
+        let key = RecordKey::from_entity(entity.key);
+        golemdb.create(branch, key, cells, None).unwrap();
+        let meta: RecordMeta = golemdb
+            .get(ReadTarget::Branch(branch), key, None, None)
+            .unwrap()
+            .into_value()
+            .and_then(|record| record.meta)
+            .unwrap();
+
+        let example = ArkivChainSpec::from_genesis(
+            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap(),
+        )
+        .unwrap();
+        for (file, spec) in [("dev", &*dev), ("example", &example)] {
+            let schedule =
+                FeeSchedule::from_weights(&spec.golemdb().expect(file).metering.weights).unwrap();
+            let time = storage_time::create(
+                units::storage_units(&meta, &schedule).unwrap(),
+                schedule.max_lifetime,
+                0,
+            )
+            .unwrap();
+            let gas = meter::storage_gas(time, &schedule).unwrap();
+            let limit = PER_TRANSACTION_CAP.min(spec.inner().genesis().gas_limit);
+            assert!(
+                gas <= limit / 10,
+                "{file}: a 1 KiB entity for {} blocks buys {gas} storage gas, above {}",
+                schedule.max_lifetime,
+                limit / 10
+            );
+        }
     }
 
     #[test]
     fn a_malformed_arkiv_section_is_refused() {
         let mut unknown = arkiv(|_| {});
         unknown["metering"] = json!({});
+        let mut legacy = arkiv(|_| {});
+        legacy["tokenomics"] = json!({});
         for (arkiv, expected) in [
             (
                 json!(null),
-                "invalid type: null, expected an object with a `golemdb`",
+                "invalid type: null, expected an object with a `golemdb` section",
             ),
             (json!({}), "missing field `golemdb`"),
             (unknown, "unknown field `metering`"),
+            (legacy, "unknown field `tokenomics`"),
+            (
+                arkiv(|g| {
+                    g.as_object_mut().unwrap().remove("metering");
+                }),
+                "missing field `metering`",
+            ),
+            (
+                arkiv(|g| g["metering"]["weights"]["host.typo"] = json!(1)),
+                "undeclared weight",
+            ),
+            (
+                arkiv(|g| g["metering"]["golemdb_code_version"] = json!(99)),
+                "unsupported GolemDB",
+            ),
+            (
+                arkiv(|g| g["metering"]["host_code_version"] = json!(0)),
+                "unsupported Arkiv",
+            ),
             (
                 arkiv(|g| g["hash_fn"] = g["hash_function"].take()),
                 "unknown field `hash_fn`",
@@ -445,7 +606,7 @@ mod tests {
         ] {
             let error = with_arkiv(arkiv.clone()).unwrap_err().to_string();
             assert!(
-                error.starts_with("genesis config.arkiv: ") && error.contains(expected),
+                error.starts_with("genesis config.arkiv") && error.contains(expected),
                 "{arkiv}: {error}"
             );
         }

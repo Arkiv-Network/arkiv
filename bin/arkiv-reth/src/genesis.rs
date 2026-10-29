@@ -102,6 +102,21 @@ mod tests {
         assert_ne!(richer.0.genesis_hash(), genesis, "balance");
     }
 
+    /// Every fee-schedule value is part of block 0: two chains that differ in
+    /// only one of them have different genesis blocks.
+    #[test]
+    fn the_genesis_hash_covers_every_pricing_weight() {
+        let genesis = specs(|_| {}).0.genesis_hash();
+        let weights = specs(|_| {}).1.golemdb().unwrap().metering.weights.clone();
+        for name in weights.keys() {
+            let changed = specs(|g| {
+                let value = &mut g["config"]["arkiv"]["golemdb"]["metering"]["weights"][name];
+                *value = (value.as_u64().unwrap() + 1).into();
+            });
+            assert_ne!(changed.0.genesis_hash(), genesis, "{name}");
+        }
+    }
+
     /// A file for an experimental store, without GolemDB's settings, keeps
     /// reth's own block 0.
     #[test]
