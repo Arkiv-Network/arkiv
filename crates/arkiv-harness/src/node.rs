@@ -1,10 +1,11 @@
 //! Spawning, killing, and restarting the `arkiv-reth` binary for black-box tests.
 //!
 //! [`NodeBuilder`] configures a launch; [`Node`] is the running process — killed
-//! and its datadir removed on drop. Ports are assigned by the OS at spawn and
-//! reused for the node's whole life. [`Node::kill`] stops the process while
-//! **keeping** the datadir, and [`Node::restart`] relaunches on the same ports and
-//! datadir, so a test can prove crash recovery (state resumes after a restart).
+//! and its datadir removed on drop. Ports are claimed at spawn from a range the
+//! harness keeps for itself, and held for the node's whole life. [`Node::kill`]
+//! stops the process while **keeping** the datadir, and [`Node::restart`]
+//! relaunches on the same ports and datadir, so a test can prove crash recovery
+//! (state resumes after a restart).
 //!
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
 //! by default is the in-process one (`memory`) and so goes with the process —
@@ -13,6 +14,7 @@
 
 use std::fs::File;
 use std::net::TcpListener;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -35,6 +37,9 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// resorting to SIGKILL.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
+/// Where nodes' ports come from.
+const PORT_RANGE: Range<u16> = 20_000..23_000;
+
 /// How to launch an `arkiv-reth`. Ports and the datadir are allocated
 /// automatically at [`spawn`](NodeBuilder::spawn); everything else has a
 /// dev-friendly default you can override.
@@ -56,7 +61,7 @@ pub struct NodeBuilder {
 
 impl NodeBuilder {
     /// A dev-mode node from the `arkiv-reth` binary at `binary` (tests pass
-    /// `env!("CARGO_BIN_EXE_arkiv-reth")`).
+    /// `env!("CARGO_BIN_EXE_arkiv-reth")`).in while needing some port coordination between the tests
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
@@ -172,6 +177,7 @@ pub struct Node {
     http_port: u16,
     authrpc_port: u16,
     p2p_port: u16,
+    _port_claim: File,
     datadir: PathBuf,
     log_path: PathBuf,
     child: Option<Child>,
@@ -187,22 +193,17 @@ impl Node {
         let log_path = std::env::temp_dir().join(format!("{name}.log"));
         let _ = std::fs::remove_dir_all(&datadir);
 
-        // Three ports the OS certifies as free. Their listeners hold them until
-        // the node is about to bind, so no other process can take one meanwhile.
-        let (http, http_port) = reserve_port();
-        let (authrpc, authrpc_port) = reserve_port();
-        let (p2p, p2p_port) = reserve_port();
-
+        let (port_claim, (http_port, authrpc_port, p2p_port)) = claim_ports();
         let mut node = Self {
             config,
             http_port,
             authrpc_port,
             p2p_port,
+            _port_claim: port_claim,
             datadir,
             log_path,
             child: None,
         };
-        drop((http, authrpc, p2p));
         node.child = Some(node.spawn_process());
         node
     }
@@ -232,6 +233,8 @@ impl Node {
             &self.authrpc_port.to_string(),
             "--port",
             &self.p2p_port.to_string(),
+            "--addr",
+            "127.0.0.1",
             "--datadir",
             self.datadir.to_str().expect("utf-8 datadir"),
             // Inside this node's datadir, not reth's shared default. Every
@@ -423,12 +426,28 @@ impl Node {
     }
 }
 
-/// Take a free port from the OS. The listener holds the port until it is
-/// dropped, which is what makes the port exclusively this node's.
-fn reserve_port() -> (TcpListener, u16) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    let port = listener.local_addr().expect("listener address").port();
-    (listener, port)
+/// Claim three consecutive ports from [`PORT_RANGE`], returning the first and
+/// the lock that holds them. The lock keeps every other harness node off them,
+/// in this process or another, until it drops or its process dies.
+fn claim_ports() -> (File, (u16, u16, u16)) {
+    let dir = std::env::temp_dir().join("arkiv-harness-ports");
+    std::fs::create_dir_all(&dir).expect("create the port claim directory");
+    let (claim, port0) = PORT_RANGE
+        .step_by(3)
+        .find_map(|first| {
+            let claim = File::create(dir.join(first.to_string())).ok()?;
+            claim.try_lock().ok()?;
+            (first..first + 3).all(is_free).then_some((claim, first))
+        })
+        .expect("a free block of harness ports");
+    (claim, (port0, port0 + 1, port0 + 2))
+}
+
+/// Whether nothing is listening on `port`. The claim keeps harness nodes off
+/// it, but not a program outside the harness, nor a node left running by a
+/// test process that was killed.
+fn is_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 impl Drop for Node {
