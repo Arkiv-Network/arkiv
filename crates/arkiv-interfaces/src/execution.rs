@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::entity::{Attribute, AttributeValue, CreationFlags};
+use crate::gas::GasBreakdown;
 use crate::primitives::{BlockNumber, EntityAddress, Gas, UserAddress};
 use crate::statemanager::{BlockRef, StateCommit, StateView};
 
@@ -17,8 +18,25 @@ pub struct ExecEnv {
     pub block_number: BlockNumber,
     /// Gas available to this transaction.
     pub gas_supplied: Gas,
+    /// The transaction's own terms: 21,000 plus its calldata. Added to compute
+    /// once, before any operation.
+    pub tx_gas: Gas,
+    /// The least compute gas the transaction pays (EIP-7623), applied once,
+    /// when the batch's gas is finished.
+    pub floor_gas: Gas,
+    /// GolemDB's work the transaction did before its batch, the read of the
+    /// caller's minting nonce its entity keys are derived from. Entity cost
+    /// like the batch's own, so the batch's meter starts from it.
+    pub golemdb_cost_before: Gas,
     /// Chain id.
     pub chain_id: u64,
+    /// The furthest ahead, in blocks, a create or extend may set an expiry:
+    /// the fee schedule's `max_lifetime`, at the block's base.
+    pub max_lifetime: BlockNumber,
+    /// Whether a successful batch keeps its writes. `false` for a question
+    /// rather than a transaction (`eth_call`, `eth_estimateGas`): its writes
+    /// are discarded like a reverted batch's, so one probe never sees another.
+    pub keep_writes: bool,
 }
 
 /// How an execution ended.
@@ -34,11 +52,20 @@ pub enum ExecStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecOutput {
     pub status: ExecStatus,
-    /// Gas charged — a placeholder until [`CostModel`](crate::gas::CostModel) is
-    /// filled in.
-    pub gas_used: Gas,
+    /// The gas charged, by what it pays for. Its total is `gas_used`.
+    pub gas: GasBreakdown,
     /// Why it reverted, when `status` is [`ExecStatus::Reverted`].
     pub revert: Option<RevertReason>,
+}
+
+impl ExecOutput {
+    /// The gas charged: compute, storage and purge together. A breakdown the
+    /// executor returns always has a total.
+    pub fn gas_used(&self) -> Gas {
+        self.gas
+            .total()
+            .expect("the executor only returns a breakdown whose total fits")
+    }
 }
 
 /// Why a batch reverted — a structured, host-agnostic reason.
@@ -75,6 +102,14 @@ pub enum RevertReason {
     },
     /// A `Transfer` named the current owner as the new owner.
     TransferToSelf { key: EntityAddress },
+    /// A `Create` or `ExtendExpiry` would leave more lifetime than the fee
+    /// schedule's `max_lifetime`, or asked for permanent expiry, which is not
+    /// sold.
+    ExpiryBeyondMaxLifetime {
+        target: BlockNumber,
+        current_block: BlockNumber,
+        max_lifetime: BlockNumber,
+    },
     /// The batch's cost exceeded the gas supplied.
     OutOfGas,
 }
@@ -133,6 +168,15 @@ impl fmt::Display for RevertReason {
                 hex(f, key)?;
                 write!(f, " to its current owner")
             }
+            Self::ExpiryBeyondMaxLifetime {
+                target,
+                current_block,
+                max_lifetime,
+            } => write!(
+                f,
+                "expiry {target} at block {current_block} exceeds the maximum lifetime \
+                 of {max_lifetime} blocks"
+            ),
             Self::OutOfGas => write!(f, "out of gas"),
         }
     }

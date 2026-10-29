@@ -61,16 +61,31 @@ fn a_batch_runs_against_golemdb_and_lands_in_the_store() {
         caller: ALICE,
         block_number: 1,
         gas_supplied: 10_000_000,
+        tx_gas: 0,
+        floor_gas: 0,
+        golemdb_cost_before: 0,
         chain_id: 7738577,
+        max_lifetime: 7_884_000,
+        keep_writes: true,
     };
 
     let ops = vec![create(1), create(2)];
-    let out = ArkivExecutor::with_cost(PlaceholderCost)
-        .apply(&env, &mut view, &ops)
-        .expect("apply");
+    let out = ArkivExecutor::with_cost(
+        PlaceholderCost,
+        arkiv_tokenomics::FeeSchedule {
+            capacity_rate: 14,
+            cell_byte_units: 1,
+            index_byte_units: 1,
+            c_cell: 64,
+            c_idx: 64,
+            max_lifetime: u64::MAX,
+        },
+    )
+    .apply(&env, &mut view, &ops)
+    .expect("apply");
 
     assert_eq!(out.status, ExecStatus::Ok);
-    assert!(out.gas_used > 0, "a create is not free");
+    assert!(out.gas_used() > 0, "a create is not free");
 
     let deltas = view.get_uncommitted_deltas().expect("deltas");
     assert_eq!(deltas.len(), 2, "one net delta per created entity");

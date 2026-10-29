@@ -23,6 +23,9 @@ arkiv-interfaces.workspace = true
 arkiv-reth-statemanager.workspace = true
 # The Solidity ABI (Operation[] calldata) the op decoder (decode.rs) parses.
 arkiv-bindings.workspace = true
+# The lifetime bound creates and extends are admitted by, and the fee schedule
+# it comes from.
+arkiv-tokenomics.workspace = true
 
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
 alloy-evm.workspace = true
@@ -39,4 +42,6 @@ alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 reth-ethereum = { workspace = true, features = ["evm", "node"] }
 arkiv-golemdb-state.workspace = true
+# In-memory GolemDB, the store the node runs on, for the executor's tests.
+arkiv-golemdb.workspace = true
 arkiv-interfaces = { workspace = true, features = ["conformance"] }

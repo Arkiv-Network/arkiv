@@ -7,6 +7,7 @@
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes};
+use arkiv_interfaces::gas::OpCost;
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivExecutorBuilder;
 use arkiv_reth_golemdbprovider::ArkivStateRootStrategy;
@@ -56,12 +57,18 @@ use tracing::{debug, warn};
 pub struct ArkivNode {
     store: HostStore,
     seals: Arc<BlockSeals>,
+    op_cost: OpCost,
 }
 
 impl ArkivNode {
-    /// The node over the store Arkiv's state lives in.
-    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
-        Self { store, seals }
+    /// The node over the store Arkiv's state lives in, with what an op costs
+    /// beyond that store's receipts.
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>, op_cost: OpCost) -> Self {
+        Self {
+            store,
+            seals,
+            op_cost,
+        }
     }
 }
 
@@ -128,6 +135,7 @@ where
             .executor(ArkivExecutorBuilder::new(
                 self.store.clone(),
                 self.seals.clone(),
+                self.op_cost,
             ))
             .payload(ArkivPayloadServiceBuilder::new(
                 self.store.clone(),
