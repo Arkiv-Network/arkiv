@@ -144,7 +144,8 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         for (key, staged) in tx_overlay {
             let before = state
                 .get_entity(key, ReadMode::ViewWithOverlay)
-                .map_err(ExecError::store)?;
+                .map_err(ExecError::store)?
+                .into_value();
             if let Some(updates) = updates_between(key, before.as_ref(), staged.as_ref()) {
                 state.update_entity(updates).map_err(ExecError::store)?;
             }
@@ -379,6 +380,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         }
         state
             .get_entity(key, ReadMode::ViewWithOverlay)
+            .map(arkiv_interfaces::store::Metered::into_value)
             .map_err(ExecError::store)
     }
 }
@@ -544,7 +546,9 @@ mod tests {
     }
 
     fn staged(view: &View, key: EntityAddress) -> Option<Entity> {
-        view.get_entity(key, ReadMode::ViewWithOverlay).unwrap()
+        view.get_entity(key, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .into_value()
     }
 
     /// Comfortably more gas than any op here costs.
@@ -609,6 +613,7 @@ mod tests {
         assert!(
             view.get_entity([1u8; 32], ReadMode::ViewOnBase)
                 .unwrap()
+                .value
                 .is_none()
         );
     }

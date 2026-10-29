@@ -14,4 +14,6 @@ arkiv-interfaces.workspace = true
 arkiv-reth-uncommitted-store.workspace = true
 
 [dev-dependencies]
+# The real engine, so the shared view contract runs against GolemDB too.
+arkiv-golemdb.workspace = true
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
