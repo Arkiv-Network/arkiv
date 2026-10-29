@@ -1756,6 +1756,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkiv-tokenomics"
+version = "0.5.1"
+dependencies = [
+ "arkiv-interfaces",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
