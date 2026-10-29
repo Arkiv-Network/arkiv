@@ -391,7 +391,14 @@ JSON-RPC 2.0, positional params `[queryString, options?]`. Chain quantities are
 | `atBlock` | hex quantity | head | must be within the node's retained range |
 | `select` | object | `{ "key": true }` | everything except `key` defaults **off** |
 | `limit` | hex quantity | node default | node max 100 |
+| `offset` | hex quantity | `0` | matches to skip before the first page |
 | `cursor` | string | — | opaque, from a previous response; bound to query/block/select |
+
+**Paging** — the first request may skip into the matches with `offset`; every
+later page comes from the previous response's `cursor`, which carries its own
+position (so it continues past the offset rather than restarting). Sending
+both in one request is not yet specified. An `offset` at or past the end of
+the matches gives an empty page and no `cursor`.
 
 **Projections** (`select`) — flat, per-field booleans:
 
@@ -406,8 +413,8 @@ JSON-RPC 2.0, positional params `[queryString, options?]`. Chain quantities are
 Selecting is independent of indexing: an unindexed attribute cannot appear in
 the query string but can be selected and returned.
 
-**`count`** — the total size of the match set, **independent of `limit` and
-`cursor`**. It is a hex QUANTITY, repeated on every page it is selected on, and
+**`count`** — the total size of the match set, **independent of `limit`,
+`offset` and `cursor`**. It is a hex QUANTITY, repeated on every page it is selected on, and
 stable across pages (the cursor pins `atBlock`). If `count` is the **only**
 selected field, `data` is `[]` and no `cursor` is returned. `"*"` +
 `{ "count": true }` counts all active entities.

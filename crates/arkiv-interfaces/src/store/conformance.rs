@@ -83,6 +83,9 @@ pub fn run_part_one<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     query_and_intersects_its_children(store_generator);
     query_sorts_ascending_and_descending(store_generator);
     query_sort_puts_records_without_a_value_below_every_value(store_generator);
+    query_offset_alone_skips_the_first_matches(store_generator);
+    query_limit_alone_truncates_from_the_first_match(store_generator);
+    query_offset_and_limit_take_a_window(store_generator);
     commit_applies_every_record_or_none(store_generator);
 
     // The `StoreExt` extensions: additions to `golem-db-api.md`, not part of it.
@@ -1635,6 +1638,108 @@ fn query_pages_with_offset_and_limit<S: Store>(store_generator: &dyn Fn() -> S) 
         matched_keys(&store, at, &paged_query(all(), 99, 10)).is_empty(),
         "an offset past the end is an empty page, not an error"
     );
+}
+
+/// [`committed_fixture`]'s records, in the store's own order or, with a
+/// `direction`, sorted by `n`: at most `limit` of them, past the first
+/// `offset`. The fixture is written in key order, so the store's own order is
+/// key order in every store.
+fn fixture_page<S: Store>(
+    store: &S,
+    at: CommitId,
+    direction: Option<SortDirection>,
+    offset: u64,
+    limit: u64,
+) -> Vec<RecordKey> {
+    let query = match direction {
+        None => paged_query(carrying("kind"), offset, limit),
+        Some(direction) => Query {
+            page: Page { offset, limit },
+            ..sorted_by_n(carrying("kind"), direction)
+        },
+    };
+    matched_keys(store, at, &query)
+}
+
+fn keys(ordinals: &[u8]) -> Vec<RecordKey> {
+    ordinals.iter().copied().map(record_key).collect()
+}
+
+/// An offset under a limit that truncates nothing: the page starts past the
+/// first `offset` matches in the result order and runs to the last. An offset
+/// at or past the end is an empty page, not an error, however far past.
+fn query_offset_alone_skips_the_first_matches<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+    let page = |direction, offset| fixture_page(&store, at, direction, offset, 10);
+    let descending = Some(SortDirection::Descending);
+
+    assert_eq!(page(None, 0), keys(&[1, 2, 3]), "no offset skips nothing");
+    assert_eq!(page(None, 1), keys(&[2, 3]), "offset skips");
+    assert_eq!(page(None, 2), keys(&[3]));
+    assert_eq!(page(descending, 1), keys(&[2, 1]), "in the sorted order");
+    for direction in [None, descending] {
+        assert!(page(direction, 3).is_empty(), "an offset at the end");
+        assert!(
+            page(direction, u64::MAX).is_empty(),
+            "an offset far past it"
+        );
+    }
+}
+
+/// A limit from the first match: the page is the first `limit` matches in the
+/// result order. A limit past the last match is a short page, not an error.
+fn query_limit_alone_truncates_from_the_first_match<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+    let page = |direction, limit| fixture_page(&store, at, direction, 0, limit);
+    let descending = Some(SortDirection::Descending);
+
+    assert_eq!(page(None, 1), keys(&[1]), "limit truncates");
+    assert_eq!(page(None, 2), keys(&[1, 2]));
+    assert_eq!(page(None, 3), keys(&[1, 2, 3]), "a limit of every match");
+    assert_eq!(
+        page(None, 10),
+        keys(&[1, 2, 3]),
+        "a limit past the last one"
+    );
+    assert_eq!(page(descending, 1), keys(&[3]), "in the sorted order");
+    assert_eq!(page(descending, 2), keys(&[3, 2]));
+}
+
+/// An offset and a limit together take a window: at most `limit` matches,
+/// past the first `offset`. A window running off the end is short, and pages
+/// each taken at the previous one's offset plus its limit partition the
+/// matches, in the result order.
+fn query_offset_and_limit_take_a_window<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let at = committed_fixture(&mut store);
+    let page = |direction, offset, limit| fixture_page(&store, at, direction, offset, limit);
+    let descending = Some(SortDirection::Descending);
+
+    assert_eq!(page(None, 1, 1), keys(&[2]), "one past the first");
+    assert_eq!(page(None, 1, 2), keys(&[2, 3]));
+    assert_eq!(page(descending, 1, 2), keys(&[2, 1]), "in the sorted order");
+    assert_eq!(
+        page(None, 2, 2),
+        keys(&[3]),
+        "a window off the end is short"
+    );
+    assert!(
+        page(None, 3, 1).is_empty(),
+        "a window past the end is empty"
+    );
+    for direction in [None, descending] {
+        let walked: Vec<RecordKey> = [0, 2]
+            .into_iter()
+            .flat_map(|offset| page(direction, offset, 2))
+            .collect();
+        assert_eq!(
+            walked,
+            page(direction, 0, 10),
+            "pages of two partition the matches, in that order"
+        );
+    }
 }
 
 /// `total_matched` counts the whole match, not the page — so a caller can page

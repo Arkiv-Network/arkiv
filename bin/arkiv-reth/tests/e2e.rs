@@ -937,6 +937,43 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(in_order(&sorted_rest), keys(&[1]));
     assert!(sorted_rest.get("cursor").is_none());
 
+    // An offset starts the page-through further in, and its cursor carries on
+    // from there. The count is still the whole match set.
+    let skipped = client
+        .query_raw(
+            by_rank_desc,
+            serde_json::json!({
+                "select": { "key": true, "count": true },
+                "limit": 2,
+                "offset": "0x1",
+            }),
+        )
+        .await
+        .expect("a page past the first match");
+    assert_eq!(in_order(&skipped), keys(&[3, 2]));
+    assert_eq!(skipped["count"], "0x4", "the match set, not the offset");
+    let skipped_rest = client
+        .query_raw(
+            by_rank_desc,
+            serde_json::json!({
+                "select": { "key": true, "count": true },
+                "limit": 2,
+                "cursor": skipped["cursor"],
+            }),
+        )
+        .await
+        .expect("the page after an offset one");
+    assert_eq!(in_order(&skipped_rest), keys(&[1]));
+    assert!(skipped_rest.get("cursor").is_none());
+
+    // Past the last match, the page is empty and there is no next one.
+    let past_end = client
+        .query_raw(by_rank_desc, serde_json::json!({ "offset": 4 }))
+        .await
+        .expect("an offset past the last match");
+    assert_eq!(past_end["data"], serde_json::json!([]));
+    assert!(past_end.get("cursor").is_none());
+
     // A user attribute names the type to sort it as; a count sets the order
     // aside.
     let untyped = client
