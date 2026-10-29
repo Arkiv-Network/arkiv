@@ -357,7 +357,7 @@ where
         |block_number, at| {
             let binding = cursor::binding(q, block_number, &projection.fingerprint());
             let offset = match options.cursor.as_deref() {
-                None => 0,
+                None => options.offset.unwrap_or(0),
                 Some(text) => {
                     cursor::decode(text, binding).map_err(|e| cursor_error(e.message()))?
                 }
