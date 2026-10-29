@@ -74,7 +74,7 @@ fn log_write_receipt(
     receipt: &golemdb::Receipt,
     error: Option<&ApiError>,
 ) {
-    tracing::debug!(
+    tracing::trace!(
         target: "arkiv::golemdb::metering",
         operation,
         cost = receipt.cost,
