@@ -138,6 +138,14 @@ where
         Ok(self.golem.get_entity_with_meta(address, read)?)
     }
 
+    fn get_entity_system_fields(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
+        Ok(self.golem.get_entity_system_fields(address, read)?)
+    }
+
     fn update_entity(&mut self, updates: EntityUpdates) -> Result<Metered<()>, Self::Error> {
         Ok(self.golem.update_entity(updates)?)
     }

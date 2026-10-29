@@ -255,6 +255,23 @@ pub trait EntityStore {
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error>;
 
+    /// The entity's system fields with its record's size, without reading its
+    /// attributes: what an op needs that leaves them alone. The entity comes
+    /// back with no attributes. By default the full read, attributes dropped;
+    /// a store that reads by the byte reads only the system cells.
+    fn get_entity_system_fields(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
+        Ok(self.get_entity_with_meta(address, read)?.map(|found| {
+            found.map(|mut stored| {
+                stored.entity.attributes.clear();
+                stored
+            })
+        }))
+    }
+
     /// The same read, without the size. A caller that needs the size uses
     /// [`get_entity_with_meta`](Self::get_entity_with_meta) rather than a
     /// second read.

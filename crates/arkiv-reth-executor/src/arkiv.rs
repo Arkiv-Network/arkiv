@@ -304,6 +304,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     meter,
                     *key,
                     Auth::OwnerOnly,
+                    EntityRead::Whole,
                     // `readonly` freezes contents; lifecycle ops still work.
                     |e| {
                         if e.creation_flags.is_readonly() {
@@ -349,6 +350,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     // Anyone may pay to keep an entity alive when the flag says
                     // so — extending can't hurt the owner.
                     Auth::OwnerOrFlag(CreationFlags::PERMISSIONLESS_EXTENSION),
+                    EntityRead::SystemFields,
                     // Lifetimes never shorten; equal is a satisfied no-op, so
                     // only an extend that moves the expiry meets the bound.
                     |e| {
@@ -387,14 +389,14 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     mutated.expires_at,
                 )))
             }
-            Op::Transfer { key, new_owner } => {
-                let previous_owner = self.current(state, meter, *key)?.map(|e| e.entity.owner);
-                self.mutate(
+            Op::Transfer { key, new_owner } => self
+                .mutate(
                     env,
                     state,
                     meter,
                     *key,
                     Auth::OwnerOnly,
+                    EntityRead::SystemFields,
                     |e| {
                         if *new_owner == e.owner {
                             return Err(RevertReason::TransferToSelf { key: *key });
@@ -408,13 +410,15 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                 )
                 .map(|r| {
                     r.map(|mutated| OpEffect {
-                        previous_owner,
+                        previous_owner: Some(mutated.owner_before),
                         ..self.effect(*key, OpKind::Transfer, mutated.owner, mutated.expires_at)
                     })
-                })
-            }
+                }),
             Op::Delete { key } => {
-                let Some(StoredEntity { entity, .. }) = self.current(state, meter, *key)? else {
+                // The owner and expiry are all it needs: the attributes go
+                // with the record, and GolemDB prices that from its counts.
+                let Some(StoredEntity { entity, .. }) = self.system_fields(state, meter, *key)?
+                else {
                     return Ok(Err(RevertReason::NotFound { key: *key }));
                 };
                 if entity.owner != env.caller {
@@ -463,9 +467,9 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         u64::try_from(delta.max(0)).map_err(|_| Overflow)
     }
 
-    /// Load, authorize, check liveness, run the op's own check, edit, and
-    /// write the fields that changed. An expired entity is not mutable —
-    /// including by extend.
+    /// Load as much as `read` says, authorize, check liveness, run the op's
+    /// own check, edit, and write the fields that changed. An expired entity
+    /// is not mutable — including by extend.
     #[allow(clippy::too_many_arguments)]
     fn mutate(
         &self,
@@ -474,13 +478,18 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         meter: &mut BatchMeter,
         key: EntityAddress,
         auth: Auth,
+        read: EntityRead,
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
         edit: impl FnOnce(&mut Entity) -> Result<(), RevertReason>,
     ) -> Result<Result<Mutated, RevertReason>, ExecError> {
+        let found = match read {
+            EntityRead::Whole => self.current(state, meter, key)?,
+            EntityRead::SystemFields => self.system_fields(state, meter, key)?,
+        };
         let Some(StoredEntity {
             entity: before,
             meta: meta_before,
-        }) = self.current(state, meter, key)?
+        }) = found
         else {
             return Ok(Err(RevertReason::NotFound { key }));
         };
@@ -512,6 +521,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
             None => WriteDetails::ZERO,
         };
         Ok(Ok(Mutated {
+            owner_before: before.owner,
             owner: entity.owner,
             expires_at: entity.expires_at,
             meta_before,
@@ -533,12 +543,38 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
             .map(|read| meter.count(read))
             .map_err(ExecError::store)
     }
+
+    /// [`current`](Self::current) without the attributes: the system fields
+    /// and the record's size, for an op that leaves the attributes alone.
+    fn system_fields(
+        &self,
+        state: &V,
+        meter: &mut BatchMeter,
+        key: EntityAddress,
+    ) -> Result<Option<StoredEntity>, ExecError> {
+        state
+            .get_entity_system_fields(key, ReadMode::ViewWithOverlay)
+            .map(|read| meter.count(read))
+            .map_err(ExecError::store)
+    }
+}
+
+/// How much of an entity an op reads before it changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntityRead {
+    /// The whole entity, for an op that changes its attributes.
+    Whole,
+    /// Its system fields and size, for one that leaves them alone: no
+    /// attribute is read, so none is paid for.
+    SystemFields,
 }
 
 /// What a mutation found and did: the entity's owner and expiry after it, the
-/// record's size and expiry before it, and what its write did to the record.
+/// owner, record's size and expiry before it, and what its write did to the
+/// record.
 #[derive(Debug)]
 struct Mutated {
+    owner_before: UserAddress,
     owner: UserAddress,
     expires_at: BlockNumber,
     meta_before: RecordMeta,

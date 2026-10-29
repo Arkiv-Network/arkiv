@@ -93,10 +93,22 @@ impl<S: Store> GolemStateView<S> {
         address: EntityAddress,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, EntityError> {
+        self.read_stored(address, read, None)
+    }
+
+    /// The entity with its record's size, read whole or only the cells
+    /// `projection` names: with [`entity_records::system_projection`], the
+    /// entity without its attributes.
+    fn read_stored(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+        projection: Option<&[CellName]>,
+    ) -> Result<Metered<Option<StoredEntity>>, EntityError> {
         let Some(key) = entity_records::record_key(address) else {
             return Ok(Metered::new(None, Receipt::default()));
         };
-        let record = self.store.get(self.target(read), key, None, None)?;
+        let record = self.store.get(self.target(read), key, projection, None)?;
         let stored = record
             .value
             .as_ref()
@@ -142,6 +154,28 @@ impl<S: Store> GolemStateView<S> {
             };
             self.record(address, updates);
             return Ok(deleted);
+        }
+
+        // An update that leaves the attributes alone, a transfer's or an
+        // extend's, writes only the system cells it sets, without reading the
+        // record first. A patch of an absent record fails, and the
+        // read-modify-write below creates it instead.
+        if updates.attributes.is_none() {
+            let changes: Vec<(CellName, CellChange)> =
+                entity_records::system_cells_set_by(&updates)?
+                    .into_iter()
+                    .map(|(name, cell)| (name, CellChange::Set(cell)))
+                    .collect();
+            if !changes.is_empty() {
+                match self.store.patch(self.branch, key, None, changes, None) {
+                    Ok(written) => {
+                        self.record(address, updates);
+                        return Ok(Metered::new((), written.receipt));
+                    }
+                    Err(StoreError::NotFound) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
         }
 
         // Read-modify-write through the overlay, so two updates in one view compose.
@@ -199,6 +233,15 @@ impl<S: Store> EntityStore for GolemStateView<S> {
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
         self.get_stored(address, read).map_err(Into::into)
+    }
+
+    fn get_entity_system_fields(
+        &self,
+        address: EntityAddress,
+        read: ReadMode,
+    ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
+        self.read_stored(address, read, Some(&entity_records::system_projection()))
+            .map_err(Into::into)
     }
 
     fn update_entity(&mut self, updates: EntityUpdates) -> Result<Metered<()>, Self::Error> {
