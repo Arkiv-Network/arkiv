@@ -178,7 +178,10 @@ mod tests {
             ("* ORDER BY n:u64    asc", Direction::Ascending),
             ("* order by n:u64 desc", Direction::Descending),
             ("* Order By n:U64 Desc", Direction::Descending),
-            ("* Order     By    n  :   U64    DESC    ", Direction::Descending),
+            (
+                "* Order     By    n  :   U64    DESC    ",
+                Direction::Descending,
+            ),
         ] {
             assert_eq!(
                 order_of(text),
