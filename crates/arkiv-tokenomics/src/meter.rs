@@ -14,10 +14,7 @@ use arkiv_interfaces::gas::GasBreakdown;
 use arkiv_interfaces::primitives::Gas;
 use arkiv_interfaces::store::Receipt;
 
-use crate::{FeeSchedule, Overflow};
-
-/// `capacity_rate` is in micro-gas per unit-block.
-const MICRO: u128 = 1_000_000;
+use crate::{FeeSchedule, Overflow, schedule::CAPACITY_RATE_SCALE};
 
 /// The fee formula's inputs, summed over one transaction's batch. Every
 /// addition is checked: a meter that cannot hold a sum fails the transaction.
@@ -104,7 +101,7 @@ pub fn storage_gas(storage_time: u128, schedule: &FeeSchedule) -> Result<Gas, Ov
     let micro_gas = storage_time
         .checked_mul(u128::from(schedule.capacity_rate))
         .ok_or(Overflow)?;
-    Gas::try_from(micro_gas.div_ceil(MICRO)).map_err(|_| Overflow)
+    Gas::try_from(micro_gas.div_ceil(CAPACITY_RATE_SCALE)).map_err(|_| Overflow)
 }
 
 #[cfg(test)]

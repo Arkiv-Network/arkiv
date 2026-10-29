@@ -3,6 +3,10 @@
 use alloc::{collections::BTreeMap, string::String};
 use arkiv_interfaces::{primitives::BlockNumber, store::PricingModel};
 
+/// Fixed scale for [`FeeSchedule::capacity_rate`]: one gas is
+/// 1_000_000 micro-gas. This is a unit conversion, not a pricing weight.
+pub const CAPACITY_RATE_SCALE: u128 = 1_000_000;
+
 /// The `host.arkiv.*` values iteration 1 needs: five weights that price storage,
 /// and the lifetime bound that admits creates and extends.
 ///
@@ -10,8 +14,9 @@ use arkiv_interfaces::{primitives::BlockNumber, store::PricingModel};
 /// base. Every host value must be explicit and positive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeeSchedule {
-    /// Micro-gas per storage unit-block: a unit-block is tiny, so a whole-gas
-    /// rate would be far too coarse.
+    /// Micro-gas per storage unit per block.
+    /// Divide the accumulated charge by [`CAPACITY_RATE_SCALE`],
+    /// rounding up once per transaction, to obtain whole gas.
     pub capacity_rate: u64,
     /// Storage units per cell byte.
     pub cell_byte_units: u64,
