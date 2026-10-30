@@ -124,7 +124,7 @@ use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
     EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_interfaces::store::BranchId;
+use arkiv_interfaces::store::{BranchId, CommitId, Origin};
 use arkiv_reth_statemanager::{
     BlockSeals, ExecutionKey, HostStateView, HostStore, OwnedBranch, WriteOverlay, host_manager,
 };
@@ -505,10 +505,7 @@ impl<DB: Database, I> ArkivEvm<DB, I> {
 
     /// The block's branch, opened on first use over `base`, the commit its
     /// prices came from.
-    fn branch(
-        &mut self,
-        base: arkiv_interfaces::store::CommitId,
-    ) -> Result<BranchId, EVMError<DB::Error>> {
+    fn branch(&mut self, base: CommitId) -> Result<BranchId, EVMError<DB::Error>> {
         if let Some(branch) = &self.branch {
             return Ok(branch.id());
         }
@@ -520,7 +517,7 @@ impl<DB: Database, I> ArkivEvm<DB, I> {
             .map_err(state_fault("read the branch's base"))?
             .origin;
         // The head moved since the prices were read. Dropping the branch discards it.
-        if origin != arkiv_interfaces::store::Origin::Commit(base) {
+        if origin != Origin::Commit(base) {
             return Err(EVMError::Custom(
                 "pricing base is no longer the store head".into(),
             ));
@@ -533,12 +530,12 @@ impl<DB: Database, I> ArkivEvm<DB, I> {
 #[derive(Debug, Clone)]
 struct BlockPricing {
     /// The commit the list was read at: the block's base.
-    commit_id: arkiv_interfaces::store::CommitId,
+    commit_id: CommitId,
     schedule: FeeSchedule,
 }
 
 impl BlockPricing {
-    fn load(store: &HostStore, at: arkiv_interfaces::store::CommitId) -> Result<Self, String> {
+    fn load(store: &HostStore, at: CommitId) -> Result<Self, String> {
         let schedule = match store.pricing_snapshot(at) {
             Ok(snapshot) if snapshot.commit_id != at => {
                 return Err("pricing snapshot does not match the block base".into());
