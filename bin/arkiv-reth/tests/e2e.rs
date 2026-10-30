@@ -2054,6 +2054,23 @@ async fn a_bad_arkiv_section_stops_the_node() {
     }
 }
 
+/// A chain without a pricing model stops at startup on any store, not only on
+/// GolemDB, which needs `config.arkiv` for its own settings first: here the
+/// node runs in memory and only the schedule is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_without_a_pricing_model_stops_the_node() {
+    let genesis_path = genesis_file(&genesis_json());
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .chain(&genesis_path)
+        .spawn();
+    let log = refusal(&mut node).await;
+    let _ = std::fs::remove_file(&genesis_path);
+    assert!(
+        log.contains("no usable pricing model"),
+        "the node names the missing pricing model: {log}"
+    );
+}
+
 /// On GolemDB, the store's genesis must have block 0's `stateRoot`. A store
 /// with this chain's settings and genesis tag, but other accounts, has another
 /// root and is refused.

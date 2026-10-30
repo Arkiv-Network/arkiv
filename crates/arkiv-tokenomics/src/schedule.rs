@@ -31,17 +31,6 @@ pub struct FeeSchedule {
 }
 
 impl FeeSchedule {
-    /// The price list for the mock stores (MemStore, Valkey), which keep none:
-    /// the values of `genesis/dev.json`.
-    pub const MOCK: Self = Self {
-        capacity_rate: 14,
-        cell_byte_units: 1,
-        index_byte_units: 1,
-        c_cell: 64,
-        c_idx: 64,
-        max_lifetime: 7_884_000,
-    };
-
     /// Read the host values of a validated model, without fallback prices.
     pub fn from_model(model: &PricingModel) -> Result<Self, ScheduleError> {
         if model.host_code_version != HOST_CODE_VERSION {
