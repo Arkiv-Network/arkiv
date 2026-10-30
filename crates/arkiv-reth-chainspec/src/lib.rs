@@ -91,6 +91,15 @@ impl ArkivChainSpec {
                 pricing
                     .validate(&[host_metering_schema()])
                     .map_err(|e| eyre::eyre!("genesis config.arkiv.golemdb.metering: {e}"))?;
+                // GolemDB only warns about a missing engine weight, then fails
+                // the first call that needs it, inside a block, on every node.
+                // Refuse it here instead.
+                for name in golemdb_api::PricingConfig::zero().weights.keys() {
+                    eyre::ensure!(
+                        pricing.weights.contains_key(name),
+                        "genesis config.arkiv.golemdb.metering: missing weight {name}"
+                    );
+                }
                 FeeSchedule::from_weights(&pricing.weights)
                     .map_err(|e| eyre::eyre!("genesis config.arkiv.golemdb.metering: {e:?}"))?;
                 Ok(config.golemdb)
@@ -422,6 +431,22 @@ mod tests {
                 serde_json::from_value(arkiv(|_| {})["golemdb"]["metering"].clone()).unwrap()
             ))
         );
+    }
+
+    /// GolemDB would open without one and fail the first call that needs it,
+    /// halting block production, so every engine weight is required too.
+    #[test]
+    fn every_engine_weight_is_required() {
+        for name in golemdb_api::PricingConfig::zero().weights.keys() {
+            let error = with_arkiv(arkiv(|g| {
+                g["metering"]["weights"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(name);
+            }))
+            .unwrap_err();
+            assert!(error.to_string().contains(name.as_str()), "{error}");
+        }
     }
 
     #[test]
