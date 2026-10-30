@@ -34,6 +34,7 @@ fn config_with(pricing: arkiv_golemdb::PricingConfig) -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
+        host_schemas: vec![],
         genesis: Genesis::new(
             HashAlgorithm::Keccak256,
             limits,

@@ -186,6 +186,7 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
     );
     Ok(arkiv_golemdb::GolemDbConfig {
         genesis: genesis.clone(),
+        host_schemas: vec![arkiv_reth_chainspec::host_metering_schema()],
         segments: arkiv_reth_statemanager::segments::ALL
             .iter()
             .map(|&(name, columns)| arkiv_golemdb::SegmentSpec {
@@ -328,6 +329,18 @@ fn main() {
         async move |builder, arkiv_args| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
             let store = open(&builder.config().chain);
+            // GolemDB keeps the chain's price list from its genesis; a node on
+            // it must have a usable one. The in-memory mock has none.
+            if on_golemdb {
+                let pricing = store.pricing_snapshot(store.head()).map_err(|e| {
+                    eyre::eyre!(
+                        "the store has no usable pricing model \
+                         (config.arkiv.golemdb.metering): {e:?}"
+                    )
+                })?;
+                arkiv_tokenomics::FeeSchedule::from_model(&pricing.model)
+                    .map_err(|e| eyre::eyre!("invalid host pricing: {e:?}"))?;
+            }
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone());
@@ -375,10 +388,6 @@ fn exit_with(err: &eyre::Report) -> ! {
 mod tests {
     use super::*;
     use arkiv_golemdb::HashAlgorithm;
-    use arkiv_interfaces::constants::{
-        MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
-    };
-    use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
     use serde_json::{Value, json};
 
     fn set(value: impl Into<OsString>) -> Option<OsString> {
@@ -465,19 +474,11 @@ mod tests {
     /// `config.arkiv.golemdb` with `hash_function`, Arkiv's limits and free
     /// metering prices.
     fn golemdb(hash_function: &str) -> Value {
-        json!({
-            "hash_function": hash_function,
-            "cell_limits": {
-                "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
-                "max_str_len": MAX_STR_BYTES,
-                "max_bytes_len": MAX_BYTES_VALUE_LEN
-            },
-            "record_limits": {
-                "max_cells": MAX_RECORD_CELLS,
-                "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-            },
-            "metering": arkiv_golemdb::PricingConfig::zero()
-        })
+        let mut genesis: Value =
+            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+        let mut golemdb = genesis["config"]["arkiv"]["golemdb"].take();
+        golemdb["hash_function"] = json!(hash_function);
+        golemdb
     }
 
     /// `archive` keeps every commit, `head-only` and `0` the head alone, and a
@@ -533,6 +534,46 @@ mod tests {
             golemdb_config(&spec).unwrap().genesis.hash_function,
             HashAlgorithm::Keccak256
         );
+    }
+
+    /// Every weight of the example genesis file reaches the store the node
+    /// opens on it, under its own name, and every host weight the field of the
+    /// fee schedule it names. The file's values all differ, so one that lands
+    /// under another name, or is left at a default, shows.
+    #[test]
+    fn every_weight_of_the_example_genesis_file_reaches_the_node() {
+        use arkiv_tokenomics::FeeSchedule;
+        use reth_cli::chainspec::ChainSpecParser;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../genesis/example.json");
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let metering = &file["config"]["arkiv"]["golemdb"]["metering"];
+        let weights: BTreeMap<String, u64> =
+            serde_json::from_value(metering["weights"].clone()).unwrap();
+        let distinct: BTreeSet<u64> = weights.values().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            weights.len(),
+            "the example's weights must all differ"
+        );
+
+        let spec = genesis::NodeChainSpecParser::parse(path).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = open_store(&spec, set(dir.path().join("golemdb")), None).unwrap();
+        let model = store.pricing_snapshot(store.head()).unwrap().model;
+        assert_eq!(*model.weights, weights);
+        assert_eq!(model.golemdb_code_version, metering["golemdb_code_version"]);
+        assert_eq!(model.host_code_version, metering["host_code_version"]);
+
+        let schedule = FeeSchedule::from_model(&model).unwrap();
+        let host = |name: &str| weights[&format!("host.arkiv.{name}")];
+        assert_eq!(schedule.capacity_rate, host("capacity_rate"));
+        assert_eq!(schedule.cell_byte_units, host("cell_byte_units"));
+        assert_eq!(schedule.index_byte_units, host("index_byte_units"));
+        assert_eq!(schedule.c_cell, host("c_cell"));
+        assert_eq!(schedule.c_idx, host("c_idx"));
+        assert_eq!(schedule.max_lifetime, host("max_lifetime"));
     }
 
     #[test]

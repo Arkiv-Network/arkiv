@@ -21,6 +21,7 @@ mod convert;
 mod tags;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use arkiv_interfaces::store::{
     BranchId, BranchInfo, BranchVersion, Budget, Cell, CellChange, CellKind, CellName, CommitId,
@@ -32,7 +33,8 @@ use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
 pub use golemdb_api::{
-    CellLimits, Genesis, HashAlgorithm, OpenError, PricingConfig, PruningConfig, RecordLimits,
+    CellLimits, Genesis, HashAlgorithm, HostMeteringSchema, OpenError, PricingConfig,
+    PruningConfig, RecordLimits,
 };
 
 use convert::{
@@ -50,6 +52,9 @@ pub struct GolemDbConfig {
     pub genesis: Genesis,
     /// The segments rows may be appended to.
     pub segments: Vec<SegmentSpec>,
+    /// The host's own pricing weights, by name, that GolemDB stores beside its
+    /// own. The adapter passes them on without knowing what they mean.
+    pub host_schemas: Vec<HostMeteringSchema>,
 }
 
 /// A segment: its name, and how many byte columns each of its rows has.
@@ -63,6 +68,11 @@ pub struct SegmentSpec {
 const SHARD_SPAN: u64 = 500_000;
 
 impl GolemDbConfig {
+    fn open_config(&self) -> Result<golemdb::OpenConfig, OpenError> {
+        Ok(golemdb::OpenConfig::new(self.full_genesis()?)
+            .with_host_schemas(self.host_schemas.clone()))
+    }
+
     /// [`genesis`](Self::genesis) with the host's segments, as LZ4-compressed
     /// byte columns, and the adapter's own.
     fn full_genesis(&self) -> Result<Genesis, OpenError> {
@@ -95,6 +105,9 @@ impl GolemDbConfig {
 #[derive(Clone)]
 pub struct GolemDbStore {
     database: golemdb::Database,
+    // Immutable segments need a temporary directory even with MemoryStore.
+    // Drop it after the database and only after the last clone is gone.
+    _memory_directory: Option<Arc<tempfile::TempDir>>,
 }
 
 impl core::fmt::Debug for GolemDbStore {
@@ -112,19 +125,29 @@ impl GolemDbStore {
         config: &GolemDbConfig,
         pruning: Option<PruningConfig>,
     ) -> Result<Self, OpenError> {
-        let mut open = golemdb::OpenConfig::new(config.full_genesis()?);
+        let mut open = config.open_config()?;
         if let Some(pruning) = pruning {
             open = open.with_pruning(pruning);
         }
         let database = golemdb::Database::open(directory, &open)?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            _memory_directory: None,
+        })
     }
 
     /// A new database in memory, created with `config`; gone when the last
     /// clone drops. It computes the same roots as one on disk.
     pub fn open_memory(config: &GolemDbConfig) -> Result<Self, OpenError> {
-        let database = golemdb::Database::open_memory(&config.full_genesis()?)?;
-        Ok(Self { database })
+        let directory = Arc::new(tempfile::TempDir::new().map_err(OpenError::Io)?);
+        let config = config
+            .open_config()?
+            .with_immutable_data_directory(directory.path());
+        let database = golemdb::Database::from_store(golemdb_storage::MemoryStore::new(), &config)?;
+        Ok(Self {
+            database,
+            _memory_directory: Some(directory),
+        })
     }
 
     /// Seal `branch`, stage its commit's `commit_tags` row and commit. If the

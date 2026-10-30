@@ -11,11 +11,17 @@ license.workspace = true
 [dependencies]
 arkiv-interfaces.workspace = true
 golemdb-api.workspace = true
+golemdb-storage.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 # The keys GolemDB keeps its own records at.
 golemdb-cells.workspace = true
 
 [dev-dependencies]
+# Arkiv's host weight names, for the tests that price with them.
+arkiv-tokenomics.workspace = true
+# The shared store contract, so GolemDB is held to the write effects the other
+# stores mirror.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
 arkiv-query.workspace = true
 # `MAX_PAGE_SIZE`, the largest page `arkiv_query` asks GolemDB for.
@@ -23,6 +29,4 @@ arkiv-rpc-types.workspace = true
 # `MAX_WAIT_COMMITS`, how long GolemDB lets old data wait before it prunes.
 golemdb-pruning.workspace = true
 # Opening a database's MDBX directly, to read how much space it takes.
-golemdb-storage.workspace = true
 golemdb-storage-mdbx.workspace = true
-tempfile.workspace = true
