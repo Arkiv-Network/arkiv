@@ -124,10 +124,9 @@ use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
     EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
 };
-use arkiv_interfaces::store::BranchId;
+use arkiv_interfaces::store::{BranchId, CommitId, Origin};
 use arkiv_reth_statemanager::{
-    BlockSeals, ExecutionKey, HostStateView, HostStore, WriteOverlay, host_manager,
-    open_block_branch,
+    BlockSeals, ExecutionKey, HostStateView, HostStore, OwnedBranch, WriteOverlay, host_manager,
 };
 use arkiv_tokenomics::FeeSchedule;
 use std::sync::Arc;
@@ -464,16 +463,16 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     store: HostStore,
     /// The sealed candidates, shared with the node that adopts one of them.
     seals: Arc<BlockSeals>,
-    /// This block's branch. Every transaction in the block runs on it, in
-    /// order, so each sees the last one's writes.
-    branch: BranchId,
+    /// This block's branch, opened by the first transaction. Every transaction
+    /// in the block runs on it, in order, so each sees the last one's writes.
+    branch: Option<OwnedBranch>,
     /// Captured once for this execution, including eth_call/estimate probes.
     pricing: Result<BlockPricing, String>,
     /// What an op costs beyond the store's receipts, by the kind of store.
     op_cost: OpCost,
     /// Whether any charged transaction ran. A speculative execution —
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
-    /// is abandoned rather than sealed.
+    /// is discarded rather than sealed.
     charged: core::cell::Cell<bool>,
     /// `(signer, nonce)` of each charged transaction, in order — the half of
     /// [`ExecutionKey`] only the EVM sees.
@@ -484,23 +483,59 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     executed: core::cell::RefCell<Vec<(UserAddress, u64)>>,
 }
 
+impl<DB: Database, I> ArkivEvm<DB, I> {
+    fn new(
+        inner: EthEvm<DB, I, PrecompilesMap>,
+        store: HostStore,
+        seals: Arc<BlockSeals>,
+        pricing: Result<BlockPricing, String>,
+        op_cost: OpCost,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            seals,
+            branch: None,
+            pricing,
+            op_cost,
+            charged: core::cell::Cell::new(false),
+            executed: core::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The block's branch, opened on first use over `base`, the commit its
+    /// prices came from.
+    fn branch(&mut self, base: CommitId) -> Result<BranchId, EVMError<DB::Error>> {
+        if let Some(branch) = &self.branch {
+            return Ok(branch.id());
+        }
+        let branch =
+            OwnedBranch::begin(&self.store).map_err(state_fault("open the block's branch"))?;
+        let origin = self
+            .store
+            .branch_info(branch.id())
+            .map_err(state_fault("read the branch's base"))?
+            .origin;
+        // The head moved since the prices were read. Dropping the branch discards it.
+        if origin != Origin::Commit(base) {
+            return Err(EVMError::Custom(
+                "pricing base is no longer the store head".into(),
+            ));
+        }
+        Ok(self.branch.insert(branch).id())
+    }
+}
+
 /// The block's price list, read once at its base and kept for its whole life.
 #[derive(Debug, Clone)]
 struct BlockPricing {
     /// The commit the list was read at: the block's base.
-    commit_id: arkiv_interfaces::store::CommitId,
+    commit_id: CommitId,
     schedule: FeeSchedule,
 }
 
 impl BlockPricing {
-    fn load(store: &HostStore, branch: BranchId) -> Result<Self, String> {
-        let origin = store
-            .branch_info(branch)
-            .map_err(|e| format!("pricing branch: {e:?}"))?
-            .origin;
-        let arkiv_interfaces::store::Origin::Commit(at) = origin else {
-            return Err("pricing requires a block branch over a commit".into());
-        };
+    fn load(store: &HostStore, at: CommitId) -> Result<Self, String> {
         // Every store error is an error: prices are consensus data, never a
         // default.
         let snapshot = store
@@ -558,8 +593,9 @@ where
             .as_ref()
             .map_err(|e| EVMError::Custom(e.clone()))?;
         let schedule = pricing.schedule;
+        let base = pricing.commit_id;
         // Advancing head invalidates the branch too; never refresh its prices.
-        if self.store.head() != pricing.commit_id {
+        if self.store.head() != base {
             return Err(EVMError::Custom(
                 "pricing base is no longer the store head".into(),
             ));
@@ -579,7 +615,7 @@ where
         let chain_id = self.inner.chain_id();
         let sender = (tx.caller.into_array(), tx.nonce);
         let store = self.store.clone();
-        let branch = self.branch;
+        let branch = self.branch(base)?;
         let db = self.inner.db_mut();
         let store = &store;
         let has_purge_selector = tx.kind == TxKind::Call(ARKIV_ADDRESS)
@@ -640,20 +676,20 @@ where
     }
 
     /// Block execution is over. Seal the branch as a candidate at this height
-    /// if a real block ran on it, and abandon it otherwise.
+    /// if a real block ran on it; otherwise it is dropped, and discarded.
     ///
     /// Sealing computes the roots and writes nothing, so reth can execute this
     /// block again — to validate what it just built — and get the same answer.
     /// Only adoption commits.
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         let height = self.inner.block().number.saturating_to::<u64>();
-        if self.charged.get() {
-            let key = ExecutionKey::new(height, self.executed.borrow().clone());
-            if let Err(error) = self.seals.seal(&self.store, key, self.branch) {
+        if self.charged.get()
+            && let Some(branch) = self.branch
+        {
+            let key = ExecutionKey::new(height, self.executed.into_inner());
+            if let Err(error) = self.seals.seal(key, branch) {
                 tracing::error!(target: "arkiv::executor", ?error, height, "failed to seal the block's Arkiv state");
             }
-        } else {
-            BlockSeals::abandon(&self.store, self.branch);
         }
         self.inner.finish()
     }
@@ -1492,19 +1528,13 @@ impl EvmFactory for ArkivEvmFactory {
             .build_mainnet_with_inspector(NoOpInspector {})
             .with_precompiles(PrecompilesMap::from_static(Precompiles::prague()));
 
-        let branch = open_block_branch(&self.store)
-            .expect("the Arkiv store refused to open a branch for this block");
-        let pricing = BlockPricing::load(&self.store, branch);
-        ArkivEvm {
-            inner: EthEvm::new(inner, false),
-            branch,
-            pricing,
-            op_cost: self.op_cost,
-            store: self.store.clone(),
-            seals: self.seals.clone(),
-            charged: core::cell::Cell::new(false),
-            executed: core::cell::RefCell::new(Vec::new()),
-        }
+        ArkivEvm::new(
+            EthEvm::new(inner, false),
+            self.store.clone(),
+            self.seals.clone(),
+            BlockPricing::load(&self.store, self.store.head()),
+            self.op_cost,
+        )
     }
 
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>, EthInterpreter>>(
@@ -1514,21 +1544,14 @@ impl EvmFactory for ArkivEvmFactory {
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let base = self.create_evm(db, input);
-        // The base EVM never executes anything; it is taken apart for its
-        // branch. Its empty `executed` list moves across with the branch, so
-        // the two stay the one record of what ran on it.
-        let (branch, charged, executed) = (base.branch, base.charged.clone(), base.executed);
         let inner = base.inner.into_inner().with_inspector(inspector);
-        ArkivEvm {
-            inner: EthEvm::new(inner, true),
-            store: self.store.clone(),
-            seals: self.seals.clone(),
-            branch,
-            pricing: base.pricing,
-            op_cost: base.op_cost,
-            charged,
-            executed,
-        }
+        ArkivEvm::new(
+            EthEvm::new(inner, true),
+            self.store.clone(),
+            self.seals.clone(),
+            base.pricing,
+            self.op_cost,
+        )
     }
 }
 
@@ -1722,18 +1745,54 @@ mod tests {
     #[test]
     fn block_pricing_captures_the_schedule_and_rejects_a_stale_base() {
         use arkiv_interfaces::store::Store;
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
         let store = host_store(1);
-        let branch = store.begin(None).unwrap();
-        let pricing = BlockPricing::load(&store, branch).unwrap();
+        let mut evm = ArkivEvmFactory::new(
+            store.clone(),
+            Arc::new(BlockSeals::default()),
+            OpCost::Placeholder,
+        )
+        .create_evm(EmptyDB::default(), EvmEnv::default());
+        let pricing = evm.pricing.clone().unwrap();
         assert_eq!(pricing.commit_id, store.head());
         assert_eq!(pricing.schedule.capacity_rate, 14);
+
         let advanced = store.begin(None).unwrap();
         store.commit(advanced).unwrap();
-        assert!(BlockPricing::load(&store, branch).is_err());
+        assert!(evm.transact(TxEnv::default()).is_err());
+        assert!(evm.branch.is_none(), "a stale base opens no branch");
         assert_eq!(
-            pricing.schedule.capacity_rate, 14,
+            evm.pricing.unwrap().schedule.capacity_rate,
+            14,
             "an acquired schedule stays as it was"
         );
+    }
+
+    /// A branch opened after the head moved past the prices' commit is refused,
+    /// even when the head check before it passed.
+    #[test]
+    fn a_branch_over_another_base_than_the_prices_is_refused() {
+        use arkiv_interfaces::store::Store;
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+        let store = host_store(1);
+        let mut evm = ArkivEvmFactory::new(
+            store.clone(),
+            Arc::new(BlockSeals::default()),
+            OpCost::Placeholder,
+        )
+        .create_evm(EmptyDB::default(), EvmEnv::default());
+        let base = evm.pricing.clone().unwrap().commit_id;
+
+        let advanced = store.begin(None).unwrap();
+        store.commit(advanced).unwrap();
+
+        let Err(EVMError::Custom(error)) = evm.branch(base) else {
+            panic!("a branch over a newer head than the prices must be refused");
+        };
+        assert_eq!(error, "pricing base is no longer the store head");
+        assert!(evm.branch.is_none(), "the refused branch is not kept");
     }
 
     /// Prices are consensus data: a store without a price list is refused,
@@ -1745,9 +1804,8 @@ mod tests {
             std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
         let genesis = store.begin(None).unwrap();
         store.commit_tagged(genesis, [0; 32]).unwrap();
-        let branch = store.begin(Some(store.head())).unwrap();
         assert!(
-            BlockPricing::load(&store, branch)
+            BlockPricing::load(&store, store.head())
                 .unwrap_err()
                 .contains("PricingUnavailable")
         );
@@ -1936,7 +1994,7 @@ mod tests {
             arkiv_transact(
                 store,
                 branch,
-                &BlockPricing::load(store, branch).unwrap().schedule,
+                &BlockPricing::load(store, store.head()).unwrap().schedule,
                 OpCost::Placeholder,
                 &mut db,
                 1,
@@ -2339,5 +2397,43 @@ mod tests {
             seals.root_of(&included).is_some(),
             "the seal is keyed by the block's transactions"
         );
+    }
+
+    /// An RPC call, payload prewarming or an aborted build drops its EVM
+    /// without `finish`. The branch has to go with it, or the store keeps it.
+    #[test]
+    fn an_evm_dropped_without_finishing_discards_its_branch() {
+        use arkiv_interfaces::store::{Store, StoreError};
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+        let store = host_store(1);
+        let mut evm = ArkivEvmFactory::new(
+            store.clone(),
+            Arc::new(BlockSeals::default()),
+            OpCost::Placeholder,
+        )
+        .create_evm(
+            EmptyDB::default(),
+            EvmEnv {
+                cfg_env: CfgEnv::default(),
+                block_env: BlockEnv {
+                    number: U256::from(1),
+                    basefee: 0,
+                    ..Default::default()
+                },
+            },
+        );
+        evm.transact(TxEnv {
+            caller: Address::repeat_byte(0xbb),
+            kind: TxKind::Call(Address::repeat_byte(0xde)),
+            gas_limit: ARKIV_TX_GAS,
+            ..Default::default()
+        })
+        .expect("transfer");
+        let branch = evm.branch.as_ref().expect("opened by the transfer").id();
+
+        drop(evm);
+
+        assert_eq!(store.discard(branch), Err(StoreError::HandleInvalid));
     }
 }

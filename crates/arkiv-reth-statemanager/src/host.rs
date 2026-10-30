@@ -40,6 +40,7 @@ use reth_ethereum::evm::revm::state::EvmState;
 use std::sync::{Condvar, Mutex};
 
 use crate::WriteOverlay;
+use crate::branch::OwnedBranch;
 use std::sync::Arc;
 
 use crate::accounts::{BalanceAccess, NonceAccess};
@@ -475,11 +476,6 @@ pub fn host_manager<'a, DB: Database>(
     Ok(HostStateView::new(golem, WriteOverlay::new(db)))
 }
 
-/// Open the branch a block's execution runs on.
-pub fn open_block_branch(store: &HostStore) -> Result<BranchId, ViewError> {
-    Ok(store.begin(Some(store.head()))?)
-}
-
 /// Session ids for host-opened views: a process-local counter, which is all a
 /// `SessionId` distinguishes.
 fn next_session() -> SessionId {
@@ -575,7 +571,7 @@ impl ExecutionKey {
 /// while two builds race.
 #[derive(Debug, Default)]
 pub struct BlockSeals {
-    pending: Mutex<BTreeMap<u64, Vec<(BranchId, SealedCommit)>>>,
+    pending: Mutex<BTreeMap<u64, Vec<(OwnedBranch, SealedCommit)>>>,
     by_execution: Mutex<BTreeMap<ExecutionKey, SealedCommit>>,
     /// The last canonical block adoption finished with, committed or not.
     finished: Mutex<Option<[u8; 32]>>,
@@ -592,14 +588,10 @@ impl BlockSeals {
         Self::default()
     }
 
-    /// Seal `branch` as a candidate for the execution `key` describes.
-    pub fn seal(
-        &self,
-        store: &HostStore,
-        key: ExecutionKey,
-        branch: BranchId,
-    ) -> Result<SealedCommit, ViewError> {
-        let sealed = store.seal(branch)?;
+    /// Seal `branch` as a candidate for the execution `key` describes. A branch
+    /// that fails to seal is discarded.
+    pub fn seal(&self, key: ExecutionKey, branch: OwnedBranch) -> Result<SealedCommit, ViewError> {
+        let sealed = branch.seal()?;
         self.pending
             .lock()
             .expect("the seal registry's lock is never poisoned")
@@ -674,7 +666,7 @@ impl BlockSeals {
             .adopting
             .lock()
             .expect("the seal registry's lock is never poisoned");
-        let stale: BTreeMap<u64, Vec<(BranchId, SealedCommit)>> = {
+        let stale: BTreeMap<u64, Vec<(OwnedBranch, SealedCommit)>> = {
             let mut pending = self
                 .pending
                 .lock()
@@ -683,61 +675,38 @@ impl BlockSeals {
             core::mem::replace(&mut *pending, future)
         };
 
-        let mut winner = None;
-        let mut losers = Vec::new();
-        for (h, candidates) in stale {
-            for (branch, sealed) in candidates {
-                if h == height && sealed.state_root == state_root {
-                    if let Some(previous) = winner.replace((branch, sealed)) {
-                        losers.push(previous.0);
-                    }
-                } else {
-                    // A height reth passed over, or another candidate here.
-                    losers.push(branch);
-                }
-            }
-        }
-        for branch in losers {
-            // Discarding is exact: a branch that never committed was never
-            // state.
-            let _ = store.discard(branch);
-        }
+        // The last match wins. Every other candidate is dropped with the
+        // iterator, and with it discarded: a height reth passed over, or
+        // another candidate at this one.
+        let winner = stale
+            .into_iter()
+            .filter(|(h, _)| *h == height)
+            .flat_map(|(_, candidates)| candidates)
+            .filter(|(_, sealed)| sealed.state_root == state_root)
+            .map(|(branch, _)| branch)
+            .next_back();
         self.forget_executions_through(height);
         if let Some(saved) = store.commit_by_tag(block_hash)? {
-            if let Some((branch, _)) = winner {
-                let _ = store.discard(branch);
-            }
             return Ok(Some(saved));
         }
-        match winner {
-            Some((branch, _)) => {
-                // One call, not one per row. A block is a row per transaction
-                // and a row per receipt, and against an out-of-process store
-                // doing those individually takes long enough that the chain
-                // moves on without us -- the payload builder asks for this
-                // block's commit before it exists and cannot build on it.
-                let batch: Vec<_> = writes
-                    .iter()
-                    .map(|write| (write.segment, write.key, write.row.clone()))
-                    .collect();
-                if let Err(error) = store.segment_append_many(branch, &batch) {
-                    // The branch must not survive a half-written block: its
-                    // staged rows would otherwise sit there until something
-                    // else committed it. Discarding takes them with it.
-                    let _ = store.discard(branch);
-                    return Err(error.into());
-                }
-                // Tagged with the block hash, which is how a historical read
-                // finds the commit for a past block.
-                Ok(Some(store.commit_tagged(branch, block_hash)?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Drop a candidate that will never be adopted — a speculative call.
-    pub fn abandon(store: &HostStore, branch: BranchId) {
-        let _ = store.discard(branch);
+        let Some(branch) = winner else {
+            return Ok(None);
+        };
+        // One call, not one per row. A block is a row per transaction and a
+        // row per receipt, and against an out-of-process store doing those
+        // individually takes long enough that the chain moves on without us --
+        // the payload builder asks for this block's commit before it exists
+        // and cannot build on it.
+        //
+        // A failed append drops the branch, and its half-written rows with it.
+        let batch: Vec<_> = writes
+            .iter()
+            .map(|write| (write.segment, write.key, write.row.clone()))
+            .collect();
+        store.segment_append_many(branch.id(), &batch)?;
+        // Tagged with the block hash, which is how a historical read finds the
+        // commit for a past block.
+        Ok(Some(branch.commit_tagged(block_hash)?))
     }
 
     /// Adoption is done with canonical block `block_hash`, whether or not it
@@ -965,9 +934,9 @@ mod tests {
         use arkiv_interfaces::store::SegmentAddress;
 
         let (store, seals) = adoptable();
-        let branch = store.begin(Some(store.head())).expect("begin");
+        let branch = OwnedBranch::begin(&store).expect("begin");
         let sealed = seals
-            .seal(&store, ExecutionKey::new(1, vec![]), branch)
+            .seal(ExecutionKey::new(1, vec![]), branch)
             .expect("seal");
 
         let writes = vec![
@@ -1039,9 +1008,9 @@ mod tests {
         let (store, seals) = adoptable();
         let mut root = [0; 32];
         for _ in 0..2 {
-            let branch = store.begin(Some(store.head())).expect("begin");
+            let branch = OwnedBranch::begin(&store).expect("begin");
             root = seals
-                .seal(&store, ExecutionKey::new(1, vec![]), branch)
+                .seal(ExecutionKey::new(1, vec![]), branch)
                 .expect("seal")
                 .state_root;
         }
@@ -1074,14 +1043,50 @@ mod tests {
         );
     }
 
+    /// The candidates adoption passes over are discarded, not left open in the
+    /// store.
+    #[test]
+    fn adoption_discards_the_candidates_it_passes_over() {
+        use arkiv_interfaces::store::{Cell, RecordKey, StoreError, TypeId};
+
+        let (store, seals) = adoptable();
+        let winner = OwnedBranch::begin(&store).expect("begin");
+        let root = seals
+            .seal(ExecutionKey::new(1, vec![]), winner)
+            .expect("seal")
+            .state_root;
+        // A write, so the loser's root differs from the winner's.
+        let loser = OwnedBranch::begin(&store).expect("begin");
+        store
+            .create(
+                loser.id(),
+                RecordKey([1; 32]),
+                vec![("tag".into(), Cell::field(TypeId::STR, b"x".to_vec()))],
+                None,
+            )
+            .expect("write");
+        let loser_id = loser.id();
+        seals
+            .seal(ExecutionKey::new(1, vec![([0xaa; 20], 0)]), loser)
+            .expect("seal");
+
+        let commit = seals
+            .adopt(&store, 1, [0xb1; 32], root, &[])
+            .expect("adopt")
+            .expect("the winner is adopted");
+
+        assert_eq!(store.head(), commit);
+        assert_eq!(store.discard(loser_id), Err(StoreError::HandleInvalid));
+    }
+
     /// A candidate is saved only for the block whose root it has.
     #[test]
     fn a_candidate_with_another_root_is_not_saved() {
         let (store, seals) = adoptable();
         let before = store.head();
-        let branch = store.begin(Some(store.head())).expect("begin");
+        let branch = OwnedBranch::begin(&store).expect("begin");
         let sealed = seals
-            .seal(&store, ExecutionKey::new(1, vec![]), branch)
+            .seal(ExecutionKey::new(1, vec![]), branch)
             .expect("seal");
         let mut other = sealed.state_root;
         other[0] ^= 1;
@@ -1102,9 +1107,9 @@ mod tests {
         let rows = [a_row(crate::segments::BLOCKS, 0xb1, b"header")];
         let mut saves = Vec::new();
         for _ in 0..2 {
-            let branch = store.begin(Some(store.head())).expect("begin");
+            let branch = OwnedBranch::begin(&store).expect("begin");
             let sealed = seals
-                .seal(&store, ExecutionKey::new(1, vec![]), branch)
+                .seal(ExecutionKey::new(1, vec![]), branch)
                 .expect("seal");
             saves.push(
                 seals
@@ -1185,9 +1190,9 @@ mod tests {
             let writes = rows_for_block(&header, &transactions, &senders, &receipts, block_hash)
                 .expect("the block's parts agree");
 
-            let branch = store.begin(Some(store.head())).expect("begin");
+            let branch = OwnedBranch::begin(&store).expect("begin");
             let sealed = seals
-                .seal(&store, ExecutionKey::new(height, vec![]), branch)
+                .seal(ExecutionKey::new(height, vec![]), branch)
                 .expect("seal");
             seals
                 .adopt(&store, height, block_hash.0, sealed.state_root, &writes)
