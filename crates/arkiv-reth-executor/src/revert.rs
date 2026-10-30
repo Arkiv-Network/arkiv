@@ -65,6 +65,16 @@ pub fn revert_data(reason: &RevertReason) -> Bytes {
             entityKey: B256::from(*key),
         }
         .abi_encode(),
+        RevertReason::ExpiryBeyondMaxLifetime {
+            target,
+            current_block,
+            max_lifetime,
+        } => E::ExpiryBeyondMaxLifetime {
+            target: *target,
+            currentBlock: *current_block,
+            maxLifetime: *max_lifetime,
+        }
+        .abi_encode(),
         // No ABI counterpart — the standard `Error(string)` keeps them readable.
         RevertReason::AlreadyExists { .. } | RevertReason::OutOfGas => {
             Revert::from(reason.to_string()).abi_encode()
@@ -185,6 +195,21 @@ mod tests {
 
         let data = revert_data(&RevertReason::ReadOnly { key });
         assert_eq!(selector(&data), E::ReadOnlyEntity::SELECTOR);
+
+        let data = revert_data(&RevertReason::ExpiryBeyondMaxLifetime {
+            target: u64::MAX,
+            current_block: 7,
+            max_lifetime: 7_884_000,
+        });
+        assert_eq!(selector(&data), E::ExpiryBeyondMaxLifetime::SELECTOR);
+        let decoded = E::ExpiryBeyondMaxLifetime::abi_decode(&data).unwrap();
+        assert_eq!(
+            decoded.target,
+            u64::MAX,
+            "permanent expiry survives the ABI"
+        );
+        assert_eq!(decoded.currentBlock, 7);
+        assert_eq!(decoded.maxLifetime, 7_884_000);
     }
 
     #[test]

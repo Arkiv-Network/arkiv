@@ -70,10 +70,13 @@ pub struct SimulateArgs {
     #[arg(long, default_value_t = 5)]
     pub max_ops_per_tx: usize,
 
-    /// Op weights, e.g. "create=4,update=3,extend=2,transfer=1,delete=1".
+    /// Op weights, e.g. "create=4,patch=3,extendExpiry=2,transfer=1,delete=1".
     /// EXPIRE is event-driven (fires when an entity passes expiry) and
     /// has no weight.
-    #[arg(long, default_value = "create=4,update=3,extend=2,transfer=1,delete=1")]
+    #[arg(
+        long,
+        default_value = "create=4,patch=3,extendExpiry=2,transfer=1,delete=1"
+    )]
     pub weights: String,
 
     /// Cap on simultaneously-tracked alive entities. CREATE is throttled

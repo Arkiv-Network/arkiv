@@ -42,6 +42,8 @@ pub enum ViewError {
     NotTheTip,
     /// A frame was merged or discarded without one being open.
     NoOpenFrame,
+    /// A frame was begun while one was already open. Frames do not nest.
+    FrameAlreadyOpen,
     /// The operation isn't available on this host.
     Unsupported(&'static str),
     /// The view cannot graduate — see [`StateView::graduate`].
@@ -146,8 +148,22 @@ impl<S: Store> GolemStateView<S> {
     ///
     /// A reverted transaction keeps its fee accounting and loses its entity
     /// ops, which is a checkpoint between the two and a rollback that reaches
-    /// only the ops.
+    /// only the ops. So account writes belong outside the frame: a host may
+    /// mirror them into state a rollback does not reach.
+    ///
+    /// One frame per transaction, and frames do not nest: a second
+    /// `begin_frame` is [`ViewError::FrameAlreadyOpen`]. The store's
+    /// checkpoints stack, but a merge cannot remove one, so discarding an
+    /// outer frame after merging an inner one would roll back only the inner
+    /// writes. Arkiv never needs nesting, so it is refused, not half-supported.
+    ///
+    /// Costs are not rolled back. Receipts are return values, never view
+    /// state, so what the calls inside a frame cost stays with the caller after
+    /// [`discard_frame`](Self::discard_frame): GolemDB charges rolled-back work.
     pub fn begin_frame(&mut self) -> Result<(), ViewError> {
+        if !self.frames.is_empty() {
+            return Err(ViewError::FrameAlreadyOpen);
+        }
         self.store.checkpoint(self.branch)?;
         self.frames.push(self.staged.clone());
         Ok(())
@@ -257,6 +273,18 @@ impl<S: Store> StateView for GolemStateView<S> {
         true
     }
 
+    fn begin_frame(&mut self) -> Result<(), ViewError> {
+        GolemStateView::begin_frame(self)
+    }
+
+    fn merge_frame(&mut self) -> Result<(), ViewError> {
+        GolemStateView::merge_frame(self)
+    }
+
+    fn discard_frame(&mut self) -> Result<(), ViewError> {
+        GolemStateView::discard_frame(self)
+    }
+
     fn graduate(self, block: BlockRef) -> Result<StateCommit, <Self as StateView>::Error> {
         if self.is_dirty() {
             return Err(ViewError::Graduate("staged writes remain uncommitted"));
@@ -332,6 +360,7 @@ pub(crate) mod tests {
         assert!(
             view.get_entity([2; 32], ReadMode::ViewWithOverlay)
                 .unwrap()
+                .value
                 .is_some(),
             "the frame sees its own writes"
         );
@@ -339,7 +368,9 @@ pub(crate) mod tests {
 
         assert_eq!(view.digest().unwrap(), before, "the digest is unmoved");
         assert_eq!(
-            view.get_entity([2; 32], ReadMode::ViewWithOverlay).unwrap(),
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .value,
             None,
             "the frame's entity is gone"
         );
@@ -366,36 +397,70 @@ pub(crate) mod tests {
 
         assert_eq!(view.open_frames(), 0);
         assert_eq!(
-            view.get_entity([2; 32], ReadMode::ViewWithOverlay).unwrap(),
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .value,
             Some(entity_of(2)),
         );
         assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
     }
 
+    /// A refused `begin_frame` must not checkpoint the store either, or the
+    /// discard that follows would roll back only what came after it.
     #[test]
-    fn frames_nest_and_an_inner_discard_spares_the_outer() {
+    fn frames_do_not_nest() {
         let mut view = view();
         view.begin_frame().unwrap();
         view.update_entity(EntityUpdates::create(entity_of(1)))
             .unwrap();
 
-        view.begin_frame().unwrap();
-        view.update_entity(EntityUpdates::create(entity_of(2)))
-            .unwrap();
-        assert_eq!(view.open_frames(), 2);
+        assert!(matches!(
+            view.begin_frame(),
+            Err(ViewError::FrameAlreadyOpen)
+        ));
+        assert_eq!(view.open_frames(), 1, "the open frame is untouched");
         view.discard_frame().unwrap();
 
         assert_eq!(
-            view.get_entity([1; 32], ReadMode::ViewWithOverlay).unwrap(),
+            view.get_entity([1; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .value,
+            None,
+            "the discard reaches back to the one real begin"
+        );
+        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+        assert_eq!(view.open_frames(), 0);
+    }
+
+    /// What a block does: one frame per transaction, one after another, each
+    /// kept or discarded on its own.
+    #[test]
+    fn frames_follow_one_another() {
+        let mut view = view();
+        view.begin_frame().unwrap();
+        view.update_entity(EntityUpdates::create(entity_of(1)))
+            .unwrap();
+        view.merge_frame().unwrap();
+
+        view.begin_frame().unwrap();
+        view.update_entity(EntityUpdates::create(entity_of(2)))
+            .unwrap();
+        view.discard_frame().unwrap();
+
+        assert_eq!(
+            view.get_entity([1; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .value,
             Some(entity_of(1)),
-            "the outer frame's write survives the inner discard"
+            "the kept transaction's write survives the next one's discard"
         );
         assert_eq!(
-            view.get_entity([2; 32], ReadMode::ViewWithOverlay).unwrap(),
+            view.get_entity([2; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .value,
             None,
         );
-        view.merge_frame().unwrap();
-        assert_eq!(view.open_frames(), 0);
+        assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
     }
 
     #[test]

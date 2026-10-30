@@ -23,8 +23,7 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
-use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
-use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
+use arkiv_interfaces::constants::MAX_STR_BYTES;
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -937,6 +936,43 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(in_order(&sorted_rest), keys(&[1]));
     assert!(sorted_rest.get("cursor").is_none());
 
+    // An offset starts the page-through further in, and its cursor carries on
+    // from there. The count is still the whole match set.
+    let skipped = client
+        .query_raw(
+            by_rank_desc,
+            serde_json::json!({
+                "select": { "key": true, "count": true },
+                "limit": 2,
+                "offset": "0x1",
+            }),
+        )
+        .await
+        .expect("a page past the first match");
+    assert_eq!(in_order(&skipped), keys(&[3, 2]));
+    assert_eq!(skipped["count"], "0x4", "the match set, not the offset");
+    let skipped_rest = client
+        .query_raw(
+            by_rank_desc,
+            serde_json::json!({
+                "select": { "key": true, "count": true },
+                "limit": 2,
+                "cursor": skipped["cursor"],
+            }),
+        )
+        .await
+        .expect("the page after an offset one");
+    assert_eq!(in_order(&skipped_rest), keys(&[1]));
+    assert!(skipped_rest.get("cursor").is_none());
+
+    // Past the last match, the page is empty and there is no next one.
+    let past_end = client
+        .query_raw(by_rank_desc, serde_json::json!({ "offset": 4 }))
+        .await
+        .expect("an offset past the last match");
+    assert_eq!(past_end["data"], serde_json::json!([]));
+    assert!(past_end.get("cursor").is_none());
+
     // A user attribute names the type to sort it as; a count sets the order
     // aside.
     let untyped = client
@@ -1663,8 +1699,9 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
 }
 
 /// Keys a caller can name where GolemDB holds a record that is not an entity:
-/// an account's and GolemDB's own. An operation there reverts and a view call is
-/// mined; a store fault instead fails every block built while it is pooled.
+/// an account's and GolemDB's own model/system records. An operation there
+/// reverts and a view call is mined; a store fault instead fails every block
+/// built while it is pooled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_that_hold_no_entity_find_none() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
@@ -1684,15 +1721,25 @@ async fn keys_that_hold_no_entity_find_none() {
     let nonce = transactions().await;
 
     let account = B256::left_padding_from(caller.as_slice());
+    // Written at genesis, beside the entities.
     // `#recordKeys` holds a cell for every record in the store.
-    let golemdb = [b"#params".as_slice(), b"#recordKeys"].map(B256::right_padding_from);
-    let keys = [account, golemdb[0], golemdb[1]];
+    let golemdb = [
+        b"#params".as_slice(),
+        b"#recordKeys",
+        b"@meteringModel",
+        b"@modelWeight",
+    ]
+    .map(B256::right_padding_from);
+    let keys = [account, golemdb[0], golemdb[1], golemdb[2], golemdb[3]];
 
-    let mut ops = vec![
-        patch_payload(account, Bytes::from_static(b"x")),
-        Operation::extend_expiry(account, 0, 5000),
-        Operation::transfer_ownership(account, Address::repeat_byte(0xbb)),
-    ];
+    let mut ops = Vec::new();
+    for key in [account] {
+        ops.extend([
+            patch_payload(key, Bytes::from_static(b"x")),
+            Operation::extend_expiry(key, 0, 5000),
+            Operation::transfer_ownership(key, Address::repeat_byte(0xbb)),
+        ]);
+    }
     ops.extend(keys.map(Operation::delete));
     for op in &ops {
         assert!(
@@ -1792,19 +1839,11 @@ fn genesis_json() -> serde_json::Value {
 /// `config.arkiv` giving GolemDB `hash_function`, Arkiv's limits and free
 /// metering prices.
 fn arkiv_section(hash_function: &str) -> serde_json::Value {
-    serde_json::json!({ "golemdb": {
-        "hash_function": hash_function,
-        "cell_limits": {
-            "max_cell_name_len": MAX_ATTRIBUTE_NAME_BYTES,
-            "max_str_len": MAX_STR_BYTES,
-            "max_bytes_len": MAX_BYTES_VALUE_LEN
-        },
-        "record_limits": {
-            "max_cells": MAX_RECORD_CELLS,
-            "max_indexed_cells": MAX_RECORD_INDEXED_CELLS
-        },
-        "metering": arkiv_golemdb::PricingConfig::zero()
-    } })
+    let mut genesis: serde_json::Value =
+        serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+    let mut arkiv = genesis["config"]["arkiv"].take();
+    arkiv["golemdb"]["hash_function"] = hash_function.into();
+    arkiv
 }
 
 /// Write `genesis` to a file of this test's own and return its path.
@@ -1834,6 +1873,7 @@ async fn refusal(node: &mut arkiv_harness::Node) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn base_fee_floor_follows_the_genesis_file() {
     let mut genesis = genesis_json();
+    genesis["config"]["arkiv"] = arkiv_section("keccak-256");
     genesis["baseFeePerGas"] = "0xa".into();
     let genesis_path = genesis_file(&genesis);
 
@@ -1850,6 +1890,71 @@ async fn base_fee_floor_follows_the_genesis_file() {
     assert_eq!(fees, vec![10; 7], "the floor is the genesis baseFeePerGas");
 }
 
+/// The lifetime bound is the genesis file's: a chain whose fee schedule allows
+/// 1,000 blocks takes a create for exactly that, and refuses one block more
+/// with `ExpiryBeyondMaxLifetime`, naming the configured bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lifetime_bound_follows_the_genesis_file() {
+    use alloy_sol_types::SolError;
+
+    let mut genesis = genesis_json();
+    genesis["config"]["arkiv"] = arkiv_section("keccak-256");
+    genesis["config"]["arkiv"]["golemdb"]["metering"]["weights"]["host.arkiv.max_lifetime"] =
+        1_000.into();
+    let genesis_path = genesis_file(&genesis);
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .chain(&genesis_path)
+        .golemdb_store()
+        .spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+
+    let receipt = client
+        .execute(vec![create_op(
+            1_000,
+            Bytes::from_static(b"at the bound"),
+            vec![],
+        )])
+        .await;
+    assert!(receipt.status(), "a create for exactly max_lifetime lands");
+
+    let calldata = IEntityRegistry::executeCall {
+        ops: vec![create_op(1_001, Bytes::from_static(b"beyond"), vec![])],
+    }
+    .abi_encode();
+    let err = client
+        .provider()
+        .raw_request::<_, Bytes>(
+            "eth_call".into(),
+            (
+                serde_json::json!({
+                    "from": caller,
+                    "to": ARKIV_ADDRESS,
+                    "data": format!("0x{}", alloy_primitives::hex::encode(&calldata)),
+                }),
+                "latest",
+            ),
+        )
+        .await
+        .expect_err("one block more must revert")
+        .to_string();
+    let _ = std::fs::remove_file(&genesis_path);
+    assert!(
+        err.contains(&alloy_primitives::hex::encode(
+            IEntityRegistry::ExpiryBeyondMaxLifetime::SELECTOR
+        )),
+        "expected ExpiryBeyondMaxLifetime revert data, got: {err}"
+    );
+    assert!(
+        err.contains(&alloy_primitives::hex::encode(B256::from(U256::from(
+            1_000
+        )))),
+        "the revert names the genesis file's bound: {err}"
+    );
+}
+
 /// GolemDB's settings follow the genesis file: a chain on Blake3 runs and takes
 /// writes. Its store then refuses the same file on Keccak-256, and opens again
 /// for the right file.
@@ -1861,6 +1966,8 @@ async fn golemdb_settings_follow_the_genesis_file() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .chain(&genesis_path)
         .golemdb_store()
+        .arg("--log.stdout.filter")
+        .arg("arkiv-reth=info")
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
@@ -1917,6 +2024,10 @@ async fn a_bad_arkiv_section_stops_the_node() {
     let mut limits = genesis_json();
     limits["config"]["arkiv"] = arkiv_section("keccak-256");
     limits["config"]["arkiv"]["golemdb"]["cell_limits"]["max_str_len"] = (MAX_STR_BYTES / 2).into();
+    let mut no_lifetime = genesis_json();
+    no_lifetime["config"]["arkiv"] = arkiv_section("keccak-256");
+    no_lifetime["config"]["arkiv"]["golemdb"]["metering"]["weights"]["host.arkiv.max_lifetime"] =
+        0.into();
     let mut segments = genesis_json();
     segments["config"]["arkiv"] = arkiv_section("keccak-256");
     segments["config"]["arkiv"]["golemdb"]["immutable_data"] =
@@ -1926,6 +2037,10 @@ async fn a_bad_arkiv_section_stops_the_node() {
         (top_level, "no config.arkiv.golemdb"),
         (misnamed, "unknown field `hash_fn`"),
         (limits, "must be Arkiv's limits"),
+        (
+            no_lifetime,
+            "config.arkiv.golemdb.metering: Zero(\"host.arkiv.max_lifetime\")",
+        ),
         (segments, "the node declares its own segments"),
     ] {
         let genesis_path = genesis_file(&genesis);
@@ -1967,6 +2082,7 @@ async fn a_golemdb_store_with_another_genesis_root_is_refused() {
     let genesis: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(example).unwrap()).unwrap();
     let config = arkiv_golemdb::GolemDbConfig {
+        host_schemas: vec![arkiv_reth_chainspec::host_metering_schema()],
         genesis: serde_json::from_value(genesis["config"]["arkiv"]["golemdb"].clone()).unwrap(),
         segments: segments::ALL
             .iter()
@@ -2062,6 +2178,588 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
     );
 }
 
+/// The pool end to end: a create's storage share of the base fee and the
+/// value it is sent reach the balance of `ARKIV_ADDRESS`, the tip reaches the
+/// beneficiary, and the sender pays value plus `gas_used × effectiveGasPrice`,
+/// on GolemDB.
+///
+/// The create carries one indexed attribute, `tag = "blue"`, and lives 1,000
+/// blocks. Its record weighs 1,195 units: the empty record's 1,042 and the
+/// attribute's 153, its cell and its index entry. At the dev chain's 14
+/// micro-gas per unit-block that is 16.73 gas, rounded up to 17, so the pool
+/// rises by `17 × base_fee + value`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pool_receives_the_storage_share_and_the_value() {
+    // Only GolemDB reports record sizes; the in-memory mock reports none.
+    for golemdb in [true] {
+        let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"));
+        let builder = if golemdb {
+            builder.golemdb_store()
+        } else {
+            builder
+        };
+        let mut node = builder.spawn();
+        let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+        let caller = signer.address();
+        let client = connect(&node.http_url(), signer);
+        node.wait_ready(&client, READY).await;
+        let store = if golemdb { "GolemDB" } else { "memory" };
+
+        let provider = client.provider();
+        const FEE_CAP: u128 = 3_000_000_000;
+        const TIP: u128 = 1_000_000_000;
+        const VALUE: u128 = 1_000;
+        const STORAGE_GAS: u128 = 17;
+        let pool_before = provider.get_balance(ARKIV_ADDRESS).await.unwrap();
+        let sender_before = provider.get_balance(caller).await.unwrap();
+
+        let tag = Attribute::from_value(
+            Ident32::encode("tag").unwrap(),
+            &AttributeValue::Str("blue".into()),
+            true,
+        )
+        .unwrap();
+        let receipt = IEntityRegistry::new(ARKIV_ADDRESS, provider)
+            .execute(vec![Operation::create(0, 0, 1_000, 0, vec![tag])])
+            .value(U256::from(VALUE))
+            .max_fee_per_gas(FEE_CAP)
+            .max_priority_fee_per_gas(TIP)
+            .send()
+            .await
+            .expect("the pool accepts a create with value")
+            .get_receipt()
+            .await
+            .expect("mined");
+        assert!(receipt.status(), "{store}: the create succeeds");
+
+        let block = provider
+            .get_block_by_number(receipt.block_number.expect("mined").into())
+            .await
+            .unwrap()
+            .expect("the receipt's block exists");
+        let base_fee = u128::from(block.header.base_fee_per_gas.expect("post-London"));
+        let gas_used = u128::from(receipt.gas_used);
+        let effective = receipt.effective_gas_price;
+        assert_eq!(effective, (base_fee + TIP).min(FEE_CAP), "{store}");
+
+        let pool_after = provider.get_balance(ARKIV_ADDRESS).await.unwrap();
+        assert_eq!(
+            pool_after - pool_before,
+            U256::from(STORAGE_GAS * base_fee + VALUE),
+            "{store}: the pool gets base_fee × storage_gas + value",
+        );
+        let sender_after = provider.get_balance(caller).await.unwrap();
+        assert_eq!(
+            sender_before - sender_after,
+            U256::from(VALUE + gas_used * effective),
+            "{store}: the sender pays value + gas_used × effectiveGasPrice",
+        );
+        // The dev miner picks a fresh random beneficiary per block, so its
+        // balance is exactly this block's tips.
+        let tips = provider
+            .get_balance(block.header.beneficiary)
+            .await
+            .unwrap();
+        assert_eq!(
+            tips,
+            U256::from(gas_used * (effective - base_fee)),
+            "{store}: the beneficiary gets the tip; the rest of the base fee is burned",
+        );
+    }
+}
+
+/// One entity transaction's fee, split as the executor charged it. Storage gas
+/// is read off the pool: it rises by `base_fee × storage_gas` and nothing else
+/// when the transaction carries no value. Purge gas is 0: iteration 1 collects
+/// no purge reserve, so nothing outside shows it. Compute is the rest of
+/// `gasUsed`.
+struct FeeBreakdown {
+    block: u64,
+    gas_used: u128,
+    compute_gas: u128,
+    storage_gas: u128,
+    purge_gas: u128,
+    effective_gas_price: u128,
+}
+
+/// Send `ops` as one transaction and split what it paid.
+async fn send_and_break_down(
+    client: &ArkivClient<impl Provider + Clone>,
+    ops: Vec<Operation>,
+) -> FeeBreakdown {
+    let pool_before = client.provider().get_balance(ARKIV_ADDRESS).await.unwrap();
+    let receipt = client.execute(ops).await;
+    break_down(client, &receipt, pool_before).await
+}
+
+/// Send `ops` as one transaction with gas limit `gas` rather than an estimate,
+/// and split what it paid, whether it succeeded or not.
+async fn send_with_gas_and_break_down(
+    client: &ArkivClient<impl Provider + Clone>,
+    ops: Vec<Operation>,
+    gas: u64,
+) -> (bool, FeeBreakdown) {
+    let pool_before = client.provider().get_balance(ARKIV_ADDRESS).await.unwrap();
+    let receipt = IEntityRegistry::new(ARKIV_ADDRESS, client.provider())
+        .execute(ops)
+        .gas(gas)
+        .send()
+        .await
+        .expect("the pool accepts the transaction")
+        .get_receipt()
+        .await
+        .expect("mined");
+    (
+        receipt.status(),
+        break_down(client, &receipt, pool_before).await,
+    )
+}
+
+/// Estimate `ops` twice in a row. A probe's writes are discarded, so the
+/// second estimate sees what the first did: the same two numbers.
+async fn estimate_twice(client: &ArkivClient<impl Provider + Clone>, ops: Vec<Operation>) -> u64 {
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+    let first = registry.execute(ops.clone()).estimate_gas().await.unwrap();
+    let second = registry.execute(ops).estimate_gas().await.unwrap();
+    assert_eq!(first, second, "an estimate does not see the one before it");
+    first
+}
+
+/// Split what the transaction behind `receipt` paid, the pool holding
+/// `pool_before` before it.
+async fn break_down(
+    client: &ArkivClient<impl Provider + Clone>,
+    receipt: &alloy_rpc_types::TransactionReceipt,
+    pool_before: U256,
+) -> FeeBreakdown {
+    let provider = client.provider();
+    let block = receipt.block_number.expect("mined");
+    let base_fee = u128::from(
+        provider
+            .get_block_by_number(block.into())
+            .await
+            .unwrap()
+            .expect("the receipt's block exists")
+            .header
+            .base_fee_per_gas
+            .expect("post-London"),
+    );
+    let pool_credit: u128 = (provider.get_balance(ARKIV_ADDRESS).await.unwrap() - pool_before)
+        .try_into()
+        .unwrap();
+    assert_eq!(pool_credit % base_fee, 0, "the pool gets whole storage gas");
+    let gas_used = u128::from(receipt.gas_used);
+    let storage_gas = pool_credit / base_fee;
+    let purge_gas = 0;
+    FeeBreakdown {
+        block,
+        gas_used,
+        compute_gas: gas_used - storage_gas - purge_gas,
+        storage_gas,
+        purge_gas,
+        effective_gas_price: receipt.effective_gas_price,
+    }
+}
+
+/// GLM, the native token, has 18 decimals like ether: 1 GLM is 10¹⁸ wei.
+const GLM_DECIMALS: u32 = 18;
+/// The rate the fee table prints in USD, 1 GLM = 0.1 USD: one more decimal.
+const USD_PER_GLM_DECIMALS: u32 = 1;
+
+/// Extend, transfer and delete leave an entity's attributes alone, so their
+/// compute does not grow with them. On GolemDB, where a read is charged by the
+/// byte, an entity with 100 KiB of payload costs what one with 16 bytes does;
+/// the storage an extend buys does grow with it, and is not compute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ops_that_leave_the_attributes_alone_cost_the_same_however_large_the_entity() {
+    let (_node, client, _, _) = spawn_on(true).await;
+    let mut keys = Vec::new();
+    for size in [16, 100 * 1024, 16, 100 * 1024] {
+        let create = create_op(5000, Bytes::from(vec![0x5a; size]), vec![]);
+        keys.push(created_key(&client.execute(vec![create]).await));
+    }
+    let (small, large) = (keys[0], keys[1]);
+    let pairs = [
+        (
+            "extend",
+            Operation::extend_expiry(small, 0, 10_000),
+            Operation::extend_expiry(large, 0, 10_000),
+        ),
+        // Each to an owner of its own, so both join a new index term.
+        (
+            "transfer",
+            Operation::transfer_ownership(small, Address::repeat_byte(0xb1)),
+            Operation::transfer_ownership(large, Address::repeat_byte(0xb2)),
+        ),
+        (
+            "delete",
+            Operation::delete(keys[2]),
+            Operation::delete(keys[3]),
+        ),
+    ];
+    for (op, on_small, on_large) in pairs {
+        let small = send_and_break_down(&client, vec![on_small])
+            .await
+            .compute_gas;
+        let large = send_and_break_down(&client, vec![on_large])
+            .await
+            .compute_gas;
+        // Only the calldata differs, in the keys' bytes.
+        assert!(
+            small.abs_diff(large) < 1_000,
+            "{op}: {small} compute gas on the small entity, {large} on the large one"
+        );
+    }
+}
+
+/// The key of the entity the transaction behind `receipt` created.
+fn created_key(receipt: &alloy_rpc_types::TransactionReceipt) -> B256 {
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.inner.address == ARKIV_ADDRESS)
+        .find_map(|log| IEntityRegistry::EntityCreated::decode_log(&log.inner).ok())
+        .expect("an EntityCreated log")
+        .entityKey
+}
+
+/// `amount` in units of `10^decimals`, exactly, without trailing zeros.
+fn decimal(amount: u128, decimals: u32) -> String {
+    let unit = 10u128.pow(decimals);
+    let fraction = format!("{:0width$}", amount % unit, width = decimals as usize);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        format!("{}", amount / unit)
+    } else {
+        format!("{}.{fraction}", amount / unit)
+    }
+}
+
+/// Storage gas for `units` kept for `blocks` at the dev chain's capacity rate
+/// of 14 micro-gas per unit-block, rounded up once.
+fn storage_gas(units: u128, blocks: u128) -> u128 {
+    (units * blocks * 14).div_ceil(1_000_000)
+}
+
+/// A node on the in-process store or on GolemDB, a signing client for the first
+/// dev key, its address, and the store's name for the output.
+async fn spawn_on(
+    golemdb: bool,
+) -> (
+    arkiv_harness::Node,
+    ArkivClient<impl Provider + Clone>,
+    Address,
+    &'static str,
+) {
+    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"));
+    let builder = if golemdb {
+        builder.golemdb_store()
+    } else {
+        builder
+    };
+    let mut node = builder.spawn();
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let caller = signer.address();
+    let client = connect(&node.http_url(), signer);
+    node.wait_ready(&client, READY).await;
+    (
+        node,
+        client,
+        caller,
+        if golemdb { "GolemDB" } else { "memory" },
+    )
+}
+
+/// The key `caller`'s next create mints, from its minting nonce, and the nonce.
+async fn predict_key(client: &ArkivClient<impl Provider + Clone>, caller: Address) -> (u64, B256) {
+    let nonce = IEntityRegistry::new(ARKIV_ADDRESS, client.provider())
+        .entityNonce(caller)
+        .call()
+        .await
+        .unwrap();
+    let key = B256::from(derive_entity_address(
+        DEV_CHAIN_ID,
+        &caller.into_array(),
+        EntityCreationNonce::new(nonce),
+        0,
+    ));
+    (nonce, key)
+}
+
+/// A string attribute.
+fn str_attr(name: &str, value: &str, indexed: bool) -> Attribute {
+    Attribute::from_value(
+        Ident32::encode(name).unwrap(),
+        &AttributeValue::Str(value.into()),
+        indexed,
+    )
+    .unwrap()
+}
+
+/// The fee table's header, for `store`.
+fn print_fee_header(store: &str) {
+    println!(
+        "[{store}] {:<9} {:>6} {:>10} {:>12} {:>12} {:>10} {:>18} {:>14} {:>14}",
+        "op",
+        "block",
+        "gas used",
+        "compute gas",
+        "storage gas",
+        "purge gas",
+        "fee (wei)",
+        "fee (GLM)",
+        "fee (USD)"
+    );
+}
+
+/// One row of the fee table.
+fn print_fee(store: &str, op: &str, fee: &FeeBreakdown) {
+    let wei = fee.gas_used * fee.effective_gas_price;
+    println!(
+        "[{store}] {op:<9} {:>6} {:>10} {:>12} {:>12} {:>10} {:>18} {:>14} {:>14}",
+        fee.block,
+        fee.gas_used,
+        fee.compute_gas,
+        fee.storage_gas,
+        fee.purge_gas,
+        wei,
+        decimal(wei, GLM_DECIMALS),
+        decimal(wei, GLM_DECIMALS + USD_PER_GLM_DECIMALS),
+    );
+}
+
+/// A create, a patch and an extend of the entity it created, each its own
+/// signed transaction, on the in-process store and on GolemDB. The test predicts the
+/// entity's key before the create, and prints each transaction's fee split into
+/// compute and storage gas. Run it with `--no-capture` to see the output:
+///
+/// ```sh
+/// cargo nextest run -p arkiv-reth --test e2e --no-capture -- a_create_a_patch
+/// ```
+///
+/// Storage follows GolemDB's size rule: a cell is `(8 + name) + (1 + value)`
+/// bytes plus `c_cell` 64, and an index entry `name + 2 + value` plus `c_idx` 64.
+/// - The create buys 1,283 units for its 1,000 blocks: the empty record's 1,042,
+///   `tag = "blue"` indexed (cell 80, index entry 73) and `note = "hello world"`
+///   unindexed (88). That is 17.96 gas, so 18.
+/// - The patch adds `memo = "patched"` unindexed, 84 units, for the blocks the
+///   entity has left; nothing else it writes changes size.
+/// - The extend moves the expiry out by a month, 1,314,000 blocks at 2 seconds
+///   (a sixth of `max_lifetime`'s six months), and buys the whole record, now
+///   1,367 units, for those blocks only: 25,147.33 gas, so 25,148.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_a_patch_and_an_extend_show_their_compute_and_storage_gas() {
+    const LIFETIME: u64 = 1_000;
+    const MONTH: u64 = 1_314_000;
+    // Only GolemDB reports record sizes; the in-memory mock reports none.
+    for golemdb in [true] {
+        let (mut node, client, caller, store) = spawn_on(golemdb).await;
+        let attr = str_attr;
+        let print = |op: &str, fee: &FeeBreakdown| print_fee(store, op, fee);
+
+        let (nonce, key) = predict_key(&client, caller).await;
+        assert!(client.get_entity(key).await.is_null(), "{store}: not yet");
+        println!("[{store}] entity key {key:#x} predicted from minting nonce {nonce}");
+        print_fee_header(store);
+
+        let create = send_and_break_down(
+            &client,
+            vec![Operation::create(
+                0,
+                0,
+                LIFETIME,
+                0,
+                vec![
+                    attr("tag", "blue", true),
+                    attr("note", "hello world", false),
+                ],
+            )],
+        )
+        .await;
+        print("create", &create);
+        let entity = client.get_entity(key).await;
+        assert!(
+            !entity.is_null(),
+            "{store}: the create minted the predicted key"
+        );
+        assert_eq!(attr_value(&entity, "tag"), "blue", "{store}");
+        assert_eq!(attr_value(&entity, "note"), "hello world", "{store}");
+        let expires_at = hex_quantity(&entity["expiresAt"]);
+        assert_eq!(expires_at, create.block + LIFETIME, "{store}");
+        assert_eq!(
+            create.storage_gas,
+            storage_gas(1_283, u128::from(LIFETIME)),
+            "{store}: the create buys its record for its lifetime"
+        );
+
+        let patch = send_and_break_down(
+            &client,
+            vec![Operation::patch(key, vec![attr("memo", "patched", false)])],
+        )
+        .await;
+        print("patch", &patch);
+        let entity = client.get_entity(key).await;
+        assert_eq!(attr_value(&entity, "memo"), "patched", "{store}");
+        assert_eq!(attr_value(&entity, "note"), "hello world", "{store}");
+        assert_eq!(
+            patch.storage_gas,
+            storage_gas(84, u128::from(expires_at - patch.block)),
+            "{store}: the patch buys its growth for the blocks left"
+        );
+
+        let extend = send_and_break_down(
+            &client,
+            vec![Operation::extend_expiry(key, expires_at + MONTH, 0)],
+        )
+        .await;
+        print("extend", &extend);
+        let entity = client.get_entity(key).await;
+        assert_eq!(
+            hex_quantity(&entity["expiresAt"]),
+            expires_at + MONTH,
+            "{store}: a month later"
+        );
+        assert_eq!(
+            extend.storage_gas,
+            storage_gas(1_367, u128::from(MONTH)),
+            "{store}: the extend buys the record for the added blocks only"
+        );
+        node.terminate();
+    }
+}
+
+/// Estimates price storage like inclusion, each one isolated from the one
+/// before it, and a patch that shrinks an entity buys no storage, on the
+/// in-process store and on GolemDB. Run with `--no-capture` for the fee table.
+///
+/// Each growing operation is estimated twice: a probe whose writes outlived it
+/// would show the second estimate the first one's growth or extension, and price
+/// its storage at 0. Then it is sent with the estimate as its gas limit, which
+/// fails if the estimate left storage out.
+/// - The patch adds `memo = "patched"` unindexed, 84 units, for the blocks left.
+/// - The extend adds a month, 1,314,000 blocks, for the 1,367-unit record.
+/// - The second patch unsets `note = "hello world"`, 88 units: storage 0, and
+///   nothing refunded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn estimates_are_isolated_and_a_shrinking_patch_buys_no_storage() {
+    const LIFETIME: u64 = 1_000;
+    const MONTH: u64 = 1_314_000;
+    // Only GolemDB reports record sizes; the in-memory mock reports none.
+    for golemdb in [true] {
+        let (mut node, client, caller, store) = spawn_on(golemdb).await;
+        let (_, key) = predict_key(&client, caller).await;
+        print_fee_header(store);
+
+        let create = send_and_break_down(
+            &client,
+            vec![Operation::create(
+                0,
+                0,
+                LIFETIME,
+                0,
+                vec![
+                    str_attr("tag", "blue", true),
+                    str_attr("note", "hello world", false),
+                ],
+            )],
+        )
+        .await;
+        print_fee(store, "create", &create);
+        let expires_at = hex_quantity(&client.get_entity(key).await["expiresAt"]);
+
+        let grow = vec![Operation::patch(
+            key,
+            vec![str_attr("memo", "patched", false)],
+        )];
+        let estimate = estimate_twice(&client, grow.clone()).await;
+        let (ok, patch) = send_with_gas_and_break_down(&client, grow, estimate).await;
+        print_fee(store, "patch +", &patch);
+        assert!(ok, "{store}: the estimate covers the patch");
+        assert!(patch.gas_used <= u128::from(estimate), "{store}");
+        assert_eq!(
+            patch.storage_gas,
+            storage_gas(84, u128::from(expires_at - patch.block)),
+            "{store}: the patch buys its growth"
+        );
+
+        let extend = vec![Operation::extend_expiry(key, expires_at + MONTH, 0)];
+        let estimate = estimate_twice(&client, extend.clone()).await;
+        let (ok, extended) = send_with_gas_and_break_down(&client, extend, estimate).await;
+        print_fee(store, "extend", &extended);
+        assert!(ok, "{store}: the estimate covers the extend");
+        assert!(extended.gas_used <= u128::from(estimate), "{store}");
+        assert_eq!(
+            extended.storage_gas,
+            storage_gas(1_367, u128::from(MONTH)),
+            "{store}: the extend buys the added blocks"
+        );
+
+        let shrink = send_and_break_down(
+            &client,
+            vec![Operation::patch(
+                key,
+                vec![Attribute::tombstone(Ident32::encode("note").unwrap())],
+            )],
+        )
+        .await;
+        print_fee(store, "patch -", &shrink);
+        assert_eq!(shrink.storage_gas, 0, "{store}: a shrink buys nothing");
+        let entity = client.get_entity(key).await;
+        assert!(attr_value(&entity, "note").is_null(), "{store}: note unset");
+        assert_eq!(attr_value(&entity, "memo"), "patched", "{store}");
+        node.terminate();
+    }
+}
+
+/// A create whose storage gas does not fit its gas limit reverts out of gas:
+/// it pays all the gas it supplied, leaves no entity at the predicted key,
+/// mints nothing, and credits the pool nothing. On the in-process store and on
+/// GolemDB; run with `--no-capture` for the fee table.
+///
+/// The gas limit is the estimate of the same create for a short lifetime, plus
+/// 10,000. The two lifetimes, 0x010000 and 0x6a0000 blocks, take one non-zero
+/// calldata byte each, so the creates' compute is the same; storage is not: the
+/// record's 2,216 units (the empty record's 1,042, `contentType` 94 and a
+/// 1,000-byte `payload` 1,080) cost about 2,000 gas for 65,536 blocks and about
+/// 215,500 for 6,946,816.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_that_does_not_fit_runs_a_create_out_of_gas() {
+    const SHORT: u64 = 0x01_0000;
+    const LONG: u64 = 0x6a_0000;
+    let payload = Bytes::from(vec![0xab; 1_000]);
+    // Only GolemDB reports record sizes; the in-memory mock reports none.
+    for golemdb in [true] {
+        let (mut node, client, caller, store) = spawn_on(golemdb).await;
+        let (nonce, key) = predict_key(&client, caller).await;
+        print_fee_header(store);
+
+        let short = estimate_twice(&client, vec![create_op(SHORT, payload.clone(), vec![])]).await;
+        let gas = short + 10_000;
+        let (ok, create) = send_with_gas_and_break_down(
+            &client,
+            vec![create_op(LONG, payload.clone(), vec![])],
+            gas,
+        )
+        .await;
+        print_fee(store, "create", &create);
+        assert!(!ok, "{store}: the create reverts");
+        assert_eq!(
+            create.gas_used,
+            u128::from(gas),
+            "{store}: out of gas pays all"
+        );
+        assert_eq!(create.storage_gas, 0, "{store}: the pool gets nothing");
+        assert!(client.get_entity(key).await.is_null(), "{store}: no entity");
+        assert_eq!(
+            predict_key(&client, caller).await.0,
+            nonce,
+            "{store}: nothing minted"
+        );
+        node.terminate();
+    }
+}
+
 /// A transaction and its receipt read back by hash from the append-only tier,
 /// with every other source of the answer removed.
 ///
@@ -2073,29 +2771,22 @@ async fn eip1559_sender_pays_the_effective_price_and_the_beneficiary_gets_the_ti
 ///   transaction is always a cache hit.
 /// * **A store that outlives the process.** The default in-process store does
 ///   not, so after a restart the tier would be empty and the provider would
-///   fall back to reth. Hence Valkey.
+///   fall back to reth. Hence GolemDB on disk.
 /// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50.
 ///   Below it reth has written nothing to its own database, so a restart
 ///   loses the block entirely and there is nothing to read either way.
 ///
-/// Ignored by default because it needs a server, like the store's own
-/// conformance tests:
+/// Ignored by default because it is slow: it waits out more than 50 blocks.
 ///
 /// ```sh
-/// VALKEY_URL=redis://127.0.0.1:6379 \
-///   cargo nextest run -p arkiv-reth --run-ignored only -- tier
+/// cargo nextest run -p arkiv-reth --run-ignored only -- tier
 /// ```
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a valkey server; set VALKEY_URL and run with --ignored"]
+#[ignore = "slow: waits out reth's persistence threshold; run with --ignored"]
 async fn a_transaction_and_receipt_are_read_from_the_tier() {
-    let url = std::env::var("VALKEY_URL").expect(
-        "this test needs the node on a store that survives a restart: \
-         set VALKEY_URL (for example redis://127.0.0.1:6379)",
-    );
-
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .block_time("50ms")
-        .valkey_store(url)
+        .golemdb_store()
         .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let client = connect(&node.http_url(), signer);

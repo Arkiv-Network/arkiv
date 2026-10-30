@@ -124,7 +124,6 @@ tempfile = "3"
 
 # Internal
 arkiv-interfaces = { path = "crates/arkiv-interfaces" }
-arkiv-valkey = { path = "crates/arkiv-valkey" }
 arkiv-rpc-types = { path = "crates/arkiv-rpc-types" }
 arkiv-query = { path = "crates/arkiv-query" }
 arkiv-genesis = { path = "crates/arkiv-genesis" }
@@ -137,6 +136,7 @@ arkiv-reth-rpc = { path = "crates/arkiv-reth-rpc" }
 arkiv-golemdb-state = { path = "crates/arkiv-golemdb-state" }
 arkiv-golemdb = { path = "crates/arkiv-golemdb" }
 arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
+arkiv-tokenomics = { path = "crates/arkiv-tokenomics" }
 
 # Copied from yagna (.cargo/config). A dev build without debug info or
 # incremental state, with dependencies optimized — much faster to link and to

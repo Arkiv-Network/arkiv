@@ -27,6 +27,32 @@ pub trait CostModel {
     fn query_cost(&self, stats: &QueryStats) -> Gas;
 }
 
+/// One transaction's gas, by what it pays for. Settlement, receipts and the
+/// fee estimate all read this one structure, so the three cannot disagree.
+///
+/// Plain data, here rather than with the arithmetic that fills it, so an
+/// execution result can carry it without depending on the pricing crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GasBreakdown {
+    /// The transaction terms, the operations and GolemDB's work, floored once
+    /// at the EIP-7623 minimum.
+    pub compute_gas: Gas,
+    /// The storage bought, rounded up once per transaction.
+    pub storage_gas: Gas,
+    /// The deletion reserve bought. Zero until purge reserves are collected.
+    pub purge_gas: Gas,
+}
+
+impl GasBreakdown {
+    /// `gas_used`: the three parts together, or `None` if they do not fit.
+    pub const fn total(&self) -> Option<Gas> {
+        match self.compute_gas.checked_add(self.storage_gas) {
+            Some(sum) => sum.checked_add(self.purge_gas),
+            None => None,
+        }
+    }
+}
+
 // --- Provisional schedule (non-final placeholder numbers) --------------------
 
 /// Base cost to create an entity.
@@ -114,6 +140,35 @@ impl CostModel for PlaceholderCost {
     }
 }
 
+/// The operation costs a node charges on top of its store's receipts.
+///
+/// [`PlaceholderCost`] stands in for stores that price nothing: the in-memory
+/// store and Valkey report a cost of 0 on every call. GolemDB prices every
+/// call with the weights of its genesis, so a node on it charges those alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpCost {
+    /// The provisional per-op schedule of [`PlaceholderCost`].
+    #[default]
+    Placeholder,
+    /// Nothing per op: the store's receipts carry the whole cost.
+    FromStore,
+}
+
+impl CostModel for OpCost {
+    fn op_cost(&self, op: &Op) -> Gas {
+        match self {
+            Self::Placeholder => PlaceholderCost.op_cost(op),
+            Self::FromStore => 0,
+        }
+    }
+
+    /// Queries serve RPC, not consensus, and keep the placeholder price
+    /// whatever the store.
+    fn query_cost(&self, stats: &QueryStats) -> Gas {
+        PlaceholderCost.query_cost(stats)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +233,26 @@ mod tests {
                 AttributeValue::Str("v".into()),
             )]),
             G_PATCH + G_BYTE
+        );
+    }
+
+    /// On a store that prices its calls, an op costs nothing beyond them; on
+    /// one that does not, the placeholder's price.
+    #[test]
+    fn op_costs_come_from_the_store_or_the_placeholder() {
+        let create = Op::Create {
+            key: [0u8; 32],
+            expires_at: 1,
+            creation_flags: CreationFlags::NONE,
+            attributes: vec![Attribute::new(
+                b"k".to_vec(),
+                AttributeValue::Str("ab".into()),
+            )],
+        };
+        assert_eq!(OpCost::FromStore.op_cost(&create), 0);
+        assert_eq!(
+            OpCost::Placeholder.op_cost(&create),
+            PlaceholderCost.op_cost(&create)
         );
     }
 

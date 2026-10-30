@@ -1,0 +1,14 @@
+[package]
+name = "arkiv-tokenomics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Arkiv's storage pricing as pure, checked arithmetic: storage units from a
+# record's size, storage time per operation and a transaction's gas meter. No
+# store, no host: the executor reads the inputs and applies
+# the results.
+
+[dependencies]
+arkiv-interfaces.workspace = true

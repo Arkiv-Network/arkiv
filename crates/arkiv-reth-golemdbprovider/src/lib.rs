@@ -1975,7 +1975,9 @@ pub struct ArkivProviderBuilder {
 }
 
 impl ArkivProviderBuilder {
-    /// Build providers over this store, promoting seals from this registry.
+    /// Build providers over this store, promoting seals from this registry and
+    /// seeding a fresh store with the chain's genesis accounts. GolemDB has
+    /// already persisted the pricing model when the store is opened.
     pub const fn new(
         store: HostStore,
         seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,

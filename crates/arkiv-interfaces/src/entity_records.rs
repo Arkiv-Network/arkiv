@@ -49,8 +49,9 @@ use alloc::vec::Vec;
 use crate::constants::ENTITY_MAX_ATTRIBUTES;
 use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
+use crate::statemanager::EntityUpdates;
 use crate::store::{
-    Cell, CellKind, CellName, ReadTarget, Record, RecordKey, Store, StoreError, TypeId,
+    Cell, CellKind, CellName, ReadTarget, Record, RecordKey, RecordMeta, Store, StoreError, TypeId,
 };
 
 /// The system cells of the layout above, which every entity record holds.
@@ -105,13 +106,18 @@ pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
 }
 
 /// The record key for an entity: its address, which is already 32 bytes. `None`
-/// for an account's key, where no entity is read or written.
+/// for a reserved key, where no entity is read or written.
 pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
-    if is_account_key(key) {
+    if is_reserved_key(key) {
         None
     } else {
         Some(RecordKey::from_entity(key))
     }
+}
+
+/// Account records must never be interpreted as entities.
+pub const fn is_reserved_key(key: EntityAddress) -> bool {
+    is_account_key(key)
 }
 
 /// Whether `key` is an account's: an address left-padded with twelve zero bytes.
@@ -194,6 +200,52 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         cells.push((CellName::from(name), cell));
     }
     Ok(cells)
+}
+
+/// The system cells and the record's `#meta`: a read projected on them gives
+/// [`from_record`] an entity without its attributes, and the record's size.
+/// What an op needs that reads an entity only to authorize and price itself.
+pub fn system_projection() -> Vec<CellName> {
+    [
+        annotations::KEY,
+        annotations::CREATOR,
+        annotations::OWNER,
+        annotations::CREATED_AT,
+        annotations::EXPIRES_AT,
+        annotations::UPDATED_AT,
+        annotations::CREATION_FLAGS,
+    ]
+    .into_iter()
+    .map(system)
+    .chain([CellName::from(RecordMeta::CELL)])
+    .collect()
+}
+
+/// The system cells `updates` sets, as [`to_cells`] encodes them. An update
+/// that leaves the attributes alone writes these and nothing else. The key
+/// never changes, so it is never among them.
+pub fn system_cells_set_by(updates: &EntityUpdates) -> Result<Vec<(CellName, Cell)>, RecordError> {
+    let mut entity = Entity::default();
+    updates.apply_to(&mut entity);
+    let set: Vec<CellName> = [
+        (annotations::CREATOR, updates.creator.is_some()),
+        (annotations::OWNER, updates.owner.is_some()),
+        (annotations::CREATED_AT, updates.created_at.is_some()),
+        (annotations::EXPIRES_AT, updates.expires_at.is_some()),
+        (annotations::UPDATED_AT, updates.updated_at.is_some()),
+        (
+            annotations::CREATION_FLAGS,
+            updates.creation_flags.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, is_set)| *is_set)
+    .map(|(name, _)| system(name))
+    .collect();
+    Ok(to_cells(&entity)?
+        .into_iter()
+        .filter(|(name, _)| set.contains(name))
+        .collect())
 }
 
 /// Read a cell of an expected type, or say which one was wrong.
@@ -336,6 +388,7 @@ mod tests {
             key: record_key(entity.key).unwrap(),
             version: RecordVersion(1),
             cells: to_cells(entity).expect("maps"),
+            meta: None,
         }
     }
 
@@ -475,5 +528,23 @@ mod tests {
         let level = record.cell("level").unwrap();
         assert_eq!(level.value, AttributeValue::Int(-7).encode());
         assert_ne!(level.value, AttributeValue::Int(-7).index_bytes());
+    }
+
+    /// No entity is read or written at a reserved key: an account's, or the fee
+    /// schedule's. Any other key is an entity's own.
+    #[test]
+    fn reserved_keys_have_no_entity_record() {
+        let mut account = [0u8; 32];
+        account[12..].copy_from_slice(&[0xaa; 20]);
+        for key in [account] {
+            assert!(is_reserved_key(key));
+            assert_eq!(record_key(key), None);
+        }
+        let mut near = [0x7b; 32];
+        near[31] ^= 1;
+        for key in [[0x11; 32], near] {
+            assert!(!is_reserved_key(key));
+            assert_eq!(record_key(key), Some(RecordKey::from_entity(key)));
+        }
     }
 }

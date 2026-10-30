@@ -94,7 +94,7 @@ pub(crate) fn arkiv_query_result(page: &golemdb::QueryPage) -> Result<QueryResul
 /// The filter as GolemDB's, node for node. Both evaluate children in the
 /// written order.
 ///
-/// Every predicate in the tree is checked against its type's index first, as
+/// Every predicate in the tree is checked against its type's index before conversion.
 fn golemdb_filter(filter: &Filter) -> Result<golemdb::Filter, StoreError> {
     if !answerable(filter) {
         return Err(StoreError::InvalidQuery);
@@ -706,6 +706,7 @@ mod tests {
             max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
         };
         let config = GolemDbConfig {
+            host_schemas: vec![],
             genesis: Genesis::new(
                 HashAlgorithm::Keccak256,
                 limits,

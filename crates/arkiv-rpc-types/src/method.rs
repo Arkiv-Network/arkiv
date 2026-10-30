@@ -20,8 +20,8 @@ pub const DEFAULT_PAGE_SIZE: u64 = 100;
 pub const MAX_PAGE_SIZE: u64 = 100;
 
 /// The `arkiv_query` options — the second positional param. The full call is
-/// `["<query>", { "atBlock": …, "select": …, "limit": …, "cursor": … }]`; the
-/// object and every field in it are optional.
+/// `["<query>", { "atBlock": …, "select": …, "limit": …, "offset": …,
+/// "cursor": … }]`; the object and every field in it are optional.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryOptions {
@@ -33,6 +33,9 @@ pub struct QueryOptions {
     /// Page size, hex or JSON number. Resolved by [`resolve_limit`].
     #[serde(default, deserialize_with = "de_u64_flexible")]
     pub limit: Option<u64>,
+    /// Matches to skip before the page, hex or JSON number; absent means none.
+    #[serde(default, deserialize_with = "de_u64_flexible")]
+    pub offset: Option<u64>,
     /// Opaque cursor from the previous page, bound to its query, block and
     /// projection. Clients must not parse it.
     pub cursor: Option<String>,
@@ -167,6 +170,18 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "limit": 100 })).unwrap();
         assert_eq!(hex.limit, Some(100));
         assert_eq!(number.limit, Some(100));
+    }
+
+    #[test]
+    fn query_options_accept_an_offset_in_either_spelling() {
+        let hex: QueryOptions =
+            serde_json::from_value(serde_json::json!({ "offset": "0x2a" })).unwrap();
+        let number: QueryOptions =
+            serde_json::from_value(serde_json::json!({ "offset": 42 })).unwrap();
+        let absent: QueryOptions = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(hex.offset, Some(42));
+        assert_eq!(number.offset, Some(42));
+        assert_eq!(absent.offset, None);
     }
 
     #[test]

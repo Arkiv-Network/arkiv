@@ -1,11 +1,10 @@
 //! Arkiv's entity executor — the business logic, host-agnostic. All-or-nothing:
-//! ops stage into a private overlay and only reach the view (as net
-//! [`EntityUpdates`]) if every one succeeds. A business-rule violation is a
-//! *revert*, not an [`Err`] — errors are host/store faults.
+//! a batch runs in one frame on the view's branch, each op writing as it runs,
+//! and only a batch whose every op succeeds keeps its writes. A business-rule
+//! violation is a *revert*, not an [`Err`] — errors are host/store faults.
 
 use core::fmt;
 use core::marker::PhantomData;
-use std::collections::BTreeMap;
 
 use arkiv_interfaces::constants::ENTITY_MAX_ATTRIBUTES;
 use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity};
@@ -14,9 +13,13 @@ use arkiv_interfaces::execution::{
     AttributeMutation, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
     TransactionExecutor,
 };
-use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
-use arkiv_interfaces::primitives::{BlockNumber, EntityAddress, EntityCreationNonce, UserAddress};
-use arkiv_interfaces::statemanager::{EntityUpdates, ReadMode, StateView};
+use arkiv_interfaces::gas::{CostModel, GasBreakdown, PlaceholderCost};
+use arkiv_interfaces::primitives::{
+    BlockNumber, EntityAddress, EntityCreationNonce, Gas, UserAddress,
+};
+use arkiv_interfaces::statemanager::{EntityUpdates, ReadMode, StateView, StoredEntity};
+use arkiv_interfaces::store::{CostUnits, Metered, Receipt, RecordMeta, WriteDetails};
+use arkiv_tokenomics::{FeeSchedule, GasMeter, Overflow, storage_time, units};
 
 /// What a successfully-applied op did — enough for the host to emit its
 /// entity-operation log.
@@ -35,43 +38,53 @@ pub struct OpEffect {
 
 pub struct ArkivExecutor<V, C = PlaceholderCost> {
     cost: C,
+    /// The block's fee schedule, which storage is priced with.
+    schedule: FeeSchedule,
     _state: PhantomData<fn() -> V>,
 }
 
 impl<V> ArkivExecutor<V, PlaceholderCost> {
-    pub const fn new() -> Self {
-        Self {
-            cost: PlaceholderCost,
-            _state: PhantomData,
-        }
+    pub const fn new(schedule: FeeSchedule) -> Self {
+        Self::with_cost(PlaceholderCost, schedule)
     }
 }
 
 impl<V, C> ArkivExecutor<V, C> {
-    pub const fn with_cost(cost: C) -> Self {
+    pub const fn with_cost(cost: C, schedule: FeeSchedule) -> Self {
         Self {
             cost,
+            schedule,
             _state: PhantomData,
         }
     }
-}
 
-impl<V> Default for ArkivExecutor<V, PlaceholderCost> {
-    fn default() -> Self {
-        Self::new()
+    pub const fn with_schedule(mut self, schedule: FeeSchedule) -> Self {
+        self.schedule = schedule;
+        self
     }
 }
 
 impl<V, C: Clone> Clone for ArkivExecutor<V, C> {
     fn clone(&self) -> Self {
-        Self::with_cost(self.cost.clone())
+        Self::with_cost(self.cost.clone(), self.schedule)
     }
 }
+
+#[cfg(test)]
+const TEST_SCHEDULE: FeeSchedule = FeeSchedule {
+    capacity_rate: 14,
+    cell_byte_units: 1,
+    index_byte_units: 1,
+    c_cell: 64,
+    c_idx: 64,
+    max_lifetime: BlockNumber::MAX,
+};
 
 impl<V, C: fmt::Debug> fmt::Debug for ArkivExecutor<V, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ArkivExecutor")
             .field("cost", &self.cost)
+            .field("schedule", &self.schedule)
             .finish()
     }
 }
@@ -102,6 +115,12 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
 
     /// Like [`apply`](Self::apply), but on success also records one
     /// [`OpEffect`] per op into `effects`. On a revert, `effects` is untouched.
+    ///
+    /// The batch runs in one frame on the view's branch: each op writes as it
+    /// runs, so later ops read earlier ones' effects through the branch. A
+    /// revert discards the frame, and so does a batch that does not keep its
+    /// writes ([`ExecEnv::keep_writes`]); otherwise the frame is merged. A
+    /// store fault discards it too, before it is returned.
     pub fn apply_with_effects(
         &self,
         env: &ExecEnv,
@@ -109,62 +128,116 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         ops: &[Op],
         effects: &mut Vec<OpEffect>,
     ) -> Result<ExecOutput, ExecError> {
-        // Per-transaction overlay: Some(entity) = staged write, None = staged
-        // delete. Reads consult it before the view, so operations in this
-        // transaction see each other's effects.
-        let mut tx_overlay = BTreeMap::<EntityAddress, Option<Entity>>::new();
-        let mut gas_used = 0u64;
+        state.begin_frame().map_err(ExecError::store)?;
         let mut staged_effects = Vec::with_capacity(ops.len());
+        let out = match self.run_batch(env, state, ops, &mut staged_effects) {
+            Ok(out) => out,
+            Err(fault) => {
+                // The fault is what the caller needs; a second one from the
+                // rollback would only hide it. Nothing builds on a branch a
+                // fault ran on: it aborts the whole block, whose branch is then
+                // abandoned, so a failed rollback leaves nothing behind.
+                let _ = state.discard_frame();
+                return Err(fault);
+            }
+        };
+        let keep = out.status == ExecStatus::Ok && env.keep_writes;
+        if keep {
+            state.merge_frame()
+        } else {
+            state.discard_frame()
+        }
+        .map_err(ExecError::store)?;
+        if out.status == ExecStatus::Ok {
+            effects.extend(staged_effects);
+        }
+        Ok(out)
+    }
 
+    /// Run `ops` in order, each metered and staged on the branch. The first
+    /// revert ends the batch; the caller's frame undoes its writes, but not
+    /// what they cost.
+    ///
+    /// Each op's own cost is checked against the supplied gas before it
+    /// writes, and everything it spent after it ran. Running out, or a sum
+    /// that does not fit, consumes all the gas supplied.
+    fn run_batch(
+        &self,
+        env: &ExecEnv,
+        state: &mut V,
+        ops: &[Op],
+        effects: &mut Vec<OpEffect>,
+    ) -> Result<ExecOutput, ExecError> {
+        let mut meter = BatchMeter::starting_at(env.golemdb_cost_before);
         for op in ops {
-            // Charge up front. Outrunning the supplied gas consumes all of it
-            // and stages nothing.
-            gas_used = gas_used.saturating_add(self.cost.op_cost(op));
-            if gas_used > env.gas_supplied {
-                return Ok(ExecOutput {
-                    status: ExecStatus::Reverted,
-                    gas_used: env.gas_supplied,
-                    revert: Some(RevertReason::OutOfGas),
-                });
+            let affordable = meter
+                .gas
+                .add_op_cost(self.cost.op_cost(op))
+                .and_then(|()| meter.gas.compute_so_far(env.tx_gas))
+                .is_ok_and(|compute| compute <= env.gas_supplied);
+            if !affordable {
+                return Ok(out_of_gas(env));
             }
-            match self.stage_op(env, state, &mut tx_overlay, op)? {
-                Ok(effect) => staged_effects.push(effect),
-                Err(reason) => {
-                    return Ok(ExecOutput {
-                        status: ExecStatus::Reverted,
-                        gas_used,
-                        revert: Some(reason),
-                    });
-                }
+            let staged = self.stage_op(env, state, &mut meter, op)?;
+            if meter.overflowed {
+                return Ok(out_of_gas(env));
             }
-        }
-
-        // Every op succeeded: write each touched entity's net change into the
-        // view, as a partial update against what the view held before.
-        for (key, staged) in tx_overlay {
-            let before = state
-                .get_entity(key, ReadMode::ViewWithOverlay)
-                .map_err(ExecError::store)?;
-            if let Some(updates) = updates_between(key, before.as_ref(), staged.as_ref()) {
-                state.update_entity(updates).map_err(ExecError::store)?;
+            match staged {
+                Ok(effect) => effects.push(effect),
+                Err(reason) => return Ok(self.reverted(env, &meter, reason)),
+            }
+            if self.spent(env, &meter).is_none() {
+                return Ok(out_of_gas(env));
             }
         }
-
-        effects.extend(staged_effects);
-        Ok(ExecOutput {
-            status: ExecStatus::Ok,
-            gas_used,
-            revert: None,
+        Ok(match self.spent(env, &meter) {
+            Some(gas) => ExecOutput {
+                status: ExecStatus::Ok,
+                gas,
+                revert: None,
+            },
+            None => out_of_gas(env),
         })
     }
 
-    /// Stage one operation into `overlay`. `Ok(Ok(effect))` staged it;
-    /// `Ok(Err(reason))` is a business-rule revert; `Err(_)` a store fault.
+    /// What the batch has spent, if it still fits the supplied gas.
+    fn spent(&self, env: &ExecEnv, meter: &BatchMeter) -> Option<GasBreakdown> {
+        meter
+            .gas
+            .finish(env.tx_gas, env.floor_gas, &self.schedule)
+            .ok()
+            .filter(|gas| gas.total().is_some_and(|total| total <= env.gas_supplied))
+    }
+
+    /// A business-rule revert pays the compute it spent, GolemDB's work on
+    /// writes now undone included: GolemDB charges rolled-back work. It buys
+    /// no storage, because the frame keeps none of it.
+    fn reverted(&self, env: &ExecEnv, meter: &BatchMeter, reason: RevertReason) -> ExecOutput {
+        if reason == RevertReason::OutOfGas {
+            return out_of_gas(env);
+        }
+        let Ok(compute) = meter.gas.compute_so_far(env.tx_gas) else {
+            return out_of_gas(env);
+        };
+        ExecOutput {
+            status: ExecStatus::Reverted,
+            gas: GasBreakdown {
+                compute_gas: compute.max(env.floor_gas).min(env.gas_supplied),
+                storage_gas: 0,
+                purge_gas: 0,
+            },
+            revert: Some(reason),
+        }
+    }
+
+    /// Stage one operation on the view's branch. `Ok(Ok(effect))` staged it;
+    /// `Ok(Err(reason))` is a business-rule revert, after which the caller
+    /// discards whatever earlier ops wrote; `Err(_)` a store fault.
     fn stage_op(
         &self,
         env: &ExecEnv,
-        state: &V,
-        overlay: &mut BTreeMap<EntityAddress, Option<Entity>>,
+        state: &mut V,
+        meter: &mut BatchMeter,
         op: &Op,
     ) -> Result<Result<OpEffect, RevertReason>, ExecError> {
         match op {
@@ -174,12 +247,16 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                 creation_flags,
                 attributes,
             } => {
-                // An account's key is taken by the account, though it holds no
-                // entity. A derived key lands there only by a hash collision.
-                if entity_records::is_account_key(*key)
-                    || self.current(state, overlay, *key)?.is_some()
+                // A reserved key is taken by its record (an account's, the fee
+                // schedule's), though it holds no entity. A derived key lands
+                // there only by a hash collision.
+                if entity_records::is_reserved_key(*key)
+                    || self.current(state, meter, *key)?.is_some()
                 {
                     return Ok(Err(RevertReason::AlreadyExists { key: *key }));
+                }
+                if let Err(reason) = admit_lifetime(env, *expires_at) {
+                    return Ok(Err(reason));
                 }
                 let entity = Entity {
                     key: *key,
@@ -191,7 +268,26 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     creation_flags: *creation_flags,
                     attributes: attributes.clone(),
                 };
-                overlay.insert(*key, Some(entity));
+                let details = meter.count_write(
+                    state
+                        .update_entity(EntityUpdates::create(entity))
+                        .map_err(ExecError::store)?,
+                );
+                // A create buys its whole size, which is all the write added,
+                // until it expires.
+                meter.buy(
+                    self.growth(&details).and_then(|units| {
+                        storage_time::create(units, *expires_at, env.block_number)
+                    }),
+                );
+                // The create's own minting-nonce step. The decoder derived this
+                // key from the nonce it read at the start of the transaction,
+                // from this same view, so the creates advance it in that order.
+                meter.count(
+                    state
+                        .fetch_increment_entity_creation_nonce(env.caller)
+                        .map_err(ExecError::store)?,
+                );
                 Ok(Ok(OpEffect {
                     key: *key,
                     kind: OpKind::Create,
@@ -201,13 +297,14 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     previous_owner: None,
                 }))
             }
-            Op::Patch { key, mutations } => self
-                .mutate(
+            Op::Patch { key, mutations } => {
+                let mutated = match self.mutate(
                     env,
                     state,
-                    overlay,
+                    meter,
                     *key,
                     Auth::OwnerOnly,
+                    EntityRead::Whole,
                     // `readonly` freezes contents; lifecycle ops still work.
                     |e| {
                         if e.creation_flags.is_readonly() {
@@ -225,23 +322,37 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                         }
                         Ok(())
                     },
-                )
-                .map(|r| {
-                    r.map(|(owner, expires_at)| self.effect(*key, OpKind::Patch, owner, expires_at))
-                }),
+                )? {
+                    Ok(mutated) => mutated,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                // A patch buys its net growth, the write's own change, until
+                // the entity expires; the size before cancels out.
+                meter.buy(self.growth(&mutated.details).and_then(|units| {
+                    storage_time::patch(0, units, mutated.expires_at, env.block_number)
+                }));
+                Ok(Ok(self.effect(
+                    *key,
+                    OpKind::Patch,
+                    mutated.owner,
+                    mutated.expires_at,
+                )))
+            }
             Op::ExtendExpiry {
                 key,
                 new_expires_at,
-            } => self
-                .mutate(
+            } => {
+                let mutated = match self.mutate(
                     env,
                     state,
-                    overlay,
+                    meter,
                     *key,
                     // Anyone may pay to keep an entity alive when the flag says
                     // so — extending can't hurt the owner.
                     Auth::OwnerOrFlag(CreationFlags::PERMISSIONLESS_EXTENSION),
-                    // Lifetimes never shorten; equal is a satisfied no-op.
+                    EntityRead::SystemFields,
+                    // Lifetimes never shorten; equal is a satisfied no-op, so
+                    // only an extend that moves the expiry meets the bound.
                     |e| {
                         if *new_expires_at < e.expires_at {
                             return Err(RevertReason::ExpiryNotExtended {
@@ -250,26 +361,42 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                                 current_expires_at: e.expires_at,
                             });
                         }
+                        if *new_expires_at > e.expires_at {
+                            admit_lifetime(env, *new_expires_at)?;
+                        }
                         Ok(())
                     },
                     |e| {
                         e.expires_at = *new_expires_at;
                         Ok(())
                     },
-                )
-                .map(|r| {
-                    r.map(|(owner, expires_at)| {
-                        self.effect(*key, OpKind::ExtendExpiry, owner, expires_at)
-                    })
-                }),
-            Op::Transfer { key, new_owner } => {
-                let previous_owner = self.current(state, overlay, *key)?.map(|e| e.owner);
-                self.mutate(
+                )? {
+                    Ok(mutated) => mutated,
+                    Err(reason) => return Ok(Err(reason)),
+                };
+                // An extend buys the size the entity has, from its read, for
+                // the blocks it adds. Its own write changes no size: the
+                // expiry is a fixed-width cell.
+                meter.buy(
+                    units::storage_units(&mutated.meta_before, &self.schedule).and_then(|units| {
+                        storage_time::extend(units, mutated.expires_before, mutated.expires_at)
+                    }),
+                );
+                Ok(Ok(self.effect(
+                    *key,
+                    OpKind::ExtendExpiry,
+                    mutated.owner,
+                    mutated.expires_at,
+                )))
+            }
+            Op::Transfer { key, new_owner } => self
+                .mutate(
                     env,
                     state,
-                    overlay,
+                    meter,
                     *key,
                     Auth::OwnerOnly,
+                    EntityRead::SystemFields,
                     |e| {
                         if *new_owner == e.owner {
                             return Err(RevertReason::TransferToSelf { key: *key });
@@ -282,14 +409,16 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                     },
                 )
                 .map(|r| {
-                    r.map(|(owner, expires_at)| OpEffect {
-                        previous_owner,
-                        ..self.effect(*key, OpKind::Transfer, owner, expires_at)
+                    r.map(|mutated| OpEffect {
+                        previous_owner: Some(mutated.owner_before),
+                        ..self.effect(*key, OpKind::Transfer, mutated.owner, mutated.expires_at)
                     })
-                })
-            }
+                }),
             Op::Delete { key } => {
-                let Some(entity) = self.current(state, overlay, *key)? else {
+                // The owner and expiry are all it needs: the attributes go
+                // with the record, and GolemDB prices that from its counts.
+                let Some(StoredEntity { entity, .. }) = self.system_fields(state, meter, *key)?
+                else {
                     return Ok(Err(RevertReason::NotFound { key: *key }));
                 };
                 if entity.owner != env.caller {
@@ -299,7 +428,11 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
                         owner: entity.owner,
                     }));
                 }
-                overlay.insert(*key, None);
+                meter.count(
+                    state
+                        .update_entity(EntityUpdates::deletion(*key))
+                        .map_err(ExecError::store)?,
+                );
                 Ok(Ok(self.effect(
                     *key,
                     OpKind::Delete,
@@ -327,93 +460,150 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         }
     }
 
-    /// Load, authorize, check liveness, run the op's own check, edit, re-stage.
-    /// An expired entity is not mutable — including by extend.
+    /// The storage units a write added: its net growth, 0 when it shrank the
+    /// record or kept its size.
+    fn growth(&self, details: &WriteDetails) -> Result<u64, Overflow> {
+        let delta = units::units_delta(details, &self.schedule)?;
+        u64::try_from(delta.max(0)).map_err(|_| Overflow)
+    }
+
+    /// Load as much as `read` says, authorize, check liveness, run the op's
+    /// own check, edit, and write the fields that changed. An expired entity
+    /// is not mutable — including by extend.
     #[allow(clippy::too_many_arguments)]
     fn mutate(
         &self,
         env: &ExecEnv,
-        state: &V,
-        overlay: &mut BTreeMap<EntityAddress, Option<Entity>>,
+        state: &mut V,
+        meter: &mut BatchMeter,
         key: EntityAddress,
         auth: Auth,
+        read: EntityRead,
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
         edit: impl FnOnce(&mut Entity) -> Result<(), RevertReason>,
-    ) -> Result<Result<(UserAddress, BlockNumber), RevertReason>, ExecError> {
-        let Some(mut entity) = self.current(state, overlay, key)? else {
+    ) -> Result<Result<Mutated, RevertReason>, ExecError> {
+        let found = match read {
+            EntityRead::Whole => self.current(state, meter, key)?,
+            EntityRead::SystemFields => self.system_fields(state, meter, key)?,
+        };
+        let Some(StoredEntity {
+            entity: before,
+            meta: meta_before,
+        }) = found
+        else {
             return Ok(Err(RevertReason::NotFound { key }));
         };
-        if !auth.permits(&entity, &env.caller) {
+        if !auth.permits(&before, &env.caller) {
             return Ok(Err(RevertReason::NotOwner {
                 key,
                 caller: env.caller,
-                owner: entity.owner,
+                owner: before.owner,
             }));
         }
-        if entity.expires_at <= env.block_number {
+        if before.expires_at <= env.block_number {
             return Ok(Err(RevertReason::Expired {
                 key,
-                expires_at: entity.expires_at,
+                expires_at: before.expires_at,
             }));
         }
-        if let Err(reason) = check(&entity) {
+        if let Err(reason) = check(&before) {
             return Ok(Err(reason));
         }
+        let mut entity = before.clone();
         if let Err(reason) = edit(&mut entity) {
             return Ok(Err(reason));
         }
         entity.updated_at = env.block_number;
-        let post_op = (entity.owner, entity.expires_at);
-        overlay.insert(key, Some(entity));
-        Ok(Ok(post_op))
+        let details = match updates_between(key, &before, &entity) {
+            Some(updates) => {
+                meter.count_write(state.update_entity(updates).map_err(ExecError::store)?)
+            }
+            None => WriteDetails::ZERO,
+        };
+        Ok(Ok(Mutated {
+            owner_before: before.owner,
+            owner: entity.owner,
+            expires_at: entity.expires_at,
+            meta_before,
+            expires_before: before.expires_at,
+            details,
+        }))
     }
 
+    /// The entity as this transaction sees it, with its record's size: through
+    /// the branch, so with every earlier op's writes.
     fn current(
         &self,
         state: &V,
-        overlay: &BTreeMap<EntityAddress, Option<Entity>>,
+        meter: &mut BatchMeter,
         key: EntityAddress,
-    ) -> Result<Option<Entity>, ExecError> {
-        if let Some(staged) = overlay.get(&key) {
-            return Ok(staged.clone());
-        }
+    ) -> Result<Option<StoredEntity>, ExecError> {
         state
-            .get_entity(key, ReadMode::ViewWithOverlay)
+            .get_entity_with_meta(key, ReadMode::ViewWithOverlay)
+            .map(|read| meter.count(read))
+            .map_err(ExecError::store)
+    }
+
+    /// [`current`](Self::current) without the attributes: the system fields
+    /// and the record's size, for an op that leaves the attributes alone.
+    fn system_fields(
+        &self,
+        state: &V,
+        meter: &mut BatchMeter,
+        key: EntityAddress,
+    ) -> Result<Option<StoredEntity>, ExecError> {
+        state
+            .get_entity_system_fields(key, ReadMode::ViewWithOverlay)
+            .map(|read| meter.count(read))
             .map_err(ExecError::store)
     }
 }
 
-/// The net `before → after` change: only the fields that differ. `None` when
-/// nothing changed (create-then-delete nets to nothing).
-fn updates_between(
-    key: EntityAddress,
-    before: Option<&Entity>,
-    after: Option<&Entity>,
-) -> Option<EntityUpdates> {
-    match (before, after) {
-        (None, None) => None,
-        (Some(_), None) => Some(EntityUpdates::deletion(key)),
-        (None, Some(a)) => Some(EntityUpdates::create(a.clone())),
-        (Some(b), Some(a)) => {
-            let updates = EntityUpdates {
-                entity: key,
-                delete: false,
-                creator: (b.creator != a.creator).then_some(a.creator),
-                owner: (b.owner != a.owner).then_some(a.owner),
-                created_at: (b.created_at != a.created_at).then_some(a.created_at),
-                updated_at: (b.updated_at != a.updated_at).then_some(a.updated_at),
-                expires_at: (b.expires_at != a.expires_at).then_some(a.expires_at),
-                creation_flags: (b.creation_flags != a.creation_flags).then_some(a.creation_flags),
-                attributes: (b.attributes != a.attributes).then(|| a.attributes.clone()),
-            };
-            (updates
-                != EntityUpdates {
-                    entity: key,
-                    ..EntityUpdates::default()
-                })
-            .then_some(updates)
-        }
-    }
+/// How much of an entity an op reads before it changes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntityRead {
+    /// The whole entity, for an op that changes its attributes.
+    Whole,
+    /// Its system fields and size, for one that leaves them alone: no
+    /// attribute is read, so none is paid for.
+    SystemFields,
+}
+
+/// What a mutation found and did: the entity's owner and expiry after it, the
+/// owner, record's size and expiry before it, and what its write did to the
+/// record.
+#[derive(Debug)]
+struct Mutated {
+    owner_before: UserAddress,
+    owner: UserAddress,
+    expires_at: BlockNumber,
+    meta_before: RecordMeta,
+    expires_before: BlockNumber,
+    /// Zero when nothing changed, so nothing was written.
+    details: WriteDetails,
+}
+
+/// One op's change to an existing entity: only the fields that differ. `None`
+/// when nothing changed, so an op that changes nothing writes nothing.
+fn updates_between(key: EntityAddress, before: &Entity, after: &Entity) -> Option<EntityUpdates> {
+    let (b, a) = (before, after);
+    let updates = EntityUpdates {
+        entity: key,
+        delete: false,
+        creator: (b.creator != a.creator).then_some(a.creator),
+        owner: (b.owner != a.owner).then_some(a.owner),
+        created_at: (b.created_at != a.created_at).then_some(a.created_at),
+        updated_at: (b.updated_at != a.updated_at).then_some(a.updated_at),
+        expires_at: (b.expires_at != a.expires_at).then_some(a.expires_at),
+        creation_flags: (b.creation_flags != a.creation_flags).then_some(a.creation_flags),
+        attributes: (b.attributes != a.attributes).then(|| a.attributes.clone()),
+    };
+    (updates
+        != EntityUpdates {
+            entity: key,
+            ..EntityUpdates::default()
+        })
+    .then_some(updates)
 }
 
 /// Who may perform a mutating op.
@@ -433,6 +623,83 @@ impl Auth {
             Auth::OwnerOrFlag(flag) => entity.creation_flags.contains(flag),
         }
     }
+}
+
+/// A batch's costs as its ops run: the meter, and whether a receipt's cost no
+/// longer fit it. A sum that overflows is out of gas, never an error, so the
+/// op that hit it finishes and the batch then reverts.
+#[derive(Debug, Default)]
+struct BatchMeter {
+    gas: GasMeter,
+    overflowed: bool,
+}
+
+impl BatchMeter {
+    /// A meter that already holds the GolemDB work done before the batch.
+    fn starting_at(golemdb_cost: Gas) -> Self {
+        let mut meter = Self::default();
+        meter.count(Metered::new(
+            (),
+            Receipt {
+                cost: CostUnits(golemdb_cost),
+                ..Receipt::default()
+            },
+        ));
+        meter
+    }
+
+    /// Count a store call's receipt and hand back its value.
+    fn count<T>(&mut self, metered: Metered<T>) -> T {
+        if self.gas.add_golemdb(&metered.receipt).is_err() {
+            self.overflowed = true;
+        }
+        metered.value
+    }
+
+    /// Count a write's receipt and hand back what it did to the record.
+    fn count_write(&mut self, metered: Metered<()>) -> WriteDetails {
+        let details = metered.receipt.details;
+        self.count(metered);
+        details
+    }
+
+    /// Add the storage time an op bought; time that does not fit is out of
+    /// gas, like a cost.
+    fn buy(&mut self, unit_blocks: Result<u128, Overflow>) {
+        if unit_blocks
+            .and_then(|time| self.gas.add_storage_time(time))
+            .is_err()
+        {
+            self.overflowed = true;
+        }
+    }
+}
+
+/// Running out of gas consumes all of it, and buys no storage.
+fn out_of_gas(env: &ExecEnv) -> ExecOutput {
+    ExecOutput {
+        status: ExecStatus::Reverted,
+        gas: GasBreakdown {
+            compute_gas: env.gas_supplied,
+            storage_gas: 0,
+            purge_gas: 0,
+        },
+        revert: Some(RevertReason::OutOfGas),
+    }
+}
+
+/// A create or extend may not leave more than the fee schedule's
+/// `max_lifetime`, nor ask for permanent expiry. A business rule: the batch
+/// reverts and pays for the operations it ran.
+fn admit_lifetime(env: &ExecEnv, expires_at: BlockNumber) -> Result<(), RevertReason> {
+    if storage_time::within_max_lifetime(expires_at, env.block_number, env.max_lifetime) {
+        return Ok(());
+    }
+    Err(RevertReason::ExpiryBeyondMaxLifetime {
+        target: expires_at,
+        current_block: env.block_number,
+        max_lifetime: env.max_lifetime,
+    })
 }
 
 /// Set some attributes, unset others, leave the rest untouched. Every `$` name
@@ -493,13 +760,14 @@ mod tests {
     use arkiv_interfaces::constants::OP_MAX_ATTRIBUTES;
     use arkiv_interfaces::entity::AttributeValue;
     use arkiv_interfaces::primitives::UserBalance;
-    use arkiv_interfaces::statemanager::{AccountBalancesStore, BlockRef, EntityStore};
+    use arkiv_interfaces::statemanager::{
+        AccountBalancesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
+    };
 
-    use arkiv_interfaces::store::reference::MemStore;
+    use arkiv_golemdb::{GolemDbConfig, GolemDbStore, PricingConfig};
     use arkiv_interfaces::store::{RecordKey, Store, StoreExt};
-    use std::sync::Arc;
 
-    type View = GolemStateView<Arc<MemStore>>;
+    type View = GolemStateView<GolemDbStore>;
 
     const GENESIS: BlockRef = BlockRef {
         height: 9,
@@ -512,9 +780,45 @@ mod tests {
         seeded_view(&[])
     }
 
-    /// A view whose base commit already holds `entities`.
+    /// A view whose base commit already holds `entities`, on a GolemDB that
+    /// prices nothing.
     fn seeded_view(entities: &[Entity]) -> View {
-        let store = Arc::new(MemStore::new());
+        view_on(golemdb(0), entities)
+    }
+
+    /// An in-memory GolemDB at Arkiv's limits, every engine weight set to
+    /// `weight`.
+    fn golemdb(weight: u64) -> GolemDbStore {
+        let mut pricing = PricingConfig::zero();
+        pricing
+            .weights
+            .values_mut()
+            .for_each(|value| *value = weight);
+        let limit = |bytes: usize| u32::try_from(bytes).unwrap();
+        let genesis = arkiv_golemdb::Genesis::new(
+            arkiv_golemdb::HashAlgorithm::Keccak256,
+            arkiv_golemdb::CellLimits {
+                max_cell_name_len: limit(arkiv_interfaces::constants::MAX_ATTRIBUTE_NAME_BYTES),
+                max_str_len: limit(arkiv_interfaces::constants::MAX_STR_BYTES),
+                max_bytes_len: limit(arkiv_interfaces::constants::MAX_BYTES_VALUE_LEN),
+            },
+            arkiv_golemdb::RecordLimits {
+                max_cells: arkiv_interfaces::entity_records::MAX_RECORD_CELLS as u64,
+                max_indexed_cells: arkiv_interfaces::entity_records::MAX_RECORD_INDEXED_CELLS
+                    as u64,
+            },
+            None,
+            pricing,
+        );
+        GolemDbStore::open_memory(&GolemDbConfig {
+            genesis,
+            segments: vec![],
+            host_schemas: vec![],
+        })
+        .expect("open golemdb")
+    }
+
+    fn view_on(store: GolemDbStore, entities: &[Entity]) -> View {
         let branch = store.begin(None).expect("begin");
         {
             let mut staging = GolemStateView::new(
@@ -543,8 +847,451 @@ mod tests {
         )
     }
 
+    /// An empty view over a GolemDB that charges 1 for every unit of work.
+    fn priced_view() -> View {
+        view_on(golemdb(1), &[])
+    }
+
+    /// An environment that charges the transaction's own terms and a floor.
+    fn priced_env(caller: [u8; 20], tx_gas: u64, floor_gas: u64) -> ExecEnv {
+        ExecEnv {
+            tx_gas,
+            floor_gas,
+            ..env(caller, 10)
+        }
+    }
+
+    /// Compute is the transaction's terms, each op's own cost and every store
+    /// call's cost, added together; the floor lifts it only when it is lower.
+    /// On a GolemDB that prices nothing, compute is the terms and the op alone.
+    /// The create's 40 blocks of storage, 0.58 gas for the empty record's
+    /// [`EMPTY_RECORD_UNITS`], round up to 1.
+    #[test]
+    fn compute_adds_the_terms_the_ops_and_golemdbs_work() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let create = create_until(1, 50);
+        let op = PlaceholderCost.op_cost(&create);
+        let env = priced_env([0xAA; 20], 21_000, 0);
+
+        let out = exec
+            .apply(&env, &mut fresh_view(), core::slice::from_ref(&create))
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(
+            out.gas,
+            GasBreakdown {
+                compute_gas: 21_000 + op,
+                storage_gas: 1,
+                purge_gas: 0,
+            }
+        );
+
+        let priced = exec
+            .apply(&env, &mut priced_view(), core::slice::from_ref(&create))
+            .unwrap();
+        assert_eq!(priced.status, ExecStatus::Ok);
+        assert!(
+            priced.gas.compute_gas > 21_000 + op,
+            "GolemDB's work is charged"
+        );
+        assert_eq!(priced.gas.storage_gas, 1);
+
+        let floor = priced.gas.compute_gas + 1;
+        let out = exec
+            .apply(
+                &priced_env([0xAA; 20], 21_000, floor),
+                &mut priced_view(),
+                &[create],
+            )
+            .unwrap();
+        assert_eq!(out.gas.compute_gas, floor, "a higher floor lifts it, once");
+    }
+
+    /// An entity record without attributes, in storage units at the
+    /// placeholder weights: 1 per byte, 64 per cell and per indexed cell. A
+    /// cell takes (8 + name) + (1 + value) bytes, an index entry
+    /// name + 2 + value:
+    ///
+    /// ```text
+    /// cell             cell bytes   index bytes
+    /// $key             12 + 33      38
+    /// $creator         16 + 21      30
+    /// $owner           14 + 21      28
+    /// $createdAt       18 + 9       -
+    /// $expiresAt       18 + 9       20
+    /// $updatedAt       18 + 9       -
+    /// $creationFlags   22 + 2       -
+    /// ```
+    ///
+    /// 222 cell bytes, 116 index bytes, 7 cells, 4 of them indexed:
+    /// 222 + 116 + 7 × 64 + 4 × 64 = 1,042.
+    const EMPTY_RECORD_UNITS: u64 = 1_042;
+
+    /// Long enough that storage gas reads well: 100,000 blocks.
+    const LIFETIME: u64 = 100_000;
+
+    /// An unindexed `note` of 1,000 bytes, in storage units: its cell,
+    /// (8 + 4) + (1 + 1,000) bytes, and 64 for the cell.
+    const NOTE_UNITS: u64 = 1_077;
+
+    fn note() -> AttributeMutation {
+        AttributeMutation::set_unindexed(b"note".to_vec(), AttributeValue::Bytes(vec![b'x'; 1_000]))
+    }
+
+    /// An entity `owner` holds without attributes, alive until `expires_at`.
+    fn owned_until(key: u8, owner: [u8; 20], expires_at: u64) -> Entity {
+        Entity {
+            key: [key; 32],
+            creator: owner,
+            owner,
+            created_at: 3,
+            updated_at: 3,
+            expires_at,
+            creation_flags: CreationFlags::NONE,
+            attributes: Vec::new(),
+        }
+    }
+
+    /// A create pays compute and buys storage: its whole record,
+    /// [`EMPTY_RECORD_UNITS`], for the [`LIFETIME`] until it expires.
+    /// 104,200,000 unit-blocks at 14 micro-gas each are 1,458.8 gas, rounded
+    /// up. No purge is charged.
+    #[test]
+    fn a_create_buys_its_size_until_expiry() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let create = create_until(1, 10 + LIFETIME);
+        let op = PlaceholderCost.op_cost(&create);
+
+        let mut view = fresh_view();
+        let out = exec
+            .apply(
+                &priced_env([0xAA; 20], 21_000, 0),
+                &mut view,
+                core::slice::from_ref(&create),
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(
+            out.gas,
+            GasBreakdown {
+                compute_gas: 21_000 + op,
+                storage_gas: 1_459,
+                purge_gas: 0,
+            }
+        );
+        assert_eq!(out.gas_used(), 21_000 + op + 1_459);
+    }
+
+    /// A patch buys its growth only, for the rest of the entity's life:
+    /// [`NOTE_UNITS`] for 100,000 blocks, 1,507.8 gas, rounded up. Removing the
+    /// note again buys nothing and refunds nothing.
+    #[test]
+    fn a_patch_buys_only_its_growth() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let alice = [0xAA; 20];
+        let mut view = seeded_view(&[owned_until(1, alice, 10 + LIFETIME)]);
+        let grow = Op::Patch {
+            key: [1; 32],
+            mutations: vec![note()],
+        };
+        let out = exec
+            .apply(&env(alice, 10), &mut view, core::slice::from_ref(&grow))
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 1_508);
+
+        let shrink = Op::Patch {
+            key: [1; 32],
+            mutations: vec![AttributeMutation::unset(b"note".to_vec())],
+        };
+        let out = exec.apply(&env(alice, 10), &mut view, &[shrink]).unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 0, "a shrink");
+    }
+
+    /// An extend buys the size the entity has for the blocks it adds:
+    /// [`EMPTY_RECORD_UNITS`] for 100,000 more blocks, 1,459 gas. An extend to
+    /// the same expiry buys nothing. The size is the branch's: after a growing
+    /// patch in the same batch, the extend buys the grown record,
+    /// (1,042 + 1,077) × 100,000, on top of the patch's 1,077 × 100,000:
+    /// 319,600,000 unit-blocks, 4,474.4 gas, rounded up once.
+    #[test]
+    fn an_extend_buys_only_the_added_blocks() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let alice = [0xAA; 20];
+        let expires_at = 10 + LIFETIME;
+        let extend = |new_expires_at| Op::ExtendExpiry {
+            key: [1; 32],
+            new_expires_at,
+        };
+
+        let mut view = seeded_view(&[owned_until(1, alice, expires_at)]);
+        let out = exec
+            .apply(&env(alice, 10), &mut view, &[extend(expires_at + LIFETIME)])
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 1_459);
+
+        let mut view = seeded_view(&[owned_until(1, alice, expires_at)]);
+        let out = exec
+            .apply(&env(alice, 10), &mut view, &[extend(expires_at)])
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 0, "no blocks added");
+
+        let mut view = seeded_view(&[owned_until(1, alice, expires_at)]);
+        let grow = Op::Patch {
+            key: [1; 32],
+            mutations: vec![note()],
+        };
+        let out = exec
+            .apply(
+                &env(alice, 10),
+                &mut view,
+                &[grow, extend(expires_at + LIFETIME)],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(
+            u128::from(NOTE_UNITS + (EMPTY_RECORD_UNITS + NOTE_UNITS)) * u128::from(LIFETIME),
+            319_600_000
+        );
+        assert_eq!(out.gas.storage_gas, 4_475);
+    }
+
+    /// A transfer and a delete buy no storage.
+    #[test]
+    fn a_transfer_and_a_delete_buy_nothing() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let alice = [0xAA; 20];
+        let mut view = seeded_view(&[
+            owned_until(1, alice, 10 + LIFETIME),
+            owned_until(2, alice, 10 + LIFETIME),
+        ]);
+        let out = exec
+            .apply(
+                &env(alice, 10),
+                &mut view,
+                &[
+                    Op::Transfer {
+                        key: [1; 32],
+                        new_owner: [0xBB; 20],
+                    },
+                    Op::Delete { key: [2; 32] },
+                ],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 0);
+    }
+
+    /// Storage gas is rounded once per batch, not per op: two creates of 20
+    /// blocks buy 20,840 unit-blocks each, 0.29 gas, so 1 together rather than
+    /// 1 each.
+    #[test]
+    fn storage_gas_is_rounded_once_per_batch() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = fresh_view();
+        let out = exec
+            .apply(
+                &env([0xAA; 20], 10),
+                &mut view,
+                &[create_until(1, 30), create_until(2, 30)],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 1);
+    }
+
+    /// Storage counts against the supplied gas: a create whose compute fits
+    /// but whose 1,459 storage gas does not runs out of gas, pays all it
+    /// supplied, and leaves nothing behind. One gas more and it succeeds.
+    #[test]
+    fn storage_can_run_a_batch_out_of_gas() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let alice = [0xAA; 20];
+        let create = create_until(1, 10 + LIFETIME);
+        let needed = PlaceholderCost.op_cost(&create) + 1_459;
+
+        let mut view = fresh_view();
+        let out = exec
+            .apply(
+                &env_gas(alice, 10, needed - 1),
+                &mut view,
+                core::slice::from_ref(&create),
+            )
+            .unwrap();
+        assert_eq!(out.revert, Some(RevertReason::OutOfGas));
+        assert_eq!(out.gas_used(), needed - 1);
+        assert_eq!(out.gas.storage_gas, 0);
+        assert!(staged(&view, [1; 32]).is_none());
+        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+        assert_eq!(view.open_frames(), 0);
+
+        let mut view = fresh_view();
+        let out = exec
+            .apply(&env_gas(alice, 10, needed), &mut view, &[create])
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas_used(), needed);
+    }
+
+    /// A patch that removes as well as adds buys its net growth. Swapping the
+    /// note for a `memo` of the same size buys nothing; swapping that for a
+    /// 2,000-byte note grows the record by 1,000 units, 1,400 gas for 100,000
+    /// blocks.
+    #[test]
+    fn a_patch_that_grows_and_shrinks_buys_its_net_growth() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let alice = [0xAA; 20];
+        let mut view = seeded_view(&[owned_until(1, alice, 10 + LIFETIME)]);
+        let patch = |mutations| Op::Patch {
+            key: [1; 32],
+            mutations,
+        };
+        let text = |len| AttributeValue::Bytes(vec![b'x'; len]);
+        let mut run = |op| {
+            let out = exec.apply(&env(alice, 10), &mut view, &[op]).unwrap();
+            assert_eq!(out.status, ExecStatus::Ok);
+            out.gas.storage_gas
+        };
+
+        assert_eq!(run(patch(vec![note()])), 1_508);
+        assert_eq!(
+            run(patch(vec![
+                AttributeMutation::unset(b"note".to_vec()),
+                AttributeMutation::set_unindexed(b"memo".to_vec(), text(1_000)),
+            ])),
+            0,
+            "an equal swap"
+        );
+        assert_eq!(
+            run(patch(vec![
+                AttributeMutation::unset(b"memo".to_vec()),
+                AttributeMutation::set_unindexed(b"note".to_vec(), text(2_000)),
+            ])),
+            1_400
+        );
+    }
+
+    /// A create with attributes buys them too, an indexed one with its index
+    /// entry. `tag = "blue"`, indexed: its cell, (8 + 3) + (1 + 4) bytes, 64
+    /// for the cell, its index entry, 3 + 2 + 4 bytes, and 64 for that, 153
+    /// units. With the note and the record itself, 1,042 + 1,077 + 153 =
+    /// 2,272 units for 100,000 blocks: 3,180.8 gas, rounded up.
+    #[test]
+    fn a_create_buys_its_attributes_and_their_index_entries() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = fresh_view();
+        let create = Op::Create {
+            key: [1; 32],
+            expires_at: 10 + LIFETIME,
+            creation_flags: CreationFlags::NONE,
+            attributes: vec![
+                Attribute::unindexed(b"note".to_vec(), AttributeValue::Bytes(vec![b'x'; 1_000])),
+                Attribute::new(b"tag".to_vec(), AttributeValue::Str("blue".into())),
+            ],
+        };
+        let out = exec
+            .apply(&env([0xAA; 20], 10), &mut view, &[create])
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(out.gas.storage_gas, 3_181);
+    }
+
+    /// Storage gas that does not fit `u64` is out of gas, like a cost: at a
+    /// `capacity_rate` of `u64::MAX`, the empty create's storage is about
+    /// 1.9 × 10²¹ gas. All the gas supplied is charged, none of it as storage,
+    /// and the create is undone.
+    #[test]
+    fn storage_gas_that_does_not_fit_is_out_of_gas() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE).with_schedule(FeeSchedule {
+            capacity_rate: u64::MAX,
+            ..TEST_SCHEDULE
+        });
+        let mut view = fresh_view();
+        let out = exec
+            .apply(
+                &env([0xAA; 20], 10),
+                &mut view,
+                &[create_until(1, 10 + LIFETIME)],
+            )
+            .unwrap();
+        assert_eq!(out.revert, Some(RevertReason::OutOfGas));
+        assert_eq!(
+            out.gas,
+            GasBreakdown {
+                compute_gas: AMPLE_GAS,
+                storage_gas: 0,
+                purge_gas: 0,
+            }
+        );
+        assert!(staged(&view, [1; 32]).is_none());
+        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+        assert_eq!(view.open_frames(), 0);
+    }
+
+    /// A business-rule revert pays for the work it did, GolemDB's on writes
+    /// now undone included, and buys no storage: on a priced GolemDB it costs
+    /// more than the same revert on a free one.
+    #[test]
+    fn a_revert_pays_for_the_golemdb_work_it_undid() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let ops = [create_until(1, 50), create_until(1, 50)];
+        let op = PlaceholderCost.op_cost(&ops[0]);
+        let env = priced_env([0xAA; 20], 21_000, 0);
+
+        let free = exec.apply(&env, &mut fresh_view(), &ops).unwrap();
+        assert_eq!(free.gas.compute_gas, 21_000 + 2 * op);
+
+        let mut view = priced_view();
+        let out = exec.apply(&env, &mut view, &ops).unwrap();
+        assert_eq!(
+            out.revert,
+            Some(RevertReason::AlreadyExists { key: [1; 32] })
+        );
+        assert!(out.gas.compute_gas > free.gas.compute_gas);
+        assert_eq!(out.gas.storage_gas, 0);
+        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+    }
+
+    /// GolemDB's work counts against the supplied gas too: a batch whose op
+    /// costs fit but whose store calls do not runs out of gas, paying it all.
+    #[test]
+    fn golemdbs_work_can_run_a_batch_out_of_gas() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let create = create_until(1, 50);
+        let op = PlaceholderCost.op_cost(&create);
+        let needed = exec
+            .apply(
+                &env([0xAA; 20], 10),
+                &mut priced_view(),
+                core::slice::from_ref(&create),
+            )
+            .unwrap()
+            .gas
+            .compute_gas;
+        assert!(needed > op);
+
+        let mut view = priced_view();
+        let out = exec
+            .apply(&env_gas([0xAA; 20], 10, needed - 1), &mut view, &[create])
+            .unwrap();
+        assert_eq!(out.revert, Some(RevertReason::OutOfGas));
+        assert_eq!(out.gas_used(), needed - 1);
+        assert!(staged_in(&view, [1u8; 32]).is_none());
+    }
+
+    fn staged_in<S: Store>(view: &GolemStateView<S>, key: EntityAddress) -> Option<Entity> {
+        view.get_entity(key, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+    }
+
     fn staged(view: &View, key: EntityAddress) -> Option<Entity> {
-        view.get_entity(key, ReadMode::ViewWithOverlay).unwrap()
+        view.get_entity(key, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
     }
 
     /// Comfortably more gas than any op here costs.
@@ -554,12 +1301,20 @@ mod tests {
         env_gas(caller, block, AMPLE_GAS)
     }
 
+    /// The genesis files' `max_lifetime`: six months of 2-second blocks.
+    const MAX_LIFETIME: u64 = 7_884_000;
+
     fn env_gas(caller: [u8; 20], block: u64, gas_supplied: u64) -> ExecEnv {
         ExecEnv {
             caller,
             block_number: block,
             gas_supplied,
+            tx_gas: 0,
+            floor_gas: 0,
+            golemdb_cost_before: 0,
             chain_id: 1,
+            max_lifetime: MAX_LIFETIME,
+            keep_writes: true,
         }
     }
 
@@ -583,7 +1338,7 @@ mod tests {
     /// fields: the caller is creator and owner, the block stamps creation.
     #[test]
     fn create_stages_into_the_view() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
 
@@ -609,14 +1364,132 @@ mod tests {
         assert!(
             view.get_entity([1u8; 32], ReadMode::ViewOnBase)
                 .unwrap()
+                .value
                 .is_none()
         );
+    }
+
+    fn create_until(key: u8, expires_at: u64) -> Op {
+        Op::Create {
+            key: [key; 32],
+            expires_at,
+            creation_flags: CreationFlags::NONE,
+            attributes: Vec::new(),
+        }
+    }
+
+    /// A create may leave exactly `max_lifetime`; one block more reverts the
+    /// whole batch, as does permanent expiry, which is not sold.
+    #[test]
+    fn a_create_is_bounded_by_max_lifetime() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let alice = [0xAA; 20];
+        let beyond = |target| RevertReason::ExpiryBeyondMaxLifetime {
+            target,
+            current_block: 10,
+            max_lifetime: MAX_LIFETIME,
+        };
+
+        let mut view = fresh_view();
+        let out = exec
+            .apply(
+                &env(alice, 10),
+                &mut view,
+                &[create_until(1, 10 + MAX_LIFETIME)],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok, "exactly the bound");
+
+        let mut view = fresh_view();
+        let out = exec
+            .apply(
+                &env(alice, 10),
+                &mut view,
+                &[
+                    create_until(1, 10 + MAX_LIFETIME),
+                    create_until(2, 10 + MAX_LIFETIME + 1),
+                ],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Reverted);
+        assert_eq!(out.revert, Some(beyond(10 + MAX_LIFETIME + 1)));
+        assert!(
+            view.get_uncommitted_deltas().unwrap().is_empty(),
+            "the create before it is reverted with it"
+        );
+
+        let mut view = fresh_view();
+        let out = exec
+            .apply(&env(alice, 10), &mut view, &[create_until(1, u64::MAX)])
+            .unwrap();
+        assert_eq!(out.revert, Some(beyond(u64::MAX)), "permanent expiry");
+    }
+
+    /// The bound is on the lifetime an extend leaves, not on the blocks it
+    /// adds: one block more than `max_lifetime` in total reverts, although a
+    /// single added block would fit on its own.
+    #[test]
+    fn an_extend_is_bounded_by_what_remains() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = seeded_view(&[sample_entity()]); // expires_at 100
+        let owner = [2u8; 20];
+        let extend = |new_expires_at| Op::ExtendExpiry {
+            key: [7u8; 32],
+            new_expires_at,
+        };
+        let beyond = |target| RevertReason::ExpiryBeyondMaxLifetime {
+            target,
+            current_block: 20,
+            max_lifetime: MAX_LIFETIME,
+        };
+
+        let out = exec
+            .apply(&env(owner, 20), &mut view, &[extend(20 + MAX_LIFETIME)])
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok, "exactly the bound");
+
+        let out = exec
+            .apply(&env(owner, 20), &mut view, &[extend(20 + MAX_LIFETIME + 1)])
+            .unwrap();
+        assert_eq!(out.revert, Some(beyond(20 + MAX_LIFETIME + 1)));
+
+        let out = exec
+            .apply(&env(owner, 20), &mut view, &[extend(u64::MAX)])
+            .unwrap();
+        assert_eq!(out.revert, Some(beyond(u64::MAX)), "permanent expiry");
+        assert_eq!(
+            staged(&view, [7u8; 32]).unwrap().expires_at,
+            20 + MAX_LIFETIME
+        );
+    }
+
+    /// An extend that does not move the expiry stays a no-op, even for an
+    /// entity that already lives longer than today's bound allows.
+    #[test]
+    fn a_no_op_extend_is_not_bounded() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let long_lived = Entity {
+            expires_at: 20 + MAX_LIFETIME + 1_000,
+            ..sample_entity()
+        };
+        let mut view = seeded_view(&[long_lived]);
+        let out = exec
+            .apply(
+                &env([2u8; 20], 20),
+                &mut view,
+                &[Op::ExtendExpiry {
+                    key: [7u8; 32],
+                    new_expires_at: 20 + MAX_LIFETIME + 1_000,
+                }],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
     }
 
     /// A revert is all-or-nothing: nothing reaches the view.
     #[test]
     fn create_on_existing_reverts_and_stages_nothing() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[Entity {
             key: [1u8; 32],
             ..sample_entity()
@@ -644,7 +1517,7 @@ mod tests {
     /// revert: a fault fails the whole block built around it.
     #[test]
     fn an_op_on_an_account_key_reverts() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let alice = [0xAA; 20];
         view.set_balance(alice, UserBalance::from_u64(500))
@@ -700,7 +1573,7 @@ mod tests {
 
     #[test]
     fn transfer_requires_ownership_then_moves_owner() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
         let owner = [2u8; 20];
 
@@ -740,7 +1613,7 @@ mod tests {
 
     #[test]
     fn transfer_to_current_owner_reverts() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
         let owner = [2u8; 20];
 
@@ -765,7 +1638,7 @@ mod tests {
     /// "> extends, == no-op, < reverts."
     #[test]
     fn extend_never_shortens_and_equal_is_a_no_op() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]); // expires_at 100
         let owner = [2u8; 20];
 
@@ -816,11 +1689,13 @@ mod tests {
         assert_eq!(staged(&view, [7u8; 32]).unwrap().expires_at, 150);
     }
 
-    /// Ops within one transaction see each other; create-then-delete nets to
-    /// nothing at all.
+    /// Ops within one transaction see each other: a delete finds the entity
+    /// the create before it wrote, and leaves nothing to read. Each op writes
+    /// as it runs, so the delta log keeps the deletion of an entity the base
+    /// never had, which every consumer treats as nothing to remove.
     #[test]
-    fn create_then_delete_in_one_tx_nets_to_nothing() {
-        let exec = ArkivExecutor::<View>::new();
+    fn create_then_delete_in_one_tx_leaves_nothing_behind() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
 
         let out = exec
@@ -840,14 +1715,91 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.status, ExecStatus::Ok);
-        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
         assert!(staged(&view, [3u8; 32]).is_none());
+        let deltas = view.get_uncommitted_deltas().unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert!(deltas[0].delete, "a deletion, not a live entity");
+        assert_eq!(deltas[0].entity, [3u8; 32]);
+    }
+
+    fn minting_nonce(view: &View, owner: [u8; 20]) -> u64 {
+        view.get_entity_creation_nonce(owner, ReadMode::ViewWithOverlay)
+            .unwrap()
+            .value
+            .get()
+    }
+
+    /// Each create advances its creator's minting nonce as it runs; a batch
+    /// that reverts advances it not at all.
+    #[test]
+    fn each_create_advances_the_minting_nonce() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = fresh_view();
+        let alice = [0xAA; 20];
+
+        let out = exec
+            .apply(
+                &env(alice, 10),
+                &mut view,
+                &[create_until(1, 50), create_until(2, 50)],
+            )
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert_eq!(minting_nonce(&view, alice), 2);
+
+        let out = exec
+            .apply(
+                &env(alice, 10),
+                &mut view,
+                &[create_until(3, 50), create_until(1, 50)],
+            )
+            .unwrap();
+        assert_eq!(
+            out.revert,
+            Some(RevertReason::AlreadyExists { key: [1; 32] })
+        );
+        assert_eq!(
+            minting_nonce(&view, alice),
+            2,
+            "the reverted create's step is undone with it"
+        );
+    }
+
+    /// A batch that does not keep its writes, as `eth_call` and
+    /// `eth_estimateGas` run one, succeeds and leaves nothing behind: not its
+    /// entities, not its minting-nonce steps.
+    #[test]
+    fn a_batch_that_does_not_keep_its_writes_leaves_nothing() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = fresh_view();
+        let alice = [0xAA; 20];
+        let probe = ExecEnv {
+            keep_writes: false,
+            ..env(alice, 10)
+        };
+
+        let out = exec
+            .apply(&probe, &mut view, &[create_until(1, 50)])
+            .unwrap();
+        assert_eq!(out.status, ExecStatus::Ok);
+        assert!(staged(&view, [1u8; 32]).is_none());
+        assert_eq!(minting_nonce(&view, alice), 0);
+        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+
+        let out = exec
+            .apply(&probe, &mut view, &[create_until(1, 50)])
+            .unwrap();
+        assert_eq!(
+            out.status,
+            ExecStatus::Ok,
+            "the next probe does not see the last one's entity"
+        );
     }
 
     /// A delete stages a tombstone the index derivation turns into all-removes.
     #[test]
     fn delete_stages_a_tombstone() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
 
         let out = exec
@@ -869,7 +1821,7 @@ mod tests {
     /// changed fields.
     #[test]
     fn patch_merges_content_and_stamps_modified() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
 
         let out = exec
@@ -922,7 +1874,7 @@ mod tests {
     /// A patch explicitly unsetting an attribute drops it from the staged set.
     #[test]
     fn patch_unset_drops_the_attribute() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
 
         exec.apply(
@@ -944,7 +1896,7 @@ mod tests {
     /// value can be moved out of (and back into) the index.
     #[test]
     fn patch_can_flip_the_indexed_flag() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = seeded_view(&[sample_entity()]);
         let blue = AttributeValue::Str("blue".into());
 
@@ -969,7 +1921,7 @@ mod tests {
 
     #[test]
     fn patches_cannot_exceed_the_entity_attribute_limit() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let owner = [0xAA; 20];
         let key = [8u8; 32];
@@ -1034,7 +1986,7 @@ mod tests {
     /// cannot resurrect by extending after the fact.
     #[test]
     fn cannot_mutate_after_expiry() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let owner = [2u8; 20];
 
         let expired_ops = [
@@ -1075,7 +2027,7 @@ mod tests {
     /// staging nothing.
     #[test]
     fn reverts_out_of_gas_when_cost_exceeds_supplied() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let create = Op::Create {
             key: [1u8; 32],
@@ -1095,14 +2047,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.status, ExecStatus::Reverted);
-        assert_eq!(out.gas_used, cost - 1);
+        assert_eq!(out.gas_used(), cost - 1);
         assert_eq!(out.revert, Some(RevertReason::OutOfGas));
         assert!(view.get_uncommitted_deltas().unwrap().is_empty());
     }
 
+    /// Running out of gas after an earlier op already wrote undoes that write:
+    /// the entity, its minting-nonce step and its delta all go, no effect is
+    /// reported, and no frame is left open.
+    #[test]
+    fn out_of_gas_after_a_write_undoes_it() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = fresh_view();
+        let alice = [0xAA; 20];
+        let ops = [create_until(1, 50), create_until(2, 50)];
+        let first = PlaceholderCost.op_cost(&ops[0]);
+        let both = first + PlaceholderCost.op_cost(&ops[1]);
+
+        let mut effects = Vec::new();
+        let out = exec
+            .apply_with_effects(&env_gas(alice, 10, both - 1), &mut view, &ops, &mut effects)
+            .unwrap();
+
+        assert_eq!(out.revert, Some(RevertReason::OutOfGas));
+        assert!(
+            staged(&view, [1u8; 32]).is_none(),
+            "the first create is undone"
+        );
+        assert_eq!(minting_nonce(&view, alice), 0);
+        assert!(view.get_uncommitted_deltas().unwrap().is_empty());
+        assert!(effects.is_empty());
+        assert_eq!(view.open_frames(), 0);
+    }
+
     #[test]
     fn succeeds_when_gas_exactly_covers_cost() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         let create = Op::Create {
             key: [1u8; 32],
@@ -1110,7 +2090,8 @@ mod tests {
             creation_flags: CreationFlags::NONE,
             attributes: Vec::new(),
         };
-        let cost = PlaceholderCost.op_cost(&create);
+        // Its op cost, and 40 blocks of storage rounded up to 1.
+        let cost = PlaceholderCost.op_cost(&create) + 1;
 
         let out = exec
             .apply(
@@ -1121,14 +2102,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.status, ExecStatus::Ok);
-        assert_eq!(out.gas_used, cost);
+        assert_eq!(out.gas_used(), cost);
         assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
     }
 
     /// Undecodable calldata surfaces as a host fault, not a silent success.
     #[test]
     fn execute_rejects_undecodable_calldata() {
-        let exec = ArkivExecutor::<View>::new();
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
         let mut view = fresh_view();
         assert!(matches!(
             exec.execute(&env([0u8; 20], 1), &mut view, &[0xDE, 0xAD]),

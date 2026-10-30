@@ -24,7 +24,8 @@ use std::collections::BTreeMap;
 /// EOAs / SDKs `CALL` this address with the `execute(Operation[])` /
 /// `nonces(address)` ABI declared by `IEntityRegistry`. No genesis
 /// allocation is required — registration is programmatic, which is what
-/// `tests::genesis_alloc_has_dev_funding_only` pins.
+/// `tests::genesis_alloc_has_dev_funding_only` pins. The address is also the
+/// storage pool: its account comes into existence with the first credit.
 ///
 /// The bytes are [`arkiv_interfaces::constants::ethereum::ARKIV_RETH_ADDRESS`], shared with the
 /// executor so genesis and execution cannot disagree about where the engine lives.
@@ -132,7 +133,8 @@ mod tests {
         let alloc = genesis_alloc().expect("alloc");
         assert!(
             !alloc.contains_key(&ARKIV_ADDRESS),
-            "ARKIV_ADDRESS is a programmatic precompile target; no genesis presence",
+            "ARKIV_ADDRESS is a programmatic call target and the pool, whose \
+             account the first credit creates; no genesis presence",
         );
         assert_eq!(alloc.len(), ARKIV_DEV_ACCOUNT_COUNT);
     }
