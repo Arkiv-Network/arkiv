@@ -2003,6 +2003,7 @@ async fn a_golemdb_store_with_another_genesis_root_is_refused() {
     let genesis: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(example).unwrap()).unwrap();
     let config = arkiv_golemdb::GolemDbConfig {
+        host_schemas: vec![arkiv_reth_chainspec::host_metering_schema()],
         genesis: serde_json::from_value(genesis["config"]["arkiv"]["golemdb"].clone()).unwrap(),
         segments: segments::ALL
             .iter()

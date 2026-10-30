@@ -1521,7 +1521,6 @@ dependencies = [
  "arkiv-golemdb",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
- "arkiv-tokenomics",
 ]
 
 [[package]]
@@ -1736,7 +1735,6 @@ dependencies = [
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "arkiv-reth-uncommitted-store",
- "arkiv-tokenomics",
  "eyre",
  "reth-engine-tree",
  "reth-ethereum",

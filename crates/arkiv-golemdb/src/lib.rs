@@ -33,16 +33,9 @@ use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
 pub use golemdb_api::{
-    CellLimits, Genesis, HashAlgorithm, OpenError, PricingConfig, PruningConfig, RecordLimits,
+    CellLimits, Genesis, HashAlgorithm, HostMeteringSchema, OpenError, PricingConfig,
+    PruningConfig, RecordLimits,
 };
-
-pub fn host_metering_schema() -> golemdb::HostMeteringSchema {
-    use arkiv_tokenomics::schedule::{HOST_CODE_VERSION, HOST_WEIGHT_NAMES};
-    golemdb::HostMeteringSchema {
-        code_version: HOST_CODE_VERSION,
-        weight_names: HOST_WEIGHT_NAMES.into_iter().map(str::to_owned).collect(),
-    }
-}
 
 use convert::{
     arkiv_query_result, arkiv_receipt, arkiv_record, branch_id, commit_id, count_op,
@@ -59,6 +52,9 @@ pub struct GolemDbConfig {
     pub genesis: Genesis,
     /// The segments rows may be appended to.
     pub segments: Vec<SegmentSpec>,
+    /// The host's own pricing weights, by name, that GolemDB stores beside its
+    /// own. The adapter passes them on without knowing what they mean.
+    pub host_schemas: Vec<HostMeteringSchema>,
 }
 
 /// A segment: its name, and how many byte columns each of its rows has.
@@ -74,7 +70,7 @@ const SHARD_SPAN: u64 = 500_000;
 impl GolemDbConfig {
     fn open_config(&self) -> Result<golemdb::OpenConfig, OpenError> {
         Ok(golemdb::OpenConfig::new(self.full_genesis()?)
-            .with_host_schemas(vec![host_metering_schema()]))
+            .with_host_schemas(self.host_schemas.clone()))
     }
 
     /// [`genesis`](Self::genesis) with the host's segments, as LZ4-compressed

@@ -12,8 +12,6 @@ license.workspace = true
 [dependencies]
 arkiv-interfaces.workspace = true
 arkiv-reth-uncommitted-store.workspace = true
-# Convert the model snapshot at a view's base into the host fee schedule.
-arkiv-tokenomics.workspace = true
 
 [dev-dependencies]
 # The real engine, so the shared view contract runs against GolemDB too.

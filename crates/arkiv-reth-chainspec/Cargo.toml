@@ -32,11 +32,12 @@ serde.workspace = true
 serde_json.workspace = true
 # GolemDB's genesis format, which `config.arkiv.golemdb` is in.
 golemdb-api.workspace = true
-arkiv-golemdb.workspace = true
 # Validate the host weights required by FeeSchedule.
 arkiv-tokenomics.workspace = true
 
 [dev-dependencies]
 alloy-rlp.workspace = true
+# In-memory GolemDB, to size a typical entity in the genesis files' pricing test.
+arkiv-golemdb.workspace = true
 # The entity record layout, to size a typical entity in the genesis files' pricing test.
 arkiv-interfaces.workspace = true

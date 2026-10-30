@@ -706,6 +706,7 @@ mod tests {
             max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
         };
         let config = GolemDbConfig {
+            host_schemas: vec![],
             genesis: Genesis::new(
                 HashAlgorithm::Keccak256,
                 limits,

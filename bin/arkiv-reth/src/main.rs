@@ -186,6 +186,7 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
     );
     Ok(arkiv_golemdb::GolemDbConfig {
         genesis: genesis.clone(),
+        host_schemas: vec![arkiv_reth_chainspec::host_metering_schema()],
         segments: arkiv_reth_statemanager::segments::ALL
             .iter()
             .map(|&(name, columns)| arkiv_golemdb::SegmentSpec {

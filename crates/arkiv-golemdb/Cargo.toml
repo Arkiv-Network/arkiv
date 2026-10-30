@@ -12,13 +12,14 @@ license.workspace = true
 arkiv-interfaces.workspace = true
 golemdb-api.workspace = true
 golemdb-storage.workspace = true
-arkiv-tokenomics.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 # The keys GolemDB keeps its own records at.
 golemdb-cells.workspace = true
 
 [dev-dependencies]
+# Arkiv's host weight names, for the tests that price with them.
+arkiv-tokenomics.workspace = true
 # The shared store contract, so GolemDB is held to the write effects the other
 # stores mirror.
 arkiv-interfaces = { workspace = true, features = ["conformance"] }

@@ -59,6 +59,16 @@ struct ArkivConfig {
     golemdb: golemdb_api::Genesis,
 }
 
+/// Arkiv's pricing weights (`host.arkiv.*`), as GolemDB declares them: the
+/// genesis file's `metering` must hold exactly these beside GolemDB's own.
+pub fn host_metering_schema() -> golemdb_api::HostMeteringSchema {
+    use arkiv_tokenomics::schedule::{HOST_CODE_VERSION, HOST_WEIGHT_NAMES};
+    golemdb_api::HostMeteringSchema {
+        code_version: HOST_CODE_VERSION,
+        weight_names: HOST_WEIGHT_NAMES.into_iter().map(str::to_owned).collect(),
+    }
+}
+
 impl ArkivChainSpec {
     /// Wrap a reth chain spec. The floor is read from its genesis header, and
     /// GolemDB's settings from its genesis `config.arkiv`, which must be valid.
@@ -79,7 +89,7 @@ impl ArkivChainSpec {
                     pricing.host_code_version
                 );
                 pricing
-                    .validate(&[arkiv_golemdb::host_metering_schema()])
+                    .validate(&[host_metering_schema()])
                     .map_err(|e| eyre::eyre!("genesis config.arkiv.golemdb.metering: {e}"))?;
                 FeeSchedule::from_weights(&pricing.weights)
                     .map_err(|e| eyre::eyre!("genesis config.arkiv.golemdb.metering: {e:?}"))?;
@@ -505,6 +515,7 @@ mod tests {
         let golemdb = arkiv_golemdb::GolemDbStore::open_memory(&arkiv_golemdb::GolemDbConfig {
             genesis: dev.golemdb().unwrap().clone(),
             segments: vec![],
+            host_schemas: vec![host_metering_schema()],
         })
         .unwrap();
         let branch = golemdb.begin(None).unwrap();

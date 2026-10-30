@@ -34,7 +34,6 @@ use arkiv_interfaces::statemanager::{
 use arkiv_interfaces::store::{
     BranchId, CommitId, Metered, SealedCommit, Store, StoreError, StoreExt,
 };
-use arkiv_tokenomics::{FeeSchedule, FeeScheduleSource};
 use core::sync::atomic::{AtomicU64, Ordering};
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::state::EvmState;
@@ -404,19 +403,6 @@ where
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
         Ok(AccountNoncesStore::commit_store(&mut self.golem)?)
-    }
-}
-
-/// The block's fee schedule, from GolemDB's side of the view.
-impl<B, C, E> FeeScheduleSource for HostStateView<B, C>
-where
-    B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
-    E: core::fmt::Debug,
-{
-    type Error = HostError<E>;
-
-    fn fee_schedule(&self) -> Result<FeeSchedule, Self::Error> {
-        Ok(self.golem.fee_schedule()?)
     }
 }
 

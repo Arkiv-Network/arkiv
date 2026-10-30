@@ -23,7 +23,6 @@ use arkiv_interfaces::statemanager::{
 };
 use arkiv_interfaces::store::{BranchId, CommitId, ReadTarget, Store, StoreError};
 use arkiv_reth_uncommitted_store::MemPruningStore;
-use arkiv_tokenomics::{FeeSchedule, FeeScheduleSource, ScheduleError};
 
 use crate::accounts::AccountError;
 use crate::entities::EntityError;
@@ -45,8 +44,6 @@ pub enum ViewError {
     NoOpenFrame,
     /// A frame was begun while one was already open. Frames do not nest.
     FrameAlreadyOpen,
-    /// The base commit holds no usable fee schedule, so nothing can be priced.
-    Schedule(ScheduleError),
     /// The operation isn't available on this host.
     Unsupported(&'static str),
     /// The view cannot graduate — see [`StateView::graduate`].
@@ -260,20 +257,6 @@ impl<S: Store> PruningStore for GolemStateView<S> {
     }
 }
 
-/// The price list at the view's base. GolemDB keeps one from its genesis; the
-/// mock stores have none, so they get [`FeeSchedule::MOCK`].
-impl<S: Store> FeeScheduleSource for GolemStateView<S> {
-    type Error = ViewError;
-
-    fn fee_schedule(&self) -> Result<FeeSchedule, ViewError> {
-        match self.store.pricing_snapshot(self.origin) {
-            Ok(snapshot) => FeeSchedule::from_model(&snapshot.model).map_err(ViewError::Schedule),
-            Err(StoreError::PricingUnavailable) => Ok(FeeSchedule::MOCK),
-            Err(error) => Err(error.into()),
-        }
-    }
-}
-
 impl<S: Store> StateView for GolemStateView<S> {
     type Error = ViewError;
 
@@ -478,11 +461,6 @@ pub(crate) mod tests {
             None,
         );
         assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_mock_store_gets_the_mock_fee_schedule() {
-        assert_eq!(view().fee_schedule(), Ok(FeeSchedule::MOCK));
     }
 
     #[test]

@@ -20,6 +20,7 @@ fn config() -> GolemDbConfig {
         max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
     };
     GolemDbConfig {
+        host_schemas: vec![],
         genesis: Genesis::new(
             HashAlgorithm::Keccak256,
             limits,
@@ -36,6 +37,13 @@ fn config() -> GolemDbConfig {
 
 fn priced_config() -> GolemDbConfig {
     let mut config = config();
+    config.host_schemas = vec![HostMeteringSchema {
+        code_version: arkiv_tokenomics::schedule::HOST_CODE_VERSION,
+        weight_names: arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    }];
     config.genesis.metering.host_code_version = arkiv_tokenomics::schedule::HOST_CODE_VERSION;
     config.genesis.metering.weights.extend(
         arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
