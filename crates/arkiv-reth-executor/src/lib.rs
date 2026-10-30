@@ -536,16 +536,16 @@ struct BlockPricing {
 
 impl BlockPricing {
     fn load(store: &HostStore, at: CommitId) -> Result<Self, String> {
-        let schedule = match store.pricing_snapshot(at) {
-            Ok(snapshot) if snapshot.commit_id != at => {
-                return Err("pricing snapshot does not match the block base".into());
-            }
-            Ok(snapshot) => FeeSchedule::from_model(&snapshot.model)
-                .map_err(|e| format!("host pricing: {e:?}"))?,
-            // The in-memory mock keeps no price list.
-            Err(arkiv_interfaces::store::StoreError::PricingUnavailable) => FeeSchedule::MOCK,
-            Err(e) => return Err(format!("pricing snapshot: {e:?}")),
-        };
+        // Every store error is an error: prices are consensus data, never a
+        // default.
+        let snapshot = store
+            .pricing_snapshot(at)
+            .map_err(|e| format!("pricing snapshot: {e:?}"))?;
+        if snapshot.commit_id != at {
+            return Err("pricing snapshot does not match the block base".into());
+        }
+        let schedule =
+            FeeSchedule::from_model(&snapshot.model).map_err(|e| format!("host pricing: {e:?}"))?;
         Ok(Self {
             commit_id: at,
             schedule,
@@ -1795,18 +1795,19 @@ mod tests {
         assert!(evm.branch.is_none(), "the refused branch is not kept");
     }
 
-    /// The in-memory mock keeps no price list, so a block on it is priced with
-    /// [`FeeSchedule::MOCK`].
+    /// Prices are consensus data: a store without a price list is refused,
+    /// never priced with defaults.
     #[test]
-    fn a_mock_store_is_priced_with_the_mock_schedule() {
+    fn a_store_without_prices_is_refused() {
         use arkiv_interfaces::store::{Store, StoreExt};
         let store: HostStore =
             std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
         let genesis = store.begin(None).unwrap();
         store.commit_tagged(genesis, [0; 32]).unwrap();
-        assert_eq!(
-            BlockPricing::load(&store, store.head()).unwrap().schedule,
-            FeeSchedule::MOCK
+        assert!(
+            BlockPricing::load(&store, store.head())
+                .unwrap_err()
+                .contains("PricingUnavailable")
         );
     }
 
@@ -2338,7 +2339,21 @@ mod tests {
         use arkiv_interfaces::store::reference::MemStore;
         use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
-        let store: HostStore = Arc::new(MemStore::new());
+        // The dev genesis's Arkiv weights: prices must come from the store.
+        let store: HostStore = Arc::new(MemStore::with_pricing(
+            arkiv_interfaces::store::PricingModel {
+                version: 1,
+                golemdb_code_version: 1,
+                host_code_version: arkiv_tokenomics::schedule::HOST_CODE_VERSION,
+                weights: Arc::new(
+                    arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
+                        .into_iter()
+                        .zip([14, 1, 1, 64, 64, 7_884_000])
+                        .map(|(name, value)| (name.to_owned(), value))
+                        .collect(),
+                ),
+            },
+        ));
         store
             .commit_tagged(store.begin(None).expect("begin"), [0; 32])
             .expect("tag genesis");
@@ -2388,13 +2403,10 @@ mod tests {
     /// without `finish`. The branch has to go with it, or the store keeps it.
     #[test]
     fn an_evm_dropped_without_finishing_discards_its_branch() {
-        use arkiv_interfaces::store::{Store, StoreError, StoreExt, reference::MemStore};
+        use arkiv_interfaces::store::{Store, StoreError};
         use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
-        let store: HostStore = Arc::new(MemStore::new());
-        store
-            .commit_tagged(store.begin(None).expect("begin"), [0; 32])
-            .expect("tag genesis");
+        let store = host_store(1);
         let mut evm = ArkivEvmFactory::new(
             store.clone(),
             Arc::new(BlockSeals::default()),

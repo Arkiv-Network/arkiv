@@ -62,8 +62,8 @@ const PATH_EXAMPLE: &str = "ARKIV_STORE_PATH=/var/lib/arkiv/golemdb";
 /// - `ARKIV_STORE_PATH` (`path`) is GolemDB's directory. It must be absolute
 ///   or start with `~`, the home directory; otherwise it is taken as written.
 /// - `ARKIV_EXPERIMENTAL_STORE` (`experimental`) is for tests: `memory` is the
-///   in-process reference store, gone when the process is. It does not use the
-///   genesis file's GolemDB settings.
+///   in-process reference store, gone when the process is. Of the genesis
+///   file's GolemDB settings it takes only the price list.
 ///
 /// GolemDB is created with the settings of the chain `spec` describes.
 fn open_store(
@@ -88,7 +88,21 @@ fn open_store(
         (None, Some(store)) => match store.to_str() {
             Some("memory") => {
                 info!(target: "arkiv-reth", "Arkiv state in-process, lost when the node stops");
-                Ok(Arc::new(arkiv_interfaces::store::reference::MemStore::new()))
+                // The genesis file's price list, as GolemDB would keep it. A
+                // file without one leaves the store unpriced, and the node
+                // refuses to start on it.
+                let store = match spec.golemdb() {
+                    Some(golemdb) => arkiv_interfaces::store::reference::MemStore::with_pricing(
+                        arkiv_interfaces::store::PricingModel {
+                            version: 1,
+                            golemdb_code_version: golemdb.metering.golemdb_code_version,
+                            host_code_version: golemdb.metering.host_code_version,
+                            weights: Arc::new(golemdb.metering.weights.clone()),
+                        },
+                    ),
+                    None => arkiv_interfaces::store::reference::MemStore::new(),
+                };
+                Ok(Arc::new(store))
             }
             _ => eyre::bail!(
                 "ARKIV_EXPERIMENTAL_STORE={}: use memory",
@@ -294,7 +308,7 @@ fn main() {
     // GolemDB is the store whose genesis root block 0's header carries.
     let on_golemdb = path.is_some();
     // GolemDB prices every call from its genesis weights; the in-memory mock
-    // prices nothing, and the placeholder stands in for it.
+    // reports no work, and the placeholder op cost stands in for it.
     let op_cost = if on_golemdb {
         OpCost::FromStore
     } else {
@@ -337,18 +351,16 @@ fn main() {
         async move |builder, arkiv_args| {
             info!(target: "arkiv-reth", "Launching arkiv-reth (reth host + Arkiv entity engine)");
             let store = open(&builder.config().chain);
-            // GolemDB keeps the chain's price list from its genesis; a node on
-            // it must have a usable one. The in-memory mock has none.
-            if on_golemdb {
-                let pricing = store.pricing_snapshot(store.head()).map_err(|e| {
-                    eyre::eyre!(
-                        "the store has no usable pricing model \
-                         (config.arkiv.golemdb.metering): {e:?}"
-                    )
-                })?;
-                arkiv_tokenomics::FeeSchedule::from_model(&pricing.model)
-                    .map_err(|e| eyre::eyre!("invalid host pricing: {e:?}"))?;
-            }
+            // Every store keeps the chain's price list from its genesis; a node
+            // must have a usable one.
+            let pricing = store.pricing_snapshot(store.head()).map_err(|e| {
+                eyre::eyre!(
+                    "the store has no usable pricing model \
+                     (config.arkiv.golemdb.metering): {e:?}"
+                )
+            })?;
+            arkiv_tokenomics::FeeSchedule::from_model(&pricing.model)
+                .map_err(|e| eyre::eyre!("invalid host pricing: {e:?}"))?;
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone(), op_cost);
