@@ -813,6 +813,7 @@ mod tests {
         GolemDbStore::open_memory(&GolemDbConfig {
             genesis,
             segments: vec![],
+            host_schemas: vec![],
         })
         .expect("open golemdb")
     }

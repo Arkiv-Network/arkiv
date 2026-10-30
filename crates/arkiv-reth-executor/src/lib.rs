@@ -1789,6 +1789,13 @@ mod tests {
             arkiv_golemdb::GolemDbStore::open_memory(&arkiv_golemdb::GolemDbConfig {
                 genesis,
                 segments: vec![],
+                host_schemas: vec![arkiv_golemdb::HostMeteringSchema {
+                    code_version: arkiv_tokenomics::schedule::HOST_CODE_VERSION,
+                    weight_names: arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                }],
             })
             .expect("open golemdb"),
         );
