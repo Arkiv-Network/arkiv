@@ -31,6 +31,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 #[cfg(unix)]
 use reth_cli_util::allocator::tikv_jemalloc_sys as _;
 
+use arkiv_interfaces::gas::OpCost;
 use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::ArkivEvmFactory;
 use arkiv_reth_golemdbprovider::{ArkivProvider, ArkivProviderBuilder};
@@ -292,6 +293,13 @@ fn main() {
     let experimental = std::env::var_os("ARKIV_EXPERIMENTAL_STORE");
     // GolemDB is the store whose genesis root block 0's header carries.
     let on_golemdb = path.is_some();
+    // GolemDB prices every call from its genesis weights; the in-memory mock
+    // prices nothing, and the placeholder stands in for it.
+    let op_cost = if on_golemdb {
+        OpCost::FromStore
+    } else {
+        OpCost::Placeholder
+    };
     let store = Arc::new(OnceLock::<HostStore>::new());
     let open = move |spec: &ArkivChainSpec| {
         store
@@ -321,7 +329,7 @@ fn main() {
             (
                 EthEvmConfig::new_with_evm_factory(
                     spec.clone(),
-                    ArkivEvmFactory::new(factory_open(&spec), factory_seals.clone()),
+                    ArkivEvmFactory::new(factory_open(&spec), factory_seals.clone(), op_cost),
                 ),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )
@@ -343,7 +351,7 @@ fn main() {
             }
             let rpc_store = store.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
-            let node = ArkivNode::new(store.clone(), seals.clone());
+            let node = ArkivNode::new(store.clone(), seals.clone(), op_cost);
             // Spelt out rather than `.node(node)`: that convenience pins the
             // provider to reth's `BlockchainProvider`, and the whole point here
             // is to run on ours. `with_types_and_provider` names the provider

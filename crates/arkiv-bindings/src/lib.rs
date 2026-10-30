@@ -106,6 +106,7 @@ alloy_sol_types::sol! {
         error EntityNotFound(bytes32 entityKey);
         error ExpiryNotExtended(bytes32 entityKey, uint64 newExpiresAt, uint64 currentExpiresAt);
         error ExpiryDeadOnArrival(uint64 target, uint64 currentBlock);
+        error ExpiryBeyondMaxLifetime(uint64 target, uint64 currentBlock, uint64 maxLifetime);
         error InvalidOpType(uint8 operation);
         error InvalidValueType(Ident32 name, uint8 typeId);
         error NonCanonicalOperationData(uint8 operation);
