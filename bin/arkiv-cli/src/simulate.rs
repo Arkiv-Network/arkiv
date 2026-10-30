@@ -718,6 +718,7 @@ pub async fn run(
         wallet.register_signer(s.clone());
     }
     let provider = ProviderBuilder::new()
+        .with_simple_nonce_management()
         .wallet(wallet)
         .connect_http(rpc_url.parse()?);
 
