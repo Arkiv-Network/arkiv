@@ -119,7 +119,7 @@ jobs:
           set -euo pipefail
           t0=$(date +%s)
           status=0
-          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps \
+          cargo clippy --workspace --all-targets --locked --profile "$PROFILE" --no-deps \
             -- -D warnings 2>&1 | tee clippy.log || status=$?
           {
             echo "seconds=$(( $(date +%s) - t0 ))"

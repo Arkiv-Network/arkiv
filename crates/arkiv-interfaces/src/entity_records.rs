@@ -536,10 +536,8 @@ mod tests {
     fn reserved_keys_have_no_entity_record() {
         let mut account = [0u8; 32];
         account[12..].copy_from_slice(&[0xaa; 20]);
-        for key in [account] {
-            assert!(is_reserved_key(key));
-            assert_eq!(record_key(key), None);
-        }
+        assert!(is_reserved_key(account));
+        assert_eq!(record_key(account), None);
         let mut near = [0x7b; 32];
         near[31] ^= 1;
         for key in [[0x11; 32], near] {
