@@ -897,11 +897,11 @@ fn arkiv_transact<DB: Database>(
     }
 
     // Otherwise it's a plain value transfer. 21k flat, floored at the calldata
-    // intrinsics should the transfer carry data. The sender checks bound the
-    // charge by the gas limit, so a limit below it halts before any write.
+    // intrinsics should the transfer carry data. A limit below that is
+    // invalid, before any write.
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
     if tx.gas_limit < gas_used {
-        return Ok(out_of_gas());
+        return Err(gas_limit_below(gas_used, &tx));
     }
     let value_out = if to == tx.caller {
         U256::ZERO
@@ -999,6 +999,16 @@ fn arkiv_purge_expired<DB: Database>(
     ))
 }
 
+/// A gas limit below what the transaction pays at least is invalid, as in
+/// Ethereum. Halting instead would put it in a block with no gas, fee or nonce
+/// bump, so the same signed transaction could be included again and again.
+fn gas_limit_below<E>(initial_gas: u64, tx: &TxEnv) -> EVMError<E> {
+    EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit {
+        initial_gas,
+        gas_limit: tx.gas_limit,
+    })
+}
+
 fn out_of_gas() -> ResultAndState<HaltReason> {
     ResultAndState::new(
         ExecutionResult::Halt {
@@ -1028,21 +1038,12 @@ fn arkiv_entity_transact<DB: Database>(
     checks: Option<SenderChecks>,
     tx: &TxEnv,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    // During eth_estimateGas the binary search probes gas limits below the
-    // pool's intrinsic minimum. Halt so the search raises its lower bound;
-    // otherwise it converges on a value the tx-pool later rejects with
-    // IntrinsicGasTooLow. Nothing is staged, so the state stays clean for the
-    // next probe.
+    // A limit below the intrinsic minimum is invalid, before anything is
+    // staged. `eth_estimateGas` reads that as "gas too low" and raises the
+    // lower bound of its search, so it never converges below the minimum.
     let floor = intrinsic_gas(&tx.data);
     if tx.gas_limit < floor {
-        return Ok(ResultAndState::new(
-            ExecutionResult::Halt {
-                reason: HaltReason::OutOfGas(OutOfGasError::Basic),
-                gas: ResultGas::default(),
-                logs: Vec::new(),
-            },
-            EvmState::default(),
-        ));
+        return Err(gas_limit_below(floor, tx));
     }
 
     let caller = tx.caller;
@@ -1159,11 +1160,10 @@ fn arkiv_view_call<DB: Database>(
     checks: Option<SenderChecks>,
     answer: impl FnOnce(&mut DB) -> Result<Result<Vec<u8>, Vec<u8>>, EVMError<DB::Error>>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    // The sender checks bound the charge by the gas limit, so a limit below
-    // the flat charge halts here, before any write.
+    // A limit below the flat charge is invalid, before any write.
     let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
     if tx.gas_limit < gas_used {
-        return Ok(out_of_gas());
+        return Err(gas_limit_below(gas_used, tx));
     }
     let output = answer(db)?;
 
@@ -2100,11 +2100,11 @@ mod tests {
     }
 
     /// A gas limit below the flat charge of a view call or a plain transfer
-    /// halts out of gas before any write. The sender checks only bound the
-    /// charge by the limit, so settling would debit more than they proved,
-    /// clamp, and fail with the value and the nonce bump already written.
+    /// makes the transaction invalid, before any write, as in Ethereum. A halt
+    /// would go into the block with no nonce bump, so it could be included
+    /// again.
     #[test]
-    fn a_gas_limit_below_the_charge_halts_before_any_write() {
+    fn a_gas_limit_below_the_charge_is_invalid_and_writes_nothing() {
         let view_call = TxEnv {
             gas_limit: 20_000,
             ..call_tx(
@@ -2120,17 +2120,17 @@ mod tests {
         for (case, tx) in [("a view call", view_call), ("a transfer", transfer)] {
             let store = host_store(FREE);
             let (branch, out) = transact(&store, tx, true, Some(all_checks()));
-            let out = out.unwrap_or_else(|e| panic!("{case}: {e:?}"));
             assert!(
                 matches!(
-                    out.result,
-                    ExecutionResult::Halt {
-                        reason: HaltReason::OutOfGas(_),
-                        ..
-                    }
+                    out,
+                    Err(EVMError::Transaction(
+                        InvalidTransaction::CallGasCostMoreThanGasLimit {
+                            gas_limit: 20_000,
+                            ..
+                        }
+                    ))
                 ),
-                "{case}: {:?}",
-                out.result
+                "{case}: {out:?}"
             );
             assert!(untouched(&store, branch), "{case}: the branch is untouched");
         }
