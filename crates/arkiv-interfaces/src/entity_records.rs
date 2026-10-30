@@ -49,8 +49,9 @@ use alloc::vec::Vec;
 use crate::constants::ENTITY_MAX_ATTRIBUTES;
 use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
 use crate::primitives::EntityAddress;
+use crate::statemanager::EntityUpdates;
 use crate::store::{
-    Cell, CellKind, CellName, ReadTarget, Record, RecordKey, Store, StoreError, TypeId,
+    Cell, CellKind, CellName, ReadTarget, Record, RecordKey, RecordMeta, Store, StoreError, TypeId,
 };
 
 /// The system cells of the layout above, which every entity record holds.
@@ -199,6 +200,52 @@ pub fn to_cells(entity: &Entity) -> Result<Vec<(CellName, Cell)>, RecordError> {
         cells.push((CellName::from(name), cell));
     }
     Ok(cells)
+}
+
+/// The system cells and the record's `#meta`: a read projected on them gives
+/// [`from_record`] an entity without its attributes, and the record's size.
+/// What an op needs that reads an entity only to authorize and price itself.
+pub fn system_projection() -> Vec<CellName> {
+    [
+        annotations::KEY,
+        annotations::CREATOR,
+        annotations::OWNER,
+        annotations::CREATED_AT,
+        annotations::EXPIRES_AT,
+        annotations::UPDATED_AT,
+        annotations::CREATION_FLAGS,
+    ]
+    .into_iter()
+    .map(system)
+    .chain([CellName::from(RecordMeta::CELL)])
+    .collect()
+}
+
+/// The system cells `updates` sets, as [`to_cells`] encodes them. An update
+/// that leaves the attributes alone writes these and nothing else. The key
+/// never changes, so it is never among them.
+pub fn system_cells_set_by(updates: &EntityUpdates) -> Result<Vec<(CellName, Cell)>, RecordError> {
+    let mut entity = Entity::default();
+    updates.apply_to(&mut entity);
+    let set: Vec<CellName> = [
+        (annotations::CREATOR, updates.creator.is_some()),
+        (annotations::OWNER, updates.owner.is_some()),
+        (annotations::CREATED_AT, updates.created_at.is_some()),
+        (annotations::EXPIRES_AT, updates.expires_at.is_some()),
+        (annotations::UPDATED_AT, updates.updated_at.is_some()),
+        (
+            annotations::CREATION_FLAGS,
+            updates.creation_flags.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, is_set)| *is_set)
+    .map(|(name, _)| system(name))
+    .collect();
+    Ok(to_cells(&entity)?
+        .into_iter()
+        .filter(|(name, _)| set.contains(name))
+        .collect())
 }
 
 /// Read a cell of an expected type, or say which one was wrong.

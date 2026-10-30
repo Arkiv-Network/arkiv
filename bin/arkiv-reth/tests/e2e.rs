@@ -2366,6 +2366,64 @@ const GLM_DECIMALS: u32 = 18;
 /// The rate the fee table prints in USD, 1 GLM = 0.1 USD: one more decimal.
 const USD_PER_GLM_DECIMALS: u32 = 1;
 
+/// Extend, transfer and delete leave an entity's attributes alone, so their
+/// compute does not grow with them. On GolemDB, where a read is charged by the
+/// byte, an entity with 100 KiB of payload costs what one with 16 bytes does;
+/// the storage an extend buys does grow with it, and is not compute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ops_that_leave_the_attributes_alone_cost_the_same_however_large_the_entity() {
+    let (_node, client, _, _) = spawn_on(true).await;
+    let mut keys = Vec::new();
+    for size in [16, 100 * 1024, 16, 100 * 1024] {
+        let create = create_op(5000, Bytes::from(vec![0x5a; size]), vec![]);
+        keys.push(created_key(&client.execute(vec![create]).await));
+    }
+    let (small, large) = (keys[0], keys[1]);
+    let pairs = [
+        (
+            "extend",
+            Operation::extend_expiry(small, 0, 10_000),
+            Operation::extend_expiry(large, 0, 10_000),
+        ),
+        // Each to an owner of its own, so both join a new index term.
+        (
+            "transfer",
+            Operation::transfer_ownership(small, Address::repeat_byte(0xb1)),
+            Operation::transfer_ownership(large, Address::repeat_byte(0xb2)),
+        ),
+        (
+            "delete",
+            Operation::delete(keys[2]),
+            Operation::delete(keys[3]),
+        ),
+    ];
+    for (op, on_small, on_large) in pairs {
+        let small = send_and_break_down(&client, vec![on_small])
+            .await
+            .compute_gas;
+        let large = send_and_break_down(&client, vec![on_large])
+            .await
+            .compute_gas;
+        // Only the calldata differs, in the keys' bytes.
+        assert!(
+            small.abs_diff(large) < 1_000,
+            "{op}: {small} compute gas on the small entity, {large} on the large one"
+        );
+    }
+}
+
+/// The key of the entity the transaction behind `receipt` created.
+fn created_key(receipt: &alloy_rpc_types::TransactionReceipt) -> B256 {
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.inner.address == ARKIV_ADDRESS)
+        .find_map(|log| IEntityRegistry::EntityCreated::decode_log(&log.inner).ok())
+        .expect("an EntityCreated log")
+        .entityKey
+}
+
 /// `amount` in units of `10^decimals`, exactly, without trailing zeros.
 fn decimal(amount: u128, decimals: u32) -> String {
     let unit = 10u128.pow(decimals);
