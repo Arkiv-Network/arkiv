@@ -84,12 +84,6 @@ pub enum ScheduleError {
     UnsupportedHostCode(u64),
 }
 
-/// One schedule from the execution base, shared by all transactions in a block.
-pub trait FeeScheduleSource {
-    type Error;
-    fn fee_schedule(&self) -> Result<FeeSchedule, Self::Error>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

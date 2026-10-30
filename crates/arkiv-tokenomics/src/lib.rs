@@ -28,4 +28,4 @@ pub mod units;
 
 pub use error::Overflow;
 pub use meter::GasMeter;
-pub use schedule::{FeeSchedule, FeeScheduleSource, ScheduleError};
+pub use schedule::{FeeSchedule, ScheduleError};
