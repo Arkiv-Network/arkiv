@@ -424,6 +424,45 @@ where
         BuildOutcome<Self::BuiltPayload>,
         reth_payload_builder_primitives::PayloadBuilderError,
     > {
+        self.build_block(args, Contents::PurgeAndPool)
+    }
+
+    /// The fallback reth races against an unfinished build when a payload is
+    /// requested early. It carries the purge alone, so it is quicker to build and
+    /// pruning keeps its pace.
+    fn build_empty_payload(
+        &self,
+        config: reth_basic_payload_builder::PayloadConfig<Self::Attributes>,
+    ) -> Result<Self::BuiltPayload, reth_payload_builder_primitives::PayloadBuilderError> {
+        let args = BuildArguments::new(
+            Default::default(),
+            Default::default(),
+            None,
+            config,
+            Default::default(),
+            None,
+        );
+        self.build_block(args, Contents::PurgeOnly)?
+            .into_payload()
+            .ok_or(reth_payload_builder_primitives::PayloadBuilderError::MissingPayload)
+    }
+}
+
+impl<Pool, Client, Evm> ArkivPayloadBuilder<Pool, Client, Evm>
+where
+    Client: reth_storage_api::StateProviderFactory
+        + reth_storage_api::BlockNumReader
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + Clone,
+    Pool: TransactionPool<Transaction = EthPooledTransaction>,
+    Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+{
+    fn build_block(
+        &self,
+        args: BuildArguments<alloy_rpc_types_engine::PayloadAttributes, EthBuiltPayload>,
+        contents: Contents,
+    ) -> Result<BuildOutcome<EthBuiltPayload>, reth_payload_builder_primitives::PayloadBuilderError>
+    {
         // Build on the parent's state. Adoption commits it a moment after reth
         // makes the parent canonical. `chain_info` is reth's head here: it
         // answers from the store only when the store is ahead, and then the
@@ -457,31 +496,21 @@ where
             self.pool.clone(),
             self.config.clone(),
             args,
-            |attrs| {
-                Box::new(PrependBest::new(
+            |attrs| match contents {
+                Contents::PurgeAndPool => Box::new(PrependBest::new(
                     purge,
                     self.pool.best_transactions_with_attributes(attrs),
-                ))
+                )),
+                Contents::PurgeOnly => Box::new(PrependBest::new(purge, std::iter::empty())),
             },
         )
     }
+}
 
-    fn build_empty_payload(
-        &self,
-        config: reth_basic_payload_builder::PayloadConfig<Self::Attributes>,
-    ) -> Result<Self::BuiltPayload, reth_payload_builder_primitives::PayloadBuilderError> {
-        let args = BuildArguments::new(
-            Default::default(),
-            Default::default(),
-            None,
-            config,
-            Default::default(),
-            None,
-        );
-        self.try_build(args)?
-            .into_payload()
-            .ok_or(reth_payload_builder_primitives::PayloadBuilderError::MissingPayload)
-    }
+/// What a built block carries. Every block opens with the purge.
+enum Contents {
+    PurgeAndPool,
+    PurgeOnly,
 }
 
 fn protocol_transaction(
