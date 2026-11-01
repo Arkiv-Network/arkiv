@@ -14,7 +14,7 @@ storage and purge have separate accounting from the start.
 
 Concretely, iteration 1:
 
-1. reads the fee schedule from store cells (values faked for now),
+1. reads the fee schedule from store cells,
 2. passes GolemDB's metered results (receipts, budgets) through to Arkiv,
 3. reads each entity's `#meta` counts,
 4. prices storage × lifetime and credits its base-fee share to the pool,
@@ -25,6 +25,45 @@ From outside, an entity transaction is a normal transaction with one fee: `gasUs
 split is internal plumbing, so the move to the target tokenomics only changes how it is
 charged and reported (decided 2026-10-27).
 
+
+## Fee calc (iteration 1)
+
+From `docs/tokenomics-spec.md`, restricted to storage, with one simplification:
+**all fees are collected through gas.** The spec charges gas for compute only,
+at `base_fee + priority_fee`, and takes storage and purge through the
+transaction's `value`, priced at `min_base_fee`; that is a later iteration. In
+iteration 1 storage gas is part of `gas_used` and charged at the effective gas
+price like compute gas. The component gas counts do not depend on the base fee;
+their wei charges do. Estimates are exact only for the quoted state, schedule and
+execution block context, as in the spec. The limitations are listed below.
+
+```
+fee           = gas_used × effective_gas_price
+gas_used      = compute_gas + storage_gas + purge_gas
+compute_gas   = max(tx_intrinsic + tx_data + Σ golemdb_cost, floor_gas)
+storage_gas   = ceil(Σ storage_time × capacity_rate / 1_000_000)
+purge_gas     = 0                                                (collection deferred)
+
+storage_time  = per operation (storage time is roughly bytes * blocks)
+                create:         storage_units × (expires_at − block_number)
+                extend:         storage_units × (new_expires_at − old_expires_at)
+                growing patch:  (storage_units_after − storage_units_before) × (expires_at − block_number)
+                otherwise:      0                                (no refunds)
+
+storage_units = cell_bytes × cell_byte_units + index_bytes × index_byte_units
+              + cells × c_cell + indexed_cells × c_idx          (all counts from #meta)
+
+capacity_rate = gas per storage_time * 1_000_000
+
+effective_gas_price = base_fee + priority_fee
+sender_charge      = effective_gas_price × gas_used
+compute_burn       = base_fee × compute_gas
+proposer_payment   = priority_fee × gas_used
+pool_credit        = storage_fee + purge_fee
+
+storage_fee   = base_fee × storage_gas                            (wei: the pool's share)
+purge_fee     = base_fee × purge_gas                              (0 in iteration 1)
+```
 ## Baseline
 
 `main` at `9e678a2`, after PR #222 (golemdb/query_integration):
@@ -42,23 +81,23 @@ charged and reported (decided 2026-10-27).
 
 ## Scope
 
-| In | Out (later iterations) |
-| --- | --- |
-| (GolemDB at `d910d14`: done by #222) | real GolemDB compute costs (still 0) |
-| receipts and budgets passed through Arkiv's store layer | purge reserve (`purge_gas` from the D5 bound) |
-| `#meta` counts read for entities | priority fee on compute gas only |
-| fee schedule as store cells, seeded from the genesis | compute-only block `gasUsed` and base fee |
-| storage units, storage gas for create, extend, growing patch | storage and purge paid through `value` at `min_base_fee`, gas for compute only |
-| | nonzero purge-reserve collection and pool-funded purge settlement |
-| storage share credited to the pool, the balance of `ARKIV_ADDRESS` | `arkiv_getFeeSchedule` |
-| | `$rate` per entity (postponed with pool payouts, decided 2026-10-27; see 6d) |
-| `max_lifetime` as an entity-operation admission check | pool payouts to validators, expiry ledger, `R` / `L` |
-| | `arkiv_estimateFee`; receipt fields `computeGas`, `storageGas`, `purgeGas`, `storageFee`, `purgeFee` (with the target tokenomics, decided 2026-10-27) |
-| | limits: `max_block_storage_units`, `max_live_bytes` |
+In
+- real GolemDB compute costs
+- receipts and budgets passed through Arkiv's store layer
+- `#meta` counts read for entities
+- fee schedule as store cells, seeded from the genesis 
+- storage units, storage gas for create, extend, growing patch 
+- `max_lifetime` as an entity-operation admission check
 
-Compute gas stays `PlaceholderCost`. All fee-schedule values are placeholders.
-Purge gas is present in the breakdown but zero: this iteration does not yet collect a
-deletion reserve. Its presence does not imply that purge funding has been implemented.
+Out
+- purge reserve (`purge_gas` from the D5 bound)
+- priority fee on compute gas only
+- nonzero purge-reserve collection and pool-funded purge settlement
+- `arkiv_estimateFee`; receipt fields `computeGas`, `storageGas`, `purgeGas`, `storageFee`, `purgeFee`
+- `arkiv_getFeeSchedule`
+- `$rate` per entity (postponed with pool payouts)
+- pool payouts to validators, expiry ledger
+- limits: `max_block_storage_units`, `max_live_bytes`
 
 ## Architecture
 
@@ -92,42 +131,8 @@ can move into the crate in a later iteration.
 | Transaction gas, settlement | `crates/arkiv-reth-executor/src/lib.rs` (`arkiv_entity_transact`, `charge_sender`, `FeeEnv`) |
 | Entity cells | `crates/arkiv-interfaces/src/entity.rs` (`annotations`), `crates/arkiv-interfaces/src/entity_records.rs` |
 
-## Pricing rules (iteration 1)
 
-From `docs/tokenomics-spec.md`, restricted to storage, with one simplification:
-**all fees are collected through gas.** The spec charges gas for compute only,
-at `base_fee + priority_fee`, and takes storage and purge through the
-transaction's `value`, priced at `min_base_fee`; that is a later iteration. In
-iteration 1 storage gas is part of `gas_used` and charged at the effective gas
-price like compute gas. The component gas counts do not depend on the base fee;
-their wei charges do. Estimates are exact only for the quoted state, schedule and
-execution block context, as in the spec. The limitations are listed below.
-
-```
-storage_units = cell_bytes × cell_byte_units + index_bytes × index_byte_units
-              + cells × c_cell + indexed_cells × c_idx          (all counts from #meta)
-
-storage_time  = per operation, in batch order:
-                create:         units_after × (expires_at − block_number)
-                extend:         units × (new_expires_at − old_expires_at)
-                growing patch:  (units_after − units_before) × (expires_at − block_number)
-                otherwise:      0                                (no refunds)
-
-storage_gas   = ceil(Σ storage_time × capacity_rate / 1_000_000)  (checked u128)
-compute_gas   = max(tx_intrinsic + tx_data + Σ PlaceholderCost, floor_gas)
-purge_gas     = 0                                                (collection deferred)
-gas_used      = compute_gas + storage_gas + purge_gas
-storage_fee   = base_fee × storage_gas                            (wei: the pool's share)
-purge_fee     = base_fee × purge_gas                              (0 in iteration 1)
-
-effective_gas_price = base_fee + priority_fee
-sender_charge      = effective_gas_price × gas_used
-compute_burn       = base_fee × compute_gas
-proposer_payment   = priority_fee × gas_used
-pool_credit        = storage_fee + purge_fee
-```
-
-### Split accounting, one payment
+## Split accounting, one payment
 
 On a successful transaction, the sender pays `sender_charge` through gas only. The following
 identity must hold:
