@@ -116,8 +116,7 @@ and CLI later.
    three components until settlement rather than passing only a combined gas count.
 
 I/O (reading the schedule, writing `$rate`, crediting the pool) stays in the
-state and executor layers. `PlaceholderCost` (`arkiv-interfaces/src/gas.rs`)
-can move into the crate in a later iteration.
+state and executor layers. 
 
 ### Plug-in points
 
@@ -170,7 +169,7 @@ is not the same as the 200-wei storage pool credit.
 `tx_intrinsic`, `tx_data` and `floor_gas` are as in the spec (21,000; EIP-2028;
 EIP-7623). The floor applies to the compute part only, as in the spec, although
 in iteration 1 all gas still counts against the block gas limit. The terms are
-added: today the executor charges `max(Σ PlaceholderCost, tx_intrinsic + tx_data,
+added: today the executor charges `max(Σ golemdb_cost, tx_intrinsic + tx_data,
 floor_gas)`, so the transaction terms are not paid whenever the ops cost more.
 
 **Per operation, measured on the branch** (decided 2026-10-26). A batch is priced as the
@@ -221,7 +220,7 @@ once it persists host weights: `host.arkiv.capacity_rate`,
 ## Known limitations
 
 Collecting storage through gas departs from the spec in ways that are
-acceptable with placeholder values and a single sequencer, and that the switch
+acceptable with golemdb_cost values and a single sequencer, and that the switch
 to `value` payment removes:
 
 | Limitation | Effect | Why acceptable for now |
@@ -378,7 +377,7 @@ tests) and is its own commit.
 
      ```rust
      pub struct GasMeter {
-         pub arkiv_op_cost: Gas,   // Σ arkiv_op_cost(op); PlaceholderCost for now
+         pub arkiv_op_cost: Gas,   // Σ arkiv_op_cost(op)
          pub golemdb_cost: Gas,    // Σ entity receipt cost; one cost unit is one gas
          pub storage_time: u128,   // Σ storage_time, in unit-blocks
          pub purge_bound: Gas,     // Σ purge_bound; 0 in iteration 1
@@ -468,7 +467,7 @@ tests) and is its own commit.
 6. **Charging and the pool.**
    Split in five substeps (decided 2026-10-27), each its own commit with CI green. The first
    two carry the priorities: exact storage gas from GolemDB's bytes, compute from
-   `PlaceholderCost` plus GolemDB's costs, purge at 0, folded into one gas fee.
+   golemdb_cost costs, purge at 0, folded into one gas fee.
    - **6a. Operations on the branch.** Per-operation execution inside one frame per
      transaction, as described below, replacing the in-memory overlay; each create advances
      the minting nonce itself; estimates always discard their frame (decided 2026-10-27).
