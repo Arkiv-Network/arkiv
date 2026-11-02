@@ -5,7 +5,7 @@ use core::fmt;
 
 use crate::entity::{Attribute, AttributeValue, CreationFlags};
 use crate::gas::GasBreakdown;
-use crate::primitives::{BlockNumber, EntityAddress, Gas, UserAddress};
+use crate::primitives::{BlockNumber, EntityKey, Gas, UserAddress};
 use crate::statemanager::{BlockRef, StateCommit, StateView};
 
 /// What a transaction executor needs to know about its context. No EVM call
@@ -76,32 +76,32 @@ impl ExecOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevertReason {
     /// A `Create` targeted a key that already exists.
-    AlreadyExists { key: EntityAddress },
+    AlreadyExists { key: EntityKey },
     /// The op targeted a key with no live entity.
-    NotFound { key: EntityAddress },
+    NotFound { key: EntityKey },
     /// The caller isn't the entity's owner.
     NotOwner {
-        key: EntityAddress,
+        key: EntityKey,
         caller: UserAddress,
         owner: UserAddress,
     },
     /// A mutation targeted an entity past its expiry.
     Expired {
-        key: EntityAddress,
+        key: EntityKey,
         expires_at: BlockNumber,
     },
     /// A `Patch` targeted an entity created with the `readonly` flag.
-    ReadOnly { key: EntityAddress },
+    ReadOnly { key: EntityKey },
     /// A `Patch` would leave the entity with too many user attributes.
     TooManyAttributes { count: usize, max: usize },
     /// An `ExtendExpiry` would have moved the expiry backwards.
     ExpiryNotExtended {
-        key: EntityAddress,
+        key: EntityKey,
         new_expires_at: BlockNumber,
         current_expires_at: BlockNumber,
     },
     /// A `Transfer` named the current owner as the new owner.
-    TransferToSelf { key: EntityAddress },
+    TransferToSelf { key: EntityKey },
     /// A `Create` or `ExtendExpiry` would leave more lifetime than the fee
     /// schedule's `max_lifetime`, or asked for permanent expiry, which is not
     /// sold.
@@ -192,7 +192,7 @@ impl fmt::Display for RevertReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Create {
-        key: EntityAddress,
+        key: EntityKey,
         expires_at: BlockNumber,
         /// Entity properties fixed at creation. Immutable thereafter.
         creation_flags: CreationFlags,
@@ -205,19 +205,19 @@ pub enum Op {
     /// attributes compose instead of clobbering one another, and the cost is
     /// proportional to the mutation count rather than the entity size.
     Patch {
-        key: EntityAddress,
+        key: EntityKey,
         mutations: Vec<AttributeMutation>,
     },
     ExtendExpiry {
-        key: EntityAddress,
+        key: EntityKey,
         new_expires_at: BlockNumber,
     },
     Transfer {
-        key: EntityAddress,
+        key: EntityKey,
         new_owner: UserAddress,
     },
     Delete {
-        key: EntityAddress,
+        key: EntityKey,
     },
 }
 
@@ -269,7 +269,7 @@ impl AttributeMutation {
 
 impl Op {
     /// The entity this operation targets (the key being created, for `Create`).
-    pub fn key(&self) -> &EntityAddress {
+    pub fn key(&self) -> &EntityKey {
         match self {
             Op::Create { key, .. }
             | Op::Patch { key, .. }

@@ -2,16 +2,16 @@
 
 use std::collections::BTreeMap;
 
-use arkiv_interfaces::primitives::EntityAddress;
+use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::statemanager::{PruningMeta, ReadMode};
 
 /// An in-memory pruning set: committed entries plus a staged overlay. An add
 /// is an upsert.
 #[derive(Debug, Default, Clone)]
 pub struct MemPruningStore {
-    committed: BTreeMap<EntityAddress, PruningMeta>,
+    committed: BTreeMap<EntityKey, PruningMeta>,
     /// `Some(meta)` = staged add/reorder; `None` = staged removal (a take).
-    staged: BTreeMap<EntityAddress, Option<PruningMeta>>,
+    staged: BTreeMap<EntityKey, Option<PruningMeta>>,
 }
 
 impl MemPruningStore {
@@ -22,17 +22,17 @@ impl MemPruningStore {
         }
     }
 
-    pub fn add_to_pruning_set(&mut self, entity: EntityAddress, pruning_meta: PruningMeta) {
+    pub fn add_to_pruning_set(&mut self, entity: EntityKey, pruning_meta: PruningMeta) {
         self.staged.insert(entity, Some(pruning_meta));
     }
 
-    pub fn peek_top(&self, top: u16, read: ReadMode) -> Vec<(EntityAddress, PruningMeta)> {
+    pub fn peek_top(&self, top: u16, read: ReadMode) -> Vec<(EntityKey, PruningMeta)> {
         let mut entries = self.merged(read);
         entries.truncate(top as usize);
         entries
     }
 
-    pub fn take_top(&mut self, top: u16) -> Vec<(EntityAddress, PruningMeta)> {
+    pub fn take_top(&mut self, top: u16) -> Vec<(EntityKey, PruningMeta)> {
         let taken = self.peek_top(top, ReadMode::ViewWithOverlay);
         for (entity, _) in &taken {
             self.staged.insert(*entity, None);
@@ -54,8 +54,8 @@ impl MemPruningStore {
     }
 
     /// Pruning order: [`PruningMeta`]'s `Ord`, ties by ascending entity.
-    fn merged(&self, read: ReadMode) -> Vec<(EntityAddress, PruningMeta)> {
-        let mut entries: Vec<(EntityAddress, PruningMeta)> = match read {
+    fn merged(&self, read: ReadMode) -> Vec<(EntityKey, PruningMeta)> {
+        let mut entries: Vec<(EntityKey, PruningMeta)> = match read {
             ReadMode::ViewOnBase => self.committed.iter().map(|(k, m)| (*k, *m)).collect(),
             ReadMode::ViewWithOverlay => {
                 let mut merged = self.committed.clone();
@@ -77,7 +77,7 @@ impl MemPruningStore {
 mod tests {
     use super::*;
 
-    fn key_of(byte: u8) -> EntityAddress {
+    fn key_of(byte: u8) -> EntityKey {
         [byte; 32]
     }
 

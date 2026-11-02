@@ -14,9 +14,7 @@ use arkiv_interfaces::execution::{
     TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, GasBreakdown, PlaceholderCost};
-use arkiv_interfaces::primitives::{
-    BlockNumber, EntityAddress, EntityCreationNonce, Gas, UserAddress,
-};
+use arkiv_interfaces::primitives::{BlockNumber, EntityCreationNonce, EntityKey, Gas, UserAddress};
 use arkiv_interfaces::statemanager::{EntityUpdates, ReadMode, StateView, StoredEntity};
 use arkiv_interfaces::store::{CostUnits, Metered, Receipt, RecordMeta, WriteDetails};
 use arkiv_tokenomics::{FeeSchedule, GasMeter, Overflow, storage_time, units};
@@ -25,7 +23,7 @@ use arkiv_tokenomics::{FeeSchedule, GasMeter, Overflow, storage_time, units};
 /// entity-operation log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpEffect {
-    pub key: EntityAddress,
+    pub key: EntityKey,
     pub kind: OpKind,
     /// The owner after the op.
     pub owner: UserAddress,
@@ -445,7 +443,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
 
     fn effect(
         &self,
-        key: EntityAddress,
+        key: EntityKey,
         kind: OpKind,
         owner: UserAddress,
         expires_at: BlockNumber,
@@ -476,7 +474,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         env: &ExecEnv,
         state: &mut V,
         meter: &mut BatchMeter,
-        key: EntityAddress,
+        key: EntityKey,
         auth: Auth,
         read: EntityRead,
         check: impl FnOnce(&Entity) -> Result<(), RevertReason>,
@@ -536,7 +534,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         &self,
         state: &V,
         meter: &mut BatchMeter,
-        key: EntityAddress,
+        key: EntityKey,
     ) -> Result<Option<StoredEntity>, ExecError> {
         state
             .get_entity_with_meta(key, ReadMode::ViewWithOverlay)
@@ -550,7 +548,7 @@ impl<V: StateView, C: CostModel> ArkivExecutor<V, C> {
         &self,
         state: &V,
         meter: &mut BatchMeter,
-        key: EntityAddress,
+        key: EntityKey,
     ) -> Result<Option<StoredEntity>, ExecError> {
         state
             .get_entity_system_fields(key, ReadMode::ViewWithOverlay)
@@ -585,7 +583,7 @@ struct Mutated {
 
 /// One op's change to an existing entity: only the fields that differ. `None`
 /// when nothing changed, so an op that changes nothing writes nothing.
-fn updates_between(key: EntityAddress, before: &Entity, after: &Entity) -> Option<EntityUpdates> {
+fn updates_between(key: EntityKey, before: &Entity, after: &Entity) -> Option<EntityUpdates> {
     let (b, a) = (before, after);
     let updates = EntityUpdates {
         entity: key,
@@ -1282,13 +1280,13 @@ mod tests {
         assert!(staged_in(&view, [1u8; 32]).is_none());
     }
 
-    fn staged_in<S: Store>(view: &GolemStateView<S>, key: EntityAddress) -> Option<Entity> {
+    fn staged_in<S: Store>(view: &GolemStateView<S>, key: EntityKey) -> Option<Entity> {
         view.get_entity(key, ReadMode::ViewWithOverlay)
             .unwrap()
             .value
     }
 
-    fn staged(view: &View, key: EntityAddress) -> Option<Entity> {
+    fn staged(view: &View, key: EntityKey) -> Option<Entity> {
         view.get_entity(key, ReadMode::ViewWithOverlay)
             .unwrap()
             .value

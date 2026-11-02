@@ -1,7 +1,7 @@
 //! The Arkiv-native types every trait speaks in.
 //!
 //! Arkiv is more than its reth host, so its interfaces name Arkiv concepts —
-//! [`UserAddress`], [`EntityAddress`], [`UserBalance`], [`UserNonce`],
+//! [`UserAddress`], [`EntityKey`], [`UserBalance`], [`UserNonce`],
 //! [`EntityCreationNonce`] — never a host's primitives. A host maps them to its
 //! own types at the boundary and keeps that mapping private: whatever address,
 //! word, or big-integer types its storage engine uses, none of them ever cross
@@ -14,7 +14,7 @@
 /// transaction's caller: someone who holds a key and signs.
 ///
 /// **Twenty bytes, deliberately.** Arkiv's own model would happily make this the
-/// full 32 an [`EntityAddress`] uses, and the store keys on 32 either way — but
+/// full 32 an [`EntityKey`] uses, and the store keys on 32 either way — but
 /// every address that actually reaches this type comes from an Ethereum
 /// transaction or from the SDK, both of which speak alloy's 20-byte `Address`. A
 /// wider type would be 12 bytes of zeros at every real call site, plus a widening
@@ -40,18 +40,15 @@ pub type UserAddress = [u8; 20];
 /// a [`UserAddress`] by coincidence of heritage, not by meaning.
 pub type EthAddress = [u8; 20];
 
-/// An **entity's** 32-byte address — its unique, stable identity, fixed at
+/// An **entity's** 32-byte key — its unique, stable identity, derived at
 /// creation.
 ///
-/// Deliberately wider than a [`UserAddress`]: entity addresses are derived
-/// (creator, nonce, and content mix into them), so they need a full hash-wide
-/// space. A host whose native keying is narrower maps internally — the reth
-/// host anchors each entity's MPT leaf by an address prefix — and that mapping
-/// never crosses this API.
-pub type EntityAddress = [u8; 32];
+/// Deliberately wider than a [`UserAddress`]: entity keys are derived (creator,
+/// nonce, and content mix into them), so they need a full hash-wide space.
+pub type EntityKey = [u8; 32];
 
-/// A 32-byte hash — a commitment root or a digest. Not an address: an
-/// [`EntityAddress`] is the same width but names a thing, not a commitment.
+/// A 32-byte hash — a commitment root or a digest. Not a key: an
+/// [`EntityKey`] is the same width but names a thing, not a commitment.
 pub type Hash = [u8; 32];
 
 /// A block number. Expiry and lifecycle are counted in blocks, never wall-clock.
@@ -189,10 +186,10 @@ impl UserNonce {
 }
 
 /// A user's **entity-minting** nonce — how many entities that user has created,
-/// and an input to every minted [`EntityAddress`].
+/// and an input to every minted [`EntityKey`].
 ///
 /// The counterpart of [`UserNonce`] (see there for why the two are distinct
-/// newtypes): mixing them up silently mints the wrong entity address.
+/// newtypes): mixing them up silently mints the wrong entity key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct EntityCreationNonce(u64);
 

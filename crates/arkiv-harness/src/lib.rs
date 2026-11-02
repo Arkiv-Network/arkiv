@@ -5,7 +5,7 @@
 //!   binary (kill-then-restart on the same datadir proves crash recovery).
 //! - [`ArkivClient`] — a typed `arkiv_*` + `eth_*` RPC client to drive a node.
 //!
-//! Protocol constants a client needs ([`ARKIV_ADDRESS`], [`derive_entity_address`])
+//! Protocol constants a client needs ([`ARKIV_ADDRESS`], [`derive_entity_key`])
 //! and the `--dev` test identities are re-exported here so a test imports from one
 //! place.
 
@@ -17,7 +17,7 @@ pub use node::{Node, NodeBuilder};
 
 // Protocol re-exports: build calldata and predict minted keys from one import.
 pub use arkiv_interfaces::primitives::EntityCreationNonce;
-pub use arkiv_reth_executor::{ARKIV_ADDRESS, derive_entity_address};
+pub use arkiv_reth_executor::{ARKIV_ADDRESS, derive_entity_key};
 
 /// Version of this support library.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

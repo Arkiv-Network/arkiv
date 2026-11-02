@@ -78,7 +78,7 @@ pub mod decode;
 pub mod revert;
 
 pub use arkiv::{ArkivExecutor, OpEffect};
-pub use decode::{DecodeError, decode_ops, derive_entity_address};
+pub use decode::{DecodeError, decode_ops, derive_entity_key};
 
 use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
@@ -1253,7 +1253,7 @@ fn view_entity<DB: Database>(
 /// `entityNonce(owner)`: the owner's entity-key minting nonce, as a `uint64`.
 ///
 /// SDKs `eth_call` this before sending creates to predict the keys the batch
-/// will mint (`derive_entity_address(chain_id, owner, nonce + i, salt)`), so it
+/// will mint (`derive_entity_key(chain_id, owner, nonce + i, salt)`), so it
 /// reads the same system-account slot the execute path mints from.
 fn arkiv_entity_nonce_call<DB: Database>(
     store: &HostStore,

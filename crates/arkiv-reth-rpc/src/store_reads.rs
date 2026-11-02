@@ -13,7 +13,7 @@
 
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::entity_records;
-use arkiv_interfaces::primitives::EntityAddress;
+use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::query::Query as ArkivQuery;
 use arkiv_interfaces::store::{CommitId, Filter, Page, Query, ReadTarget, Sort, Store, StoreError};
 
@@ -49,7 +49,7 @@ impl From<arkiv_interfaces::entity_records::RecordError> for ReadError {
 pub fn entity<S: Store + ?Sized>(
     store: &S,
     at: CommitId,
-    key: EntityAddress,
+    key: EntityKey,
 ) -> Result<Option<Entity>, ReadError> {
     entity_records::read(store, ReadTarget::Commit(at), key)
 }

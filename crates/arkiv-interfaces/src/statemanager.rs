@@ -14,7 +14,7 @@ use core::ops::Bound;
 use crate::entity::{Attribute, AttributeValue, CreationFlags, Entity};
 use crate::execution::Op;
 use crate::primitives::{
-    BlockNumber, EntityAddress, EntityCreationNonce, Gas, Hash, UserAddress, UserBalance, UserNonce,
+    BlockNumber, EntityCreationNonce, EntityKey, Gas, Hash, UserAddress, UserBalance, UserNonce,
 };
 use crate::query::QueryStats;
 use crate::store::{Metered, RecordMeta};
@@ -66,7 +66,7 @@ pub enum StoreKind {
 /// an absent entity with every field set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EntityUpdates {
-    pub entity: EntityAddress,
+    pub entity: EntityKey,
     pub delete: bool,
     pub creator: Option<UserAddress>,
     pub owner: Option<UserAddress>,
@@ -92,7 +92,7 @@ impl EntityUpdates {
         }
     }
 
-    pub fn deletion(entity: EntityAddress) -> Self {
+    pub fn deletion(entity: EntityKey) -> Self {
         Self {
             entity,
             delete: true,
@@ -206,7 +206,7 @@ pub trait AccountNoncesStore {
     fn commit_store(&mut self) -> Result<Commitment, Self::Error>;
 }
 
-/// The entity-creation nonces: an input to every minted [`EntityAddress`].
+/// The entity-creation nonces: an input to every minted [`EntityKey`].
 ///
 /// Reads and writes return what they cost: minting-nonce traffic is entity
 /// cost. A caller that does not charge for it says so with
@@ -239,7 +239,7 @@ pub struct StoredEntity {
     pub meta: RecordMeta,
 }
 
-/// The entities: [`EntityAddress`] → [`Entity`].
+/// The entities: [`EntityKey`] → [`Entity`].
 ///
 /// Reads and writes return what they cost, a read that finds nothing
 /// included. A caller that does not charge for it says so with
@@ -251,7 +251,7 @@ pub trait EntityStore {
     /// needs as the size before a write.
     fn get_entity_with_meta(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error>;
 
@@ -261,7 +261,7 @@ pub trait EntityStore {
     /// a store that reads by the byte reads only the system cells.
     fn get_entity_system_fields(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
         Ok(self.get_entity_with_meta(address, read)?.map(|found| {
@@ -277,7 +277,7 @@ pub trait EntityStore {
     /// second read.
     fn get_entity(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<Entity>>, Self::Error> {
         Ok(self
@@ -307,7 +307,7 @@ pub trait EqualityIndexStore {
         attribute: &[u8],
         value: &AttributeValue,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, Self::Error>;
+    ) -> Result<Vec<EntityKey>, Self::Error>;
 
     /// Raw byte prefix, no normalization. Ascending entity order.
     fn get_prefixed_entities(
@@ -315,7 +315,7 @@ pub trait EqualityIndexStore {
         attribute: &[u8],
         prefix: &str,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, Self::Error>;
+    ) -> Result<Vec<EntityKey>, Self::Error>;
 
     /// Removals are derived by diffing against the base, so each update must be
     /// net-against-base ([`EntityStore::get_uncommitted_deltas`]'s shape); a
@@ -338,7 +338,7 @@ pub trait RangeIndexStore {
         low: Bound<&AttributeValue>,
         high: Bound<&AttributeValue>,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, Self::Error>;
+    ) -> Result<Vec<EntityKey>, Self::Error>;
 
     /// Same contract as [`EqualityIndexStore::apply_deltas`].
     fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), Self::Error>;
@@ -353,7 +353,7 @@ pub trait PruningStore {
 
     fn add_to_pruning_set(
         &mut self,
-        entity: EntityAddress,
+        entity: EntityKey,
         pruning_meta: PruningMeta,
     ) -> Result<(), Self::Error>;
 
@@ -361,9 +361,9 @@ pub trait PruningStore {
         &self,
         top: u16,
         read: ReadMode,
-    ) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error>;
+    ) -> Result<Vec<(EntityKey, PruningMeta)>, Self::Error>;
 
-    fn take_top(&mut self, top: u16) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error>;
+    fn take_top(&mut self, top: u16) -> Result<Vec<(EntityKey, PruningMeta)>, Self::Error>;
 
     fn commit_store(&mut self) -> Result<(), Self::Error>;
 }

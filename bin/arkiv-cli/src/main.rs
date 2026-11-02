@@ -278,7 +278,7 @@ fn random_payload(size: usize) -> Bytes {
 }
 
 /// Predict the entity key the `n`-th CREATE will mint, mirroring the node's
-/// `derive_entity_address`: keccak over (chain id, registry address, owner, nonce).
+/// `derive_entity_key`: keccak over (chain id, registry address, owner, nonce).
 fn predict_entity_key(
     chain_id: u64,
     registry: Address,
@@ -286,7 +286,7 @@ fn predict_entity_key(
     nonce: u64,
     salt: u128,
 ) -> B256 {
-    // Must match `arkiv_reth_executor::decode::derive_entity_address` byte for byte:
+    // Must match `arkiv_reth_executor::decode::derive_entity_key` byte for byte:
     // chain_id ‖ registry ‖ owner ‖ nonce ‖ salt.
     let mut buf = Vec::with_capacity(
         EVM_WORD_LENGTH + ETH_ADDRESS_LEN + ETH_ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),

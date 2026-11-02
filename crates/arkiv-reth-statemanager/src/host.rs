@@ -24,7 +24,7 @@ use arkiv_golemdb_state::{GolemStateView, ViewError};
 use arkiv_interfaces::entity::AttributeValue;
 use arkiv_interfaces::gas::PlaceholderCost;
 use arkiv_interfaces::primitives::{
-    EntityAddress, EntityCreationNonce, UserAddress, UserBalance, UserNonce,
+    EntityCreationNonce, EntityKey, UserAddress, UserBalance, UserNonce,
 };
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, Commitment, EntityCreationNoncesStore,
@@ -132,7 +132,7 @@ where
 
     fn get_entity_with_meta(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
         Ok(self.golem.get_entity_with_meta(address, read)?)
@@ -140,7 +140,7 @@ where
 
     fn get_entity_system_fields(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
         Ok(self.golem.get_entity_system_fields(address, read)?)
@@ -173,7 +173,7 @@ where
         attribute: &[u8],
         value: &AttributeValue,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, Self::Error> {
+    ) -> Result<Vec<EntityKey>, Self::Error> {
         Ok(self.golem.get_equal_entities(attribute, value, read)?)
     }
 
@@ -182,7 +182,7 @@ where
         attribute: &[u8],
         prefix: &str,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, Self::Error> {
+    ) -> Result<Vec<EntityKey>, Self::Error> {
         Ok(self.golem.get_prefixed_entities(attribute, prefix, read)?)
     }
 
@@ -211,7 +211,7 @@ where
         low: Bound<&AttributeValue>,
         high: Bound<&AttributeValue>,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, Self::Error> {
+    ) -> Result<Vec<EntityKey>, Self::Error> {
         Ok(self.golem.get_within_range(attribute, low, high, read)?)
     }
 
@@ -265,7 +265,7 @@ where
 
     fn add_to_pruning_set(
         &mut self,
-        entity: EntityAddress,
+        entity: EntityKey,
         pruning_meta: PruningMeta,
     ) -> Result<(), Self::Error> {
         Ok(self.golem.add_to_pruning_set(entity, pruning_meta)?)
@@ -275,11 +275,11 @@ where
         &self,
         top: u16,
         read: ReadMode,
-    ) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error> {
+    ) -> Result<Vec<(EntityKey, PruningMeta)>, Self::Error> {
         Ok(self.golem.peek_top(top, read)?)
     }
 
-    fn take_top(&mut self, top: u16) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error> {
+    fn take_top(&mut self, top: u16) -> Result<Vec<(EntityKey, PruningMeta)>, Self::Error> {
         Ok(self.golem.take_top(top)?)
     }
 

@@ -18,7 +18,7 @@ use alloy_signer_local::PrivateKeySigner;
 use arkiv_bindings::{Attribute, AttributeValue, Ident32, Operation};
 use arkiv_harness::{
     ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce, NodeBuilder, connect,
-    derive_entity_address, hex_quantity, result_keys,
+    derive_entity_key, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::rpc_error_codes;
 
@@ -166,13 +166,13 @@ async fn state_and_index_survive_shutdown_and_restart() {
             create_op(1000, Bytes::from_static(b"beta"), attrs(20, "blue")),
         ])
         .await;
-    let key0 = B256::from(derive_entity_address(
+    let key0 = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
         0,
     ));
-    let key1 = B256::from(derive_entity_address(
+    let key1 = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(1),
@@ -257,7 +257,7 @@ async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
     );
     let provider = client.provider();
     let key = |nonce| {
-        B256::from(derive_entity_address(
+        B256::from(derive_entity_key(
             DEV_CHAIN_ID,
             &caller.into_array(),
             EntityCreationNonce::new(nonce),
@@ -389,7 +389,7 @@ async fn pruning_schedule_survives_kill_and_restart() {
             vec![],
         )])
         .await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -427,7 +427,7 @@ async fn pruning_schedule_rebuilds_from_chain_history() {
             vec![],
         )])
         .await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),

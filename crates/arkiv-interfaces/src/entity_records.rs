@@ -48,7 +48,7 @@ use alloc::vec::Vec;
 
 use crate::constants::ENTITY_MAX_ATTRIBUTES;
 use crate::entity::{Attribute, AttributeType, AttributeValue, CreationFlags, Entity, annotations};
-use crate::primitives::EntityAddress;
+use crate::primitives::EntityKey;
 use crate::statemanager::EntityUpdates;
 use crate::store::{
     Cell, CellKind, CellName, ReadTarget, Record, RecordKey, RecordMeta, Store, StoreError, TypeId,
@@ -107,7 +107,7 @@ pub const fn type_id_for(attr_type: AttributeType) -> TypeId {
 
 /// The record key for an entity: its address, which is already 32 bytes. `None`
 /// for a reserved key, where no entity is read or written.
-pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
+pub const fn record_key(key: EntityKey) -> Option<RecordKey> {
     if is_reserved_key(key) {
         None
     } else {
@@ -116,18 +116,18 @@ pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
 }
 
 /// Account records must never be interpreted as entities.
-pub const fn is_reserved_key(key: EntityAddress) -> bool {
+pub const fn is_reserved_key(key: EntityKey) -> bool {
     is_account_key(key)
 }
 
 /// Whether `key` is an account's: an address left-padded with twelve zero bytes.
 /// A caller can name any key; at an account's there is no entity.
-pub const fn is_account_key(key: EntityAddress) -> bool {
+pub const fn is_account_key(key: EntityKey) -> bool {
     RecordKey::from_entity(key).as_address().is_some()
 }
 
 /// The entity at `key` as of `target`, or `None` if there is none.
-pub fn read<S, E>(store: &S, target: ReadTarget, key: EntityAddress) -> Result<Option<Entity>, E>
+pub fn read<S, E>(store: &S, target: ReadTarget, key: EntityKey) -> Result<Option<Entity>, E>
 where
     S: Store + ?Sized,
     E: From<StoreError> + From<RecordError>,

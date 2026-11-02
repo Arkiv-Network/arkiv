@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::entity::{AttributeType, AttributeValue, Entity};
-use crate::primitives::{EntityAddress, Gas};
+use crate::primitives::{EntityKey, Gas};
 use crate::statemanager::{BlockRef, StateView};
 
 /// A query — a tree of predicates over an entity's attributes.
@@ -174,7 +174,7 @@ pub struct PageParams {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueryMatches {
     /// The matching entity keys for this page.
-    pub keys: Vec<EntityAddress>,
+    pub keys: Vec<EntityKey>,
     /// A cursor for the next page, if more remain.
     pub next_cursor: Option<u64>,
     /// The statistics of the work done.

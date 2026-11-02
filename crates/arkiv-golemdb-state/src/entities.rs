@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 
 use arkiv_interfaces::entity::Entity;
 use arkiv_interfaces::entity_records::{self, RecordError};
-use arkiv_interfaces::primitives::EntityAddress;
+use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::statemanager::{
     Commitment, EntityStore, EntityUpdates, ReadMode, StoredEntity,
 };
@@ -34,7 +34,7 @@ pub enum EntityError {
     Record(RecordError),
     /// The key is reserved for an account, where no
     /// entity is written.
-    AccountKey(EntityAddress),
+    AccountKey(EntityKey),
 }
 
 impl From<StoreError> for EntityError {
@@ -90,7 +90,7 @@ impl<S: Store> GolemStateView<S> {
     /// key holds no entity, so it reads as `None` without a read.
     fn get_stored(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, EntityError> {
         self.read_stored(address, read, None)
@@ -101,7 +101,7 @@ impl<S: Store> GolemStateView<S> {
     /// entity without its attributes.
     fn read_stored(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
         projection: Option<&[CellName]>,
     ) -> Result<Metered<Option<StoredEntity>>, EntityError> {
@@ -125,7 +125,7 @@ impl<S: Store> GolemStateView<S> {
     /// [`get_stored`](Self::get_stored), without the size.
     fn get(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<Entity>>, EntityError> {
         Ok(self
@@ -211,7 +211,7 @@ impl<S: Store> GolemStateView<S> {
         Ok(Metered::new((), receipt))
     }
 
-    fn record(&mut self, address: EntityAddress, updates: EntityUpdates) {
+    fn record(&mut self, address: EntityKey, updates: EntityUpdates) {
         self.staged
             .entry(address)
             .and_modify(|base| merge(base, updates.clone()))
@@ -229,7 +229,7 @@ impl<S: Store> EntityStore for GolemStateView<S> {
 
     fn get_entity_with_meta(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
         self.get_stored(address, read).map_err(Into::into)
@@ -237,7 +237,7 @@ impl<S: Store> EntityStore for GolemStateView<S> {
 
     fn get_entity_system_fields(
         &self,
-        address: EntityAddress,
+        address: EntityKey,
         read: ReadMode,
     ) -> Result<Metered<Option<StoredEntity>>, Self::Error> {
         self.read_stored(address, read, Some(&entity_records::system_projection()))
@@ -407,7 +407,7 @@ mod tests {
     const ACCOUNT: [u8; 20] = [0xaa; 20];
 
     /// A view where `ACCOUNT` holds a balance, and the key its record sits at.
-    fn funded_account() -> (GolemStateView<MemStore>, EntityAddress) {
+    fn funded_account() -> (GolemStateView<MemStore>, EntityKey) {
         let mut view = view();
         view.set_balance(ACCOUNT, UserBalance::from_u64(500))
             .expect("fund");

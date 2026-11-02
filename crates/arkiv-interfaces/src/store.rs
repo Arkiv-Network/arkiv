@@ -246,7 +246,7 @@ impl<T> Metered<T> {
 pub struct RecordKey(pub [u8; 32]);
 
 impl RecordKey {
-    /// An [`EntityAddress`](crate::primitives::EntityAddress) is already the
+    /// An [`EntityKey`](crate::primitives::EntityKey) is already the
     /// full key width.
     pub const fn from_entity(address: [u8; 32]) -> Self {
         Self(address)

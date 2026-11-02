@@ -22,7 +22,7 @@ use core::ops::Bound;
 
 use arkiv_interfaces::entity::{AttributeValue, annotations};
 use arkiv_interfaces::entity_records::type_id_of;
-use arkiv_interfaces::primitives::EntityAddress;
+use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::statemanager::{
     EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode,
 };
@@ -91,7 +91,7 @@ fn matching<S: Store>(
     store: &S,
     at: CommitId,
     filter: Filter,
-) -> Result<Vec<EntityAddress>, IndexError> {
+) -> Result<Vec<EntityKey>, IndexError> {
     let query = Query {
         filter,
         // No sort: GolemDB cannot sort yet, so the addresses are put in order
@@ -116,7 +116,7 @@ fn matching<S: Store>(
                 .and_then(|cell| cell.value.as_slice().try_into().ok())
                 .ok_or(IndexError::MissingKey)
         })
-        .collect::<Result<Vec<EntityAddress>, _>>()?;
+        .collect::<Result<Vec<EntityKey>, _>>()?;
     // The store's own order need not be key order: GolemDB's is the order the
     // entities were created in. An entity's record key is its address, so
     // sorting the addresses is what gives the order the index traits promise.
@@ -152,7 +152,7 @@ impl<'s, S: Store> StoreIndices<'s, S> {
         &self,
         attribute: &[u8],
         value: &AttributeValue,
-    ) -> Result<Vec<EntityAddress>, IndexError> {
+    ) -> Result<Vec<EntityKey>, IndexError> {
         matching(
             self.store,
             self.at,
@@ -161,11 +161,7 @@ impl<'s, S: Store> StoreIndices<'s, S> {
     }
 
     /// Entities whose string `attribute` starts with `prefix`.
-    pub fn prefixed(
-        &self,
-        attribute: &[u8],
-        prefix: &str,
-    ) -> Result<Vec<EntityAddress>, IndexError> {
+    pub fn prefixed(&self, attribute: &[u8], prefix: &str) -> Result<Vec<EntityKey>, IndexError> {
         // `type_id_of` already gives `STR` for a `Str` operand, so the type
         // needs no override here.
         let term = predicate(
@@ -185,7 +181,7 @@ impl<'s, S: Store> StoreIndices<'s, S> {
         attribute: &[u8],
         low: Bound<&AttributeValue>,
         high: Bound<&AttributeValue>,
-    ) -> Result<Vec<EntityAddress>, IndexError> {
+    ) -> Result<Vec<EntityKey>, IndexError> {
         let mut terms = Vec::new();
         match low {
             Bound::Included(value) => terms.push(predicate(attribute, value, CompareOp::Gte)?),
@@ -233,7 +229,7 @@ impl<S: Store> EqualityIndexStore for GolemStateView<S> {
         attribute: &[u8],
         value: &AttributeValue,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, ViewError> {
+    ) -> Result<Vec<EntityKey>, ViewError> {
         Ok(self.indices(read)?.equal(attribute, value)?)
     }
 
@@ -242,7 +238,7 @@ impl<S: Store> EqualityIndexStore for GolemStateView<S> {
         attribute: &[u8],
         prefix: &str,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, ViewError> {
+    ) -> Result<Vec<EntityKey>, ViewError> {
         Ok(self.indices(read)?.prefixed(attribute, prefix)?)
     }
 
@@ -265,7 +261,7 @@ impl<S: Store> RangeIndexStore for GolemStateView<S> {
         low: Bound<&AttributeValue>,
         high: Bound<&AttributeValue>,
         read: ReadMode,
-    ) -> Result<Vec<EntityAddress>, ViewError> {
+    ) -> Result<Vec<EntityKey>, ViewError> {
         Ok(self.indices(read)?.within(attribute, low, high)?)
     }
 

@@ -5,13 +5,13 @@
 //! Account state needs a key space that can never collide with an entity's. The
 //! seam already has one: [`RecordKey::from_address`] left-pads a 20-byte address
 //! with **twelve zero bytes**, and [`RecordKey::as_address`] reverses it. Those
-//! twelve zeros are the reservation — an [`EntityAddress`] is a derived 32-byte
+//! twelve zeros are the reservation — an [`EntityKey`] is a derived 32-byte
 //! value, so one landing in that range is a hash collision rather than a layout
 //! mistake, and [`tests::an_account_key_cannot_be_an_entity_key`] pins the property.
 //! A caller can still name such a key in an operation, so entity reads and writes
 //! check for it: see [`is_account_key`].
 //!
-//! [`EntityAddress`]: arkiv_interfaces::primitives::EntityAddress
+//! [`EntityKey`]: arkiv_interfaces::primitives::EntityKey
 //! [`is_account_key`]: arkiv_interfaces::entity_records::is_account_key
 //!
 //! # One record, three cells

@@ -16,7 +16,7 @@
 //!   one absolute block, `max(expiresAt, current + minLifetime)`, which must be
 //!   in the future. See [`resolve_expiry`].
 //! - **The create key.** A `Create` carries no key — the node mints it from
-//!   `(domain, owner, nonce, salt)`; see [`derive_entity_address`]. A batch shares
+//!   `(domain, owner, nonce, salt)`; see [`derive_entity_key`]. A batch shares
 //!   one caller, so successive creates use `start_nonce`, `start_nonce + 1`, …;
 //!   reading and advancing the caller's persistent nonce is the wiring step's
 //!   job, which is why `start_nonce` is a parameter and decode stays a pure
@@ -43,7 +43,7 @@ use arkiv_bindings::{
 };
 use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::{AttributeMutation, ExecEnv, Op};
-use arkiv_interfaces::primitives::{BlockNumber, EntityAddress, EntityCreationNonce};
+use arkiv_interfaces::primitives::{BlockNumber, EntityCreationNonce, EntityKey};
 
 use arkiv_interfaces::constants::ethereum::{ETH_ADDRESS_LEN, EVM_WORD_LENGTH};
 
@@ -83,7 +83,7 @@ pub fn decode_ops(
                 let nonce = start_nonce.advanced_by(create_index);
                 create_index += 1;
                 Op::Create {
-                    key: derive_entity_address(env.chain_id, &env.caller, nonce, c.salt),
+                    key: derive_entity_key(env.chain_id, &env.caller, nonce, c.salt),
                     expires_at: resolve_expiry(env.block_number, c.expiresAt, c.minLifetime)?,
                     creation_flags,
                     attributes: convert_create_attributes(&c.attributes)?,
@@ -182,12 +182,12 @@ pub fn resolve_expiry(
 ///
 /// This must match the SDK's local derivation exactly — a client predicts the
 /// key it is about to create, and a later op in the same batch targets it.
-pub fn derive_entity_address(
+pub fn derive_entity_key(
     chain_id: u64,
     owner: &[u8; 20],
     nonce: EntityCreationNonce,
     salt: u128,
-) -> EntityAddress {
+) -> EntityKey {
     // chain_id ‖ ARKIV_ADDRESS ‖ owner ‖ nonce ‖ salt
     let mut buf = Vec::with_capacity(
         EVM_WORD_LENGTH + ETH_ADDRESS_LEN + ETH_ADDRESS_LEN + size_of::<u64>() + size_of::<u128>(),
@@ -309,7 +309,7 @@ pub enum DecodeError {
     /// canonically encoded.
     OperationData { operation: u8, reason: OpAbiError },
     /// A `patch` carried no mutations — it would be a no-op costing gas.
-    EmptyMutations { key: EntityAddress },
+    EmptyMutations { key: EntityKey },
     /// Resolved expiry is at or before the current block.
     ExpiryDeadOnArrival {
         target: BlockNumber,
@@ -327,7 +327,7 @@ pub enum DecodeError {
     /// A triple named a `$` attribute — the engine owns all of them.
     SystemAttributeNotWritable { name: Vec<u8> },
     /// A `Transfer` named the zero address as the new owner.
-    TransferToZeroAddress { key: EntityAddress },
+    TransferToZeroAddress { key: EntityKey },
     /// An attribute's value isn't a well-formed encoding of its declared type.
     InvalidAttributeValue {
         name: [u8; 32],
@@ -455,7 +455,7 @@ mod tests {
             } => {
                 assert_eq!(
                     *key,
-                    derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(7), 0)
+                    derive_entity_key(1, &[0xAA; 20], EntityCreationNonce::new(7), 0)
                 ); // nonce = start_nonce
                 assert_eq!(*expires_at, 60); // block 10 + minLifetime 50
             }
@@ -469,11 +469,11 @@ mod tests {
         let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityCreationNonce::new(100)).unwrap();
         assert_eq!(
             *ops[0].key(),
-            derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(100), 0)
+            derive_entity_key(1, &[0xAA; 20], EntityCreationNonce::new(100), 0)
         );
         assert_eq!(
             *ops[1].key(),
-            derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(101), 0)
+            derive_entity_key(1, &[0xAA; 20], EntityCreationNonce::new(101), 0)
         );
     }
 
@@ -495,25 +495,25 @@ mod tests {
     /// input must actually reach the preimage.
     #[test]
     fn every_derivation_input_changes_the_key() {
-        let base = derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(5), 9);
+        let base = derive_entity_key(1, &[0xAA; 20], EntityCreationNonce::new(5), 9);
         assert_ne!(
             base,
-            derive_entity_address(2, &[0xAA; 20], EntityCreationNonce::new(5), 9),
+            derive_entity_key(2, &[0xAA; 20], EntityCreationNonce::new(5), 9),
             "chain_id"
         );
         assert_ne!(
             base,
-            derive_entity_address(1, &[0xBB; 20], EntityCreationNonce::new(5), 9),
+            derive_entity_key(1, &[0xBB; 20], EntityCreationNonce::new(5), 9),
             "owner"
         );
         assert_ne!(
             base,
-            derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(6), 9),
+            derive_entity_key(1, &[0xAA; 20], EntityCreationNonce::new(6), 9),
             "nonce"
         );
         assert_ne!(
             base,
-            derive_entity_address(1, &[0xAA; 20], EntityCreationNonce::new(5), 8),
+            derive_entity_key(1, &[0xAA; 20], EntityCreationNonce::new(5), 8),
             "salt"
         );
     }

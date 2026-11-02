@@ -33,7 +33,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::entity::{Attribute, AttributeValue, Entity};
-use crate::primitives::{EntityAddress, UserAddress, UserBalance};
+use crate::primitives::{EntityKey, UserAddress, UserBalance};
 use crate::statemanager::{
     BlockRef, EntityUpdates, PruningMeta, PruningStore, ReadMode, StateView,
 };
@@ -105,7 +105,7 @@ fn entity(key: u8) -> Entity {
     }
 }
 
-fn address(key: u8) -> EntityAddress {
+fn address(key: u8) -> EntityKey {
     [key; 32]
 }
 
@@ -398,7 +398,7 @@ fn deltas_come_back_in_ascending_entity_order<V: StateView>(new_view: &dyn Fn() 
         view.update_entity(EntityUpdates::create(entity(key)))
             .unwrap();
     }
-    let seen: Vec<EntityAddress> = view
+    let seen: Vec<EntityKey> = view
         .get_uncommitted_deltas()
         .unwrap()
         .iter()

@@ -21,7 +21,7 @@ use arkiv_bindings::{
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
-    NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
+    NodeBuilder, connect, derive_entity_key, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::MAX_STR_BYTES;
 
@@ -161,7 +161,7 @@ async fn create_then_get_entity_over_a_live_node() {
 
     // 2) The key the node minted for this caller's first create (minting nonce 0),
     //    derived independently — the test never learns it from the node.
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -327,7 +327,7 @@ async fn typed_revert_errors_over_a_live_node() {
     // A stranger updating a real entity → NotOwner(key, caller, owner).
     let op = create_op(100, Bytes::from_static(b"v1"), vec![]);
     client.execute(vec![op]).await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -397,7 +397,7 @@ async fn estimated_gas_is_accepted_by_the_pool() {
     assert!(receipt.status(), "create must succeed");
 
     // Update the same entity — the op that used to estimate below the floor.
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -456,7 +456,7 @@ async fn query_operator_classes_over_a_live_node() {
         .map(|i| {
             format!(
                 "{:#x}",
-                B256::from(derive_entity_address(
+                B256::from(derive_entity_key(
                     DEV_CHAIN_ID,
                     &caller.into_array(),
                     EntityCreationNonce::new(i),
@@ -991,7 +991,7 @@ async fn write_path_ops_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
     let key = |i: u64| {
-        B256::from(derive_entity_address(
+        B256::from(derive_entity_key(
             DEV_CHAIN_ID,
             &caller.into_array(),
             EntityCreationNonce::new(i),
@@ -1098,7 +1098,7 @@ async fn write_path_ops_over_a_live_node() {
 async fn historical_reads_and_block_timing_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
 
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -1172,7 +1172,7 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
     owner
         .execute(vec![create_op(1000, Bytes::from_static(b"v1"), vec![])])
         .await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &owner_addr.into_array(),
         EntityCreationNonce::new(0),
@@ -1212,7 +1212,7 @@ async fn unauthorized_ops_and_batch_atomicity_over_a_live_node() {
             .await,
         "a batch with a failing op must revert wholesale",
     );
-    let would_be = B256::from(derive_entity_address(
+    let would_be = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &owner_addr.into_array(),
         EntityCreationNonce::new(1),
@@ -1241,7 +1241,7 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
     client
         .execute(vec![create_op(60, Bytes::from_static(b"ttl"), vec![])])
         .await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -1283,7 +1283,7 @@ async fn expired_entity_is_physically_purged() {
     client
         .execute(vec![create_op(8, Bytes::from_static(b"purge-me"), vec![])])
         .await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -1350,7 +1350,7 @@ async fn purge_respects_max_keys_per_block() {
         .await;
     let keys: Vec<_> = (0..entity_count)
         .map(|nonce| {
-            B256::from(derive_entity_address(
+            B256::from(derive_entity_key(
                 DEV_CHAIN_ID,
                 &caller.into_array(),
                 EntityCreationNonce::new(nonce),
@@ -1371,7 +1371,7 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
     let keys: Vec<_> = (0..6)
         .map(|nonce| {
-            B256::from(derive_entity_address(
+            B256::from(derive_entity_key(
                 DEV_CHAIN_ID,
                 &caller.into_array(),
                 EntityCreationNonce::new(nonce),
@@ -1617,7 +1617,7 @@ async fn a_pooled_create_transaction_does_not_stall_block_production() {
         .execute(vec![create_op(1000, Bytes::from_static(b"alive"), vec![])])
         .await;
 
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &bystander_addr.into_array(),
         EntityCreationNonce::new(0),
@@ -1677,7 +1677,7 @@ async fn a_pooled_user_purge_does_not_stall_block_production() {
             vec![],
         )])
         .await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &bystander_addr.into_array(),
         EntityCreationNonce::new(0),
@@ -1986,7 +1986,7 @@ async fn golemdb_settings_follow_the_genesis_file() {
     // wait, so a restart resumes the chain. The store has the write by then.
     let mined = receipt.block_number.expect("mined");
     client.wait_for_block(mined + 60, READY).await;
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         FILE_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(0),
@@ -2495,7 +2495,7 @@ async fn predict_key(client: &ArkivClient<impl Provider + Clone>, caller: Addres
         .call()
         .await
         .unwrap();
-    let key = B256::from(derive_entity_address(
+    let key = B256::from(derive_entity_key(
         DEV_CHAIN_ID,
         &caller.into_array(),
         EntityCreationNonce::new(nonce),

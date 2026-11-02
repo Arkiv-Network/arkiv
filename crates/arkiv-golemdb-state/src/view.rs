@@ -16,7 +16,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use arkiv_interfaces::primitives::EntityAddress;
+use arkiv_interfaces::primitives::EntityKey;
 use arkiv_interfaces::statemanager::{
     BlockRef, Commitment, EntityUpdates, PruningMeta, PruningStore, ReadMode, SessionId,
     StateCommit, StateView, StoreKind,
@@ -84,11 +84,11 @@ pub struct GolemStateView<S: Store> {
     pub(crate) origin: CommitId,
     /// Net-against-base change per touched entity, ascending — the order
     /// [`EntityStore::get_uncommitted_deltas`] promises.
-    pub(crate) staged: BTreeMap<EntityAddress, EntityUpdates>,
+    pub(crate) staged: BTreeMap<EntityKey, EntityUpdates>,
     pub(crate) pruning: MemPruningStore,
     /// The delta log as it stood when each open frame began, innermost last.
     /// The store keeps the record side; this is the half only the view has.
-    frames: Vec<BTreeMap<EntityAddress, EntityUpdates>>,
+    frames: Vec<BTreeMap<EntityKey, EntityUpdates>>,
     block: BlockRef,
     session: SessionId,
     commitment: Option<Commitment>,
@@ -229,7 +229,7 @@ impl<S: Store> PruningStore for GolemStateView<S> {
 
     fn add_to_pruning_set(
         &mut self,
-        entity: EntityAddress,
+        entity: EntityKey,
         pruning_meta: PruningMeta,
     ) -> Result<(), Self::Error> {
         self.pruning.add_to_pruning_set(entity, pruning_meta);
@@ -240,14 +240,14 @@ impl<S: Store> PruningStore for GolemStateView<S> {
         &self,
         top: u16,
         read: ReadMode,
-    ) -> Result<alloc::vec::Vec<(EntityAddress, PruningMeta)>, Self::Error> {
+    ) -> Result<alloc::vec::Vec<(EntityKey, PruningMeta)>, Self::Error> {
         Ok(self.pruning.peek_top(top, read))
     }
 
     fn take_top(
         &mut self,
         top: u16,
-    ) -> Result<alloc::vec::Vec<(EntityAddress, PruningMeta)>, Self::Error> {
+    ) -> Result<alloc::vec::Vec<(EntityKey, PruningMeta)>, Self::Error> {
         Ok(self.pruning.take_top(top))
     }
 
