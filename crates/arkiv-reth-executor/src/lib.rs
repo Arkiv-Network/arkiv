@@ -15,12 +15,15 @@
 //!
 //! Read that literally: it is not only the interpreter that is skipped but revm's
 //! **whole handler pipeline**, and that includes its pre-execution *validation* stage.
-//! Every check revm would have made — nonce, balance, base fee, chain id, EIP-3607 — is
-//! therefore ours to make or to knowingly go without. Anything [`arkiv_transact`] is
-//! handed and does not explicitly reject *succeeds*. The nonce is checked in
-//! [`validate_nonce`] and the fee preconditions (fee cap vs. base fee, priority fee
-//! vs. fee cap, balance vs. the maximum spend) in [`validate_fees`]; chain id and
-//! EIP-3607 are not yet, which is a real gap and not a design choice.
+//! Every check revm would have made is therefore ours to make or to knowingly go
+//! without, and anything [`arkiv_transact`] is handed and does not explicitly reject
+//! *succeeds*. Made here: the chain id and the transaction gas cap in
+//! [`validate_tx_env`], the nonce in [`validate_nonce`], and the fee preconditions
+//! (fee cap vs. base fee, priority fee vs. fee cap, balance vs. the maximum spend) in
+//! [`validate_fees`]. Not made yet, among others: EIP-3607, the intrinsic gas of access
+//! lists and authorizations, the transaction-type rules (EIP-7702, EIP-4844 and their
+//! fork gating) and nonce overflow. None of these is skipped by decision; each still
+//! needs one.
 //!
 //! Fees follow EIP-1559 exactly as revm applies it ([`charge_sender`]): the sender
 //! pays `gas_used × effective_gas_price`, where the effective price is
@@ -100,6 +103,7 @@ use reth_ethereum::{
                     EVMError, ExecutionResult, HaltReason, InvalidTransaction, OutOfGasError,
                     Output, ResultAndState, ResultGas, SuccessReason,
                 },
+                transaction::TransactionType,
             },
             database_interface::DBErrorMarker,
             inspector::{Inspector, NoOpInspector},
@@ -612,6 +616,7 @@ where
             solvency_checked: fee_checks.balance,
             ..FeeEnv::from_block(self.inner.block())
         };
+        validate_tx_env(self.cfg_env(), &tx)?;
         let chain_id = self.inner.chain_id();
         let sender = (tx.caller.into_array(), tx.nonce);
         let store = self.store.clone();
@@ -636,6 +641,7 @@ where
             op_cost,
             db,
             block_number,
+            chain_id,
             fees,
             checks,
             tx,
@@ -711,6 +717,34 @@ fn is_protocol_purge(tx: &TxEnv, block_number: u64, chain_id: u64) -> bool {
         && tx.access_list.is_empty()
         && tx.blob_hashes.is_empty()
         && tx.authorization_list.is_empty()
+}
+
+/// The chain id (EIP-155) and the transaction gas cap (EIP-7825), checked as
+/// revm-handler's `validate_tx_env` checks them. Following `cfg` keeps them off
+/// wherever reth turns them off, as for the nonce and fee checks.
+fn validate_tx_env<DBError>(cfg: &CfgEnv<SpecId>, tx: &TxEnv) -> Result<(), EVMError<DBError>> {
+    if cfg.tx_chain_id_check() {
+        let tx_type = TransactionType::from(tx.tx_type);
+        match tx.chain_id {
+            Some(chain_id) if chain_id != cfg.chain_id() => {
+                return Err(EVMError::Transaction(InvalidTransaction::InvalidChainId));
+            }
+            None if !tx_type.is_legacy() && !tx_type.is_custom() => {
+                return Err(EVMError::Transaction(InvalidTransaction::MissingChainId));
+            }
+            _ => {}
+        }
+    }
+    let cap = cfg.tx_gas_limit_cap();
+    if !cfg.is_amsterdam_eip8037_enabled() && tx.gas_limit > cap {
+        return Err(EVMError::Transaction(
+            InvalidTransaction::TxGasLimitGreaterThanCap {
+                gas_limit: tx.gas_limit,
+                cap,
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn invalid_transaction<DBError>(message: impl Into<String>) -> EVMError<DBError> {
@@ -867,6 +901,7 @@ fn arkiv_transact<DB: Database>(
     op_cost: OpCost,
     db: &mut DB,
     block_number: u64,
+    chain_id: u64,
     fees: FeeEnv,
     checks: Option<SenderChecks>,
     tx: TxEnv,
@@ -926,6 +961,7 @@ fn arkiv_transact<DB: Database>(
             op_cost,
             db,
             block_number,
+            chain_id,
             &fees,
             checks,
             &tx,
@@ -1070,6 +1106,7 @@ fn arkiv_entity_transact<DB: Database>(
     op_cost: OpCost,
     db: &mut DB,
     block_number: u64,
+    chain_id: u64,
     fees: &FeeEnv,
     checks: Option<SenderChecks>,
     tx: &TxEnv,
@@ -1106,7 +1143,9 @@ fn arkiv_entity_transact<DB: Database>(
         tx_gas: tx_gas(&tx.data),
         floor_gas: floor_gas(&tx.data),
         golemdb_cost_before: start_nonce.receipt.cost.0,
-        chain_id: tx.chain_id.unwrap_or(1),
+        // The chain's own id, not the transaction's: a legacy transaction may
+        // carry none, and keys must not depend on what the sender signed.
+        chain_id,
         max_lifetime: schedule.max_lifetime,
         // `eth_call` and `eth_estimateGas` run with charging off on the
         // block's branch, one probe after another: their writes must not
@@ -1998,6 +2037,7 @@ mod tests {
                 OpCost::Placeholder,
                 &mut db,
                 1,
+                1,
                 fees,
                 checks,
                 tx,
@@ -2435,5 +2475,138 @@ mod tests {
         drop(evm);
 
         assert_eq!(store.discard(branch), Err(StoreError::HandleInvalid));
+    }
+
+    /// An EVM for block 1 over `store`, configured by `cfg_env`.
+    fn evm_with(
+        store: &HostStore,
+        cfg_env: CfgEnv,
+    ) -> ArkivEvm<reth_ethereum::evm::revm::database_interface::EmptyDB> {
+        ArkivEvmFactory::new(
+            store.clone(),
+            Arc::new(BlockSeals::default()),
+            OpCost::Placeholder,
+        )
+        .create_evm(
+            Default::default(),
+            EvmEnv {
+                cfg_env,
+                block_env: BlockEnv {
+                    number: U256::from(1),
+                    basefee: 0,
+                    ..Default::default()
+                },
+            },
+        )
+    }
+
+    /// A transfer from the funded sender.
+    fn transfer(tx_type: u8, chain_id: Option<u64>, gas_limit: u64) -> TxEnv {
+        TxEnv {
+            caller: HOST_SENDER,
+            kind: TxKind::Call(Address::repeat_byte(0xde)),
+            tx_type,
+            chain_id,
+            gas_limit,
+            ..TxEnv::default()
+        }
+    }
+
+    /// A transaction signed for another chain is refused before it opens the
+    /// block's branch, so a block that carries one is invalid.
+    #[test]
+    fn a_transaction_for_another_chain_is_refused() {
+        let mut evm = evm_with(&host_store(1), CfgEnv::default());
+        assert!(matches!(
+            evm.transact(transfer(0, Some(2), ARKIV_TX_GAS)),
+            Err(EVMError::Transaction(InvalidTransaction::InvalidChainId))
+        ));
+        assert!(
+            evm.branch.is_none(),
+            "a refused transaction opens no branch"
+        );
+
+        let mut unchecked = CfgEnv::default();
+        unchecked.tx_chain_id_check = false;
+        evm_with(&host_store(1), unchecked)
+            .transact(transfer(0, Some(2), ARKIV_TX_GAS))
+            .expect("the check is off where reth turns it off");
+    }
+
+    /// Only a legacy transaction may leave out its chain id (EIP-155).
+    #[test]
+    fn only_a_legacy_transaction_may_omit_its_chain_id() {
+        let mut evm = evm_with(&host_store(1), CfgEnv::default());
+        assert!(matches!(
+            evm.transact(transfer(2, None, ARKIV_TX_GAS)),
+            Err(EVMError::Transaction(InvalidTransaction::MissingChainId))
+        ));
+        evm.transact(transfer(0, None, ARKIV_TX_GAS))
+            .expect("a legacy transaction without a chain id");
+    }
+
+    /// From Osaka, a transaction's gas limit is capped at 2^24 (EIP-7825).
+    #[test]
+    fn the_transaction_gas_cap_applies_from_osaka() {
+        const CAP: u64 = 1 << 24;
+        let mut evm = evm_with(&host_store(1), CfgEnv::new_with_spec(SpecId::OSAKA));
+        assert!(matches!(
+            evm.transact(transfer(0, Some(1), CAP + 1)),
+            Err(EVMError::Transaction(InvalidTransaction::TxGasLimitGreaterThanCap {
+                gas_limit,
+                cap: CAP,
+            })) if gas_limit == CAP + 1
+        ));
+        evm.transact(transfer(0, Some(1), CAP))
+            .expect("a limit at the cap");
+
+        evm_with(&host_store(1), CfgEnv::new_with_spec(SpecId::PRAGUE))
+            .transact(transfer(0, Some(1), CAP + 1))
+            .expect("no cap before Osaka");
+
+        // `eth_call` lifts the cap this way (reth's `call.rs`).
+        let mut lifted = CfgEnv::new_with_spec(SpecId::OSAKA);
+        lifted.tx_gas_limit_cap = Some(u64::MAX);
+        evm_with(&host_store(1), lifted)
+            .transact(transfer(0, Some(1), CAP + 1))
+            .expect("no cap where reth lifts it");
+    }
+
+    /// Entity keys come from the chain's id, so a legacy create that carries
+    /// none mints the key a create signed for this chain mints.
+    #[test]
+    fn a_create_without_a_chain_id_mints_this_chains_key() {
+        let minted = |chain: u64, chain_id: Option<u64>| {
+            let mut cfg = CfgEnv::default();
+            cfg.chain_id = chain;
+            let out = evm_with(&host_store(1), cfg)
+                .transact(TxEnv {
+                    chain_id,
+                    ..call_tx(
+                        IEntityRegistry::executeCall {
+                            ops: vec![create()],
+                        }
+                        .abi_encode(),
+                        U256::ZERO,
+                    )
+                })
+                .expect("the create executes");
+            out.result
+                .logs()
+                .iter()
+                .find(|log| log.topics()[0] == IEntityRegistry::EntityCreated::SIGNATURE_HASH)
+                .expect("an EntityCreated log")
+                .topics()[1]
+        };
+        assert_eq!(
+            minted(7, None),
+            minted(7, Some(7)),
+            "a missing chain id takes the chain's"
+        );
+        assert_ne!(
+            minted(7, None),
+            minted(8, None),
+            "the key depends on the chain's id"
+        );
     }
 }
