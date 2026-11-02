@@ -130,6 +130,12 @@ where
         let pruning_path = ctx.config().datadir().data_dir().join("arkiv-pruning.db");
         let pruning_map = ChainPruningMap::open(&pruning_path, Handle::current()).await?;
         info!(target: "arkiv-reth", path = %pruning_path.display(), "opened chain pruning map");
+        let conf = ctx.config().builder.clone();
+        // Target gas limit for built blocks: `--builder.gaslimit`, else the genesis `gasLimit`.
+        let gas_limit = conf
+            .gas_limit
+            .unwrap_or(ctx.chain_spec().genesis().gas_limit);
+        info!(target: "arkiv-reth", gas_limit, "block gas limit target");
         let payload_builder = ArkivPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
@@ -139,10 +145,10 @@ where
             store: self.store.clone(),
             seals: self.seals.clone(),
             config: EthereumBuilderConfig::new()
-                .with_extra_data(ctx.payload_builder_config().extra_data())
+                .with_gas_limit(gas_limit)
+                .with_extra_data(conf.extra_data())
                 .with_state_root_resolver(arkiv_state_root_resolver(self.seals.clone())),
         };
-        let conf = ctx.config().builder.clone();
         let generator = BasicPayloadJobGenerator::with_builder(
             ctx.provider().clone(),
             ctx.task_executor().clone(),
