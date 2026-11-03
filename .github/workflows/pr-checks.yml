@@ -134,7 +134,7 @@ jobs:
           # Clippy exits 0 on lint warnings, so `-D warnings` is what makes
           # this a gate rather than a report.
           status=0
-          cargo clippy --workspace --locked --profile "$PROFILE" --no-deps \
+          cargo clippy --workspace --all-targets --locked --profile "$PROFILE" --no-deps \
             -- -D warnings 2>&1 | tee clippy.log || status=$?
           {
             echo "seconds=$(( $(date +%s) - t0 ))"

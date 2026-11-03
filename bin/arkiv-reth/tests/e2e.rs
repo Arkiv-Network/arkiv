@@ -1732,14 +1732,11 @@ async fn keys_that_hold_no_entity_find_none() {
     .map(B256::right_padding_from);
     let keys = [account, golemdb[0], golemdb[1], golemdb[2], golemdb[3]];
 
-    let mut ops = Vec::new();
-    for key in [account] {
-        ops.extend([
-            patch_payload(key, Bytes::from_static(b"x")),
-            Operation::extend_expiry(key, 0, 5000),
-            Operation::transfer_ownership(key, Address::repeat_byte(0xbb)),
-        ]);
-    }
+    let mut ops = vec![
+        patch_payload(account, Bytes::from_static(b"x")),
+        Operation::extend_expiry(account, 0, 5000),
+        Operation::transfer_ownership(account, Address::repeat_byte(0xbb)),
+    ];
     ops.extend(keys.map(Operation::delete));
     for op in &ops {
         assert!(

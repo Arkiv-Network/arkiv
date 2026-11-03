@@ -176,10 +176,14 @@ mod tests {
 
     #[test]
     fn genesis_accounts_come_from_alloc_in_address_order() {
-        let mut funded = alloy_genesis::GenesisAccount::default();
-        funded.balance = U256::from(2);
-        let mut used = alloy_genesis::GenesisAccount::default();
-        used.nonce = Some(3);
+        let funded = alloy_genesis::GenesisAccount {
+            balance: U256::from(2),
+            ..Default::default()
+        };
+        let used = alloy_genesis::GenesisAccount {
+            nonce: Some(3),
+            ..Default::default()
+        };
         let alloc = BTreeMap::from([
             (Address::repeat_byte(2), funded),
             (Address::repeat_byte(1), used),
