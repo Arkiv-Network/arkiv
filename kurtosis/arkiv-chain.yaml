@@ -21,6 +21,12 @@ participants:
     # Lighthouse hands reth every block it syncs, in order. By default it skips
     # that for finalized blocks and leaves reth to sync them itself, which reth
     # does on GolemDB for 1024 blocks at most.
+    # Reject a transaction below the sender's tracked nonce. Without it a
+    # validation that predates a block can insert an already mined nonce as
+    # pending and wedge that sender (paradigmxyz/reth#26980). Safe on a chain
+    # with one sequencer and no reorgs.
+    el_extra_params:
+      - --txpool.enforce-tracked-nonce
     cl_extra_params:
       - --disable-optimistic-finalized-sync
     validator_count: 1

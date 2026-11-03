@@ -78,8 +78,10 @@ ENTRYPOINT ["arkiv-reth"]
 # `arkiv` must NOT appear in --http.api/--ws.api: reth rejects unknown module
 # names; the arkiv_* namespace is merged onto both transports at launch.
 # 250ms block time matches the harness default so time-based behavior advances
-# without traffic.
-CMD ["node", "--dev", "--dev.block-time", "250ms", \
+# without traffic. --txpool.enforce-tracked-nonce rejects a transaction below
+# the sender's tracked nonce, so a validation that predates a block cannot wedge
+# that sender (paradigmxyz/reth#26980).
+CMD ["node", "--dev", "--dev.block-time", "250ms", "--txpool.enforce-tracked-nonce", \
      "--http", "--http.addr", "0.0.0.0", "--http.api", "eth,net,web3,txpool", \
      "--ws", "--ws.addr", "0.0.0.0", "--ws.api", "eth,net,web3,txpool", \
      "--datadir", "/data"]
