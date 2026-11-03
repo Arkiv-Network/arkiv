@@ -40,6 +40,9 @@ services:
       # is also why the Kurtosis args file never sets --http.api either.
       - --http.api
       - eth,net,web3
+      # Reject a transaction below the sender's tracked nonce, so a validation
+      # that predates a block cannot wedge that sender (paradigmxyz/reth#26980).
+      - --txpool.enforce-tracked-nonce
       # CI sets ARKIV_LOG_FILTER=debug so a failure shows what the node was
       # doing; locally `info` keeps the console readable.
       - --log.stdout.filter
