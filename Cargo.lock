@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-bindings"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-contract",
  "alloy-primitives",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-contract",
  "alloy-network",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-genesis"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-golemdb"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arkiv-interfaces",
  "arkiv-query",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-golemdb-state"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arkiv-golemdb",
  "arkiv-interfaces",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-harness"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -1543,11 +1543,11 @@ dependencies = [
 
 [[package]]
 name = "arkiv-interfaces"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "arkiv-query"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-primitives",
  "arkiv-interfaces",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-network",
  "alloy-primitives",
@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-chainspec"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-executor"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-evm",
  "alloy-primitives",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-golemdbprovider"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-payload-builder"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus",
  "alloy-network",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-rpc"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-statemanager"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1746,14 +1746,14 @@ dependencies = [
 
 [[package]]
 name = "arkiv-reth-uncommitted-store"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arkiv-interfaces",
 ]
 
 [[package]]
 name = "arkiv-rpc-types"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "arkiv-tokenomics"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arkiv-interfaces",
 ]
