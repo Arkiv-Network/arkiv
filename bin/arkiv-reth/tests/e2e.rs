@@ -2013,6 +2013,66 @@ async fn golemdb_settings_follow_the_genesis_file() {
     assert_eq!(client.get_entity(key).await, entity, "the entity survives");
 }
 
+/// The block gas limit of [`genesis_json`].
+const FILE_GAS_LIMIT: u64 = 60_000_000;
+
+/// The gas limit of blocks 0 to 6 of a chain on [`genesis_json`], built with
+/// `--builder.gaslimit` set to `flag` if there is one.
+async fn gas_limits_on_the_file_chain(flag: Option<u64>) -> Vec<u64> {
+    let mut genesis = genesis_json();
+    genesis["config"]["arkiv"] = arkiv_section("keccak-256");
+    assert_eq!(hex_quantity(&genesis["gasLimit"]), FILE_GAS_LIMIT);
+    let genesis_path = genesis_file(&genesis);
+    let binary = env!("CARGO_BIN_EXE_arkiv-reth");
+    let mut builder = NodeBuilder::new(binary).chain(&genesis_path);
+    if let Some(flag) = flag {
+        builder = builder.arg(format!("--builder.gaslimit={flag}"));
+    }
+    let mut node = builder.spawn();
+    let client = arkiv_harness::connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    client.wait_for_block(6, READY).await;
+
+    let mut limits = Vec::new();
+    for number in 0..=6u64 {
+        let block = client
+            .provider()
+            .get_block_by_number(number.into())
+            .await
+            .expect("eth_getBlockByNumber")
+            .unwrap_or_else(|| panic!("block {number} exists"));
+        limits.push(block.header.gas_limit);
+    }
+    let _ = std::fs::remove_file(&genesis_path);
+    limits
+}
+
+/// The block gas limit follows the genesis file: without `--builder.gaslimit`,
+/// every block keeps the file's 60M. Aiming for reth's default of 30M instead,
+/// the builder would lower it from block 1 on, by 1/1024 of the parent's
+/// limit per block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_block_gas_limit_follows_the_genesis_file() {
+    assert_eq!(
+        gas_limits_on_the_file_chain(None).await,
+        [FILE_GAS_LIMIT; 7],
+        "every block keeps the genesis gasLimit"
+    );
+}
+
+/// `--builder.gaslimit` overrides the genesis file's limit. A block's limit may
+/// differ from its parent's by less than 1/1024 of it, so the chain moves
+/// towards the flag's limit at that rate, then holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn builder_gaslimit_overrides_the_genesis_file() {
+    const TARGET: u64 = FILE_GAS_LIMIT + 100_000;
+    let limits = gas_limits_on_the_file_chain(Some(TARGET)).await;
+    // Block 1 can rise by at most 60M / 1024 - 1 = 58,592, which is short of
+    // the target; block 2 reaches it.
+    assert_eq!(limits[..2], [FILE_GAS_LIMIT, 60_058_592]);
+    assert_eq!(limits[2..], [TARGET; 5], "the chain holds the flag's limit");
+}
+
 /// A GolemDB chain whose genesis file lacks a usable `config.arkiv.golemdb`
 /// stops at startup, with the reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

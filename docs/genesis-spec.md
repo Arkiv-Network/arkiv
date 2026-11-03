@@ -136,7 +136,8 @@ Values are placeholders.
 
 | Field | Meaning | Becomes | Status |
 | --- | --- | --- | --- |
-| `config`, `gasLimit`, `difficulty`, … | Standard, chain config | reth chain spec | done |
+| `config`, `difficulty`, … | Standard, chain config | reth chain spec | done |
+| `gasLimit` | Standard, block 0's gas limit, and the limit every later block moves towards unless `--builder.gaslimit` names another | header; block builder's target | done |
 | `baseFeePerGas` | Standard, genesis base fee, and the chain's `min_base_fee` floor | header; base-fee rule | done |
 | `alloc` | Standard, prefunded accounts: `balance`, optional `nonce` | one user record per address (`$balance`, `$nonce`) | done on MemStore/Valkey |
 | `golemdb.encoding` | Custom, consensus encoding rules: hash function and Roaring serialization version; both determine the roots | stored by GolemDB (superblock `hash_fn`, `roaring`) | planned (phase 1) |
