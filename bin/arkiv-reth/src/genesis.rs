@@ -96,6 +96,8 @@ mod tests {
         let genesis = specs(|_| {}).0.genesis_hash();
         let blake3 = specs(|g| g["config"]["arkiv"]["golemdb"]["hash_function"] = "blake3".into());
         assert_ne!(blake3.0.genesis_hash(), genesis, "hash function");
+        let retained = specs(|g| g["config"]["arkiv"]["golemdb"]["min_retention"] = 1.into());
+        assert_ne!(retained.0.genesis_hash(), genesis, "min_retention");
         let richer = specs(|g| {
             g["alloc"]["0x2222222222222222222222222222222222222222"]["balance"] = "0x2".into();
         });
