@@ -133,14 +133,15 @@ fn expand_home(path: PathBuf) -> eyre::Result<PathBuf> {
 fn open_golemdb(directory: &Path, spec: &ArkivChainSpec) -> eyre::Result<HostStore> {
     let at = directory.display();
     let history = match std::env::var("ARKIV_STORE_HISTORY") {
-        Err(std::env::VarError::NotPresent) => History::HeadOnly,
+        Err(std::env::VarError::NotPresent) => History::MinRetention,
         history => history
             .map_err(|e| eyre::eyre!("ARKIV_STORE_HISTORY: {e}"))?
             .parse()?,
     };
     let config = golemdb_config(spec)?;
-    let store = arkiv_golemdb::GolemDbStore::open(directory, &config, history.pruning_config())
-        .map_err(|e| match e {
+    let pruning = history.pruning(config.genesis.min_retention)?;
+    let store =
+        arkiv_golemdb::GolemDbStore::open(directory, &config, pruning).map_err(|e| match e {
             arkiv_golemdb::OpenError::GenesisMismatch => eyre::eyre!(
                 "open GolemDB at {at}: it was created with other GolemDB settings. Delete it if \
                  the node never ran on it; otherwise use a new directory"
@@ -215,11 +216,13 @@ fn golemdb_config(spec: &ArkivChainSpec) -> eyre::Result<arkiv_golemdb::GolemDbC
 /// How much history GolemDB keeps, as `ARKIV_STORE_HISTORY` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum History {
-    /// That many past blocks besides the head.
+    /// The genesis `min_retention` past blocks; the default.
+    MinRetention,
+    /// That many past blocks besides the head; at least `min_retention`.
     Blocks(u64),
     /// Every block.
     Archive,
-    /// Only the head; the default.
+    /// Only the head; only when `min_retention` is 0.
     HeadOnly,
 }
 
@@ -228,12 +231,13 @@ impl std::str::FromStr for History {
 
     fn from_str(history: &str) -> eyre::Result<Self> {
         Ok(match history {
+            "min-retention" => Self::MinRetention,
             "archive" => Self::Archive,
             "head-only" => Self::HeadOnly,
             n => Self::Blocks(n.parse().map_err(|_| {
                 eyre::eyre!(
-                    "ARKIV_STORE_HISTORY={history}: use an integer number of blocks, 'archive' \
-                     or 'head-only'"
+                    "ARKIV_STORE_HISTORY={history}: use 'min-retention', an integer number of \
+                     blocks, 'archive' or 'head-only'"
                 )
             })?),
         })
@@ -241,13 +245,23 @@ impl std::str::FromStr for History {
 }
 
 impl History {
-    /// GolemDB's pruning for this history; `None` keeps every commit.
-    fn pruning_config(self) -> Option<arkiv_golemdb::PruningConfig> {
-        match self {
-            Self::Blocks(window) => Some(arkiv_golemdb::PruningConfig::new(window)),
-            Self::Archive => None,
-            Self::HeadOnly => Some(arkiv_golemdb::PruningConfig::new(0)),
-        }
+    /// GolemDB's pruning for this history, refusing a window below the
+    /// genesis `min_retention` as GolemDB would, but naming the setting.
+    fn pruning(self, min_retention: u64) -> eyre::Result<arkiv_golemdb::Pruning> {
+        use arkiv_golemdb::{Pruning, PruningConfig};
+        let window = match self {
+            Self::MinRetention => return Ok(Pruning::MinRetention),
+            Self::Blocks(window) => window,
+            Self::Archive => return Ok(Pruning::Off),
+            Self::HeadOnly => 0,
+        };
+        eyre::ensure!(
+            window >= min_retention,
+            "ARKIV_STORE_HISTORY keeps {window} past blocks, fewer than the chain's minimum, \
+             config.arkiv.golemdb.min_retention = {min_retention}; use 'min-retention' or a \
+             number of at least {min_retention}"
+        );
+        Ok(Pruning::Custom(PruningConfig::new(window)))
     }
 }
 
@@ -501,24 +515,42 @@ mod tests {
         golemdb
     }
 
-    /// `archive` keeps every commit, `head-only` and `0` the head alone, and a
-    /// number that many blocks besides; anything else is refused.
+    /// `archive` keeps every commit, `min-retention` the genesis minimum,
+    /// `head-only` and `0` the head alone, and a number that many blocks
+    /// besides; anything else is refused.
     #[test]
     fn history_names_the_pruning_window() {
-        let window = |history: &str| {
-            let history: History = history.parse().unwrap();
-            history.pruning_config().map(|p| p.window())
-        };
-        assert_eq!(window("archive"), None);
-        assert_eq!(window("head-only"), Some(0));
-        assert_eq!(window("0"), Some(0));
-        assert_eq!(window("100"), Some(100));
+        use arkiv_golemdb::{Pruning, PruningConfig};
+        let pruning = |history: &str| history.parse::<History>().unwrap().pruning(0).unwrap();
+        let window = |blocks| Pruning::Custom(PruningConfig::new(blocks));
+        assert_eq!(pruning("min-retention"), Pruning::MinRetention);
+        assert_eq!(pruning("100"), window(100));
+        assert_eq!(pruning("0"), window(0));
+        assert_eq!(pruning("archive"), Pruning::Off);
+        assert_eq!(pruning("head-only"), window(0));
         for wrong in ["-1", "", "abc"] {
             let error = wrong.parse::<History>().unwrap_err().to_string();
             assert!(
-                error.contains("use an integer number of blocks"),
+                error.contains("use 'min-retention', an integer number of blocks"),
                 "{wrong}: {error}"
             );
+        }
+    }
+
+    /// A window below the genesis `min_retention` is refused naming
+    /// `ARKIV_STORE_HISTORY`; at the minimum, or following it, it is not.
+    #[test]
+    fn history_below_min_retention_is_refused() {
+        let pruning = |history: &str| history.parse::<History>().unwrap().pruning(100);
+        for below in ["head-only", "0", "99"] {
+            let error = pruning(below).unwrap_err().to_string();
+            assert!(
+                error.contains("ARKIV_STORE_HISTORY") && error.contains("min_retention = 100"),
+                "{below}: {error}"
+            );
+        }
+        for allowed in ["min-retention", "100", "archive"] {
+            pruning(allowed).unwrap();
         }
     }
 

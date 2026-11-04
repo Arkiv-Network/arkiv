@@ -27,6 +27,7 @@ fn config() -> GolemDbConfig {
             record_limits,
             None,
             PricingConfig::zero(),
+            0,
         ),
         segments: vec![SegmentSpec {
             name: SEGMENT.into(),
@@ -65,7 +66,7 @@ fn both_backends_use_and_expose_the_persisted_pricing_model() {
     let config = priced_config();
     let directory = TempDir::new().unwrap();
     let memory = GolemDbStore::open_memory(&config).unwrap();
-    let disk = GolemDbStore::open(directory.path(), &config, None).unwrap();
+    let disk = GolemDbStore::open(directory.path(), &config, Pruning::Off).unwrap();
     let pricing_root = |config: &GolemDbConfig| {
         let store = GolemDbStore::open_memory(config).unwrap();
         let branch = store.begin(None).unwrap();
@@ -106,7 +107,7 @@ fn both_backends_use_and_expose_the_persisted_pricing_model() {
         );
     }
     drop(disk);
-    let reopened = GolemDbStore::open(directory.path(), &config, None).unwrap();
+    let reopened = GolemDbStore::open(directory.path(), &config, Pruning::Off).unwrap();
     assert_eq!(
         *reopened
             .pricing_snapshot(reopened.head())
@@ -131,7 +132,7 @@ fn both_backends_use_and_expose_the_persisted_pricing_model() {
             "genesis root must cover {name}",
         );
         assert!(matches!(
-            GolemDbStore::open(directory.path(), &changed, None),
+            GolemDbStore::open(directory.path(), &changed, Pruning::Off),
             Err(OpenError::GenesisMismatch)
         ));
     }
@@ -158,7 +159,7 @@ fn stage(store: &GolemDbStore, n: u8) -> BranchId {
 }
 
 fn open(dir: &TempDir) -> GolemDbStore {
-    GolemDbStore::open(dir.path(), &config(), None).unwrap()
+    GolemDbStore::open(dir.path(), &config(), Pruning::Off).unwrap()
 }
 
 fn cell(kind: CellKind, type_id: TypeId, value: &[u8]) -> Cell {
@@ -433,7 +434,7 @@ fn reopening_keeps_head_and_records_but_not_another_config() {
     hash.genesis.hash_function = HashAlgorithm::Blake3;
     for other in [limits, record_limits, segments, hash] {
         assert!(matches!(
-            GolemDbStore::open(dir.path(), &other, None),
+            GolemDbStore::open(dir.path(), &other, Pruning::Off),
             Err(OpenError::GenesisMismatch)
         ));
     }
@@ -489,7 +490,7 @@ const CHILD_DIR: &str = "ARKIV_GOLEMDB_TEST_CHILD_DIR";
 #[test]
 fn a_killed_process_keeps_only_its_commits() {
     if let Some(dir) = std::env::var_os(CHILD_DIR) {
-        let store = GolemDbStore::open(dir.as_ref(), &config(), None).unwrap();
+        let store = GolemDbStore::open(dir.as_ref(), &config(), Pruning::Off).unwrap();
         store.commit_tagged(stage(&store, 1), [1; 32]).unwrap();
         stage(&store, 2);
         eprintln!("ready");
@@ -723,7 +724,7 @@ fn a_host_segment_may_not_be_named_commit_tags() {
         name: tags::SEGMENT.into(),
         columns: 1,
     });
-    let error = GolemDbStore::open(dir.path(), &config, None).unwrap_err();
+    let error = GolemDbStore::open(dir.path(), &config, Pruning::Off).unwrap_err();
     assert!(error.to_string().contains("duplicate"), "{error}");
 }
 
@@ -754,7 +755,7 @@ fn a_genesis_with_segments_is_refused() {
         shard_span: SHARD_SPAN,
         segments: vec![tags::segment()],
     });
-    let error = GolemDbStore::open(dir.path(), &config, None).unwrap_err();
+    let error = GolemDbStore::open(dir.path(), &config, Pruning::Off).unwrap_err();
     assert!(matches!(error, OpenError::InvalidConfig(_)), "{error}");
     assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
 }

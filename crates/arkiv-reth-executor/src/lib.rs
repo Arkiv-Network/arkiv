@@ -1882,6 +1882,7 @@ mod tests {
             },
             None,
             pricing,
+            0,
         );
         let store: HostStore = std::sync::Arc::new(
             arkiv_golemdb::GolemDbStore::open_memory(&arkiv_golemdb::GolemDbConfig {

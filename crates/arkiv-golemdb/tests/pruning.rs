@@ -2,8 +2,8 @@
 //! commits through [`GolemDbStore`] follows how much history it keeps.
 
 use arkiv_golemdb::{
-    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PricingConfig, PruningConfig,
-    RecordLimits,
+    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, OpenError, PricingConfig,
+    Pruning, PruningConfig, RecordLimits,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
@@ -40,6 +40,7 @@ fn config() -> GolemDbConfig {
             record_limits,
             None,
             PricingConfig::zero(),
+            0,
         ),
         segments: vec![],
     }
@@ -65,7 +66,7 @@ fn entity(n: u16) -> Entity {
 /// The bytes MDBX's pages in use span after [`COMMITS`] commits, each creating
 /// one entity. The file itself grows in steps and never shrinks, but pages
 /// pruning frees are used again.
-fn db_size(pruning: Option<PruningConfig>) -> u64 {
+fn db_size(pruning: Pruning) -> u64 {
     let dir = TempDir::new().unwrap();
     let store = GolemDbStore::open(dir.path(), &config(), pruning).unwrap();
     for n in 1..=COMMITS {
@@ -90,11 +91,24 @@ fn db_size(pruning: Option<PruningConfig>) -> u64 {
 /// than an archive.
 #[test]
 fn pruning_frees_space() {
-    let archive = db_size(None);
-    let head_only = db_size(Some(PruningConfig::new(0)));
-    let window = db_size(Some(PruningConfig::new(WINDOW)));
+    let archive = db_size(Pruning::Off);
+    let head_only = db_size(Pruning::Custom(PruningConfig::new(0)));
+    let window = db_size(Pruning::Custom(PruningConfig::new(WINDOW)));
     assert!(
         head_only < window && window < archive,
         "head-only {head_only}, window {window}, archive {archive} bytes"
     );
+}
+
+/// A window below the genesis `min_retention` does not open.
+#[test]
+fn a_window_below_min_retention_is_refused() {
+    let mut config = config();
+    config.genesis.min_retention = WINDOW;
+    let dir = TempDir::new().unwrap();
+    let below = Pruning::Custom(PruningConfig::new(WINDOW - 1));
+    let error = GolemDbStore::open(dir.path(), &config, below).unwrap_err();
+    assert!(matches!(error, OpenError::InvalidConfig(_)), "{error}");
+    let at = Pruning::Custom(PruningConfig::new(WINDOW));
+    GolemDbStore::open(dir.path(), &config, at).unwrap();
 }
