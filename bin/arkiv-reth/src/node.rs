@@ -49,7 +49,8 @@ use reth_node_ethereum::{
 use reth_storage_api::EthStorage;
 use reth_storage_overlay::OverlayManager;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use std::time::Instant;
+use tracing::{debug, info, warn};
 
 /// The Arkiv node: Ethereum node types on [`ArkivChainSpec`], with the no-EVM
 /// executor in place of reth's EVM.
@@ -338,8 +339,29 @@ impl<V: EngineValidator<EthEngineTypes>> EngineValidator<EthEngineTypes>
         payload: ExecutionData,
         ctx: TreeCtx<'_, EthPrimitives>,
     ) -> ValidationOutcome<EthPrimitives> {
+        let started = Instant::now();
+        let _span = tracing::info_span!(
+            target: "arkiv::timing", "payload_validation",
+            height = payload.block_number(), block_hash = %payload.block_hash(),
+            parent = %payload.parent_hash(),
+        )
+        .entered();
+        debug!(target: "arkiv::timing", "Arkiv validation started");
+        let phase = Instant::now();
         self.save_parent(payload.parent_hash(), &ctx);
-        self.inner.validate_payload(payload, ctx)
+        let save_parent = phase.elapsed();
+        let phase = Instant::now();
+        let result = self.inner.validate_payload(payload, ctx);
+        let validation = phase.elapsed();
+        info!(
+            target: "arkiv::timing",
+            save_parent_ms = save_parent.as_secs_f64() * 1000.0,
+            validation_ms = validation.as_secs_f64() * 1000.0,
+            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+            outcome = if result.is_ok() { "valid" } else { "error" },
+            "Arkiv validation finished",
+        );
+        result
     }
 
     fn validate_block(
@@ -347,8 +369,29 @@ impl<V: EngineValidator<EthEngineTypes>> EngineValidator<EthEngineTypes>
         block: SealedBlockWithAccessList<Block>,
         ctx: TreeCtx<'_, EthPrimitives>,
     ) -> ValidationOutcome<EthPrimitives> {
+        let started = Instant::now();
+        let _span = tracing::info_span!(
+            target: "arkiv::timing", "block_validation",
+            height = block.header().number, block_hash = %block.hash(),
+            parent = %block.header().parent_hash,
+        )
+        .entered();
+        debug!(target: "arkiv::timing", "Arkiv validation started");
+        let phase = Instant::now();
         self.save_parent(block.header().parent_hash, &ctx);
-        self.inner.validate_block(block, ctx)
+        let save_parent = phase.elapsed();
+        let phase = Instant::now();
+        let result = self.inner.validate_block(block, ctx);
+        let validation = phase.elapsed();
+        info!(
+            target: "arkiv::timing",
+            save_parent_ms = save_parent.as_secs_f64() * 1000.0,
+            validation_ms = validation.as_secs_f64() * 1000.0,
+            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+            outcome = if result.is_ok() { "valid" } else { "error" },
+            "Arkiv validation finished",
+        );
+        result
     }
 
     fn on_inserted_executed_block(
