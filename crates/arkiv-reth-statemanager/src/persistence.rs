@@ -30,6 +30,7 @@ use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockNumHash;
 use reth_engine_tree::persistence::{PersistenceAction, PersistenceHandle, PersistenceResult};
 use reth_ethereum::EthPrimitives;
+use reth_ethereum::primitives::SealedHeader;
 use tracing::{debug, error};
 
 use crate::host::{BlockSeals, HostStore};
@@ -76,6 +77,14 @@ fn run(store: &HostStore, receiver: &Receiver<PersistenceAction>) {
                         } else {
                             asked
                         };
+                        let acked = committed_through(
+                            store,
+                            input
+                                .persist_rest_blocks()
+                                .iter()
+                                .map(|block| block.recovered_block().sealed_header()),
+                            acked,
+                        );
                         let _ = reply.send(PersistenceResult {
                             last_block: acked,
                             last_state_trie_block: acked,
@@ -133,6 +142,14 @@ fn run(store: &HostStore, receiver: &Receiver<PersistenceAction>) {
     debug!(target: "arkiv-reth", "arkiv persistence service stopped");
 }
 
+fn committed_through<'a>(
+    _store: &HostStore,
+    _blocks: impl IntoIterator<Item = &'a SealedHeader>,
+    acked: BlockNumHash,
+) -> BlockNumHash {
+    acked
+}
+
 /// How far the store is committed: the block its head commit holds.
 ///
 /// The head commit is tagged with its block hash, which names the row in the
@@ -158,4 +175,66 @@ fn durable(store: &HostStore) -> eyre::Result<Option<BlockNumHash>> {
     let block = crate::segments::decode_block(&row)
         .map_err(|error| eyre::eyre!("decode the head block row: {error}"))?;
     Ok(Some(BlockNumHash::new(block.header.number(), hash)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use arkiv_interfaces::store::reference::MemStore;
+
+    /// Blocks 1 to `n`, each naming the one before as its parent.
+    fn chain(n: u64) -> Vec<SealedHeader> {
+        let mut parent = alloy_primitives::B256::ZERO;
+        (1..=n)
+            .map(|number| {
+                let header = SealedHeader::seal_slow(Header {
+                    number,
+                    parent_hash: parent,
+                    ..Header::default()
+                });
+                parent = header.hash();
+                header
+            })
+            .collect()
+    }
+
+    /// A store holding a commit tagged with the hash of each of `blocks`.
+    fn store_with(blocks: &[&SealedHeader]) -> HostStore {
+        let store: HostStore = Arc::new(MemStore::new());
+        for block in blocks {
+            let branch = store.begin(None).expect("begin");
+            store.commit_tagged(branch, block.hash().0).expect("commit");
+        }
+        store
+    }
+
+    #[test]
+    fn a_fully_committed_range_is_acknowledged_in_full() {
+        let chain = chain(3);
+        let store = store_with(&[&chain[0], &chain[1], &chain[2]]);
+        let asked = chain[2].num_hash();
+        assert_eq!(committed_through(&store, &chain, asked), asked);
+    }
+
+    #[test]
+    fn a_range_with_an_uncommitted_block_is_acknowledged_only_up_to_the_gap() {
+        let chain = chain(3);
+        // Block 2 was never adopted; the store's head is block 3 regardless.
+        let store = store_with(&[&chain[0], &chain[2]]);
+        assert_eq!(
+            committed_through(&store, &chain, chain[2].num_hash()),
+            chain[0].num_hash(),
+        );
+    }
+
+    #[test]
+    fn a_range_whose_first_block_is_uncommitted_acknowledges_only_its_parent() {
+        let chain = chain(3);
+        let store = store_with(&[&chain[1], &chain[2]]);
+        assert_eq!(
+            committed_through(&store, &chain, chain[2].num_hash()),
+            BlockNumHash::new(0, alloy_primitives::B256::ZERO),
+        );
+    }
 }
