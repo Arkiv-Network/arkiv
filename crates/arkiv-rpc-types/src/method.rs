@@ -58,11 +58,12 @@ pub fn resolve_limit(requested: Option<u64>) -> Result<u64, String> {
 /// The `arkiv_getEntityCount` request: an optional query to filter by (default
 /// `$all`) and an optional past block (default the tip).
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CountRequest {
     #[serde(default)]
     pub query: Option<String>,
-    #[serde(default)]
+    /// Block to count at, hex or JSON number, like `arkiv_query`'s `atBlock`.
+    #[serde(default, deserialize_with = "de_u64_flexible")]
     pub block: Option<u64>,
 }
 
