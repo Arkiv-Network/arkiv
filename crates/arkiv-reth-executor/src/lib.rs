@@ -2609,4 +2609,97 @@ mod tests {
             "the key depends on the chain's id"
         );
     }
+
+    /// A view call reads the whole entity from GolemDB. Mined, it pays for that
+    /// read at the block's read weights -- `read.key + read.cell × cells +
+    /// read.byte × cell_bytes`, all 1 here -- so one block of views over a large
+    /// entity cannot make validators decode gigabytes for the flat 21,000 each.
+    /// Running out of gas consumes the limit and reverts, as everywhere. An
+    /// `eth_estimateGas` probe charges nothing but reports the same gas, so a
+    /// view sent with its estimate does not run out.
+    #[test]
+    fn mined_view_call_pays_for_the_entity_it_reads() {
+        use arkiv_bindings::{AttributeValue, Ident32};
+        use arkiv_interfaces::store::StoreExt;
+
+        let blob = |len: usize| {
+            arkiv_bindings::Attribute::from_value(
+                Ident32::encode("blob").unwrap(),
+                &AttributeValue::Bytes(vec![7; len]),
+                false,
+            )
+            .unwrap()
+        };
+        // The store, the record's size and a view call on an entity holding
+        // `len` bytes.
+        let entity = |len: usize| {
+            let store = host_store(PRICED);
+            let ops = vec![arkiv_bindings::Operation::create(
+                0,
+                0,
+                100,
+                0,
+                vec![blob(len)],
+            )];
+            let (branch, out) = transact(
+                &store,
+                call_tx(
+                    IEntityRegistry::executeCall { ops }.abi_encode(),
+                    U256::ZERO,
+                ),
+                true,
+                None,
+            );
+            let key = out.expect("the create executes").result.logs()[0].topics()[1];
+            store.commit_tagged(branch, [0x22; 32]).expect("commit");
+            let fresh = arkiv_interfaces::store::Store::begin(&*store, Some(store.head()));
+            let meta = branch_view(&store, fresh.expect("begin"))
+                .get_entity_with_meta(key.0, ReadMode::ViewOnBase)
+                .expect("read")
+                .value
+                .expect("the entity exists")
+                .meta;
+            let view = IEntityRegistry::customAttributeNamesCall { entityKey: key }.abi_encode();
+            (store, meta, call_tx(view, U256::ZERO))
+        };
+        let gas = |len: usize, charge: bool| {
+            let (store, meta, view) = entity(len);
+            let read = 1 + meta.cells + meta.cell_bytes;
+            let expected = (tx_gas(&view.data) + read).max(floor_gas(&view.data));
+            let out = transact(&store, view, charge, None).1;
+            let out = out.expect("the view executes").result;
+            assert!(out.is_success());
+            (out.tx_gas_used(), expected, meta)
+        };
+
+        let (small, expected, _) = gas(1, true);
+        assert_eq!(small, expected, "a mined view pays the read weights");
+        let (big, expected, meta) = gas(60_000, true);
+        assert_eq!(big, expected, "a mined view pays the read weights");
+        assert!(
+            meta.cell_bytes >= 60_000,
+            "the read covers the blob's bytes"
+        );
+        assert!(big > small + 59_000, "{small} vs {big}");
+        assert_eq!(
+            gas(60_000, false).0,
+            big,
+            "an estimate reports the gas a mined view pays"
+        );
+
+        let (store, _, view) = entity(60_000);
+        let gas_limit = big - 1;
+        let out = transact(&store, TxEnv { gas_limit, ..view }, true, None).1;
+        let out = out.expect("the view executes").result;
+        assert_eq!(
+            out.tx_gas_used(),
+            gas_limit,
+            "out of gas consumes the limit"
+        );
+        assert!(
+            matches!(&out, ExecutionResult::Revert { output, .. }
+                if *output == revert::revert_data(&arkiv_interfaces::RevertReason::OutOfGas)),
+            "a view short of its read's gas runs out of gas: {out:?}"
+        );
+    }
 }
