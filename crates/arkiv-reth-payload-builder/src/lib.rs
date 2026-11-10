@@ -496,20 +496,23 @@ where
                 Vec::new()
             });
         let purge = protocol_transaction(self.chain_id, block, keys);
-        default_ethereum_payload(
-            self.evm.clone(),
-            self.client.clone(),
-            self.pool.clone(),
-            self.config.clone(),
-            args,
-            |attrs| match contents {
-                Contents::PurgeAndPool => Box::new(PrependBest::new(
-                    purge,
-                    self.pool.best_transactions_with_attributes(attrs),
-                )),
-                Contents::PurgeOnly => Box::new(PrependBest::new(purge, std::iter::empty())),
-            },
-        )
+        // The resolver looks this execution's seal up, so it has to leave one.
+        BlockSeals::sealing(|| {
+            default_ethereum_payload(
+                self.evm.clone(),
+                self.client.clone(),
+                self.pool.clone(),
+                self.config.clone(),
+                args,
+                |attrs| match contents {
+                    Contents::PurgeAndPool => Box::new(PrependBest::new(
+                        purge,
+                        self.pool.best_transactions_with_attributes(attrs),
+                    )),
+                    Contents::PurgeOnly => Box::new(PrependBest::new(purge, std::iter::empty())),
+                },
+            )
+        })
     }
 }
 

@@ -583,9 +583,43 @@ pub struct BlockSeals {
     adopting: Mutex<()>,
 }
 
+std::thread_local! {
+    /// Whether this thread is executing a block whose seal is wanted. See
+    /// [`BlockSeals::sealing`].
+    static SEALING: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
 impl BlockSeals {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Run `execute` as a block execution whose seal is wanted: the payload
+    /// builder building a block, or the engine validating one. Only an EVM
+    /// created inside it seals; see [`is_sealing`](Self::is_sealing).
+    ///
+    /// Every other execution finishes its EVM too -- `eth_simulateV1`, reth's
+    /// local pending block, block replays for tracing -- with fees charged and
+    /// every check a block has, or with only those a caller could also set.
+    /// Nothing in the EVM's environment tells them apart from a block, and a
+    /// seal they left would stay until a block at their height is adopted and
+    /// would replace a block's own seal under the same key. So the two callers
+    /// that look a seal up say so instead, around the execution they run on
+    /// their own thread.
+    pub fn sealing<R>(execute: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SEALING.set(self.0);
+            }
+        }
+        let _restore = Restore(SEALING.replace(true));
+        execute()
+    }
+
+    /// Whether this thread is inside [`sealing`](Self::sealing).
+    pub fn is_sealing() -> bool {
+        SEALING.get()
     }
 
     /// Seal `branch` as a candidate for the execution `key` describes. A branch

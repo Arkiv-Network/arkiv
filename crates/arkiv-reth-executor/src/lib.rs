@@ -478,6 +478,10 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
     /// is discarded rather than sealed.
     charged: core::cell::Cell<bool>,
+    /// Whether this EVM was created inside [`BlockSeals::sealing`]: by a block
+    /// execution whose seal is wanted. Anything else that charges fees, such
+    /// as `eth_simulateV1`, is discarded rather than sealed like a probe.
+    sealing: bool,
     /// `(signer, nonce)` of each charged transaction, in order — the half of
     /// [`ExecutionKey`] only the EVM sees.
     ///
@@ -503,6 +507,7 @@ impl<DB: Database, I> ArkivEvm<DB, I> {
             pricing,
             op_cost,
             charged: core::cell::Cell::new(false),
+            sealing: BlockSeals::is_sealing(),
             executed: core::cell::RefCell::new(Vec::new()),
         }
     }
@@ -682,14 +687,16 @@ where
     }
 
     /// Block execution is over. Seal the branch as a candidate at this height
-    /// if a real block ran on it; otherwise it is dropped, and discarded.
+    /// if a real block ran on it -- charged transactions, inside
+    /// [`BlockSeals::sealing`]; otherwise it is dropped, and discarded.
     ///
     /// Sealing computes the roots and writes nothing, so reth can execute this
     /// block again — to validate what it just built — and get the same answer.
     /// Only adoption commits.
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         let height = self.inner.block().number.saturating_to::<u64>();
-        if self.charged.get()
+        if self.sealing
+            && self.charged.get()
             && let Some(branch) = self.branch
         {
             let key = ExecutionKey::new(height, self.executed.into_inner());
@@ -2403,13 +2410,16 @@ mod tests {
             basefee: 0,
             ..Default::default()
         };
-        let mut evm = ArkivEvmFactory::new(store, seals.clone(), OpCost::Placeholder).create_evm(
-            EmptyDB::default(),
-            EvmEnv {
-                cfg_env: CfgEnv::default(),
-                block_env,
-            },
-        );
+        let factory = ArkivEvmFactory::new(store, seals.clone(), OpCost::Placeholder);
+        let mut evm = BlockSeals::sealing(|| {
+            factory.create_evm(
+                EmptyDB::default(),
+                EvmEnv {
+                    cfg_env: CfgEnv::default(),
+                    block_env,
+                },
+            )
+        });
 
         let refused = Address::repeat_byte(0xaa);
         let sender = Address::repeat_byte(0xbb);
