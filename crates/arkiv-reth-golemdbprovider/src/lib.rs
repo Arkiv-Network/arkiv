@@ -1596,7 +1596,7 @@ fn no_history_range(method: &str, range: &impl RangeBounds<BlockNumber>) -> Prov
 ///
 /// A free function so it can be tested without a whole `BlockchainProvider`.
 fn maps_to_head(number: BlockNumber, adopted: Option<BlockNumber>) -> bool {
-    number <= adopted.map_or(0, |block| block + 1)
+    Some(number) == adopted || number == adopted.map_or(0, |block| block + 1)
 }
 
 /// Refuse a commit that is not the store's head — see [`ArkivProvider::commit_of`].
