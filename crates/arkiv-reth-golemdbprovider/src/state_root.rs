@@ -32,7 +32,7 @@ use reth_engine_tree::tree::state_root_strategy::{
 };
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
-use reth_provider::{BlockExecutionOutput, ProviderResult};
+use reth_provider::{BlockExecutionOutput, ProviderError, ProviderResult};
 use reth_trie::updates::TrieUpdates;
 
 /// Answers engine validation with the root GolemDB sealed.
@@ -93,15 +93,23 @@ impl<N: NodePrimitives> StateRootJob<N> for ArkivStateRootJob {
                 .collect(),
         );
 
-        // Falling back to the header's own root rather than erroring. A block
-        // whose execution left no seal is one Arkiv charged nothing for -- an
-        // empty block -- and refusing those would stall the chain on the first
-        // quiet slot. A block that *did* seal and disagrees still fails, in
+        // A block whose execution left no seal is refused, never answered with
+        // the header's own root: that would compare the root to itself and
+        // accept whatever the header claims. Two kinds of block get here. One
+        // whose seal failed, which the executor can only log. And one with no
+        // transactions, which charges nothing and so seals nothing; no Arkiv
+        // builder makes one, since every block opens with the purge. Neither
+        // could be adopted either, as adoption commits a seal, so accepting it
+        // would only stall the chain at the next block, which builds on its
+        // commit. A block that *did* seal and disagrees still fails, in
         // reth's own root check a moment later, which is where it belongs.
-        let state_root = self
-            .seals
-            .root_of(&key)
-            .map_or_else(|| block.header().state_root(), B256::from);
+        let state_root = self.seals.root_of(&key).map(B256::from).ok_or_else(|| {
+            ProviderError::other(std::io::Error::other(format!(
+                "block {} at height {} left no Arkiv seal, so its state root cannot be checked",
+                block.hash(),
+                key.height
+            )))
+        })?;
 
         // No trie updates, ever: Arkiv maintains no account trie, which is the
         // deliberate trade recorded in #145 -- `eth_getProof` cannot be served
