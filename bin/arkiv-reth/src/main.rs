@@ -362,6 +362,7 @@ fn main() {
             arkiv_tokenomics::FeeSchedule::from_model(&pricing.model)
                 .map_err(|e| eyre::eyre!("invalid host pricing: {e:?}"))?;
             let rpc_store = store.clone();
+            let rpc_seals = seals.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
             let node = ArkivNode::new(store.clone(), seals.clone(), op_cost);
             // Spelt out rather than `.node(node)`: that convenience pins the
@@ -378,6 +379,7 @@ fn main() {
                     let module = arkiv_reth_rpc::arkiv_module(
                         ctx.provider().clone(),
                         rpc_store.clone(),
+                        rpc_seals.clone(),
                         arkiv_args.rpc_max_arkiv_requests,
                     )?;
                     ctx.modules.merge_configured(module)?;
