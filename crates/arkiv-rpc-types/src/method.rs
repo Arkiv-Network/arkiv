@@ -189,4 +189,37 @@ mod tests {
         let bad = serde_json::from_value::<QueryOptions>(serde_json::json!({ "atBlok": "latest" }));
         assert!(bad.is_err());
     }
+
+    /// A string quantity without the `0x` prefix would otherwise be read as
+    /// hex, so `"50"` would page 80 entities and `"10"` would skip 16.
+    #[test]
+    fn a_quantity_string_without_the_hex_prefix_or_with_a_sign_is_rejected() {
+        for text in ["50", "+0x10", "+10", "-1", "0X10", "0x", ""] {
+            let limit =
+                serde_json::from_value::<QueryOptions>(serde_json::json!({ "limit": text }));
+            assert!(limit.is_err(), "limit {text:?} was accepted");
+            let offset =
+                serde_json::from_value::<QueryOptions>(serde_json::json!({ "offset": text }));
+            assert!(offset.is_err(), "offset {text:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_count_request_accepts_a_block_in_either_spelling() {
+        let hex: CountRequest =
+            serde_json::from_value(serde_json::json!({ "block": "0x10" })).unwrap();
+        let number: CountRequest =
+            serde_json::from_value(serde_json::json!({ "block": 16 })).unwrap();
+        let absent: CountRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(hex.block, Some(16));
+        assert_eq!(number.block, Some(16));
+        assert_eq!(absent.block, None);
+    }
+
+    /// A misspelt `query` would otherwise count every live entity.
+    #[test]
+    fn an_unknown_count_field_is_rejected() {
+        let bad = serde_json::from_value::<CountRequest>(serde_json::json!({ "querry": "a = 1" }));
+        assert!(bad.is_err());
+    }
 }
