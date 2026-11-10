@@ -20,7 +20,8 @@
 //!
 //! The answer has to be honest. Telling reth a block is persisted is what
 //! lets it drop that block from memory, so this reports the store's head
-//! rather than the height it was asked about. A block the store has not
+//! rather than the height it was asked about, and stops short of any block
+//! below that head the store holds no commit for. A block the store has not
 //! committed is simply not acknowledged, and reth holds on to it.
 
 use std::sync::Arc;
@@ -142,11 +143,44 @@ fn run(store: &HostStore, receiver: &Receiver<PersistenceAction>) {
     debug!(target: "arkiv-reth", "arkiv persistence service stopped");
 }
 
+/// How far reth may forget: `acked`, or the parent of the first of `blocks`
+/// at or below it that the store holds no commit for.
+///
+/// The store's head is not proof enough. Adoption commits blocks one at a
+/// time, and a block it skipped -- an adoption that failed, a block that never
+/// sealed, a notification adopted only at its tip -- leaves a gap below a head
+/// that has moved on. Acknowledging across that gap would let reth drop a block
+/// the store does not have, and with it the only copy of its header, body and
+/// receipts. So every block must have a commit tagged with its own hash; the
+/// first that does not stops the acknowledgement, and it and every block after
+/// it stay in reth's memory.
 fn committed_through<'a>(
-    _store: &HostStore,
-    _blocks: impl IntoIterator<Item = &'a SealedHeader>,
+    store: &HostStore,
+    blocks: impl IntoIterator<Item = &'a SealedHeader>,
     acked: BlockNumHash,
 ) -> BlockNumHash {
+    for block in blocks
+        .into_iter()
+        .take_while(|block| block.number <= acked.number)
+    {
+        match store.commit_by_tag(block.hash().0) {
+            Ok(Some(_)) => continue,
+            Ok(None) => error!(
+                target: "arkiv-reth",
+                number = block.number,
+                hash = %block.hash(),
+                "the arkiv store has no commit for this block; keeping it and every block after it in memory",
+            ),
+            Err(error) => error!(
+                target: "arkiv-reth",
+                number = block.number,
+                hash = %block.hash(),
+                ?error,
+                "cannot tell whether the arkiv store committed this block; keeping it and every block after it in memory",
+            ),
+        }
+        return block.parent_num_hash();
+    }
     acked
 }
 
