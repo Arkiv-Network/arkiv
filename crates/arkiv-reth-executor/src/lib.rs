@@ -2439,6 +2439,40 @@ mod tests {
         );
     }
 
+    /// `eth_simulateV1` leaves fee charging on and finishes its EVM the way a
+    /// block execution does, but it is a question, not a block. Sealed, its
+    /// branch would sit in `BlockSeals` until a block at its height is adopted,
+    /// and would replace a real block's seal under the same key.
+    #[test]
+    fn a_simulation_does_not_seal() {
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+        let seals = Arc::new(BlockSeals::default());
+        // What `eth_simulateV1` without `validation` sets that revm always
+        // has; it also lifts EIP-3607 and the base-fee check, which are behind
+        // revm features. Fees are charged.
+        let mut cfg_env = CfgEnv::default();
+        cfg_env.disable_nonce_check = true;
+        let mut evm = ArkivEvmFactory::new(host_store(1), seals.clone(), OpCost::Placeholder)
+            .create_evm(
+                EmptyDB::default(),
+                EvmEnv {
+                    cfg_env,
+                    block_env: BlockEnv {
+                        number: U256::from(1),
+                        basefee: 0,
+                        ..Default::default()
+                    },
+                },
+            );
+        evm.transact(transfer(0, None, ARKIV_TX_GAS))
+            .expect("transfer");
+        evm.finish();
+
+        let simulated = ExecutionKey::new(1, vec![(HOST_SENDER.into_array(), 0)]);
+        assert_eq!(seals.root_of(&simulated), None, "a simulation sealed");
+    }
+
     /// An RPC call, payload prewarming or an aborted build drops its EVM
     /// without `finish`. The branch has to go with it, or the store keeps it.
     #[test]
