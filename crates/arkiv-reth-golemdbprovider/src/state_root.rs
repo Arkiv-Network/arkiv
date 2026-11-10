@@ -112,3 +112,71 @@ impl<N: NodePrimitives> StateRootJob<N> for ArkivStateRootJob {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Header, SignableTransaction, TxLegacy};
+    use alloy_primitives::{Address, Signature};
+    use reth_ethereum::tasks::LazyHandle;
+    use reth_ethereum_primitives::{Block, BlockBody, EthPrimitives, TransactionSigned};
+    use reth_trie::HashedPostState;
+
+    /// Finish an Arkiv state-root job for `block` against `seals`.
+    fn finish(
+        seals: Arc<BlockSeals>,
+        block: &RecoveredBlock<Block>,
+    ) -> ProviderResult<StateRootJobOutcome> {
+        StateRootJob::<EthPrimitives>::finish(
+            &mut ArkivStateRootJob { seals },
+            block,
+            Arc::new(BlockExecutionOutput::default()),
+            &LazyHandle::ready(Arc::new(HashedPostState::default())),
+        )
+    }
+
+    /// A block at height 1 carrying `transactions`, whose header claims a root
+    /// no execution produced.
+    fn block(transactions: Vec<TransactionSigned>) -> RecoveredBlock<Block> {
+        let senders = vec![Address::repeat_byte(0x11); transactions.len()];
+        let header = Header {
+            number: 1,
+            state_root: B256::repeat_byte(0xab),
+            ..Default::default()
+        };
+        RecoveredBlock::new_unhashed(
+            Block {
+                header,
+                body: BlockBody {
+                    transactions,
+                    ..Default::default()
+                },
+            },
+            senders,
+        )
+    }
+
+    /// A block with no transactions seals nothing, so there is no root to
+    /// check its header against. Answering with the header's own root would
+    /// accept whatever it claims.
+    #[test]
+    fn an_empty_block_without_a_seal_is_refused() {
+        let outcome = finish(Arc::new(BlockSeals::new()), &block(Vec::new()));
+        assert!(
+            outcome.is_err(),
+            "an unsealed block's header root was accepted unchecked: {outcome:?}"
+        );
+    }
+
+    /// A block whose transactions ran but left no seal -- the executor failed
+    /// to seal it -- has no root to check either.
+    #[test]
+    fn a_block_whose_seal_is_missing_is_refused() {
+        let tx = TxLegacy::default().into_signed(Signature::test_signature());
+        let outcome = finish(Arc::new(BlockSeals::new()), &block(vec![tx.into()]));
+        assert!(
+            outcome.is_err(),
+            "an unsealed block's header root was accepted unchecked: {outcome:?}"
+        );
+    }
+}
