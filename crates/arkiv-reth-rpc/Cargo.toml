@@ -29,3 +29,9 @@ base64 = "0.23"
 tokio.workspace = true
 eyre.workspace = true
 arkiv-reth-statemanager.workspace = true
+
+[dev-dependencies]
+# `MemStore`, the in-memory reference store, for the resolution tests.
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
+# `ChainInfo`, in the test chain's `BlockNumReader`.
+reth-chainspec.workspace = true

@@ -173,7 +173,7 @@ fn resolve_at<Provider>(
     block: Option<u64>,
 ) -> Result<(BlockNumber, CommitId), ErrorObjectOwned>
 where
-    Provider: BlockNumReader + HeaderProvider,
+    Provider: BlockNumReader,
 {
     let tip = provider
         .best_block_number()
@@ -478,7 +478,9 @@ where
 mod tests {
     use super::*;
     use crate::error::rpc_error_codes;
+    use arkiv_interfaces::store::reference::MemStore;
     use jsonrpsee::types::error::INTERNAL_ERROR_CODE;
+    use reth_storage_api::errors::ProviderResult;
     use std::cell::Cell;
 
     /// Finds block `first` and its commit, then the next block on each call, as
@@ -552,5 +554,76 @@ mod tests {
             read.await.unwrap().unwrap();
         }
         assert_eq!(most.load(Ordering::SeqCst), 2);
+    }
+
+    /// A chain whose block `n` is `self.0[n]`; the last is reth's tip.
+    struct Chain(Vec<B256>);
+
+    impl reth_storage_api::BlockHashReader for Chain {
+        fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
+            Ok(self.0.get(number as usize).copied())
+        }
+
+        fn canonical_hashes_range(&self, start: u64, end: u64) -> ProviderResult<Vec<B256>> {
+            Ok(self.0[start as usize..end as usize].to_vec())
+        }
+    }
+
+    impl BlockNumReader for Chain {
+        fn chain_info(&self) -> ProviderResult<reth_chainspec::ChainInfo> {
+            Ok(reth_chainspec::ChainInfo {
+                best_hash: *self.0.last().expect("a chain has a genesis"),
+                best_number: self.best_block_number()?,
+            })
+        }
+
+        fn best_block_number(&self) -> ProviderResult<u64> {
+            Ok(self.0.len() as u64 - 1)
+        }
+
+        fn last_block_number(&self) -> ProviderResult<u64> {
+            self.best_block_number()
+        }
+
+        fn block_number(&self, hash: B256) -> ProviderResult<Option<u64>> {
+            Ok(self.0.iter().position(|&h| h == hash).map(|n| n as u64))
+        }
+    }
+
+    /// Block `n`'s hash in these tests.
+    fn hash(n: u8) -> B256 {
+        B256::repeat_byte(n + 1)
+    }
+
+    /// A store holding blocks `0..=head`, each in a commit tagged with its hash.
+    fn store_through(head: u8) -> HostStore {
+        let store: HostStore = Arc::new(MemStore::new());
+        for n in 0..=head {
+            let branch = store.begin(None).expect("begin");
+            store.commit_tagged(branch, hash(n).0).expect("commit");
+        }
+        store
+    }
+
+    /// The block a commit holds the state of, by its tag.
+    fn block_of(store: &HostStore, chain: &Chain, commit: CommitId) -> u64 {
+        let tag = store.tag_of(commit).expect("tag_of").expect("tagged");
+        chain
+            .block_number(B256::from(tag))
+            .unwrap()
+            .expect("a known block")
+    }
+
+    /// reth has made block 2 canonical, but the store's head is still block 1.
+    /// A read at the tip, by `None` or by number, never answers with block 1's
+    /// state labelled as block 2.
+    #[test]
+    fn a_tip_read_is_labelled_with_the_block_its_state_is_from() {
+        let chain = Chain(vec![hash(0), hash(1), hash(2)]);
+        let store = store_through(1);
+        for block in [None, Some(2)] {
+            let (number, commit) = resolve_at(&chain, &store, block).unwrap();
+            assert_eq!(number, block_of(&store, &chain, commit), "at {block:?}");
+        }
     }
 }
