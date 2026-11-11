@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 
 use arkiv_golemdb_state::{GolemStateView, ViewError};
 use arkiv_interfaces::entity::AttributeValue;
-use arkiv_interfaces::gas::PlaceholderCost;
 use arkiv_interfaces::primitives::{
     EntityAddress, EntityCreationNonce, UserAddress, UserBalance, UserNonce,
 };
@@ -61,8 +60,6 @@ pub enum HostError<E> {
     Store(ViewError),
     /// The account backend refused.
     Backend(E),
-    /// The view cannot graduate — see [`StateView::graduate`].
-    Graduate(&'static str),
 }
 
 impl<E> From<ViewError> for HostError<E> {
@@ -74,37 +71,19 @@ impl<E> From<ViewError> for HostError<E> {
 /// One view over Arkiv's state for one block: GolemDB throughout, with the
 /// two account lanes mirrored into reth's `EvmState` diff on the way past.
 #[derive(Debug)]
-pub struct HostStateView<B, C = PlaceholderCost> {
+pub struct HostStateView<B> {
     golem: GolemStateView<HostStore>,
     // RefCell because the spec's reads are `&self` while the reth account
     // seams read with `&mut` (caches). Borrows never overlap: one per method.
     base: RefCell<B>,
-    costs: C,
-    commitment: Option<Commitment>,
 }
 
 impl<B> HostStateView<B> {
     pub fn new(golem: GolemStateView<HostStore>, base: B) -> Self {
-        Self::with_cost_model(golem, base, PlaceholderCost)
-    }
-}
-
-impl<B, C> HostStateView<B, C> {
-    pub fn with_cost_model(golem: GolemStateView<HostStore>, base: B, costs: C) -> Self {
         Self {
             golem,
             base: RefCell::new(base),
-            costs,
-            commitment: None,
         }
-    }
-
-    pub const fn cost_model(&self) -> &C {
-        &self.costs
-    }
-
-    pub fn backend_mut(&mut self) -> &mut B {
-        self.base.get_mut()
     }
 
     pub fn into_base(self) -> B {
@@ -123,7 +102,7 @@ impl<B, C> HostStateView<B, C> {
 
 // ── Arkiv's own state: straight through to GolemDB ──────────────────────────
 
-impl<B, C, E> EntityStore for HostStateView<B, C>
+impl<B, E> EntityStore for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -155,13 +134,11 @@ where
     }
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
-        let commitment = EntityStore::commit_store(&mut self.golem)?;
-        self.commitment = Some(commitment);
-        Ok(commitment)
+        Ok(EntityStore::commit_store(&mut self.golem)?)
     }
 }
 
-impl<B, C, E> EqualityIndexStore for HostStateView<B, C>
+impl<B, E> EqualityIndexStore for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -187,7 +164,7 @@ where
     }
 }
 
-impl<B, C, E> RangeIndexStore for HostStateView<B, C>
+impl<B, E> RangeIndexStore for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -207,7 +184,7 @@ where
 
 /// Minting nonces were system-account storage slots on the MPT host; here they
 /// are the account record's `mnt` cell, so they move with the entities.
-impl<B, C, E> EntityCreationNoncesStore for HostStateView<B, C>
+impl<B, E> EntityCreationNoncesStore for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -236,7 +213,7 @@ where
 
 // ── The two lanes Ethereum also reads: GolemDB, mirrored into reth's diff ───
 
-impl<B, C, E> HostStateView<B, C>
+impl<B, E> HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -270,7 +247,7 @@ where
     }
 }
 
-impl<B, C, E> AccountBalancesStore for HostStateView<B, C>
+impl<B, E> AccountBalancesStore for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -332,7 +309,7 @@ where
     }
 }
 
-impl<B, C, E> AccountNoncesStore for HostStateView<B, C>
+impl<B, E> AccountNoncesStore for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -361,7 +338,7 @@ where
     }
 }
 
-impl<B, C, E> StateView for HostStateView<B, C>
+impl<B, E> StateView for HostStateView<B>
 where
     B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
     E: core::fmt::Debug,
@@ -432,7 +409,7 @@ fn next_session() -> SessionId {
     SessionId(bytes)
 }
 
-impl<'a, DB: Database, C> HostStateView<WriteOverlay<'a, DB>, C> {
+impl<'a, DB: Database> HostStateView<WriteOverlay<'a, DB>> {
     /// End one transaction: hand back the account diff for reth, leaving the
     /// block's branch open for the next transaction.
     ///

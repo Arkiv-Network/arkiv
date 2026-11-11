@@ -11,11 +11,9 @@ use core::fmt::Debug;
 use core::ops::Bound;
 
 use crate::entity::{Attribute, AttributeValue, CreationFlags, Entity};
-use crate::execution::Op;
 use crate::primitives::{
-    BlockNumber, EntityAddress, EntityCreationNonce, Gas, Hash, UserAddress, UserBalance, UserNonce,
+    BlockNumber, EntityAddress, EntityCreationNonce, Hash, UserAddress, UserBalance, UserNonce,
 };
-use crate::query::QueryStats;
 use crate::store::{Metered, RecordMeta};
 
 /// A 32-byte commitment over a store's contents.
@@ -453,8 +451,7 @@ pub trait StateView:
 #[cfg(feature = "conformance")]
 pub mod conformance;
 
-/// Mints [`StateView`]s, and prices work. Pricing is consensus: it decides
-/// out-of-gas, so two managers at the same state must answer identically.
+/// Mints [`StateView`]s.
 pub trait StateManager {
     type Error: Debug;
     type View: StateView<Error = Self::Error>;
@@ -462,10 +459,6 @@ pub trait StateManager {
     /// Open a view over the state as committed through `at`, with a fresh
     /// [`SessionId`].
     fn view(&self, at: BlockRef) -> Result<Self::View, Self::Error>;
-
-    fn get_operation_cost(&mut self, op: &Op) -> Result<Gas, Self::Error>;
-
-    fn get_query_cost(&mut self, stats: &QueryStats) -> Result<Gas, Self::Error>;
 }
 
 #[cfg(test)]
