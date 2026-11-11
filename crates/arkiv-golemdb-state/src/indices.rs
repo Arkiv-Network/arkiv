@@ -8,13 +8,8 @@
 //! be built on top of it.
 //!
 //! A GolemDB store indexes every attribute cell itself. So the two index traits
-//! reduce to writing a lookup as a [`Filter`] and asking the store, and
-//! `apply_deltas` — the whole write-side maintenance path — becomes **nothing at
-//! all**: writing the entity record already moved its index entries.
-//!
-//! That is the argument for native records in one file. It is worth checking against
-//! [`tests::applying_deltas_is_a_no_op`], which pins the claim rather than leaving it
-//! in a comment.
+//! reduce to writing a lookup as a [`Filter`] and asking the store: writing the
+//! entity record already moved its index entries.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -23,9 +18,7 @@ use core::ops::Bound;
 use arkiv_interfaces::entity::{AttributeValue, annotations};
 use arkiv_interfaces::entity_records::type_id_of;
 use arkiv_interfaces::primitives::EntityAddress;
-use arkiv_interfaces::statemanager::{
-    EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode,
-};
+use arkiv_interfaces::statemanager::{EqualityIndexStore, RangeIndexStore, ReadMode};
 use arkiv_interfaces::store::{
     CellName, CommitId, CompareOp, Filter, Page, Predicate, Query, QueryResult, Store, StoreError,
     Test,
@@ -201,13 +194,6 @@ impl<'s, S: Store> StoreIndices<'s, S> {
     }
 }
 
-/// Fold staged entity changes into the index.
-///
-/// Deliberately nothing. The store indexes attribute cells as they are written,
-/// so by the time an entity record is staged its index entries have already
-/// moved. The parameter is kept so the shape still matches the trait it serves.
-pub const fn apply_deltas(_updates: &[EntityUpdates]) {}
-
 /// Read mode is not a distinction this index can make.
 ///
 /// `Store::query` answers from a commit and never from a branch, so there is no
@@ -223,8 +209,8 @@ pub const fn supports(read: ReadMode) -> bool {
 ///
 /// `ViewWithOverlay` is refused rather than silently answered from the base:
 /// `Store::query` cannot see a branch, and a stale index answer is a wrong query
-/// result, not a slow one. Nothing in the executor reads the indexes — it only
-/// folds deltas in — so this refusal is unreachable today and loud if that changes.
+/// result, not a slow one. Nothing in the executor reads the indexes, so this
+/// refusal is unreachable today and loud if that changes.
 impl<S: Store> EqualityIndexStore for GolemStateView<S> {
     type Error = ViewError;
 
@@ -245,15 +231,6 @@ impl<S: Store> EqualityIndexStore for GolemStateView<S> {
     ) -> Result<Vec<EntityAddress>, ViewError> {
         Ok(self.indices(read)?.prefixed(attribute, prefix)?)
     }
-
-    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), ViewError> {
-        apply_deltas(entity_updates);
-        Ok(())
-    }
-
-    fn commit_store(&mut self) -> Result<(), ViewError> {
-        Ok(())
-    }
 }
 
 impl<S: Store> RangeIndexStore for GolemStateView<S> {
@@ -267,15 +244,6 @@ impl<S: Store> RangeIndexStore for GolemStateView<S> {
         read: ReadMode,
     ) -> Result<Vec<EntityAddress>, ViewError> {
         Ok(self.indices(read)?.within(attribute, low, high)?)
-    }
-
-    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), ViewError> {
-        apply_deltas(entity_updates);
-        Ok(())
-    }
-
-    fn commit_store(&mut self) -> Result<(), ViewError> {
-        Ok(())
     }
 }
 
@@ -426,27 +394,6 @@ mod tests {
             .equal(b"level", &AttributeValue::Int(1))
             .expect("query");
         assert_eq!(hits, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
-    }
-
-    #[test]
-    fn applying_deltas_is_a_no_op() {
-        // The claim that deletes ~4k lines of index maintenance: writing the entity
-        // record is what moves its index entries, so there is no separate index to
-        // keep in step. Query results must be identical before and after.
-        let (store, at) = stored(&[entity(1, 10, "a")]);
-        let indices = StoreIndices::new(&store, at);
-        let before = indices
-            .equal(b"level", &AttributeValue::Int(10))
-            .expect("query");
-        apply_deltas(&[EntityUpdates {
-            entity: [1; 32],
-            delete: false,
-            ..EntityUpdates::default()
-        }]);
-        let after = indices
-            .equal(b"level", &AttributeValue::Int(10))
-            .expect("query");
-        assert_eq!(before, after);
     }
 
     #[test]

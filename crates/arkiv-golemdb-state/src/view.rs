@@ -9,20 +9,15 @@
 //! The one piece of genuinely view-local state is [`staged`](GolemStateView) —
 //! the net-against-base delta per touched entity, which the trait promises and
 //! the store does not keep. Writes themselves go straight to the branch.
-//!
-//! Pruning is node-local and carries no commitment, so it reuses
-//! [`MemPruningStore`] unchanged rather than paying for store round-trips.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::statemanager::{
-    BlockRef, Commitment, EntityUpdates, PruningMeta, PruningStore, ReadMode, SessionId,
-    StateCommit, StateView, StoreKind,
+    BlockRef, Commitment, EntityUpdates, ReadMode, SessionId, StateCommit, StateView, StoreKind,
 };
 use arkiv_interfaces::store::{BranchId, CommitId, ReadTarget, Store, StoreError};
-use arkiv_reth_uncommitted_store::MemPruningStore;
 
 use crate::accounts::AccountError;
 use crate::entities::EntityError;
@@ -85,7 +80,6 @@ pub struct GolemStateView<S: Store> {
     /// Net-against-base change per touched entity, ascending — the order
     /// [`EntityStore::get_uncommitted_deltas`] promises.
     pub(crate) staged: BTreeMap<EntityAddress, EntityUpdates>,
-    pub(crate) pruning: MemPruningStore,
     /// The delta log as it stood when each open frame began, innermost last.
     /// The store keeps the record side; this is the half only the view has.
     frames: Vec<BTreeMap<EntityAddress, EntityUpdates>>,
@@ -108,7 +102,6 @@ impl<S: Store> GolemStateView<S> {
             branch,
             origin,
             staged: BTreeMap::new(),
-            pruning: MemPruningStore::new(),
             frames: Vec::new(),
             block,
             session,
@@ -143,8 +136,7 @@ impl<S: Store> GolemStateView<S> {
     /// This is the store's [`checkpoint`](Store::checkpoint)/
     /// [`rollback`](Store::rollback) pair, with the view's own delta log
     /// stacked alongside: the store cannot know about that log, and a rolled
-    /// back frame has to lose both halves or the index stores fold in writes
-    /// that no longer exist.
+    /// back frame has to lose both halves.
     ///
     /// A reverted transaction keeps its fee accounting and loses its entity
     /// ops, which is a checkpoint between the two and a rollback that reaches
@@ -207,7 +199,7 @@ impl<S: Store> GolemStateView<S> {
     }
 
     fn is_dirty(&self) -> bool {
-        !self.staged.is_empty() || self.pruning.is_dirty() || !self.frames.is_empty()
+        !self.staged.is_empty() || !self.frames.is_empty()
     }
 
     /// Every store commits to the same value: the branch's content digest.
@@ -224,39 +216,6 @@ impl<S: Store> GolemStateView<S> {
     }
 }
 
-impl<S: Store> PruningStore for GolemStateView<S> {
-    type Error = ViewError;
-
-    fn add_to_pruning_set(
-        &mut self,
-        entity: EntityAddress,
-        pruning_meta: PruningMeta,
-    ) -> Result<(), Self::Error> {
-        self.pruning.add_to_pruning_set(entity, pruning_meta);
-        Ok(())
-    }
-
-    fn peek_top(
-        &self,
-        top: u16,
-        read: ReadMode,
-    ) -> Result<alloc::vec::Vec<(EntityAddress, PruningMeta)>, Self::Error> {
-        Ok(self.pruning.peek_top(top, read))
-    }
-
-    fn take_top(
-        &mut self,
-        top: u16,
-    ) -> Result<alloc::vec::Vec<(EntityAddress, PruningMeta)>, Self::Error> {
-        Ok(self.pruning.take_top(top))
-    }
-
-    fn commit_store(&mut self) -> Result<(), Self::Error> {
-        self.pruning.commit_store();
-        Ok(())
-    }
-}
-
 impl<S: Store> StateView for GolemStateView<S> {
     type Error = ViewError;
 
@@ -268,7 +227,7 @@ impl<S: Store> StateView for GolemStateView<S> {
         self.session
     }
 
-    /// One store backs all seven lanes, so either all are here or none is.
+    /// One store backs them all, so either all are here or none is.
     fn has_store(&self, _store: StoreKind) -> bool {
         true
     }
@@ -536,22 +495,5 @@ pub(crate) mod tests {
         let commit = ok.graduate(BlockRef::new(11, [0x11; 32])).unwrap();
         assert_eq!(commit.parent, BlockRef::new(10, [0xBB; 32]));
         assert_eq!(commit.entities, commit.balances);
-    }
-
-    #[test]
-    fn pruning_rides_along_in_memory() {
-        let mut view = view();
-        let meta = PruningMeta {
-            priority: 1,
-            introduced_at: 3,
-        };
-        view.add_to_pruning_set([1; 32], meta).unwrap();
-        assert_eq!(
-            view.peek_top(4, ReadMode::ViewWithOverlay).unwrap().len(),
-            1
-        );
-        assert!(view.peek_top(4, ReadMode::ViewOnBase).unwrap().is_empty());
-        PruningStore::commit_store(&mut view).unwrap();
-        assert_eq!(view.peek_top(4, ReadMode::ViewOnBase).unwrap().len(), 1);
     }
 }

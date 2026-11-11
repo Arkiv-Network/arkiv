@@ -26,7 +26,6 @@ arkiv/
 │   ├── arkiv-reth-mpt-committed-store  # Implement storage
 │   ├── arkiv-reth-rpc                  # available JSON RPC endpoints (read-only)
 │   ├── arkiv-reth-statemanager
-│   ├── arkiv-reth-uncommitted-store
 │   └── arkiv-rpc-types                 # Shared request and response types for the JSON-RPC API
 │
 ├── docker/                             # Dockerfiles for debian-slim

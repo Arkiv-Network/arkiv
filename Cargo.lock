@@ -1520,7 +1520,6 @@ version = "1.0.1"
 dependencies = [
  "arkiv-golemdb",
  "arkiv-interfaces",
- "arkiv-reth-uncommitted-store",
 ]
 
 [[package]]
@@ -1736,19 +1735,11 @@ dependencies = [
  "alloy-rlp",
  "arkiv-golemdb-state",
  "arkiv-interfaces",
- "arkiv-reth-uncommitted-store",
  "eyre",
  "reth-engine-tree",
  "reth-ethereum",
  "reth-provider",
  "tracing",
-]
-
-[[package]]
-name = "arkiv-reth-uncommitted-store"
-version = "1.0.1"
-dependencies = [
- "arkiv-interfaces",
 ]
 
 [[package]]

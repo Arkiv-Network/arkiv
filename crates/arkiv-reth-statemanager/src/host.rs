@@ -1,7 +1,7 @@
 //! [`HostStateView`] — the reth host's `StateView`, on GolemDB.
 //!
-//! Every lane is GolemDB's: entities, the query index, the pruning set, the
-//! entity-minting nonces, and — since the accounts cutover — balances and
+//! Every lane is GolemDB's: entities, the query index, the entity-minting
+//! nonces, and — since the accounts cutover — balances and
 //! transaction nonces too. All of it goes through [`GolemStateView`].
 //!
 //! # Why the `EvmState` diff is still here
@@ -28,8 +28,8 @@ use arkiv_interfaces::primitives::{
 };
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, Commitment, EntityCreationNoncesStore,
-    EntityStore, EntityUpdates, EqualityIndexStore, PruningMeta, PruningStore, RangeIndexStore,
-    ReadMode, SessionId, StateCommit, StateView, StoreKind, StoredEntity,
+    EntityStore, EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode, SessionId,
+    StateCommit, StateView, StoreKind, StoredEntity,
 };
 use arkiv_interfaces::store::{
     BranchId, CommitId, Metered, SealedCommit, Store, StoreError, StoreExt,
@@ -185,17 +185,6 @@ where
     ) -> Result<Vec<EntityAddress>, Self::Error> {
         Ok(self.golem.get_prefixed_entities(attribute, prefix, read)?)
     }
-
-    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), Self::Error> {
-        Ok(EqualityIndexStore::apply_deltas(
-            &mut self.golem,
-            entity_updates,
-        )?)
-    }
-
-    fn commit_store(&mut self) -> Result<(), Self::Error> {
-        Ok(EqualityIndexStore::commit_store(&mut self.golem)?)
-    }
 }
 
 impl<B, C, E> RangeIndexStore for HostStateView<B, C>
@@ -213,17 +202,6 @@ where
         read: ReadMode,
     ) -> Result<Vec<EntityAddress>, Self::Error> {
         Ok(self.golem.get_within_range(attribute, low, high, read)?)
-    }
-
-    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), Self::Error> {
-        Ok(RangeIndexStore::apply_deltas(
-            &mut self.golem,
-            entity_updates,
-        )?)
-    }
-
-    fn commit_store(&mut self) -> Result<(), Self::Error> {
-        Ok(RangeIndexStore::commit_store(&mut self.golem)?)
     }
 }
 
@@ -253,38 +231,6 @@ where
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
         Ok(EntityCreationNoncesStore::commit_store(&mut self.golem)?)
-    }
-}
-
-impl<B, C, E> PruningStore for HostStateView<B, C>
-where
-    B: BalanceAccess<Error = E> + NonceAccess<Error = E>,
-    E: core::fmt::Debug,
-{
-    type Error = HostError<E>;
-
-    fn add_to_pruning_set(
-        &mut self,
-        entity: EntityAddress,
-        pruning_meta: PruningMeta,
-    ) -> Result<(), Self::Error> {
-        Ok(self.golem.add_to_pruning_set(entity, pruning_meta)?)
-    }
-
-    fn peek_top(
-        &self,
-        top: u16,
-        read: ReadMode,
-    ) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error> {
-        Ok(self.golem.peek_top(top, read)?)
-    }
-
-    fn take_top(&mut self, top: u16) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error> {
-        Ok(self.golem.take_top(top)?)
-    }
-
-    fn commit_store(&mut self) -> Result<(), Self::Error> {
-        Ok(PruningStore::commit_store(&mut self.golem)?)
     }
 }
 
