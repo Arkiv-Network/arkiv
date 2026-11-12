@@ -478,6 +478,10 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     /// `eth_call`, `eth_estimateGas` — never produces a block, so its branch
     /// is discarded rather than sealed.
     charged: core::cell::Cell<bool>,
+    /// Whether this EVM was created inside [`BlockSeals::sealing`]: by a block
+    /// execution whose seal is wanted. Anything else that charges fees, such
+    /// as `eth_simulateV1`, is discarded rather than sealed like a probe.
+    sealing: bool,
     /// `(signer, nonce)` of each charged transaction, in order — the half of
     /// [`ExecutionKey`] only the EVM sees.
     ///
@@ -503,6 +507,7 @@ impl<DB: Database, I> ArkivEvm<DB, I> {
             pricing,
             op_cost,
             charged: core::cell::Cell::new(false),
+            sealing: BlockSeals::is_sealing(),
             executed: core::cell::RefCell::new(Vec::new()),
         }
     }
@@ -682,14 +687,16 @@ where
     }
 
     /// Block execution is over. Seal the branch as a candidate at this height
-    /// if a real block ran on it; otherwise it is dropped, and discarded.
+    /// if a real block ran on it -- charged transactions, inside
+    /// [`BlockSeals::sealing`]; otherwise it is dropped, and discarded.
     ///
     /// Sealing computes the roots and writes nothing, so reth can execute this
     /// block again — to validate what it just built — and get the same answer.
     /// Only adoption commits.
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         let height = self.inner.block().number.saturating_to::<u64>();
-        if self.charged.get()
+        if self.sealing
+            && self.charged.get()
             && let Some(branch) = self.branch
         {
             let key = ExecutionKey::new(height, self.executed.into_inner());
@@ -2384,13 +2391,16 @@ mod tests {
             basefee: 0,
             ..Default::default()
         };
-        let mut evm = ArkivEvmFactory::new(store, seals.clone(), OpCost::Placeholder).create_evm(
-            EmptyDB::default(),
-            EvmEnv {
-                cfg_env: CfgEnv::default(),
-                block_env,
-            },
-        );
+        let factory = ArkivEvmFactory::new(store, seals.clone(), OpCost::Placeholder);
+        let mut evm = BlockSeals::sealing(|| {
+            factory.create_evm(
+                EmptyDB::default(),
+                EvmEnv {
+                    cfg_env: CfgEnv::default(),
+                    block_env,
+                },
+            )
+        });
 
         let refused = Address::repeat_byte(0xaa);
         let sender = Address::repeat_byte(0xbb);
@@ -2418,6 +2428,40 @@ mod tests {
             seals.root_of(&included).is_some(),
             "the seal is keyed by the block's transactions"
         );
+    }
+
+    /// `eth_simulateV1` leaves fee charging on and finishes its EVM the way a
+    /// block execution does, but it is a question, not a block. Sealed, its
+    /// branch would sit in `BlockSeals` until a block at its height is adopted,
+    /// and would replace a real block's seal under the same key.
+    #[test]
+    fn a_simulation_does_not_seal() {
+        use reth_ethereum::evm::revm::database_interface::EmptyDB;
+
+        let seals = Arc::new(BlockSeals::default());
+        // What `eth_simulateV1` without `validation` sets that revm always
+        // has; it also lifts EIP-3607 and the base-fee check, which are behind
+        // revm features. Fees are charged.
+        let mut cfg_env = CfgEnv::default();
+        cfg_env.disable_nonce_check = true;
+        let mut evm = ArkivEvmFactory::new(host_store(1), seals.clone(), OpCost::Placeholder)
+            .create_evm(
+                EmptyDB::default(),
+                EvmEnv {
+                    cfg_env,
+                    block_env: BlockEnv {
+                        number: U256::from(1),
+                        basefee: 0,
+                        ..Default::default()
+                    },
+                },
+            );
+        evm.transact(transfer(0, None, ARKIV_TX_GAS))
+            .expect("transfer");
+        evm.finish();
+
+        let simulated = ExecutionKey::new(1, vec![(HOST_SENDER.into_array(), 0)]);
+        assert_eq!(seals.root_of(&simulated), None, "a simulation sealed");
     }
 
     /// An RPC call, payload prewarming or an aborted build drops its EVM

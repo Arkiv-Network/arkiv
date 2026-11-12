@@ -339,7 +339,9 @@ impl<V: EngineValidator<EthEngineTypes>> EngineValidator<EthEngineTypes>
         ctx: TreeCtx<'_, EthPrimitives>,
     ) -> ValidationOutcome<EthPrimitives> {
         self.save_parent(payload.parent_hash(), &ctx);
-        self.inner.validate_payload(payload, ctx)
+        // The state-root strategy looks the execution's seal up, and adoption
+        // commits it, so it has to leave one. reth executes on this thread.
+        BlockSeals::sealing(|| self.inner.validate_payload(payload, ctx))
     }
 
     fn validate_block(
@@ -348,7 +350,7 @@ impl<V: EngineValidator<EthEngineTypes>> EngineValidator<EthEngineTypes>
         ctx: TreeCtx<'_, EthPrimitives>,
     ) -> ValidationOutcome<EthPrimitives> {
         self.save_parent(block.header().parent_hash, &ctx);
-        self.inner.validate_block(block, ctx)
+        BlockSeals::sealing(|| self.inner.validate_block(block, ctx))
     }
 
     fn on_inserted_executed_block(
