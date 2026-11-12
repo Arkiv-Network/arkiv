@@ -126,7 +126,7 @@ use arkiv_interfaces::gas::{CostModel, GasBreakdown, OpCost};
 use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
-    EqualityIndexStore, RangeIndexStore, ReadMode, StateView,
+    ReadMode, StateView,
 };
 use arkiv_interfaces::store::{BranchId, CommitId, Origin};
 use arkiv_reth_statemanager::{
@@ -1048,15 +1048,6 @@ fn arkiv_purge_expired<DB: Database>(
             .map_err(state_fault("stage purge deletion"))?
             .into_value();
     }
-    let deltas = view
-        .get_uncommitted_deltas()
-        .map_err(state_fault("purge deltas"))?;
-    view.equality_index_mut()
-        .apply_deltas(&deltas)
-        .map_err(state_fault("purge equality index"))?;
-    view.range_index_mut()
-        .apply_deltas(&deltas)
-        .map_err(state_fault("purge range index"))?;
     StateView::commit(&mut view).map_err(state_fault("commit purge"))?;
     let state = view.finish().map_err(state_fault("close view"))?;
     let gas_used = modeled_gas.max(intrinsic_gas(&tx.data));
@@ -1430,9 +1421,8 @@ struct Outcome {
     logs: Vec<Log>,
 }
 
-/// Run a decoded batch through the write view: on success, fold the staged
-/// deltas into the index stores; on a revert nothing is staged. Each create
-/// advances the minting nonce itself, inside the batch's frame.
+/// Run a decoded batch through the write view; on a revert nothing is staged.
+/// Each create advances the minting nonce itself, inside the batch's frame.
 ///
 /// Generic over the view, so the same batch logic runs on any `StateView`
 /// backend. `costs` is passed rather than read off the view: a cost schedule is
@@ -1451,15 +1441,6 @@ fn run_ops<V: StateView, C: CostModel>(
 
     match out.status {
         ExecStatus::Ok => {
-            let deltas = view
-                .get_uncommitted_deltas()
-                .map_err(|e| eyre::eyre!("uncommitted deltas: {e:?}"))?;
-            view.equality_index_mut()
-                .apply_deltas(&deltas)
-                .map_err(|e| eyre::eyre!("equality index apply_deltas: {e:?}"))?;
-            view.range_index_mut()
-                .apply_deltas(&deltas)
-                .map_err(|e| eyre::eyre!("range index apply_deltas: {e:?}"))?;
             let logs = effects.iter().map(entity_operation_log).collect();
             Ok(Outcome {
                 gas: out.gas,

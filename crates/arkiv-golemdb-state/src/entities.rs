@@ -252,8 +252,8 @@ impl<S: Store> EntityStore for GolemStateView<S> {
         Ok(self.uncommitted_deltas())
     }
 
-    /// The writes are already on the branch; what clears is the delta log the
-    /// index stores fold in, which only this view keeps.
+    /// The writes are already on the branch; what clears is the delta log,
+    /// which only this view keeps.
     fn commit_store(&mut self) -> Result<Commitment, Self::Error> {
         self.staged.clear();
         self.shared_commitment()

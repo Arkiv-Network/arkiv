@@ -5,19 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# The reth-host StateManager. MptStateManager composes the committed-store
-# lanes (arkiv-reth-mpt-committed-store) with the uncommitted pruning map into
-# the one arkiv_interfaces::manager::StateManager seam; WriteOverlay is the
-# write-path base bridging revm's Database to the raw seams and accumulating
-# the EvmState diff reth commits.
+# The reth-host state view. HostStateView puts Arkiv's state on GolemDB;
+# WriteOverlay bridges revm's Database and accumulates the EvmState diff reth
+# commits.
 
 [dependencies]
 # The StateManager trait family this crate implements.
 arkiv-interfaces.workspace = true
 arkiv-golemdb-state.workspace = true
-# The committed lanes: entities, index, balances, nonces, minting nonces.
-# The uncommitted lane(s): the pruning map.
-arkiv-reth-uncommitted-store.workspace = true
 
 # `alloc`, the genesis file's accounts.
 alloy-genesis.workspace = true

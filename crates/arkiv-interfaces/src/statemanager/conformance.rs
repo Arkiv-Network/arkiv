@@ -34,9 +34,7 @@ use alloc::vec::Vec;
 
 use crate::entity::{Attribute, AttributeValue, Entity};
 use crate::primitives::{EntityAddress, UserAddress, UserBalance};
-use crate::statemanager::{
-    BlockRef, EntityUpdates, PruningMeta, PruningStore, ReadMode, StateView,
-};
+use crate::statemanager::{BlockRef, EntityUpdates, ReadMode, StateView};
 
 const ALICE: UserAddress = [0xaa; 20];
 const BOB: UserAddress = [0xbb; 20];
@@ -71,10 +69,6 @@ pub fn run_all<V: StateView>(new_view: &dyn Fn() -> V) {
     a_merged_frame_keeps_its_writes(new_view);
     frames_do_not_nest(new_view);
     closing_a_frame_that_was_never_opened_fails(new_view);
-
-    // pruning
-    the_pruning_set_stages_then_commits(new_view);
-    pruning_order_is_urgent_first(new_view);
 
     // the view as a whole
     a_committed_view_graduates(new_view);
@@ -506,66 +500,6 @@ fn closing_a_frame_that_was_never_opened_fails<V: StateView>(new_view: &dyn Fn()
     let mut view = new_view();
     assert!(view.merge_frame().is_err());
     assert!(view.discard_frame().is_err());
-}
-
-// ---------------------------------------------------------------------------
-// pruning
-// ---------------------------------------------------------------------------
-
-fn the_pruning_set_stages_then_commits<V: StateView>(new_view: &dyn Fn() -> V) {
-    let mut view = new_view();
-    let meta = PruningMeta {
-        priority: 1,
-        introduced_at: 3,
-    };
-    view.add_to_pruning_set(address(1), meta).unwrap();
-    assert_eq!(
-        view.peek_top(4, ReadMode::ViewWithOverlay).unwrap().len(),
-        1
-    );
-    assert!(view.peek_top(4, ReadMode::ViewOnBase).unwrap().is_empty());
-
-    PruningStore::commit_store(&mut view).unwrap();
-    assert_eq!(view.peek_top(4, ReadMode::ViewOnBase).unwrap().len(), 1);
-
-    assert_eq!(
-        view.take_top(4).unwrap().len(),
-        1,
-        "take returns what it took"
-    );
-    assert!(
-        view.peek_top(4, ReadMode::ViewWithOverlay)
-            .unwrap()
-            .is_empty(),
-        "and removes it"
-    );
-}
-
-/// Node-local, but the order is consensus: higher priority first, then oldest.
-fn pruning_order_is_urgent_first<V: StateView>(new_view: &dyn Fn() -> V) {
-    let mut view = new_view();
-    view.add_to_pruning_set(
-        address(1),
-        PruningMeta {
-            priority: 1,
-            introduced_at: 1,
-        },
-    )
-    .unwrap();
-    view.add_to_pruning_set(
-        address(2),
-        PruningMeta {
-            priority: 9,
-            introduced_at: 50,
-        },
-    )
-    .unwrap();
-    let top = view.peek_top(2, ReadMode::ViewWithOverlay).unwrap();
-    assert_eq!(
-        top[0].0,
-        address(2),
-        "the higher priority comes first regardless of age"
-    );
 }
 
 // ---------------------------------------------------------------------------

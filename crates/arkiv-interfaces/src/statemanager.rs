@@ -7,7 +7,6 @@
 //! the same block are independent — that is simulation. There is no rewind.
 
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 use core::fmt::Debug;
 use core::ops::Bound;
 
@@ -58,7 +57,6 @@ pub enum StoreKind {
     AccountBalances,
     AccountNonces,
     EntityCreationNonces,
-    Pruning,
 }
 
 /// A partial write to one entity: `None` leaves a field alone, `attributes`
@@ -123,33 +121,6 @@ impl EntityUpdates {
         if let Some(v) = &self.attributes {
             entity.attributes = v.clone();
         }
-    }
-}
-
-/// How urgently a tombstoned entity should be pruned. Higher prunes first.
-pub type PruningPriority = u8;
-
-/// Orders the pruning set: "less" is "pruned sooner" — higher priority first,
-/// then older introduction. The order is consensus; the store breaks ties by
-/// ascending entity address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PruningMeta {
-    pub priority: PruningPriority,
-    pub introduced_at: BlockNumber,
-}
-
-impl Ord for PruningMeta {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| self.introduced_at.cmp(&other.introduced_at))
-    }
-}
-
-impl PartialOrd for PruningMeta {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -289,8 +260,7 @@ pub trait EntityStore {
     /// included. Errors do not roll back writes: that is what a frame is for.
     fn update_entity(&mut self, updates: EntityUpdates) -> Result<Metered<()>, Self::Error>;
 
-    /// One net-against-base entry per touched entity, ascending — what the
-    /// index stores fold in.
+    /// One net-against-base entry per touched entity, ascending.
     fn get_uncommitted_deltas(&self) -> Result<Vec<EntityUpdates>, Self::Error>;
 
     fn commit_store(&mut self) -> Result<Commitment, Self::Error>;
@@ -316,13 +286,6 @@ pub trait EqualityIndexStore {
         prefix: &str,
         read: ReadMode,
     ) -> Result<Vec<EntityAddress>, Self::Error>;
-
-    /// Removals are derived by diffing against the base, so each update must be
-    /// net-against-base ([`EntityStore::get_uncommitted_deltas`]'s shape); a
-    /// repeated entity replaces its earlier delta.
-    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), Self::Error>;
-
-    fn commit_store(&mut self) -> Result<(), Self::Error>;
 }
 
 /// The range index: ordered lookups over the range-indexable types.
@@ -339,37 +302,9 @@ pub trait RangeIndexStore {
         high: Bound<&AttributeValue>,
         read: ReadMode,
     ) -> Result<Vec<EntityAddress>, Self::Error>;
-
-    /// Same contract as [`EqualityIndexStore::apply_deltas`].
-    fn apply_deltas(&mut self, entity_updates: &[EntityUpdates]) -> Result<(), Self::Error>;
-
-    fn commit_store(&mut self) -> Result<(), Self::Error>;
 }
 
-/// The pruning set, ordered by [`PruningMeta`]. Node-local and uncommitted,
-/// but the order is consensus.
-pub trait PruningStore {
-    type Error: Debug;
-
-    fn add_to_pruning_set(
-        &mut self,
-        entity: EntityAddress,
-        pruning_meta: PruningMeta,
-    ) -> Result<(), Self::Error>;
-
-    fn peek_top(
-        &self,
-        top: u16,
-        read: ReadMode,
-    ) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error>;
-
-    fn take_top(&mut self, top: u16) -> Result<Vec<(EntityAddress, PruningMeta)>, Self::Error>;
-
-    fn commit_store(&mut self) -> Result<(), Self::Error>;
-}
-
-/// What graduating a committed [`StateView`] produces. The index and pruning
-/// stores finalize without committing to a root.
+/// What graduating a committed [`StateView`] produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateCommit {
     pub block: BlockRef,
@@ -389,7 +324,6 @@ pub trait StateView:
     + AccountBalancesStore<Error = <Self as StateView>::Error>
     + AccountNoncesStore<Error = <Self as StateView>::Error>
     + EntityCreationNoncesStore<Error = <Self as StateView>::Error>
-    + PruningStore<Error = <Self as StateView>::Error>
 {
     type Error: Debug;
 
@@ -419,7 +353,8 @@ pub trait StateView:
     fn discard_frame(&mut self) -> Result<(), <Self as StateView>::Error>;
 
     // Each store, narrowed to its own trait — `_mut` for the write half. The
-    // view *is* every store; these just present one at a time.
+    // view *is* every store; these just present one at a time. The indexes are
+    // read-only: the store maintains them as entities are written.
 
     fn entities(&self) -> &impl EntityStore<Error = <Self as StateView>::Error>
     where
@@ -442,23 +377,7 @@ pub trait StateView:
         self
     }
 
-    fn equality_index_mut(
-        &mut self,
-    ) -> &mut impl EqualityIndexStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
     fn range_index(&self) -> &impl RangeIndexStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn range_index_mut(&mut self) -> &mut impl RangeIndexStore<Error = <Self as StateView>::Error>
     where
         Self: Sized,
     {
@@ -515,29 +434,12 @@ pub trait StateView:
         self
     }
 
-    fn pruning(&self) -> &impl PruningStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn pruning_mut(&mut self) -> &mut impl PruningStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    /// Commit every store, entities before the indexes.
+    /// Commit every store.
     fn commit(&mut self) -> Result<(), <Self as StateView>::Error> {
         EntityStore::commit_store(self)?;
-        EqualityIndexStore::commit_store(self)?;
-        RangeIndexStore::commit_store(self)?;
         AccountBalancesStore::commit_store(self)?;
         AccountNoncesStore::commit_store(self)?;
         EntityCreationNoncesStore::commit_store(self)?;
-        PruningStore::commit_store(self)?;
         Ok(())
     }
 
@@ -570,29 +472,6 @@ pub trait StateManager {
 mod tests {
     use super::*;
     use alloc::vec;
-
-    #[test]
-    fn pruning_meta_orders_urgent_first() {
-        let urgent = PruningMeta {
-            priority: 10,
-            introduced_at: 100,
-        };
-        let lazy = PruningMeta {
-            priority: 1,
-            introduced_at: 5,
-        };
-        assert!(urgent < lazy, "higher priority wins over earlier arrival");
-
-        let old = PruningMeta {
-            priority: 5,
-            introduced_at: 10,
-        };
-        let new = PruningMeta {
-            priority: 5,
-            introduced_at: 11,
-        };
-        assert!(old < new, "same priority: first in, first pruned");
-    }
 
     #[test]
     fn entity_updates_apply_only_what_is_set() {

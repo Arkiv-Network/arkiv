@@ -1,8 +1,8 @@
 //! The reth-host `StateView`.
 //!
 //! [`HostStateView`] is the one view the node executes against, and every lane
-//! of it is a GolemDB store's: entities, the query index, the pruning set, the
-//! minting nonces, and — since the accounts cutover — balances and transaction
+//! of it is a GolemDB store's: entities, the query index, the minting nonces,
+//! and — since the accounts cutover — balances and transaction
 //! nonces too.
 //!
 //! The two account lanes are additionally *mirrored* into the [`EvmState`] diff
