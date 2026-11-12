@@ -1,7 +1,10 @@
 //! The values one block prices and admits with.
 
 use alloc::{collections::BTreeMap, string::String};
-use arkiv_interfaces::{primitives::BlockNumber, store::PricingModel};
+use arkiv_interfaces::{
+    primitives::{BlockNumber, Gas},
+    store::{PricingModel, RecordMeta},
+};
 
 /// Fixed scale for [`FeeSchedule::capacity_rate`]: one gas is
 /// 1_000_000 micro-gas. This is a unit conversion, not a pricing weight.
@@ -60,6 +63,56 @@ impl FeeSchedule {
         })
     }
 }
+
+/// GolemDB's read weights, which price a whole-record read.
+///
+/// GolemDB v1 declares these weights but does not meter reads itself, so a
+/// read's receipt costs nothing. A mined view call reads an entity's whole
+/// record, and pays for it with these weights instead: otherwise a block of
+/// view calls over a large entity would make every validator decode the record
+/// once per call, for the flat 21,000 each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPricing {
+    /// Per record looked up, present or not.
+    pub key: u64,
+    /// Per cell read.
+    pub cell: u64,
+    /// Per cell byte read.
+    pub byte: u64,
+}
+
+impl ReadPricing {
+    /// Read the weights of a validated model, without fallback prices. A zero
+    /// weight is a free read, as it is to GolemDB; a missing one is an error,
+    /// as it is to GolemDB once a call needs it.
+    pub fn from_model(model: &PricingModel) -> Result<Self, ScheduleError> {
+        let value = |name| {
+            model
+                .weights
+                .get(name)
+                .copied()
+                .ok_or(ScheduleError::Missing(name))
+        };
+        Ok(Self {
+            key: value(READ_KEY)?,
+            cell: value(READ_CELL)?,
+            byte: value(READ_BYTE)?,
+        })
+    }
+
+    /// `read.key + read.cell × cells + read.byte × cell_bytes` for reading the
+    /// record `meta` describes; an absent record is the key lookup alone. A
+    /// sum that does not fit saturates, which no gas limit covers.
+    pub fn record_read(&self, meta: &RecordMeta) -> Gas {
+        self.key
+            .saturating_add(self.cell.saturating_mul(meta.cells))
+            .saturating_add(self.byte.saturating_mul(meta.cell_bytes))
+    }
+}
+
+pub const READ_KEY: &str = "read.key";
+pub const READ_CELL: &str = "read.cell";
+pub const READ_BYTE: &str = "read.byte";
 
 pub const HOST_CODE_VERSION: u64 = 1;
 pub const CAPACITY_RATE: &str = "host.arkiv.capacity_rate";
@@ -134,6 +187,42 @@ mod tests {
                 Err(ScheduleError::Missing(name))
             );
         }
+    }
+
+    #[test]
+    fn read_pricing_takes_the_read_weights_and_prices_a_whole_record() {
+        let mut model = model();
+        for name in [READ_KEY, READ_CELL, READ_BYTE] {
+            assert_eq!(
+                ReadPricing::from_model(&model),
+                Err(ScheduleError::Missing(name))
+            );
+            let weight = if name == READ_KEY { 0 } else { 3 };
+            Arc::make_mut(&mut model.weights).insert(String::from(name), weight);
+        }
+        Arc::make_mut(&mut model.weights).insert(String::from(READ_CELL), 5);
+        let reads = ReadPricing::from_model(&model).expect("a zero weight is a price");
+        assert_eq!(
+            reads,
+            ReadPricing {
+                key: 0,
+                cell: 5,
+                byte: 3
+            }
+        );
+        let meta = RecordMeta {
+            cells: 2,
+            cell_bytes: 100,
+            indexed_cells: 1,
+            index_bytes: 50,
+        };
+        assert_eq!(reads.record_read(&meta), 5 * 2 + 3 * 100);
+        assert_eq!(reads.record_read(&RecordMeta::default()), 0);
+        let huge = RecordMeta {
+            cell_bytes: u64::MAX,
+            ..meta
+        };
+        assert_eq!(reads.record_read(&huge), Gas::MAX);
     }
 
     #[test]

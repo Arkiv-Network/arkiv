@@ -123,7 +123,7 @@ use core::cmp::Ordering;
 
 use arkiv_interfaces::execution::{ExecEnv, ExecStatus, Op, OpKind};
 use arkiv_interfaces::gas::{CostModel, GasBreakdown, OpCost};
-use arkiv_interfaces::primitives::{Hash, UserAddress, UserBalance};
+use arkiv_interfaces::primitives::{Gas, Hash, UserAddress, UserBalance};
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, EntityStore,
     ReadMode, StateView,
@@ -132,7 +132,7 @@ use arkiv_interfaces::store::{BranchId, CommitId, Origin};
 use arkiv_reth_statemanager::{
     BlockSeals, ExecutionKey, HostStateView, HostStore, OwnedBranch, WriteOverlay, host_manager,
 };
-use arkiv_tokenomics::FeeSchedule;
+use arkiv_tokenomics::{FeeSchedule, ReadPricing};
 use std::sync::Arc;
 
 /// The Arkiv address — `0x4400…0044`, as an alloy [`Address`].
@@ -536,6 +536,8 @@ struct BlockPricing {
     /// The commit the list was read at: the block's base.
     commit_id: CommitId,
     schedule: FeeSchedule,
+    /// What a view call pays for the record it reads.
+    reads: ReadPricing,
 }
 
 impl BlockPricing {
@@ -550,9 +552,12 @@ impl BlockPricing {
         }
         let schedule =
             FeeSchedule::from_model(&snapshot.model).map_err(|e| format!("host pricing: {e:?}"))?;
+        let reads =
+            ReadPricing::from_model(&snapshot.model).map_err(|e| format!("read pricing: {e:?}"))?;
         Ok(Self {
             commit_id: at,
             schedule,
+            reads,
         })
     }
 }
@@ -597,6 +602,7 @@ where
             .as_ref()
             .map_err(|e| EVMError::Custom(e.clone()))?;
         let schedule = pricing.schedule;
+        let reads = pricing.reads;
         let base = pricing.commit_id;
         // Advancing head invalidates the branch too; never refresh its prices.
         if self.store.head() != base {
@@ -638,6 +644,7 @@ where
             store,
             branch,
             &schedule,
+            &reads,
             op_cost,
             db,
             block_number,
@@ -898,6 +905,7 @@ fn arkiv_transact<DB: Database>(
     store: &HostStore,
     branch: BranchId,
     schedule: &FeeSchedule,
+    reads: &ReadPricing,
     op_cost: OpCost,
     db: &mut DB,
     block_number: u64,
@@ -933,6 +941,7 @@ fn arkiv_transact<DB: Database>(
             return arkiv_custom_attribute_names_call(
                 store,
                 branch,
+                reads,
                 db,
                 &tx,
                 block_number,
@@ -944,6 +953,7 @@ fn arkiv_transact<DB: Database>(
             return arkiv_attribute_type_id_call(
                 store,
                 branch,
+                reads,
                 db,
                 &tx,
                 block_number,
@@ -1207,9 +1217,17 @@ fn arkiv_entity_transact<DB: Database>(
 ///
 /// Every view has the same shape — decode args, read committed state, ABI-encode
 /// the return — so the *accounting* around it is written once here rather than
-/// per view. `answer` returns `Ok(return_data)` or `Err(revert_data)`.
+/// per view. `answer` returns `Ok(return_data)` or `Err(revert_data)`, with
+/// what its reads cost.
 ///
-/// The only state staged is the sender's flat gas charge + EOA nonce bump, and
+/// A view pays for its reads on top of its terms, as an entity transaction
+/// pays for GolemDB's work: a view reads a whole entity record, and every
+/// validator does that read again. Running out of gas consumes the limit and
+/// reverts, as it does there. An `eth_call` or `eth_estimateGas` probe reports
+/// the same gas and charges none of it, so an estimate is what the view costs
+/// once mined.
+///
+/// The only state staged is the sender's gas charge + EOA nonce bump, and
 /// the value of an answered call to the pool: meaningless for an `eth_call`
 /// (the diff is discarded), but it keeps reth's sender invariants intact if the
 /// call ever arrives as a mined transaction. So the sender is checked like any
@@ -1224,14 +1242,25 @@ fn arkiv_view_call<DB: Database>(
     block_number: u64,
     fees: &FeeEnv,
     checks: Option<SenderChecks>,
-    answer: impl FnOnce(&mut DB) -> Result<Result<Vec<u8>, Vec<u8>>, EVMError<DB::Error>>,
+    answer: impl FnOnce(&mut DB) -> Result<(Result<Vec<u8>, Vec<u8>>, Gas), EVMError<DB::Error>>,
 ) -> Result<ResultAndState<HaltReason>, EVMError<DB::Error>> {
-    // A limit below the flat charge is invalid, before any write.
-    let gas_used = ARKIV_TX_GAS.max(intrinsic_gas(&tx.data));
-    if tx.gas_limit < gas_used {
-        return Err(gas_limit_below(gas_used, tx));
+    // A limit below the transaction's terms is invalid, before any write.
+    let floor = intrinsic_gas(&tx.data);
+    if tx.gas_limit < floor {
+        return Err(gas_limit_below(floor, tx));
     }
-    let output = answer(db)?;
+    let (mut output, read_cost) = answer(db)?;
+    let gas_used = tx_gas(&tx.data)
+        .checked_add(read_cost)
+        .map(|compute| compute.max(floor_gas(&tx.data)))
+        .filter(|gas| *gas <= tx.gas_limit);
+    let gas_used = match gas_used {
+        Some(gas) => gas,
+        None => {
+            output = Err(revert::revert_data(&arkiv_interfaces::RevertReason::OutOfGas).to_vec());
+            tx.gas_limit
+        }
+    };
 
     let mut view = open_view(store, branch, db, block_number, fees)?;
     check_sender(&view, checks, fees, tx)?;
@@ -1262,22 +1291,26 @@ fn bad_view_args(view: &str, e: impl core::fmt::Display) -> Vec<u8> {
     alloy_sol_types::Revert::from(format!("invalid {view} calldata: {e}")).abi_encode()
 }
 
-/// Read a committed entity for a view call.
+/// Read a committed entity for a view call, with what reading its whole record
+/// costs. GolemDB v1 does not meter reads, so the cost is priced here, from
+/// the record's size and the block's read weights.
 fn view_entity<DB: Database>(
     store: &HostStore,
     branch: BranchId,
+    reads: &ReadPricing,
     db: &mut DB,
     key: B256,
     block_number: u64,
-) -> Result<Option<arkiv_interfaces::entity::Entity>, EVMError<DB::Error>> {
+) -> Result<(Option<arkiv_interfaces::entity::Entity>, Gas), EVMError<DB::Error>> {
     let view = host_manager(store, branch, db, parent_ref(block_number))
         .map_err(state_fault("open view"))?;
-    let entity = view
-        .get_entity(key.0, ReadMode::ViewOnBase)
+    let stored = view
+        .get_entity_with_meta(key.0, ReadMode::ViewOnBase)
         .map_err(state_fault("read entity"))?
         .into_value();
     view.finish().map_err(state_fault("close view"))?;
-    Ok(entity)
+    let meta = stored.as_ref().map(|s| s.meta).unwrap_or_default();
+    Ok((stored.map(|s| s.entity), reads.record_read(&meta)))
 }
 
 /// `entityNonce(owner)`: the owner's entity-key minting nonce, as a `uint64`.
@@ -1297,16 +1330,20 @@ fn arkiv_entity_nonce_call<DB: Database>(
     arkiv_view_call(store, branch, db, tx, block_number, fees, checks, |db| {
         let call = match IEntityRegistry::entityNonceCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
-            Err(e) => return Ok(Err(bad_view_args("entityNonce", e))),
+            Err(e) => return Ok((Err(bad_view_args("entityNonce", e)), 0)),
         };
+        // A fixed-size record: its terms cover the read.
         let nonce = host_manager(store, branch, db, parent_ref(block_number))
             .map_err(state_fault("open view"))?
             .get_entity_creation_nonce(call.owner.into_array(), ReadMode::ViewOnBase)
             .map_err(state_fault("read minting nonce"))?
             .into_value();
-        Ok(Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
-            &nonce.get(),
-        )))
+        Ok((
+            Ok(IEntityRegistry::entityNonceCall::abi_encode_returns(
+                &nonce.get(),
+            )),
+            0,
+        ))
     })
 }
 
@@ -1317,9 +1354,11 @@ fn arkiv_entity_nonce_call<DB: Database>(
 /// entity, so listing them would be noise. A missing or expired entity answers
 /// with an empty list rather than reverting — "no attributes" is the truthful
 /// answer to "what does this entity have", and it keeps the view total.
+#[allow(clippy::too_many_arguments)] // The view context plus the block's read prices.
 fn arkiv_custom_attribute_names_call<DB: Database>(
     store: &HostStore,
     branch: BranchId,
+    reads: &ReadPricing,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
@@ -1329,17 +1368,17 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
     arkiv_view_call(store, branch, db, tx, block_number, fees, checks, |db| {
         let call = match IEntityRegistry::customAttributeNamesCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
-            Err(e) => return Ok(Err(bad_view_args("customAttributeNames", e))),
+            Err(e) => return Ok((Err(bad_view_args("customAttributeNames", e)), 0)),
         };
-        let names = match live_entity(
-            view_entity(store, branch, db, call.entityKey, block_number)?,
-            block_number,
-        ) {
+        let (entity, read_cost) =
+            view_entity(store, branch, reads, db, call.entityKey, block_number)?;
+        let names = match live_entity(entity, block_number) {
             Some(e) => e.attributes.iter().map(|a| ident32_of(&a.key)).collect(),
             None => Vec::new(),
         };
-        Ok(Ok(
-            IEntityRegistry::customAttributeNamesCall::abi_encode_returns(&names),
+        Ok((
+            Ok(IEntityRegistry::customAttributeNamesCall::abi_encode_returns(&names)),
+            read_cost,
         ))
     })
 }
@@ -1350,9 +1389,11 @@ fn arkiv_custom_attribute_names_call<DB: Database>(
 /// 0 is [`TOMBSTONE_TYPE_ID`](arkiv_interfaces::entity::TOMBSTONE_TYPE_ID) — the
 /// tag that means "unset" on the wire — so "absent" reads the same here as it
 /// does in a patch. No type ever has id 0, so the answer stays unambiguous.
+#[allow(clippy::too_many_arguments)] // The view context plus the block's read prices.
 fn arkiv_attribute_type_id_call<DB: Database>(
     store: &HostStore,
     branch: BranchId,
+    reads: &ReadPricing,
     db: &mut DB,
     tx: &TxEnv,
     block_number: u64,
@@ -1362,26 +1403,28 @@ fn arkiv_attribute_type_id_call<DB: Database>(
     arkiv_view_call(store, branch, db, tx, block_number, fees, checks, |db| {
         let call = match IEntityRegistry::attributeTypeIdCall::abi_decode_raw(&tx.data[4..]) {
             Ok(c) => c,
-            Err(e) => return Ok(Err(bad_view_args("attributeTypeId", e))),
+            Err(e) => return Ok((Err(bad_view_args("attributeTypeId", e)), 0)),
         };
         let wanted = strip_trailing_zeros(call.name.0.to_vec());
-        let type_id = live_entity(
-            view_entity(store, branch, db, call.entityKey, block_number)?,
-            block_number,
-        )
-        .and_then(|e| {
-            e.attributes.iter().find(|a| a.key == wanted).map(|a| {
-                let flag = if a.indexed {
-                    arkiv_interfaces::entity::INDEXED_FLAG
-                } else {
-                    0
-                };
-                a.value.type_id() | flag
+        let (entity, read_cost) =
+            view_entity(store, branch, reads, db, call.entityKey, block_number)?;
+        let type_id = live_entity(entity, block_number)
+            .and_then(|e| {
+                e.attributes.iter().find(|a| a.key == wanted).map(|a| {
+                    let flag = if a.indexed {
+                        arkiv_interfaces::entity::INDEXED_FLAG
+                    } else {
+                        0
+                    };
+                    a.value.type_id() | flag
+                })
             })
-        })
-        .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
-        Ok(Ok(
-            IEntityRegistry::attributeTypeIdCall::abi_encode_returns(&type_id),
+            .unwrap_or(arkiv_interfaces::entity::TOMBSTONE_TYPE_ID);
+        Ok((
+            Ok(IEntityRegistry::attributeTypeIdCall::abi_encode_returns(
+                &type_id,
+            )),
+            read_cost,
         ))
     })
 }
@@ -2009,12 +2052,14 @@ mod tests {
             charge,
             solvency_checked: true,
         };
+        let pricing = BlockPricing::load(store, store.head()).unwrap();
         (
             branch,
             arkiv_transact(
                 store,
                 branch,
-                &BlockPricing::load(store, store.head()).unwrap().schedule,
+                &pricing.schedule,
+                &pricing.reads,
                 OpCost::Placeholder,
                 &mut db,
                 1,
@@ -2370,6 +2415,14 @@ mod tests {
                     arkiv_tokenomics::schedule::HOST_WEIGHT_NAMES
                         .into_iter()
                         .zip([14, 1, 1, 64, 64, 7_884_000])
+                        .chain(
+                            [
+                                arkiv_tokenomics::schedule::READ_KEY,
+                                arkiv_tokenomics::schedule::READ_CELL,
+                                arkiv_tokenomics::schedule::READ_BYTE,
+                            ]
+                            .map(|name| (name, 1)),
+                        )
                         .map(|(name, value)| (name.to_owned(), value))
                         .collect(),
                 ),
@@ -2588,6 +2641,99 @@ mod tests {
             minted(7, None),
             minted(8, None),
             "the key depends on the chain's id"
+        );
+    }
+
+    /// A view call reads the whole entity from GolemDB. Mined, it pays for that
+    /// read at the block's read weights -- `read.key + read.cell × cells +
+    /// read.byte × cell_bytes`, all 1 here -- so one block of views over a large
+    /// entity cannot make validators decode gigabytes for the flat 21,000 each.
+    /// Running out of gas consumes the limit and reverts, as everywhere. An
+    /// `eth_estimateGas` probe charges nothing but reports the same gas, so a
+    /// view sent with its estimate does not run out.
+    #[test]
+    fn mined_view_call_pays_for_the_entity_it_reads() {
+        use arkiv_bindings::{AttributeValue, Ident32};
+        use arkiv_interfaces::store::StoreExt;
+
+        let blob = |len: usize| {
+            arkiv_bindings::Attribute::from_value(
+                Ident32::encode("blob").unwrap(),
+                &AttributeValue::Bytes(vec![7; len]),
+                false,
+            )
+            .unwrap()
+        };
+        // The store, the record's size and a view call on an entity holding
+        // `len` bytes.
+        let entity = |len: usize| {
+            let store = host_store(PRICED);
+            let ops = vec![arkiv_bindings::Operation::create(
+                0,
+                0,
+                100,
+                0,
+                vec![blob(len)],
+            )];
+            let (branch, out) = transact(
+                &store,
+                call_tx(
+                    IEntityRegistry::executeCall { ops }.abi_encode(),
+                    U256::ZERO,
+                ),
+                true,
+                None,
+            );
+            let key = out.expect("the create executes").result.logs()[0].topics()[1];
+            store.commit_tagged(branch, [0x22; 32]).expect("commit");
+            let fresh = arkiv_interfaces::store::Store::begin(&*store, Some(store.head()));
+            let meta = branch_view(&store, fresh.expect("begin"))
+                .get_entity_with_meta(key.0, ReadMode::ViewOnBase)
+                .expect("read")
+                .value
+                .expect("the entity exists")
+                .meta;
+            let view = IEntityRegistry::customAttributeNamesCall { entityKey: key }.abi_encode();
+            (store, meta, call_tx(view, U256::ZERO))
+        };
+        let gas = |len: usize, charge: bool| {
+            let (store, meta, view) = entity(len);
+            let read = 1 + meta.cells + meta.cell_bytes;
+            let expected = (tx_gas(&view.data) + read).max(floor_gas(&view.data));
+            let out = transact(&store, view, charge, None).1;
+            let out = out.expect("the view executes").result;
+            assert!(out.is_success());
+            (out.tx_gas_used(), expected, meta)
+        };
+
+        let (small, expected, _) = gas(1, true);
+        assert_eq!(small, expected, "a mined view pays the read weights");
+        let (big, expected, meta) = gas(60_000, true);
+        assert_eq!(big, expected, "a mined view pays the read weights");
+        assert!(
+            meta.cell_bytes >= 60_000,
+            "the read covers the blob's bytes"
+        );
+        assert!(big > small + 59_000, "{small} vs {big}");
+        assert_eq!(
+            gas(60_000, false).0,
+            big,
+            "an estimate reports the gas a mined view pays"
+        );
+
+        let (store, _, view) = entity(60_000);
+        let gas_limit = big - 1;
+        let out = transact(&store, TxEnv { gas_limit, ..view }, true, None).1;
+        let out = out.expect("the view executes").result;
+        assert_eq!(
+            out.tx_gas_used(),
+            gas_limit,
+            "out of gas consumes the limit"
+        );
+        assert!(
+            matches!(&out, ExecutionResult::Revert { output, .. }
+                if *output == revert::revert_data(&arkiv_interfaces::RevertReason::OutOfGas)),
+            "a view short of its read's gas runs out of gas: {out:?}"
         );
     }
 }
