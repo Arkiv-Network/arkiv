@@ -1123,8 +1123,7 @@ impl<N: ProviderNodeTypes> ArkivProvider<N> {
             return Err(ProviderError::StateForHashNotFound(hash));
         };
         let adopted = self.store_head_block()?;
-        let next = adopted.map_or(0, |block| block + 1);
-        if number <= next {
+        if maps_to_head(number, adopted) {
             return Ok(self.store.head());
         }
         tracing::warn!(
@@ -1588,6 +1587,18 @@ fn no_history_range(method: &str, range: &impl RangeBounds<BlockNumber>) -> Prov
     no_history(method, first)
 }
 
+/// Whether an untagged block of this number is a block the store's head
+/// legitimately stands for -- see [`ArkivProvider::unadopted`].
+///
+/// Only the adopted head itself and the block built on it qualify. Anything
+/// else is a block the store never tagged: a gap, or one from before the node
+/// started tagging. Its state is not the head's, so answering would be a lie.
+///
+/// A free function so it can be tested without a whole `BlockchainProvider`.
+fn maps_to_head(number: BlockNumber, adopted: Option<BlockNumber>) -> bool {
+    Some(number) == adopted || number == adopted.map_or(0, |block| block + 1)
+}
+
 /// Refuse a commit that is not the store's head — see [`ArkivProvider::commit_of`].
 ///
 /// A free function rather than a method so it can be tested without standing up
@@ -1629,6 +1640,34 @@ mod tx_bounds_tests {
     fn an_empty_range_is_expressed_as_a_last_below_the_start() {
         // `4..4` names nothing, and the loop's `id <= last` sees that.
         assert_eq!(tx_bounds(&(4u64..4)), (4, Some(3)));
+    }
+}
+
+#[cfg(test)]
+mod maps_to_head_tests {
+    use super::maps_to_head;
+
+    #[test]
+    fn the_adopted_head_and_the_block_built_on_it_map_to_head() {
+        assert!(maps_to_head(7, Some(7)));
+        assert!(maps_to_head(8, Some(7)));
+    }
+
+    #[test]
+    fn an_untagged_older_block_does_not() {
+        assert!(!maps_to_head(6, Some(7)));
+        assert!(!maps_to_head(0, Some(7)));
+    }
+
+    #[test]
+    fn a_block_further_ahead_does_not() {
+        assert!(!maps_to_head(9, Some(7)));
+    }
+
+    #[test]
+    fn with_nothing_adopted_only_genesis_maps_to_head() {
+        assert!(maps_to_head(0, None));
+        assert!(!maps_to_head(1, None));
     }
 }
 
