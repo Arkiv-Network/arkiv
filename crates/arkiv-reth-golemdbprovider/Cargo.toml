@@ -40,3 +40,7 @@ rocksdb.workspace = true
 reth-node-builder.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `LazyHandle`, to hand a state-root job the hashed state its signature names.
+reth-ethereum = { workspace = true, features = ["tasks"] }
