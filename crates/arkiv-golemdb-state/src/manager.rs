@@ -16,10 +16,6 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use arkiv_interfaces::execution::Op;
-use arkiv_interfaces::gas::{CostModel, PlaceholderCost};
-use arkiv_interfaces::primitives::Gas;
-use arkiv_interfaces::query::QueryStats;
 use arkiv_interfaces::statemanager::{BlockRef, SessionId, StateManager};
 use arkiv_interfaces::store::{CommitId, Store, StoreExt};
 
@@ -27,9 +23,8 @@ use crate::view::{GolemStateView, ViewError};
 
 /// Mints [`GolemStateView`]s over one shared store.
 #[derive(Debug)]
-pub struct GolemStateManager<S: ?Sized, C = PlaceholderCost> {
+pub struct GolemStateManager<S: ?Sized> {
     store: Arc<S>,
-    costs: C,
     /// Session ids are a plain counter.
     ///
     /// ponytail: unique within a process, which is all a [`SessionId`] is for
@@ -38,22 +33,11 @@ pub struct GolemStateManager<S: ?Sized, C = PlaceholderCost> {
 }
 
 impl<S: StoreExt + ?Sized> GolemStateManager<S> {
-    pub fn new(store: Arc<S>) -> Self {
-        Self::with_cost_model(store, PlaceholderCost)
-    }
-}
-
-impl<S: StoreExt + ?Sized, C> GolemStateManager<S, C> {
-    pub const fn with_cost_model(store: Arc<S>, costs: C) -> Self {
+    pub const fn new(store: Arc<S>) -> Self {
         Self {
             store,
-            costs,
             sessions: AtomicU64::new(0),
         }
-    }
-
-    pub const fn cost_model(&self) -> &C {
-        &self.costs
     }
 
     pub fn store(&self) -> &Arc<S> {
@@ -82,7 +66,7 @@ impl<S: StoreExt + ?Sized, C> GolemStateManager<S, C> {
     }
 }
 
-impl<S: StoreExt + ?Sized, C: CostModel> StateManager for GolemStateManager<S, C> {
+impl<S: StoreExt + ?Sized> StateManager for GolemStateManager<S> {
     type Error = ViewError;
     type View = GolemStateView<Arc<S>>;
 
@@ -110,14 +94,6 @@ impl<S: StoreExt + ?Sized, C: CostModel> StateManager for GolemStateManager<S, C
             at,
             self.next_session(),
         ))
-    }
-
-    fn get_operation_cost(&mut self, op: &Op) -> Result<Gas, ViewError> {
-        Ok(self.costs.op_cost(op))
-    }
-
-    fn get_query_cost(&mut self, stats: &QueryStats) -> Result<Gas, ViewError> {
-        Ok(self.costs.query_cost(stats))
     }
 }
 
