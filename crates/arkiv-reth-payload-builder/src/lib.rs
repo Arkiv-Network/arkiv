@@ -46,9 +46,19 @@ use reth_ethereum_payload_builder::{
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderHandle, PayloadBuilderService};
 use reth_storage_api::{BlockReader, ReceiptProvider, StateProviderFactory};
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
+
+// Distinguishes rebuilds and purge-only fallbacks sharing a payload ID.
+static NEXT_BUILD_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 /// Public protocol material, not an authentication secret.
 const PURGE_ENVELOPE_KEY: &str = "8b3a350cf5c34c9194ca3a545d4b54b69356a5f5a39d9c7f94a17e5f7f9a6c31";
@@ -174,6 +184,7 @@ where
                 let seals = seals.clone();
                 let pruning_map = pruning_map.clone();
                 async move {
+                    let started = Instant::now();
                     // The block is canonical, so its Arkiv state is no longer
                     // speculative: promote the seal to a commit, unless the
                     // engine validator saved it already, before a child of it
@@ -182,18 +193,22 @@ where
                     let height = tip.number;
                     let block_hash = tip.hash().0;
                     let state_root = tip.state_root.0;
+                    debug!(target: "arkiv::timing", height, block_hash = %B256::from(block_hash), "Arkiv canonical notification started");
                     // The block's own rows go into the append-only tier in the
                     // same commit as its state. Built before `adopt` because a
                     // block we cannot encode is one we must not commit state
                     // for either -- the two would disagree permanently.
+                    let encoding_started = Instant::now();
                     let writes = match rows_for_canonical_tip(&notification) {
                         Ok(writes) => writes,
                         Err(error) => {
                             warn!(target: "arkiv-reth", %error, height, "failed to encode the block's rows; its Arkiv state is not adopted");
                             seals.finish_adoption(block_hash);
+                            info!(target: "arkiv::timing", height, block_hash = %B256::from(block_hash), outcome = "encoding_error", total_ms = started.elapsed().as_secs_f64() * 1000.0, "Arkiv canonical notification finished");
                             return notification;
                         }
                     };
+                    let encoding = encoding_started.elapsed();
                     // On a blocking thread, not this one. Adoption is now a
                     // write per transaction and receipt rather than a couple
                     // of calls, and the store's seam is synchronous -- against
@@ -204,10 +219,19 @@ where
                     // test. `catch_up` below already does the same thing.
                     let adopting_store = store.clone();
                     let adopting_seals = seals.clone();
+                    let adoption_started = Instant::now();
                     let adopted = tokio::task::spawn_blocking(move || {
+                        debug!(target: "arkiv::timing", height, block_hash = %B256::from(block_hash), queue_wait_ms = adoption_started.elapsed().as_secs_f64() * 1000.0, "Arkiv adoption worker started");
                         adopting_seals.adopt(&adopting_store, height, block_hash, state_root, &writes)
                     })
                     .await;
+                    let adoption = adoption_started.elapsed();
+                    let adoption_outcome = match &adopted {
+                        Ok(Ok(Some(_))) => "committed",
+                        Ok(Ok(None)) => "no_candidate",
+                        Ok(Err(_)) => "error",
+                        Err(_) => "worker_error",
+                    };
                     match adopted {
                         Ok(Ok(Some(commit))) => {
                             debug!(target: "arkiv-reth", height, commit = commit.0, "adopted the block's Arkiv state")
@@ -221,7 +245,19 @@ where
                         }
                     }
                     seals.finish_adoption(block_hash);
-                    if let Err(error) = catch_up(provider, store, pruning_map).await {
+                    let catch_up_started = Instant::now();
+                    let caught_up = catch_up(provider, store, pruning_map).await;
+                    let catch_up = catch_up_started.elapsed();
+                    info!(
+                        target: "arkiv::timing", height, block_hash = %B256::from(block_hash),
+                        adoption_outcome, catch_up_ok = caught_up.is_ok(),
+                        encoding_ms = encoding.as_secs_f64() * 1000.0,
+                        adoption_ms = adoption.as_secs_f64() * 1000.0,
+                        catch_up_ms = catch_up.as_secs_f64() * 1000.0,
+                        total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        "Arkiv canonical notification finished",
+                    );
+                    if let Err(error) = caught_up {
                         warn!(target: "arkiv-reth", %error, "failed to advance chain pruning map");
                     }
                     notification
@@ -305,18 +341,31 @@ where
         + Sync
         + 'static,
 {
+    let started = Instant::now();
     // No genesis walk: genesis holds no entities now that there is no seeding,
     // so the map learns everything it needs from the logs replayed below.
     let _guard = pruning_map.update_guard().await;
+    let lock_wait = started.elapsed();
+    let mut blocks = 0u64;
+    let mut first_height = None;
+    let mut last_height = None;
     loop {
         let watermark = pruning_map.watermark().await?;
         let tip = provider
             .best_block_number()
             .map_err(|error| eyre::eyre!("read chain tip: {error:?}"))?;
         if watermark >= tip {
+            debug!(
+                target: "arkiv::timing", blocks, first_height, last_height,
+                lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+                total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                outcome = "caught_up",
+                "Arkiv pruning catch-up finished",
+            );
             return Ok(());
         }
         let height = watermark + 1;
+        let block_started = Instant::now();
         let block_provider = provider.clone();
         let block_store = store.clone();
         let (entries, removed) = tokio::task::spawn_blocking(move || {
@@ -324,7 +373,23 @@ where
         })
         .await
         .map_err(|error| eyre::eyre!("join pruning replay for block {height}: {error}"))??;
-        pruning_map.apply_next(height, &entries, &removed).await?;
+        let replay = block_started.elapsed();
+        let phase = Instant::now();
+        let applied = pruning_map.apply_next(height, &entries, &removed).await;
+        let apply = phase.elapsed();
+        debug!(
+            target: "arkiv::timing", height, entries = entries.len(), removed = removed.len(),
+            replay_ms = replay.as_secs_f64() * 1000.0,
+            apply_ms = apply.as_secs_f64() * 1000.0,
+            total_ms = block_started.elapsed().as_secs_f64() * 1000.0,
+            outcome = if applied.is_ok() { "applied" } else { "error" },
+            error = ?applied.as_ref().err(),
+            "Arkiv pruning block finished",
+        );
+        applied?;
+        first_height.get_or_insert(height);
+        blocks += 1;
+        last_height = Some(height);
     }
 }
 
@@ -469,20 +534,44 @@ where
         contents: Contents,
     ) -> Result<BuildOutcome<EthBuiltPayload>, reth_payload_builder_primitives::PayloadBuilderError>
     {
+        let started = Instant::now();
+        let attempt = NEXT_BUILD_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let block = args.config.parent_header.number + 1;
+        let parent = args.config.parent_header.hash();
+        let kind = match contents {
+            Contents::PurgeAndPool => "pool",
+            Contents::PurgeOnly => "purge_only",
+        };
+        let _span = tracing::info_span!(
+            target: "arkiv::timing", "payload_build",
+            attempt, payload_id = %args.config.payload_id(), height = block, %parent, kind,
+        )
+        .entered();
+        debug!(target: "arkiv::timing", "Arkiv payload build started");
         // Build on the parent's state. Adoption commits it a moment after reth
         // makes the parent canonical. `chain_info` is reth's head here: it
         // answers from the store only when the store is ahead, and then the
         // parent is committed already.
-        let parent = args.config.parent_header.hash();
         let is_head = || {
             self.client
                 .chain_info()
                 .is_ok_and(|info| info.best_hash == parent)
         };
-        self.seals
-            .wait_for_commit(&self.store, parent.0, is_head)
-            .map_err(reth_payload_builder_primitives::PayloadBuilderError::other)?;
-        let block = args.config.parent_header.number + 1;
+        let phase = Instant::now();
+        let committed = self.seals.wait_for_commit(&self.store, parent.0, is_head);
+        let parent_wait = phase.elapsed();
+        committed.map_err(|error| {
+            info!(
+                target: "arkiv::timing", outcome = "error", ?error,
+                total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                parent_wait_ms = parent_wait.as_secs_f64() * 1000.0,
+                "Arkiv payload build finished",
+            );
+            reth_payload_builder_primitives::PayloadBuilderError::other(error)
+        })?;
+        let purge_started = Instant::now();
+        let phase = Instant::now();
+        let mut pruning_skipped = false;
         let keys = self
             .pruning_map
             .select_expired(
@@ -492,11 +581,18 @@ where
                 PURGE_GAS_LIMIT,
             )
             .unwrap_or_else(|error| {
+                pruning_skipped = true;
                 debug!(target: "arkiv-reth", %error, block, "skip pruning for payload");
                 Vec::new()
             });
+        let pruning_select = phase.elapsed();
+        let purge_keys = keys.len();
+        let phase = Instant::now();
         let purge = protocol_transaction(self.chain_id, block, keys);
-        default_ethereum_payload(
+        let protocol_tx = phase.elapsed();
+        let purge_prepare = purge_started.elapsed();
+        let phase = Instant::now();
+        let result = default_ethereum_payload(
             self.evm.clone(),
             self.client.clone(),
             self.pool.clone(),
@@ -509,7 +605,32 @@ where
                 )),
                 Contents::PurgeOnly => Box::new(PrependBest::new(purge, std::iter::empty())),
             },
-        )
+        );
+        let execution_assembly = phase.elapsed();
+        let outcome = match &result {
+            Ok(BuildOutcome::Better { .. }) => "better",
+            Ok(BuildOutcome::Freeze(_)) => "frozen",
+            Ok(BuildOutcome::Aborted { .. }) => "aborted",
+            Ok(BuildOutcome::Cancelled) => "cancelled",
+            Err(_) => "error",
+        };
+        let payload = result.as_ref().ok().and_then(|outcome| outcome.payload());
+        info!(
+            target: "arkiv::timing",
+            outcome,
+            block_hash = payload.map(|payload| tracing::field::display(payload.block().hash())),
+            transactions = payload.map(|payload| payload.block().body().transactions.len()),
+            purge_keys, pruning_skipped,
+            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+            parent_wait_ms = parent_wait.as_secs_f64() * 1000.0,
+            purge_prepare_ms = purge_prepare.as_secs_f64() * 1000.0,
+            pruning_select_ms = pruning_select.as_secs_f64() * 1000.0,
+            protocol_tx_ms = protocol_tx.as_secs_f64() * 1000.0,
+            execution_assembly_ms = execution_assembly.as_secs_f64() * 1000.0,
+            error = ?result.as_ref().err(),
+            "Arkiv payload build finished",
+        );
+        result
     }
 }
 

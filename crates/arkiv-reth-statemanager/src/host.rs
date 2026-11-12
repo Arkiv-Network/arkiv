@@ -19,7 +19,9 @@
 use core::cell::RefCell;
 use core::ops::Bound;
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
+use alloy_primitives::B256;
 use arkiv_golemdb_state::{GolemStateView, ViewError};
 use arkiv_interfaces::entity::AttributeValue;
 use arkiv_interfaces::primitives::{
@@ -514,23 +516,37 @@ impl BlockSeals {
     /// Seal `branch` as a candidate for the execution `key` describes. A branch
     /// that fails to seal is discarded.
     pub fn seal(&self, key: ExecutionKey, branch: OwnedBranch) -> Result<SealedCommit, ViewError> {
-        let sealed = branch.seal()?;
-        self.pending
-            .lock()
-            .expect("the seal registry's lock is never poisoned")
-            .entry(key.height)
-            .or_default()
-            .push((branch, sealed));
-        // Last writer wins. Two executions sharing a key ran the same
-        // transactions over the same height, so a deterministic store gives
-        // them the same root and the overwrite is a no-op in everything that
-        // matters. If it ever is not, the roots disagreed and the chain would
-        // have halted anyway -- see `root_of`.
-        self.by_execution
-            .lock()
-            .expect("the seal registry's lock is never poisoned")
-            .insert(key, sealed);
-        Ok(sealed)
+        let started = Instant::now();
+        let height = key.height;
+        let branch_id = branch.id().0;
+        let result: Result<SealedCommit, ViewError> = (|| {
+            let sealed = branch.seal()?;
+            self.pending
+                .lock()
+                .expect("the seal registry's lock is never poisoned")
+                .entry(key.height)
+                .or_default()
+                .push((branch, sealed));
+            // Last writer wins. Two executions sharing a key ran the same
+            // transactions over the same height, so a deterministic store gives
+            // them the same root and the overwrite is a no-op in everything that
+            // matters. If it ever is not, the roots disagreed and the chain would
+            // have halted anyway -- see `root_of`.
+            self.by_execution
+                .lock()
+                .expect("the seal registry's lock is never poisoned")
+                .insert(key, sealed);
+            Ok(sealed)
+        })();
+        tracing::debug!(
+            target: "arkiv::timing", height, branch_id,
+            state_root = result.as_ref().ok().map(|sealed| tracing::field::display(B256::from(sealed.state_root))),
+            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+            outcome = if result.is_ok() { "sealed" } else { "error" },
+            error = ?result.as_ref().err(),
+            "Arkiv state seal finished",
+        );
+        result
     }
 
     /// The state root sealed for `key`, if that execution has sealed.
@@ -585,51 +601,87 @@ impl BlockSeals {
         state_root: [u8; 32],
         writes: &[SegmentWrite],
     ) -> Result<Option<CommitId>, ViewError> {
-        let _adopting = self
-            .adopting
-            .lock()
-            .expect("the seal registry's lock is never poisoned");
-        let stale: BTreeMap<u64, Vec<(OwnedBranch, SealedCommit)>> = {
-            let mut pending = self
-                .pending
+        let started = Instant::now();
+        let mut lock_wait = Duration::ZERO;
+        let mut candidate = Duration::ZERO;
+        let mut append = Duration::ZERO;
+        let mut commit = Duration::ZERO;
+        let mut outcome = "error";
+        tracing::debug!(target: "arkiv::timing", height, block_hash = %B256::from(block_hash), "Arkiv adoption started");
+        let result: Result<Option<CommitId>, ViewError> = (|| {
+            let phase = Instant::now();
+            let _adopting = self
+                .adopting
                 .lock()
                 .expect("the seal registry's lock is never poisoned");
-            let future = pending.split_off(&(height + 1));
-            core::mem::replace(&mut *pending, future)
-        };
+            lock_wait = phase.elapsed();
+            let phase = Instant::now();
+            let stale: BTreeMap<u64, Vec<(OwnedBranch, SealedCommit)>> = {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .expect("the seal registry's lock is never poisoned");
+                let future = pending.split_off(&(height + 1));
+                core::mem::replace(&mut *pending, future)
+            };
 
-        // The last match wins. Every other candidate is dropped with the
-        // iterator, and with it discarded: a height reth passed over, or
-        // another candidate at this one.
-        let winner = stale
-            .into_iter()
-            .filter(|(h, _)| *h == height)
-            .flat_map(|(_, candidates)| candidates)
-            .filter(|(_, sealed)| sealed.state_root == state_root)
-            .map(|(branch, _)| branch)
-            .next_back();
-        self.forget_executions_through(height);
-        if let Some(saved) = store.commit_by_tag(block_hash)? {
-            return Ok(Some(saved));
-        }
-        let Some(branch) = winner else {
-            return Ok(None);
-        };
-        // One call, not one per row. A block is a row per transaction and a
-        // row per receipt, and against an out-of-process store doing those
-        // individually takes long enough that the chain moves on without us --
-        // the payload builder asks for this block's commit before it exists
-        // and cannot build on it.
-        //
-        // A failed append drops the branch, and its half-written rows with it.
-        let batch: Vec<_> = writes
-            .iter()
-            .map(|write| (write.segment, write.key, write.row.clone()))
-            .collect();
-        store.segment_append_many(branch.id(), &batch)?;
-        // Tagged with the block hash, which is how a historical read finds the
-        // commit for a past block.
-        Ok(Some(branch.commit_tagged(block_hash)?))
+            // The last match wins. Every other candidate is dropped with the
+            // iterator, and with it discarded: a height reth passed over, or
+            // another candidate at this one.
+            let winner = stale
+                .into_iter()
+                .filter(|(h, _)| *h == height)
+                .flat_map(|(_, candidates)| candidates)
+                .filter(|(_, sealed)| sealed.state_root == state_root)
+                .map(|(branch, _)| branch)
+                .next_back();
+            self.forget_executions_through(height);
+            let saved = store.commit_by_tag(block_hash);
+            candidate = phase.elapsed();
+            if let Some(saved) = saved? {
+                outcome = "already_committed";
+                return Ok(Some(saved));
+            }
+            let Some(branch) = winner else {
+                outcome = "no_candidate";
+                return Ok(None);
+            };
+            // One call, not one per row. A block is a row per transaction and a
+            // row per receipt, and against an out-of-process store doing those
+            // individually takes long enough that the chain moves on without us --
+            // the payload builder asks for this block's commit before it exists
+            // and cannot build on it.
+            //
+            // A failed append drops the branch, and its half-written rows with it.
+            let phase = Instant::now();
+            let batch: Vec<_> = writes
+                .iter()
+                .map(|write| (write.segment, write.key, write.row.clone()))
+                .collect();
+            let appended = store.segment_append_many(branch.id(), &batch);
+            append = phase.elapsed();
+            appended?;
+            // Tagged with the block hash, which is how a historical read finds the
+            // commit for a past block.
+            let phase = Instant::now();
+            let committed = branch.commit_tagged(block_hash);
+            commit = phase.elapsed();
+            let committed = committed?;
+            outcome = "committed";
+            Ok(Some(committed))
+        })();
+        tracing::info!(
+            target: "arkiv::timing", height, block_hash = %B256::from(block_hash), outcome,
+            rows = writes.len(), commit_id = result.as_ref().ok().and_then(|id| id.map(|id| id.0)),
+            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+            lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+            candidate_ms = candidate.as_secs_f64() * 1000.0,
+            append_ms = append.as_secs_f64() * 1000.0,
+            commit_ms = commit.as_secs_f64() * 1000.0,
+            error = ?result.as_ref().err(),
+            "Arkiv adoption finished",
+        );
+        result
     }
 
     /// Adoption is done with canonical block `block_hash`, whether or not it
@@ -660,27 +712,41 @@ impl BlockSeals {
         hash: [u8; 32],
         is_head: impl Fn() -> bool,
     ) -> Result<CommitId, CommitWaitError> {
-        let committed = || store.commit_by_tag(hash).map_err(CommitWaitError::Store);
-        // The usual case, without the lock.
-        if let Some(commit) = committed()? {
-            return Ok(commit);
-        }
-        let mut finished = self
-            .finished
-            .lock()
-            .expect("the seal registry's lock is never poisoned");
-        loop {
+        let started = Instant::now();
+        let mut waited = false;
+        let result = (|| {
+            let committed = || store.commit_by_tag(hash).map_err(CommitWaitError::Store);
+            // The usual case, without the lock.
             if let Some(commit) = committed()? {
                 return Ok(commit);
             }
-            if *finished == Some(hash) || !is_head() {
-                return Err(CommitWaitError::NotComing(hash));
-            }
-            finished = self
-                .finished_signal
-                .wait(finished)
+            tracing::debug!(target: "arkiv::timing", parent = %B256::from(hash), "Arkiv parent commit not ready");
+            let mut finished = self
+                .finished
+                .lock()
                 .expect("the seal registry's lock is never poisoned");
-        }
+            loop {
+                if let Some(commit) = committed()? {
+                    return Ok(commit);
+                }
+                if *finished == Some(hash) || !is_head() {
+                    return Err(CommitWaitError::NotComing(hash));
+                }
+                waited = true;
+                finished = self
+                    .finished_signal
+                    .wait(finished)
+                    .expect("the seal registry's lock is never poisoned");
+            }
+        })();
+        tracing::debug!(
+            target: "arkiv::timing", parent = %B256::from(hash), waited,
+            total_ms = started.elapsed().as_secs_f64() * 1000.0,
+            outcome = if result.is_ok() { "committed" } else { "error" },
+            error = ?result.as_ref().err(),
+            "Arkiv parent commit wait finished",
+        );
+        result
     }
 }
 
