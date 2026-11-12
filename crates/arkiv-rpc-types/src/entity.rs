@@ -438,8 +438,10 @@ pub fn ser_opt_u64_hex<S: serde::Serializer>(value: &Option<u64>, s: S) -> Resul
     }
 }
 
-/// Accept a chain quantity as either a hex string (the spec's form) or a JSON
-/// number (what a hand-written client usually sends).
+/// Accept a chain quantity as either a `0x`-prefixed hex string (the spec's
+/// form) or a JSON number (what a hand-written client usually sends). A string
+/// without the prefix is refused rather than read as hex, since `"50"` would
+/// silently mean 80; a sign is refused too, which `from_str_radix` would take.
 pub fn de_u64_flexible<'de, D>(de: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -457,11 +459,11 @@ where
         None => Ok(None),
         Some(Either::Num(number)) => Ok(Some(number)),
         Some(Either::Hex(text)) => {
-            let stripped = text
+            let digits = text
                 .strip_prefix("0x")
-                .or_else(|| text.strip_prefix("0X"))
-                .unwrap_or(&text);
-            u64::from_str_radix(stripped, 16)
+                .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| D::Error::custom(format!("invalid hex quantity {text:?}")))?;
+            u64::from_str_radix(digits, 16)
                 .map(Some)
                 .map_err(|e| D::Error::custom(format!("invalid hex quantity {text:?}: {e}")))
         }
