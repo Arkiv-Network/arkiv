@@ -713,10 +713,11 @@ mod tests {
                 record_limits,
                 None,
                 PricingConfig::zero(),
+                0,
             ),
             segments: vec![],
         };
-        let store = GolemDbStore::open(dir.path(), &config, None).unwrap();
+        let store = GolemDbStore::open(dir.path(), &config, crate::Pruning::Off).unwrap();
         let branch = store.begin(None).unwrap();
         for (n, level, name) in [(1, -5, "alpha"), (2, 3, "beta"), (3, 10, "albert")] {
             let cells = vec![
