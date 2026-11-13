@@ -66,14 +66,14 @@
 //! This file is the **exact executor** — the reth-specific wiring (the [`Evm`],
 //! [`EvmFactory`] and [`ExecutorBuilder`] reth injects). The **entity business
 //! logic** is not here: it lives in [`arkiv`], written against the host-agnostic
-//! [`arkiv_interfaces::execution::TransactionExecutor`] interface. And the
+//! [`StateView`](arkiv_interfaces::statemanager::StateView). And the
 //! **state machinery** is not here either: all state — entities, the query
 //! index, minting nonces, sender balances and EOA nonces — is reached through
 //! one [`host_manager`] view (arkiv-reth-statemanager's `HostStateView` over
 //! its `WriteOverlay`), so a transaction's every effect lands in a single
 //! `EvmState` diff for reth to commit.
 
-/// Entity business logic, implementing the `arkiv-interfaces` executor interface.
+/// Entity business logic, over any `StateView`.
 pub mod arkiv;
 /// ABI op decoding: `execute(Operation[])` calldata → the spec's `Op`s.
 pub mod decode;
@@ -1635,23 +1635,30 @@ mod tests {
         hash: [0; 32],
     };
 
-    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+    /// A view over a fresh MemStore, on a branch of its head.
+    fn genesis_view() -> arkiv_golemdb_state::GolemStateView<
+        std::sync::Arc<arkiv_interfaces::store::reference::MemStore>,
+    > {
+        use arkiv_interfaces::store::Store;
+
+        let store = std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
+        let branch = store.begin(None).expect("begin");
+        let head = store.head();
+        arkiv_golemdb_state::GolemStateView::new(
+            store,
+            branch,
+            head,
+            CLAMP_GENESIS,
+            arkiv_interfaces::statemanager::SessionId([0; 16]),
+        )
+    }
+
     fn clamp_view(
         amount: u64,
     ) -> arkiv_golemdb_state::GolemStateView<
         std::sync::Arc<arkiv_interfaces::store::reference::MemStore>,
     > {
-        use arkiv_interfaces::statemanager::StateManager;
-        use arkiv_interfaces::store::{Store, StoreExt};
-
-        let store = std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
-        let branch = store.begin(None).expect("begin");
-        store
-            .commit_tagged(branch, CLAMP_GENESIS.hash)
-            .expect("tag genesis");
-        let mut view = arkiv_golemdb_state::GolemStateManager::new(store)
-            .view(CLAMP_GENESIS)
-            .expect("view");
+        let mut view = genesis_view();
         view.fetch_add_balance(CLAMP_ALICE, UserBalance::from_u64(amount))
             .expect("fund");
         view
@@ -1713,19 +1720,8 @@ mod tests {
     /// A probe (`eth_call`, `eth_estimateGas`) from a caller with no account
     /// leaves the branch exactly as it was: no zero-balance account appears.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
     fn a_probe_writes_no_account() {
-        use arkiv_interfaces::statemanager::StateManager;
-        use arkiv_interfaces::store::{Store, StoreExt};
-
-        let store = std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
-        let branch = store.begin(None).expect("begin");
-        store
-            .commit_tagged(branch, CLAMP_GENESIS.hash)
-            .expect("tag genesis");
-        let mut view = arkiv_golemdb_state::GolemStateManager::new(store)
-            .view(CLAMP_GENESIS)
-            .expect("view");
+        let mut view = genesis_view();
         let before = view.digest().unwrap();
 
         let probe = FeeEnv {

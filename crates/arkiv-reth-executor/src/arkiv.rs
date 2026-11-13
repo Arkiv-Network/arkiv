@@ -11,12 +11,9 @@ use arkiv_interfaces::entity::{Attribute, CreationFlags, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::execution::{
     AttributeMutation, ExecEnv, ExecOutput, ExecStatus, Op, OpKind, RevertReason,
-    TransactionExecutor,
 };
 use arkiv_interfaces::gas::{CostModel, GasBreakdown, PlaceholderCost};
-use arkiv_interfaces::primitives::{
-    BlockNumber, EntityAddress, EntityCreationNonce, Gas, UserAddress,
-};
+use arkiv_interfaces::primitives::{BlockNumber, EntityAddress, Gas, UserAddress};
 use arkiv_interfaces::statemanager::{EntityUpdates, ReadMode, StateView, StoredEntity};
 use arkiv_interfaces::store::{CostUnits, Metered, Receipt, RecordMeta, WriteDetails};
 use arkiv_tokenomics::{FeeSchedule, GasMeter, Overflow, storage_time, units};
@@ -86,24 +83,6 @@ impl<V, C: fmt::Debug> fmt::Debug for ArkivExecutor<V, C> {
             .field("cost", &self.cost)
             .field("schedule", &self.schedule)
             .finish()
-    }
-}
-
-impl<V: StateView, C: CostModel> TransactionExecutor for ArkivExecutor<V, C> {
-    type State = V;
-    type Error = ExecError;
-
-    fn execute(
-        &self,
-        env: &ExecEnv,
-        state: &mut Self::State,
-        op_bytes: &[u8],
-    ) -> Result<ExecOutput, Self::Error> {
-        // `start_nonce` is zero here: threading the caller's persistent nonce is
-        // the wiring step's job. Decode failures are host faults.
-        let ops = crate::decode::decode_ops(env, op_bytes, EntityCreationNonce::ZERO)
-            .map_err(|e| ExecError::Decode(e.to_string()))?;
-        self.apply(env, state, &ops)
     }
 }
 
@@ -732,7 +711,6 @@ fn apply_mutations(entity: &mut Entity, mutations: &[AttributeMutation]) {
 /// which is a normal [`ExecOutput`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecError {
-    Decode(String),
     Store(String),
 }
 
@@ -745,7 +723,6 @@ impl ExecError {
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExecError::Decode(m) => write!(f, "op decode error: {m}"),
             ExecError::Store(m) => write!(f, "store error: {m}"),
         }
     }
@@ -2104,16 +2081,5 @@ mod tests {
         assert_eq!(out.status, ExecStatus::Ok);
         assert_eq!(out.gas_used(), cost);
         assert_eq!(view.get_uncommitted_deltas().unwrap().len(), 1);
-    }
-
-    /// Undecodable calldata surfaces as a host fault, not a silent success.
-    #[test]
-    fn execute_rejects_undecodable_calldata() {
-        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
-        let mut view = fresh_view();
-        assert!(matches!(
-            exec.execute(&env([0u8; 20], 1), &mut view, &[0xDE, 0xAD]),
-            Err(ExecError::Decode(_))
-        ));
     }
 }

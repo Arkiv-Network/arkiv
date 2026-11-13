@@ -234,10 +234,9 @@ pub trait QueryProcessor {
 ///
 /// History is served by opening a [`StateView`] at the older block, so this is
 /// implementable exactly as far back as the backend retains the index and
-/// entity lanes ([`has_store`](StateView::has_store)) — a block outside that
-/// window is an error, never a silently-wrong answer from the tip. The query
-/// runs exactly as [`QueryProcessor::query`], but as of the state committed
-/// through `at`.
+/// entities — a block outside that window is an error, never a silently-wrong
+/// answer from the tip. The query runs exactly as [`QueryProcessor::query`],
+/// but as of the state committed through `at`.
 pub trait HistoricalQuery: QueryProcessor {
     /// Answer `query` as of block `at`.
     fn query_at(
