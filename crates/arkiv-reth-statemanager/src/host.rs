@@ -30,7 +30,7 @@ use arkiv_interfaces::primitives::{
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, Commitment, EntityCreationNoncesStore,
     EntityStore, EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode, SessionId,
-    StateCommit, StateView, StoreKind, StoredEntity,
+    StateCommit, StateView, StoredEntity,
 };
 use arkiv_interfaces::store::{
     BranchId, CommitId, Metered, SealedCommit, Store, StoreError, StoreExt,
@@ -353,10 +353,6 @@ where
 
     fn session(&self) -> SessionId {
         self.golem.session()
-    }
-
-    fn has_store(&self, _store: StoreKind) -> bool {
-        true
     }
 
     /// The frame covers what GolemDB holds. The account mirror is not rolled
@@ -754,9 +750,7 @@ impl BlockSeals {
 mod tests {
     use super::*;
     use alloy_primitives::U256;
-    use arkiv_golemdb_state::GolemStateManager;
     use arkiv_interfaces::entity::Entity;
-    use arkiv_interfaces::statemanager::StateManager;
     use arkiv_interfaces::store::Store;
     use arkiv_interfaces::store::reference::MemStore;
     use core::convert::Infallible;
@@ -804,16 +798,11 @@ mod tests {
         hash: [0; 32],
     };
 
-    // MemStore is a RefCell, so this handle is not Send + Sync. That is the
-    // reference store's limitation, not the view's.
-    #[allow(clippy::arc_with_non_send_sync)]
     fn view() -> HostStateView<MemAccounts> {
         let store: HostStore = Arc::new(MemStore::new());
         let branch = store.begin(None).expect("begin");
-        store
-            .commit_tagged(branch, GENESIS.hash)
-            .expect("tag genesis");
-        let golem = GolemStateManager::new(store).view(GENESIS).expect("view");
+        let head = store.head();
+        let golem = GolemStateView::new(store, branch, head, GENESIS, SessionId([0; 16]));
         HostStateView::new(golem, MemAccounts::default())
     }
 

@@ -198,12 +198,10 @@ fn nonce_of(record: &Record) -> Result<u64, AccountReadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arkiv_golemdb_state::GolemStateManager;
     use arkiv_interfaces::primitives::UserBalance;
     use arkiv_interfaces::statemanager::{
-        AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, StateManager,
+        AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, SessionId,
     };
-    use arkiv_interfaces::store::StoreExt;
     use arkiv_interfaces::store::reference::MemStore;
     use std::sync::Arc;
 
@@ -214,28 +212,20 @@ mod tests {
     };
 
     /// Write through a view, commit, and read back at that commit.
-    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
     fn committed(
         write: impl FnOnce(&mut arkiv_golemdb_state::GolemStateView<Arc<MemStore>>),
     ) -> GolemAccounts<Arc<MemStore>> {
         let store = Arc::new(MemStore::new());
         let branch = store.begin(None).expect("begin");
-        store
-            .commit_tagged(branch, GENESIS.hash)
-            .expect("tag genesis");
-
-        let manager = GolemStateManager::new(store.clone());
-        let mut view = manager.view(GENESIS).expect("view");
+        let mut view = arkiv_golemdb_state::GolemStateView::new(
+            store.clone(),
+            branch,
+            store.head(),
+            GENESIS,
+            SessionId([0; 16]),
+        );
         write(&mut view);
-        let commit = manager
-            .seal(
-                view,
-                BlockRef {
-                    height: 1,
-                    hash: [1; 32],
-                },
-            )
-            .expect("seal");
+        let commit = store.commit(branch).expect("commit");
 
         GolemAccounts::new(store, commit)
     }
