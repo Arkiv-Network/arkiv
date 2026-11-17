@@ -5,6 +5,10 @@ implementation exists in
 [arkiv-state-db-experiment](https://github.com/scx1332/arkiv-state-db-experiment)
 (issue #9), where the measurements below come from.
 
+It is an alternative to the planned consensus purge (issue #292,
+`docs/purging-spec.md` on `matthiaszimmermann/feat/tokenomics-init`); see
+[Relation to the planned purge](#relation-to-the-planned-purge).
+
 ## Summary
 
 Delete every entity exactly at its recorded expiry block, bound the deletions
@@ -31,9 +35,15 @@ number reaches `expiresAt`; the producer later removes at most 10 per block
 - Dead entities stay in the state and its indexes, so every read, count and
   proof has to exclude them, and the state root commits to rows that no
   longer exist for applications.
-- The producer chooses the keys from a local side database
-  (`arkiv-pruning.db`), so which entities a block removes is not a function
-  of the state.
+- Which entities a block removes is outside consensus. The producer chooses
+  the keys from a local side database (`arkiv-pruning.db`) and lists them in
+  the transaction; the other nodes check only that each listed key has
+  expired (`arkiv_purge_expired`), not that these were the keys to remove. A
+  block that purges nothing is valid, and the producer builds one whenever
+  its database lags or the selection times out. Execution is still
+  deterministic, because the keys are in the block: nodes do not diverge.
+  But the purge is not a function of the state, and no rule makes a producer
+  do it.
 - The purge is unfunded (`purge_gas` is 0).
 
 **Exact expiry with a hard cap.** The alternative, which the reference
@@ -106,6 +116,53 @@ free blocks are never paid twice and never paid out. The events
   them yet.
 - The expiry schedule (entities per block) becomes consensus state.
 
+## Relation to the planned purge
+
+Issue #292 ("Move to consensus based purging") and `docs/purging-spec.md`
+already plan to replace today's purge. Their target keeps expiry and deletion
+apart: an entity disappears from reads at `$expiresAt`, and a system step
+deletes it later, selecting from committed state with a `purge_cursor`, under
+a `purge_budget` (6,000,000 gas to start) outside the block gas limit, prepaid
+by a purge reserve collected at create.
+
+That target and this proposal agree on most of it: the purge is a system step
+before the transactions, every node derives the same deletions from committed
+state, and its work is bounded per block.
+Both remove the `purgeExpired` transaction and the pruning database, and both
+find entities prefilled at block 0, which never appear in a log (#333, #334).
+The prepaid purge reserve fits either.
+
+They differ in what happens when more entities expire than a block can
+delete:
+
+| | Planned purge (`purge_cursor`) | This proposal |
+| --- | --- | --- |
+| Overload shows up as | a backlog of expired entities still in state | a later `expiresAt`, by at most `W` blocks, then a failed write |
+| Who is affected | nobody directly; nodes hold dead bytes | the writer who aimed at the full block |
+| Expired entities in state | yes, until the cursor reaches them | never |
+| Reads, counts, proofs | filter by `$expiresAt` | no filter |
+| Storage between expiry and purge | open (O17 in the spec) | does not arise |
+| `live_bytes` | includes the backlog, so it can block creates | live entities only |
+| Bound on the work | gas budget, metered by GolemDB | count `C`, sized for the worst case |
+| Extra consensus state | `purge_cursor` | entities per expiry block |
+| Recorded `expiresAt` | always as requested | may be later than requested |
+
+The spec sizes the budget at about 55 purges per block for 1 KiB entities.
+The benchmark above created about 125 entities per block, so under that
+load the planned purge still builds a backlog; it drains when writes slow
+down.
+
+A count is a cruder bound than a gas budget: the measurements show a factor
+of about 14 between a typical and a worst-case block of 128. The two can be
+combined: cap an expiry block by its summed deletion bound (D5, from `#meta`)
+instead of by a count, and spill on that.
+
+Earlier documents in `arkiv-architecture` leave the question open:
+ADR-EXE-004 (expiry first in the block, exact deletion; open), ADR-ECO-003
+(price expiry concentration instead of capping it; research), and
+`proposals/expiry-model.md` (per-block autonomous expiry with a budget and a
+queue, written for the OP Stack design).
+
 ## What changes in Arkiv
 
 - The executor deletes exactly at `expiresAt`, in a sweep at the start of
@@ -114,8 +171,13 @@ free blocks are never paid twice and never paid out. The events
   (`arkiv-pruning.db`) and `MAX_PURGE_KEYS` go away.
 - Genesis gains `expiry_per_block` and `W`.
 - Create and extend resolve `E'` and report it in their events.
-- `purge_gas` is replaced by the reserve of `C × max deletion cost` in the
-  block budget.
+- The block budget reserves `C × max deletion cost` for the sweep, in place
+  of `PURGE_GAS_LIMIT` today or `purge_budget` in the planned purge.
+
+Compared with the planned purge (step 2 of `docs/purging-spec.md`), the sweep
+replaces the cursor and the backlog, and create and extend gain the capacity
+check. The system step, the removal of the purge transaction and the reserve
+are the same work.
 
 ## Open questions
 
