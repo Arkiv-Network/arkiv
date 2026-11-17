@@ -15,7 +15,10 @@ test_doc *args:
 # They drive the real binary across a restart, on GolemDB on disk, past reth's
 # persistence threshold.
 #
+# Scoped to arkiv-reth: the workspace's other #[ignore]d test is a benchmark,
+# run by hand.
+#
 # Runs arkiv-reth's slow restart tests, which are #[ignore]d by default
 [group('test')]
-test_ignored *args:
-  cargo test -p arkiv-reth {{locked}} {{_cargo_profile}} {{args}} -- --ignored
+test_slow *args:
+  cargo nextest run {{locked}} {{_nextest_profile}} -p arkiv-reth --run-ignored only {{args}}

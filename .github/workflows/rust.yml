@@ -75,9 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
+      - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
-      - run: just test_ignored
+      - run: just test_slow
 
   udeps:
     runs-on: ubuntu-latest
