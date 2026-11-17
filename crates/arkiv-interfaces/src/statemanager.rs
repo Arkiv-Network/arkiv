@@ -32,10 +32,6 @@ impl BlockRef {
     }
 }
 
-/// The identity of one open [`StateView`] — auto-generated at open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(pub [u8; 16]);
-
 /// Which state a read answers from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadMode {
@@ -316,8 +312,6 @@ pub trait StateView:
 
     /// The block this view reads as its base.
     fn base(&self) -> BlockRef;
-
-    fn session(&self) -> SessionId;
 
     /// Open the transaction's frame: a safe point that
     /// [`discard_frame`](Self::discard_frame) rolls entity and minting-nonce

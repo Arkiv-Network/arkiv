@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::statemanager::{
-    BlockRef, Commitment, EntityUpdates, ReadMode, SessionId, StateCommit, StateView,
+    BlockRef, Commitment, EntityUpdates, ReadMode, StateCommit, StateView,
 };
 use arkiv_interfaces::store::{BranchId, CommitId, ReadTarget, Store, StoreError};
 
@@ -79,19 +79,12 @@ pub struct GolemStateView<S: Store> {
     /// The store keeps the record side; this is the half only the view has.
     frames: Vec<BTreeMap<EntityAddress, EntityUpdates>>,
     block: BlockRef,
-    session: SessionId,
     commitment: Option<Commitment>,
 }
 
 impl<S: Store> GolemStateView<S> {
     /// Stage on `branch` over the state committed at `origin`, as of `block`.
-    pub const fn new(
-        store: S,
-        branch: BranchId,
-        origin: CommitId,
-        block: BlockRef,
-        session: SessionId,
-    ) -> Self {
+    pub const fn new(store: S, branch: BranchId, origin: CommitId, block: BlockRef) -> Self {
         Self {
             store,
             branch,
@@ -99,18 +92,8 @@ impl<S: Store> GolemStateView<S> {
             staged: BTreeMap::new(),
             frames: Vec::new(),
             block,
-            session,
             commitment: None,
         }
-    }
-
-    pub const fn store(&self) -> &S {
-        &self.store
-    }
-
-    /// The branch this view stages on — what a host commits to promote it.
-    pub const fn branch(&self) -> BranchId {
-        self.branch
     }
 
     pub(crate) const fn target(&self, read: ReadMode) -> ReadTarget {
@@ -213,10 +196,6 @@ impl<S: Store> StateView for GolemStateView<S> {
         self.block
     }
 
-    fn session(&self) -> SessionId {
-        self.session
-    }
-
     fn begin_frame(&mut self) -> Result<(), ViewError> {
         GolemStateView::begin_frame(self)
     }
@@ -264,13 +243,7 @@ pub(crate) mod tests {
         let store = MemStore::new();
         let origin = store.head();
         let branch = store.begin(Some(origin)).unwrap();
-        GolemStateView::new(
-            store,
-            branch,
-            origin,
-            BlockRef::new(10, [0xBB; 32]),
-            SessionId([7; 16]),
-        )
+        GolemStateView::new(store, branch, origin, BlockRef::new(10, [0xBB; 32]))
     }
 
     fn entity_of(key: u8) -> Entity {
@@ -280,10 +253,39 @@ pub(crate) mod tests {
         }
     }
 
-    /// The shared `StateView` contract, the same suite the MPT host runs.
+    /// The shared `StateView` contract, the same suite the host view runs.
     #[test]
     fn conformance() {
         arkiv_interfaces::statemanager::conformance::run_all(&view);
+    }
+
+    /// Two views over one store stage on their own branches, so each reads its
+    /// own writes and never the other's. Candidate blocks at one height rely
+    /// on it.
+    #[test]
+    fn two_views_over_one_store_are_independent() {
+        let store = alloc::sync::Arc::new(MemStore::new());
+        let origin = store.head();
+        let open = || {
+            let branch = store.begin(Some(origin)).unwrap();
+            GolemStateView::new(store.clone(), branch, origin, BlockRef::new(10, [0xBB; 32]))
+        };
+        let (mut a, mut b) = (open(), open());
+
+        a.update_entity(EntityUpdates::create(entity_of(1)))
+            .unwrap();
+        b.update_entity(EntityUpdates::create(entity_of(2)))
+            .unwrap();
+
+        let read = |view: &GolemStateView<_>, key: u8| {
+            view.get_entity([key; 32], ReadMode::ViewWithOverlay)
+                .unwrap()
+                .value
+        };
+        assert_eq!(read(&a, 1), Some(entity_of(1)));
+        assert_eq!(read(&b, 2), Some(entity_of(2)));
+        assert_eq!(read(&a, 2), None, "a must not see b's staged write");
+        assert_eq!(read(&b, 1), None, "b must not see a's staged write");
     }
 
     /// The property that makes speculative execution safe: `eth_call` and

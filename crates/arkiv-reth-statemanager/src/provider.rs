@@ -200,7 +200,7 @@ mod tests {
     use super::*;
     use arkiv_interfaces::primitives::UserBalance;
     use arkiv_interfaces::statemanager::{
-        AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore, SessionId,
+        AccountBalancesStore, AccountNoncesStore, BlockRef, EntityCreationNoncesStore,
     };
     use arkiv_interfaces::store::reference::MemStore;
     use std::sync::Arc;
@@ -217,13 +217,8 @@ mod tests {
     ) -> GolemAccounts<Arc<MemStore>> {
         let store = Arc::new(MemStore::new());
         let branch = store.begin(None).expect("begin");
-        let mut view = arkiv_golemdb_state::GolemStateView::new(
-            store.clone(),
-            branch,
-            store.head(),
-            GENESIS,
-            SessionId([0; 16]),
-        );
+        let mut view =
+            arkiv_golemdb_state::GolemStateView::new(store.clone(), branch, store.head(), GENESIS);
         write(&mut view);
         let commit = store.commit(branch).expect("commit");
 

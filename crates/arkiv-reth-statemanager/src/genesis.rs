@@ -161,7 +161,6 @@ mod tests {
     const ALICE: Address = Address::repeat_byte(0xaa);
     const HASH: [u8; 32] = [7; 32];
 
-    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
     fn store() -> HostStore {
         Arc::new(MemStore::new())
     }
@@ -314,7 +313,6 @@ mod root_tests {
     /// balance has to move that root. If it does not, every block advertises
     /// the same root and the field says nothing about the state behind it.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
     fn a_balance_change_moves_the_sealed_state_root() {
         let store: HostStore = Arc::new(MemStore::new());
         seed_genesis(
@@ -341,7 +339,6 @@ mod root_tests {
             spent,
             store.head(),
             arkiv_interfaces::statemanager::BlockRef::new(1, [9; 32]),
-            arkiv_interfaces::statemanager::SessionId([1; 16]),
         );
         view.fetch_sub_balance([0xaa; 20], UserBalance::from_u64(1))
             .expect("debit");

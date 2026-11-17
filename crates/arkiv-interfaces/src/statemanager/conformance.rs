@@ -1,10 +1,9 @@
 //! The [`StateView`] contract, as executable assertions.
 //!
 //! Sibling of [`store::conformance`](crate::store::conformance), and there for
-//! the same reason: Arkiv has two `StateView` implementations — the MPT host
-//! and the GolemDB one — and during the migration both are live. If they
-//! disagree about what a read returns, the two disagree about state, and that
-//! is a fork.
+//! the same reason: Arkiv has two `StateView` implementations — the GolemDB
+//! view and the host view that wraps it. If they disagree about what a read
+//! returns, the two disagree about state, and that is a fork.
 //!
 //! Usage, from an implementation's test module:
 //!
@@ -20,9 +19,8 @@
 //!
 //! # What this does not assert
 //!
-//! - **Commitment values.** Every implementation commits to a different thing
-//!   — the MPT host returns a placeholder, the GolemDB one returns the
-//!   branch's content digest. Only that committing *works* is shared.
+//! - **Commitment values.** They come from the store behind the view. Only
+//!   that committing *works* is shared.
 //! - **Index lookups.** They answer from committed state, and nothing here can
 //!   commit: the suite holds a view, not the store behind it. Covered by each
 //!   implementation's own tests instead.

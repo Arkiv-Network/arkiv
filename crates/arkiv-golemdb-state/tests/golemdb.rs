@@ -13,7 +13,7 @@ use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN,
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::statemanager::{
-    BlockRef, EntityCreationNoncesStore, EntityStore, EntityUpdates, ReadMode, SessionId,
+    BlockRef, EntityCreationNoncesStore, EntityStore, EntityUpdates, ReadMode,
 };
 use arkiv_interfaces::store::Store;
 
@@ -62,13 +62,7 @@ fn view_over(config: GolemDbConfig) -> GolemStateView<GolemDbStore> {
     let store = GolemDbStore::open_memory(&config).expect("open golemdb");
     let origin = store.head();
     let branch = store.begin(Some(origin)).expect("begin");
-    GolemStateView::new(
-        store,
-        branch,
-        origin,
-        BlockRef::new(10, [0xBB; 32]),
-        SessionId([1; 16]),
-    )
+    GolemStateView::new(store, branch, origin, BlockRef::new(10, [0xBB; 32]))
 }
 
 #[test]
