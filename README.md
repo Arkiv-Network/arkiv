@@ -50,7 +50,7 @@ arkiv/
 > **Prerequisites:**
 >
 > - [Rust](https://rust-lang.org/tools/install/) installed
-> - [just](https://just.systems/man/en/packages.html), the command runner
+> - [just](https://just.systems/man/en/packages.html) 1.46 or newer, the command runner
 > - [Docker](https://www.docker.com/)
 > - [Kurtosis](https://docs.kurtosis.com/install)  CLI
 

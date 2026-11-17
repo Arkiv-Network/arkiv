@@ -25,12 +25,17 @@ genesis_image_build:
 kurtosis_check *args:
   python3 scripts/kurtosis/check.py --enclave {{enclave}} {{args}}
 
-# Shows the devnet's enclave, its services and their recent logs
+# `just kurtosis_logs --lines 1000` starts further back; `--no-follow` prints
+# the logs and exits, as CI's diagnostics step does.
+#
+# Shows the devnet's enclave and its services, then follows their logs
 [group('kurtosis')]
-kurtosis_logs name=enclave:
+[arg('lines', long='lines', help='how many of the latest log lines to show first')]
+[arg('follow', long='no-follow', value='false', help='print the logs and exit instead of following them')]
+kurtosis_logs lines="200" follow="true" name=enclave:
   -kurtosis enclave ls
   -kurtosis enclave inspect {{name}}
-  -kurtosis service logs --all-services --num 200 {{name}}
+  -kurtosis service logs --all-services --num {{lines}} {{ if follow == "true" { "--follow" } else { "" } }} {{name}}
 
 # Tears the devnet down
 [group('kurtosis')]

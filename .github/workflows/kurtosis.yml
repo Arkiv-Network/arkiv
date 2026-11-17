@@ -97,7 +97,7 @@ jobs:
 
       - name: Collect Kurtosis diagnostics
         if: always()
-        run: just kurtosis_logs
+        run: just kurtosis_logs --no-follow
 
       - name: Tear down Kurtosis enclave
         if: always()
