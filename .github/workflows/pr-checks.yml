@@ -1,6 +1,7 @@
 # The checks lane: two jobs off two different caches.
 #
-#   tests — cargo nextest over the workspace, from the build cache
+#   tests — cargo nextest over the workspace, then the doc tests, from the
+#           build cache
 #   lint  — cargo fmt, then clippy as a blocking gate, from the clippy cache
 #
 # They were one sequential job until the timings showed why they should not be:
@@ -70,9 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
-      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry is
-      # needed by anything that compiles the workspace — clippy included.
-      - uses: foundry-rs/foundry-toolchain@v1
+      # Every check is a just recipe. They read PROFILE from the job env, and
+      # add `--locked` because the runner sets CI.
+      - uses: taiki-e/install-action@just
       - if: matrix.task == 'tests'
         uses: taiki-e/install-action@nextest
       - uses: oras-project/setup-oras@v2
@@ -81,7 +82,7 @@ jobs:
       # a misformatted push fails in seconds rather than after a 33s restore.
       - name: fmt
         if: matrix.task == 'lint'
-        run: cargo fmt --all --check
+        run: just fmt --check
 
       - name: Restore the shared cache
         id: restore
@@ -114,16 +115,29 @@ jobs:
         run: |
           set -euo pipefail
           t0=$(date +%s)
-          cargo nextest run --workspace --locked --cargo-profile "$PROFILE"
+          just nextest
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      # nextest does not run doc tests. Their libraries and dev-dependencies
+      # come from the same build cache, so this is mostly rustdoc's own compile.
+      # Whether or not nextest passed, so the pull request learns both.
+      - name: doc tests
+        id: doctests
+        if: matrix.task == 'tests' && (success() || failure())
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          just test_doc
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       # Blocking, and now nothing waits behind it: the tests report from their
       # own job regardless of what clippy finds.
-      # Fast because cold-build's clippy lane ran this exact command to
+      # Fast because cold-build's clippy lane ran this exact recipe to
       # produce the cache this job restored, so every untouched crate comes
       # back warm. Any divergence from that invocation — profile, `--no-deps`,
       # the `-D warnings` argument — changes the fingerprint and silently costs
-      # the full 212s again.
+      # the full 212s again. The flags live in just/code_check.just, so only a
+      # different PROFILE can split the two.
       - name: clippy
         id: clippy
         if: matrix.task == 'lint'
@@ -131,14 +145,14 @@ jobs:
           # pipefail matters: without it `tee` would mask clippy's exit status.
           set -euo pipefail
           t0=$(date +%s)
-          # Clippy exits 0 on lint warnings, so `-D warnings` is what makes
-          # this a gate rather than a report.
+          # Clippy exits 0 on lint warnings; the recipe's `-D warnings` is what
+          # makes this a gate rather than a report.
           status=0
-          cargo clippy --workspace --all-targets --locked --profile "$PROFILE" --no-deps \
-            -- -D warnings 2>&1 | tee clippy.log || status=$?
+          just clippy 2>&1 | tee clippy.log || status=$?
           {
             echo "seconds=$(( $(date +%s) - t0 ))"
-            echo "lints=$(grep -c '^error: ' clippy.log || true)"
+            # Not just's own "error: recipe `clippy` failed" line.
+            echo "lints=$(grep '^error: ' clippy.log | grep -vic '^error: recipe ' || true)"
           } >> "$GITHUB_OUTPUT"
           exit $status
 
@@ -152,6 +166,7 @@ jobs:
             echo "| restore | ${{ steps.restore.outputs.seconds }} |"
             if [ "${{ matrix.task }}" = tests ]; then
               echo "| tests | ${{ steps.tests.outputs.seconds }} |"
+              echo "| doc tests | ${{ steps.doctests.outputs.seconds }} |"
             else
               echo "| clippy | ${{ steps.clippy.outputs.seconds }} |"
               echo

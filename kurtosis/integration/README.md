@@ -3,15 +3,17 @@
 Black-box tests that drive the Arkiv devnet through the
 [Arkiv SDK](https://www.npmjs.com/package/@arkiv-network/sdk), run with
 [bun](https://bun.sh). They expect a chain that is already up: in CI the
-`kurtosis.yml` workflow runs them after `scripts/kurtosis/up.py` has brought the
-two-node enclave up and the health check has passed.
+`kurtosis.yml` workflow runs them after `just devnet_up` (`scripts/kurtosis/up.py`)
+has brought the two-node enclave up and the health check has passed.
 
 ```sh
-scripts/kurtosis/up.py            # once; builds the image and starts the enclave
-cd kurtosis/integration
-bun install
-bun test
+just devnet_up                    # once; builds the image and starts the enclave
+just sdk_test                     # bun install + bun test, from the repo root
+just sdk_restart_test             # the follower restart tests, below
 ```
+
+`just sdk_test` passes its arguments to `bun test`; running `bun install` and
+`bun test` by hand in this directory works just as well.
 
 | Variable                 | Default                                    | Meaning                                                 |
 | ------------------------ | ------------------------------------------ | ------------------------------------------------------- |

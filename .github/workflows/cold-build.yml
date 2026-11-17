@@ -67,8 +67,9 @@ jobs:
       # installs. The clippy lane needs them too: check mode still compiles and
       # runs every build script, C and all.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
-      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
-      - uses: foundry-rs/foundry-toolchain@v1
+      # The cargo invocations are just recipes. They read PROFILE from the job
+      # env, and add `--locked` because the runner sets CI.
+      - uses: taiki-e/install-action@just
       - if: matrix.lane == 'build'
         uses: taiki-e/install-action@nextest
       - uses: oras-project/setup-oras@v2
@@ -82,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           t0=$(date +%s)
-          cargo build --workspace --locked --profile "$PROFILE"
+          just build
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       # Compiles the test binaries without running them. dev-dependencies pull
@@ -95,7 +96,7 @@ jobs:
         run: |
           set -euo pipefail
           t0=$(date +%s)
-          cargo nextest run --workspace --locked --cargo-profile "$PROFILE" --no-run
+          just nextest --no-run
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       # The whole clippy lane. Cold, in an empty target dir, which is what
@@ -105,7 +106,9 @@ jobs:
       # The invocation has to match pr-checks exactly — profile, `--no-deps`
       # and the `-D warnings` argument are all part of the fingerprint, and any
       # difference means the restored artifacts are ignored and the pull
-      # request silently pays the full ~212s anyway.
+      # request silently pays the full ~212s anyway. Both run `just clippy`
+      # with the same PROFILE, so the flags live in one place:
+      # just/code_check.just.
       #
       # Not a gate: this workflow's deliverable is the cache. A lint that only
       # main can fix must not stop it from being published, so the status goes
@@ -119,12 +122,12 @@ jobs:
           set -euo pipefail
           t0=$(date +%s)
           status=0
-          cargo clippy --workspace --all-targets --locked --profile "$PROFILE" --no-deps \
-            -- -D warnings 2>&1 | tee clippy.log || status=$?
+          just clippy 2>&1 | tee clippy.log || status=$?
           {
             echo "seconds=$(( $(date +%s) - t0 ))"
             echo "status=$status"
-            echo "lints=$(grep -c '^error: ' clippy.log || true)"
+            # Not just's own "error: recipe `clippy` failed" line.
+            echo "lints=$(grep '^error: ' clippy.log | grep -vic '^error: recipe ' || true)"
           } >> "$GITHUB_OUTPUT"
           # clippy.log sits next to target/, not inside it, so packing is
           # unaffected — but leave nothing for a later glob to pick up.

@@ -1,4 +1,4 @@
-# Builds all artifacts
+# Builds the workspace: arkiv-reth, arkiv-cli and the library crates
 [group('build')]
-build:
-  cargo build --workspace --all-targets --all-features
+build *args:
+  cargo build {{locked}} {{_cargo_profile}} {{args}}

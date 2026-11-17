@@ -8,6 +8,10 @@ scripts/demo/run.py --restart  # 30 seconds, then a stop and a start
 scripts/demo/run.py 10         # or however long, without the restart
 ```
 
+Or build and run in one step with `just demo --restart`. It builds with the
+current `PROFILE` (cargo's default unless set) and runs on exactly those
+binaries.
+
 Nothing it starts is shared: the chain and GolemDB get their own directories, so two runs can overlap.
 
 | Flag / variable | Meaning |

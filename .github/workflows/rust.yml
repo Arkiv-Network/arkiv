@@ -18,12 +18,16 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Every job below runs a just recipe. No PROFILE is set here, so the recipes
+  # use cargo's default profile, and they add `--locked` because the runner
+  # sets CI.
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - run: cargo fmt --all --check
+      - uses: taiki-e/install-action@just
+      - run: just fmt --check
 
   build:
     runs-on: ubuntu-latest
@@ -37,11 +41,10 @@ jobs:
       - uses: actions/checkout@v7
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
-      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
-      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: taiki-e/install-action@just
       # Caches ~/.cargo registry+git and ./target, keyed on Cargo.lock.
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --locked
+      - run: just build
 
   test:
     runs-on: ubuntu-latest
@@ -54,12 +57,12 @@ jobs:
       - uses: actions/checkout@v7
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
-      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
-      - uses: foundry-rs/foundry-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       # nextest is the test runner; installed from a prebuilt binary.
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --locked
+      - uses: taiki-e/install-action@just
+      # nextest, then the doc tests, which nextest does not run.
+      - run: just test
 
   # arkiv-reth's restart tests are #[ignore] by default because they are slow:
   # they drive the real binary across a restart, on GolemDB on disk, past
@@ -72,8 +75,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
+      - uses: taiki-e/install-action@just
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p arkiv-reth --locked -- --ignored
+      - run: just test_ignored
 
   udeps:
     runs-on: ubuntu-latest
@@ -82,24 +86,18 @@ jobs:
     # analysis build doesn't OOM the runner's linker.
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
-      # Later nightlies fail to compile turso's `branches` 0.4 dependency.
-      NIGHTLY: nightly-2026-10-03
     steps:
       - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@just
       # cargo-udeps needs a nightly rustc to run its analysis, independent of
-      # the workspace's pinned 1.97 stable toolchain.
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.NIGHTLY }}
+      # the workspace's pinned stable toolchain. The pin lives next to the
+      # recipe, in just/code_check.just; this only installs what it names.
+      - run: rustup toolchain install "$(just --evaluate udeps_toolchain)" --profile minimal
       # reth pulls C deps (libmdbx via bindgen, etc.) — same set the Dockerfile installs.
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
-      # arkiv-bindings' build.rs shells out to `forge build`, so Foundry must be on PATH.
-      - uses: foundry-rs/foundry-toolchain@v1
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-udeps
-      # rust-toolchain.toml pins 1.97, which overrides `rustup default nightly`;
-      # `+$NIGHTLY` is needed to actually invoke the nightly rustc udeps requires.
-      - run: cargo +"$NIGHTLY" udeps --workspace --locked
+      - run: just udeps
 
   # Builds all three images once per platform, each leg on a runner of that
   # architecture. Each platform job pushes every image by digest only;

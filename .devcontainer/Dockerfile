@@ -1,6 +1,6 @@
 # A light dev container for arkiv: the pinned Rust toolchain plus the system
 # packages the full workspace build needs (reth's bindgen and C deps), plus
-# what CI's tests run with: cargo-nextest. Nothing else —
+# what CI runs its checks with: just and cargo-nextest. Nothing else —
 # no Docker socket, no Kurtosis, no Foundry. See devcontainer.json.
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
@@ -17,6 +17,10 @@ RUN case "$(dpkg --print-architecture)" in \
         *) echo "no cargo-nextest build for $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
     && curl -LsSf "https://get.nexte.st/latest/$platform" | tar zxf - -C "$CARGO_HOME/bin"
+
+# just, which every task in the repo runs through (see the Justfile).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+    | bash -s -- --to "$CARGO_HOME/bin"
 
 # Install the toolchain rust-toolchain.toml pins (channel and components) into
 # the image, so the first `cargo` call in the container does not download it.

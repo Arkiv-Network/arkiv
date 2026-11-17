@@ -45,7 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential zstd
-      - uses: foundry-rs/foundry-toolchain@v1
+      # The build is a just recipe. It reads PROFILE from the job env, and adds
+      # `--locked` because the runner sets CI.
+      - uses: taiki-e/install-action@just
       - uses: oras-project/setup-oras@v2
 
       - name: Restore the shared cache
@@ -78,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           t0=$(date +%s)
-          cargo build --workspace --locked --profile "$PROFILE"
+          just build
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
       # The binaries are already stripped by the profile, so there is nothing
