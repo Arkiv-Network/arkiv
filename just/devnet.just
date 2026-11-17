@@ -3,13 +3,22 @@ enclave := "arkiv-harness"
 
 _bun_frozen := if _ci != "" { "--frozen-lockfile" } else { "" }
 
-# Set ARKIV_RETH_BINARY to package an already-built binary instead of
-# compiling the workspace inside Docker.
-#
-# Builds the arkiv-reth image and brings up the two-node devnet in Kurtosis
+# Builds the images from source and brings up the two-node devnet in Kurtosis
 [group('devnet')]
-devnet_up name=enclave:
+devnet_up name=enclave: image genesis_image
   python3 scripts/kurtosis/up.py {{name}}
+
+# The binary must suit the image's glibc; see image_prebuilt.
+#
+# Packages an already-built arkiv-reth (see `just build`) and brings up the devnet on it
+[group('devnet')]
+devnet_up_prebuilt binary=(bin_dir / "arkiv-reth") name=enclave: (image_prebuilt binary) genesis_image
+  python3 scripts/kurtosis/up.py {{name}}
+
+# Builds the genesis generator image, which takes its arkiv-reth from arkiv-reth:dev
+[group('devnet')]
+genesis_image:
+  docker build -t arkiv-genesis-generator:dev kurtosis/genesis-generator
 
 # Checks the devnet: RPC, block production, and the follower keeping up
 [group('devnet')]

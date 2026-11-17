@@ -47,6 +47,9 @@ jobs:
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
       ARKIV_LOG_FILTER: ${{ inputs.log_filter || 'debug' }}
+      # Two compile jobs keep a from-source image build within the runner's
+      # memory; `just image` passes this into the Docker build.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v7
       # The image and stack steps are just recipes (just/docker.just), the same
@@ -69,16 +72,15 @@ jobs:
           docker compose version
           python3 --version
 
-      # Same two paths as scripts/kurtosis/up.py, and the same image tag the
-      # compose file expects. Two build jobs keep the from-source compile
-      # within the runner's memory.
+      # The same two image recipes `just devnet_up` and `devnet_up_prebuilt`
+      # use, and the same image tag the compose file expects.
       - name: Build the arkiv-reth:dev image
         run: |
           set -euxo pipefail
           if [ -n "$ARTIFACT" ]; then
             just image_prebuilt prebuilt/arkiv-reth
           else
-            just image --build-arg CARGO_BUILD_JOBS=2
+            just image
           fi
           docker image inspect arkiv-reth:dev --format '{{.Id}} {{.Size}} bytes'
 

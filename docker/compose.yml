@@ -1,17 +1,18 @@
 # A single-node dev stack: one auto-sealing arkiv-reth, on GolemDB.
 #
-#   docker buildx build -t arkiv-reth:dev -f docker/arkiv-reth.Dockerfile .
-#   docker compose -f docker/compose.yml up -d --wait
-#   scripts/kurtosis/check.py --no-enclave --sequencer-rpc http://127.0.0.1:8545
-#   docker compose -f docker/compose.yml down -v
+#   just image          # or `just image_prebuilt`, after `just build`
+#   just stack_up
+#   just stack_check
+#   just stack_down
 #
 # For a real two-node network with a consensus layer, use Kurtosis
-# (scripts/kurtosis/up.py). This is for a node you can poke at, without the
+# (`just devnet_up`). This is for a node you can poke at, without the
 # enclave.
 
 services:
   arkiv-reth:
-    # Built by scripts/kurtosis/up.py, or by hand with the buildx line above.
+    # Built by `just image` or `just image_prebuilt`, which the devnet
+    # recipes run too.
     image: arkiv-reth:dev
     ports:
       - "8545:8545"

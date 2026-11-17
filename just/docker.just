@@ -2,20 +2,27 @@
 # with no consensus layer. For the two-node network, see devnet.just.
 compose := "docker/compose.yml"
 
+# CARGO_BUILD_JOBS, when set, caps the compile jobs inside Docker as it would on
+# the host; unset, the Dockerfile's default applies.
+#
 # Builds the arkiv-reth:dev image from source, compiling inside Docker
 [group('docker')]
 image *args:
-  docker buildx build -t arkiv-reth:dev -f docker/arkiv-reth.Dockerfile {{args}} --load .
+  docker buildx build -t arkiv-reth:dev -f docker/arkiv-reth.Dockerfile --build-arg CARGO_BUILD_JOBS {{args}} --load .
 
 # The Dockerfile's base image is ubuntu:24.04, the CI runner's distribution. A
 # binary built on a newer host needs a newer glibc: set
-# ARKIV_PREBUILT_BASE_IMAGE (e.g. ubuntu:26.04), the variable up.py reads too.
+# ARKIV_PREBUILT_BASE_IMAGE (e.g. ubuntu:26.04).
 #
 # Packages an already-built arkiv-reth binary into the arkiv-reth:dev image
 [group('docker')]
 image_prebuilt binary=(bin_dir / "arkiv-reth"):
   #!/usr/bin/env bash
   set -euo pipefail
+  if [ ! -f "{{binary}}" ]; then
+    echo "error: no arkiv-reth at {{binary}}; build it with \`just build\`" >&2
+    exit 1
+  fi
   base=()
   if [ -n "${ARKIV_PREBUILT_BASE_IMAGE:-}" ]; then
     base=(--build-arg "BASE_IMAGE=$ARKIV_PREBUILT_BASE_IMAGE")

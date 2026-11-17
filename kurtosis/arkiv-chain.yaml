@@ -53,7 +53,7 @@ participants:
 # GolemDB's settings in the genesis give block 0 GolemDB's state root, and so a
 # hash the stock generator does not derive. This image adds the settings and
 # writes arkiv-reth's block 0 to SHADOW_FORK_FILE, which the CL genesis is then
-# built on (kurtosis/genesis-generator; up.py builds it).
+# built on (kurtosis/genesis-generator; `just genesis_image` builds it).
 ethereum_genesis_generator_params:
   image: arkiv-genesis-generator:dev
   extra_env:

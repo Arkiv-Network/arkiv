@@ -62,6 +62,7 @@ just build                     # build the workspace
 just test                      # nextest, then the doc tests
 just check_code                # rustfmt check + clippy, as CI gates them
 just devnet_up                 # build arkiv-reth image, run devnet
+just devnet_up_prebuilt        # the same, on the binary `just build` made
 just devnet_down               # tear down
 ```
 

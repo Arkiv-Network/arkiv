@@ -33,6 +33,9 @@ jobs:
       CI: "true"
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
+      # Two compile jobs keep a from-source image build within the runner's
+      # memory; `just image` passes this into the Docker build.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,13 +73,11 @@ jobs:
       - name: Start sequencer and follower and run health check
         run: |
           set -euxo pipefail
-          # up.py packages this binary when the variable is set, and builds the
-          # image from source when it is empty.
           if [ -n "$ARTIFACT" ]; then
-            chmod +x prebuilt/arkiv-reth
-            export ARKIV_RETH_BINARY="$PWD/prebuilt/arkiv-reth"
+            just devnet_up_prebuilt prebuilt/arkiv-reth
+          else
+            just devnet_up
           fi
-          just devnet_up
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
