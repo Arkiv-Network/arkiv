@@ -34,13 +34,13 @@ jobs:
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
       # Two compile jobs keep a from-source image build within the runner's
-      # memory; `just image` passes this into the Docker build.
+      # memory; `just image_build` passes this into the Docker build.
       CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # The devnet and SDK test steps are just recipes (just/devnet.just), the
+      # The devnet and SDK test steps are just recipes (just/kurtosis.just), the
       # same ones used locally.
       - uses: taiki-e/install-action@just
 
@@ -74,9 +74,9 @@ jobs:
         run: |
           set -euxo pipefail
           if [ -n "$ARTIFACT" ]; then
-            just devnet_up_prebuilt prebuilt/arkiv-reth
+            just kurtosis_up_prebuilt prebuilt/arkiv-reth
           else
-            just devnet_up
+            just kurtosis_up
           fi
 
       - name: Install bun
@@ -87,18 +87,18 @@ jobs:
       # Drives the running enclave through the Arkiv SDK; see
       # kurtosis/integration/README.md for what is covered.
       - name: Run SDK integration tests
-        run: just sdk_test
+        run: just test_kurtosis_sdk
 
       # After the other tests, and whether or not they passed: these stop and
       # start the follower, and one that fails to catch up stays behind.
       - name: Restart the follower and check it catches up
         if: success() || failure()
-        run: just sdk_restart_test
+        run: just test_kurtosis_sdk_restart
 
       - name: Collect Kurtosis diagnostics
         if: always()
-        run: just devnet_logs
+        run: just kurtosis_logs
 
       - name: Tear down Kurtosis enclave
         if: always()
-        run: just devnet_down
+        run: just kurtosis_down

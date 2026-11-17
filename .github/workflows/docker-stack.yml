@@ -48,7 +48,7 @@ jobs:
       ARTIFACT: ${{ inputs.artifact }}
       ARKIV_LOG_FILTER: ${{ inputs.log_filter || 'debug' }}
       # Two compile jobs keep a from-source image build within the runner's
-      # memory; `just image` passes this into the Docker build.
+      # memory; `just image_build` passes this into the Docker build.
       CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v7
@@ -72,32 +72,33 @@ jobs:
           docker compose version
           python3 --version
 
-      # The same two image recipes `just devnet_up` and `devnet_up_prebuilt`
-      # use, and the same image tag the compose file expects.
+      # The same two image recipes `just kurtosis_up` and
+      # `kurtosis_up_prebuilt` use, and the same image tag the compose file
+      # expects.
       - name: Build the arkiv-reth:dev image
         run: |
           set -euxo pipefail
           if [ -n "$ARTIFACT" ]; then
-            just image_prebuilt prebuilt/arkiv-reth
+            just image_prebuilt_build prebuilt/arkiv-reth
           else
-            just image
+            just image_build
           fi
           docker image inspect arkiv-reth:dev --format '{{.Id}} {{.Size}} bytes'
 
       # `up --wait` blocks on both healthchecks, so a failure here means a
       # container never became healthy rather than a race in a later step.
       - name: Bring up the stack
-        run: just stack_up
+        run: just docker_compose_up
 
       # The node's own startup logs, before anything else touches it: this is
       # where a bad genesis or a refused flag shows up.
       - name: Node startup logs
-        run: just stack_logs arkiv-reth
+        run: just docker_compose_logs arkiv-reth
 
       # No --follower-rpc: one node, so the cross-node agreement checks are
       # skipped and this verifies RPC reachability and block production.
       - name: Check the node is producing blocks
-        run: just stack_check --wait 60 --samples 3 --no-color
+        run: just docker_compose_check --wait 60 --samples 3 --no-color
 
       - name: Show a block and the arkiv_* namespace
         run: |
@@ -117,8 +118,8 @@ jobs:
       # not only to debug failures.
       - name: Container logs
         if: always()
-        run: just stack_logs --tail 400 arkiv-reth
+        run: just docker_compose_logs --tail 400 arkiv-reth
 
       - name: Tear down
         if: always()
-        run: just stack_down
+        run: just docker_compose_down

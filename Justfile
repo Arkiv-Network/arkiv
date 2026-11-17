@@ -2,7 +2,8 @@ import "./just/build.just"
 import "./just/code_check.just"
 import "./just/test.just"
 import "./just/docker.just"
-import "./just/devnet.just"
+import "./just/kurtosis.just"
+import "./just/demo.just"
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 

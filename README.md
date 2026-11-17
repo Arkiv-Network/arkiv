@@ -61,15 +61,15 @@ them all.
 just build                     # build the workspace
 just test                      # nextest, then the doc tests
 just check_code                # rustfmt check + clippy, as CI gates them
-just devnet_up                 # build arkiv-reth image, run devnet
-just devnet_up_prebuilt        # the same, on the binary `just build` made
-just devnet_down               # tear down
+just kurtosis_up               # build arkiv-reth image, run devnet
+just kurtosis_up_prebuilt      # the same, on the binary `just build` made
+just kurtosis_down             # tear down
 ```
 
 The recipes build with cargo's default profile. Set `PROFILE` to change it,
 as CI does: `PROFILE=dev-fast just build`, or `just profile=dev-fast build`.
 
-`just devnet_up` builds the `arkiv-reth` image and brings up a two-node Arkiv-only
+`just kurtosis_up` builds the `arkiv-reth` image and brings up a two-node Arkiv-only
 network in one enclave via `ethereum-package`: one Lighthouse participant with
 one validator (the sequencer) and one with zero validators (the follower).
 There is no L1/L2 or settlement-chain coordination.

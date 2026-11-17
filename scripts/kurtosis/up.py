@@ -4,7 +4,7 @@
 The Arkiv chain is run from the remote ethereum-package with the local
 arkiv-reth execution client image and Lighthouse consensus client.
 
-This script builds nothing: `just devnet_up` (or `just devnet_up_prebuilt`)
+This script builds nothing: `just kurtosis_up` (or `just kurtosis_up_prebuilt`)
 builds the arkiv-reth:dev and arkiv-genesis-generator:dev images first, then
 runs it.
 
@@ -48,7 +48,7 @@ def require_images():
         if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode
     ]
     if missing:
-        sys.exit(f"missing image(s) {', '.join(missing)}: build them with `just devnet_up`")
+        sys.exit(f"missing image(s) {', '.join(missing)}: build them with `just kurtosis_up`")
 
 
 def remove_stopped_enclave(name):

@@ -1,5 +1,5 @@
 # The single-node dev stack: one auto-sealing `arkiv-reth --dev` on GolemDB,
-# with no consensus layer. For the two-node network, see devnet.just.
+# with no consensus layer. For the two-node network, see kurtosis.just.
 compose := "docker/compose.yml"
 
 # CARGO_BUILD_JOBS, when set, caps the compile jobs inside Docker as it would on
@@ -7,7 +7,7 @@ compose := "docker/compose.yml"
 #
 # Builds the arkiv-reth:dev image from source, compiling inside Docker
 [group('docker')]
-image *args:
+image_build *args:
   docker buildx build -t arkiv-reth:dev -f docker/arkiv-reth.Dockerfile --build-arg CARGO_BUILD_JOBS {{args}} --load .
 
 # The Dockerfile's base image is ubuntu:24.04, the CI runner's distribution. A
@@ -16,7 +16,7 @@ image *args:
 #
 # Packages an already-built arkiv-reth binary into the arkiv-reth:dev image
 [group('docker')]
-image_prebuilt binary=(bin_dir / "arkiv-reth"):
+image_prebuilt_build binary=(bin_dir / "arkiv-reth"):
   #!/usr/bin/env bash
   set -euo pipefail
   if [ ! -f "{{binary}}" ]; then
@@ -40,22 +40,22 @@ image_prebuilt binary=(bin_dir / "arkiv-reth"):
 
 # Starts the single-node stack on the arkiv-reth:dev image and waits until it is healthy
 [group('docker')]
-stack_up:
+docker_compose_up:
   docker compose -f {{compose}} up -d --wait
   docker compose -f {{compose}} ps
 
 # Checks the stack's node answers RPC and produces blocks
 [group('docker')]
-stack_check *args:
+docker_compose_check *args:
   python3 scripts/kurtosis/check.py --no-enclave --sequencer-rpc http://127.0.0.1:8545 {{args}}
 
-# Shows the stack's containers and their logs; e.g. `just stack_logs --tail 100 arkiv-reth`
+# Shows the stack's containers and their logs; e.g. `just docker_compose_logs --tail 100 arkiv-reth`
 [group('docker')]
-stack_logs *args:
+docker_compose_logs *args:
   docker compose -f {{compose}} ps -a
   docker compose -f {{compose}} logs --no-color {{args}}
 
 # Stops the single-node stack and deletes its volumes
 [group('docker')]
-stack_down:
+docker_compose_down:
   docker compose -f {{compose}} down -v
