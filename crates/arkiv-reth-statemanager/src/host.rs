@@ -29,13 +29,12 @@ use arkiv_interfaces::primitives::{
 };
 use arkiv_interfaces::statemanager::{
     AccountBalancesStore, AccountNoncesStore, BlockRef, Commitment, EntityCreationNoncesStore,
-    EntityStore, EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode, SessionId,
-    StateCommit, StateView, StoredEntity,
+    EntityStore, EntityUpdates, EqualityIndexStore, RangeIndexStore, ReadMode, StateCommit,
+    StateView, StoredEntity,
 };
 use arkiv_interfaces::store::{
     BranchId, CommitId, Metered, SealedCommit, Store, StoreError, StoreExt,
 };
-use core::sync::atomic::{AtomicU64, Ordering};
 use reth_ethereum::evm::primitives::Database;
 use reth_ethereum::evm::revm::state::EvmState;
 use std::sync::{Condvar, Mutex};
@@ -351,10 +350,6 @@ where
         self.golem.base()
     }
 
-    fn session(&self) -> SessionId {
-        self.golem.session()
-    }
-
     /// The frame covers what GolemDB holds. The account mirror is not rolled
     /// back with it, which is why account writes stay outside the frame.
     fn begin_frame(&mut self) -> Result<(), <Self as StateView>::Error> {
@@ -393,18 +388,8 @@ pub fn host_manager<'a, DB: Database>(
     parent: BlockRef,
 ) -> Result<HostStateView<WriteOverlay<'a, DB>>, ViewError> {
     let origin = store.head();
-    let golem = GolemStateView::new(store.clone(), branch, origin, parent, next_session());
+    let golem = GolemStateView::new(store.clone(), branch, origin, parent);
     Ok(HostStateView::new(golem, WriteOverlay::new(db)))
-}
-
-/// Session ids for host-opened views: a process-local counter, which is all a
-/// `SessionId` distinguishes.
-fn next_session() -> SessionId {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut bytes = [0u8; 16];
-    bytes[..4].copy_from_slice(&std::process::id().to_be_bytes());
-    bytes[8..].copy_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-    SessionId(bytes)
 }
 
 impl<'a, DB: Database> HostStateView<WriteOverlay<'a, DB>> {
@@ -802,11 +787,11 @@ mod tests {
         let store: HostStore = Arc::new(MemStore::new());
         let branch = store.begin(None).expect("begin");
         let head = store.head();
-        let golem = GolemStateView::new(store, branch, head, GENESIS, SessionId([0; 16]));
+        let golem = GolemStateView::new(store, branch, head, GENESIS);
         HostStateView::new(golem, MemAccounts::default())
     }
 
-    /// The same suite `MptStateView` and `GolemStateView` pass. A host that
+    /// The same suite `GolemStateView` passes. A host that
     /// splits state across two backends has to be indistinguishable from one
     /// that does not, or the split is observable and therefore consensus.
     #[test]

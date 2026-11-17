@@ -1644,13 +1644,7 @@ mod tests {
         let store = std::sync::Arc::new(arkiv_interfaces::store::reference::MemStore::new());
         let branch = store.begin(None).expect("begin");
         let head = store.head();
-        arkiv_golemdb_state::GolemStateView::new(
-            store,
-            branch,
-            head,
-            CLAMP_GENESIS,
-            arkiv_interfaces::statemanager::SessionId([0; 16]),
-        )
+        arkiv_golemdb_state::GolemStateView::new(store, branch, head, CLAMP_GENESIS)
     }
 
     fn clamp_view(
@@ -1945,13 +1939,7 @@ mod tests {
         branch: BranchId,
     ) -> arkiv_golemdb_state::GolemStateView<HostStore> {
         use arkiv_interfaces::store::Store;
-        arkiv_golemdb_state::GolemStateView::new(
-            store.clone(),
-            branch,
-            store.head(),
-            CLAMP_GENESIS,
-            arkiv_interfaces::statemanager::SessionId([9; 16]),
-        )
+        arkiv_golemdb_state::GolemStateView::new(store.clone(), branch, store.head(), CLAMP_GENESIS)
     }
 
     /// A call to [`ARKIV_ADDRESS`] from the funded sender with ample gas.

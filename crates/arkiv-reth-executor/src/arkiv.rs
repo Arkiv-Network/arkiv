@@ -798,13 +798,7 @@ mod tests {
     fn view_on(store: GolemDbStore, entities: &[Entity]) -> View {
         let branch = store.begin(None).expect("begin");
         {
-            let mut staging = GolemStateView::new(
-                store.clone(),
-                branch,
-                store.head(),
-                GENESIS,
-                arkiv_interfaces::statemanager::SessionId([0; 16]),
-            );
+            let mut staging = GolemStateView::new(store.clone(), branch, store.head(), GENESIS);
             for entity in entities {
                 staging
                     .update_entity(EntityUpdates::create(entity.clone()))
@@ -815,13 +809,7 @@ mod tests {
             .commit_tagged(branch, GENESIS.hash)
             .expect("commit base");
         let branch = store.begin(Some(base)).expect("begin");
-        GolemStateView::new(
-            store,
-            branch,
-            base,
-            GENESIS,
-            arkiv_interfaces::statemanager::SessionId([1; 16]),
-        )
+        GolemStateView::new(store, branch, base, GENESIS)
     }
 
     /// An empty view over a GolemDB that charges 1 for every unit of work.
