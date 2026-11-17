@@ -753,9 +753,6 @@ pub enum StoreError {
     /// Segment storage is specified upstream but unimplemented there today, so
     /// a store may honestly answer "not me" rather than pretend.
     NotImplemented,
-    /// The `key` argument disagreed with the branch lineage's key-assignment
-    /// mode.
-    KeyModeMismatch,
     /// A range or prefix op against a type whose [`IndexClass`] lacks it.
     InvalidQuery,
     InvalidArgument,

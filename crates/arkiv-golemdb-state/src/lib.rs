@@ -10,10 +10,8 @@ extern crate alloc;
 pub mod accounts;
 pub mod entities;
 pub mod indices;
-pub mod manager;
 pub mod view;
 
-pub use manager::GolemStateManager;
 pub use view::{GolemStateView, ViewError};
 
 /// The node carries one erased store handle, so nothing downstream has to be

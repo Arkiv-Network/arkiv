@@ -101,12 +101,6 @@ impl Ident32 {
         self.0
     }
 
-    /// Wrap a raw word, without validating it — for reading names *back* out of
-    /// ABI data that the node already accepted.
-    pub fn from_word(word: FixedBytes<32>) -> Self {
-        Self(word)
-    }
-
     /// Encode a **system** attribute name (leading `$`). No client may write
     /// one — this exists to build the triples the engine must reject.
     /// [`Ident32::encode`] refuses these by design — its leading-byte charset

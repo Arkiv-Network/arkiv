@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use arkiv_interfaces::primitives::EntityAddress;
 use arkiv_interfaces::statemanager::{
-    BlockRef, Commitment, EntityUpdates, ReadMode, SessionId, StateCommit, StateView, StoreKind,
+    BlockRef, Commitment, EntityUpdates, ReadMode, SessionId, StateCommit, StateView,
 };
 use arkiv_interfaces::store::{BranchId, CommitId, ReadTarget, Store, StoreError};
 
@@ -30,11 +30,6 @@ pub enum ViewError {
     Account(AccountError),
     Index(IndexError),
     Store(StoreError),
-    /// No commit carries that block's hash as its tag.
-    UnknownBlock,
-    /// A view was asked for over a block that is not the tip. Writes only ever
-    /// extend head; reading the past is a commit-targeted read, not a branch.
-    NotTheTip,
     /// A frame was merged or discarded without one being open.
     NoOpenFrame,
     /// A frame was begun while one was already open. Frames do not nest.
@@ -107,11 +102,6 @@ impl<S: Store> GolemStateView<S> {
             session,
             commitment: None,
         }
-    }
-
-    /// Give the store back.
-    pub fn into_store(self) -> S {
-        self.store
     }
 
     pub const fn store(&self) -> &S {
@@ -225,11 +215,6 @@ impl<S: Store> StateView for GolemStateView<S> {
 
     fn session(&self) -> SessionId {
         self.session
-    }
-
-    /// One store backs them all, so either all are here or none is.
-    fn has_store(&self, _store: StoreKind) -> bool {
-        true
     }
 
     fn begin_frame(&mut self) -> Result<(), ViewError> {

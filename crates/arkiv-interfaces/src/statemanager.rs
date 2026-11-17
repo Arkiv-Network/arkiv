@@ -1,7 +1,7 @@
-//! [`StateManager`] — the single seam over all of Arkiv's state. It only
+//! [`StateView`] — the single seam over all of Arkiv's state. It only
 //! speaks Arkiv types and never leaks host primitives.
 //!
-//! The manager mints [`StateView`]s at a block. Writes stage into the view's
+//! A view reads and stages state at one block. Writes stage into the view's
 //! overlay, reads pick [`ReadMode`], [`StateView::commit`] finalizes each
 //! store, and a committed view graduates into a [`StateCommit`]. Two views at
 //! the same block are independent — that is simulation. There is no rewind.
@@ -44,17 +44,6 @@ pub enum ReadMode {
     /// The base plus this view's staged (uncommitted) writes.
     #[default]
     ViewWithOverlay,
-}
-
-/// The stores a [`StateView`] can present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StoreKind {
-    Entities,
-    EqualityIndex,
-    RangeIndex,
-    AccountBalances,
-    AccountNonces,
-    EntityCreationNonces,
 }
 
 /// A partial write to one entity: `None` leaves a field alone, `attributes`
@@ -330,10 +319,6 @@ pub trait StateView:
 
     fn session(&self) -> SessionId;
 
-    /// The backend retains a bounded window of heights per store, so an old
-    /// view may lack some.
-    fn has_store(&self, store: StoreKind) -> bool;
-
     /// Open the transaction's frame: a safe point that
     /// [`discard_frame`](Self::discard_frame) rolls entity and minting-nonce
     /// writes back to, delta log included.
@@ -349,88 +334,6 @@ pub trait StateView:
 
     /// Roll the open frame's writes back.
     fn discard_frame(&mut self) -> Result<(), <Self as StateView>::Error>;
-
-    // Each store, narrowed to its own trait — `_mut` for the write half. The
-    // view *is* every store; these just present one at a time. The indexes are
-    // read-only: the store maintains them as entities are written.
-
-    fn entities(&self) -> &impl EntityStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn entities_mut(&mut self) -> &mut impl EntityStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn equality_index(&self) -> &impl EqualityIndexStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn range_index(&self) -> &impl RangeIndexStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn account_balances(&self) -> &impl AccountBalancesStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn account_balances_mut(
-        &mut self,
-    ) -> &mut impl AccountBalancesStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn account_nonces(&self) -> &impl AccountNoncesStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn account_nonces_mut(
-        &mut self,
-    ) -> &mut impl AccountNoncesStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn entity_creation_nonces(
-        &self,
-    ) -> &impl EntityCreationNoncesStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    fn entity_creation_nonces_mut(
-        &mut self,
-    ) -> &mut impl EntityCreationNoncesStore<Error = <Self as StateView>::Error>
-    where
-        Self: Sized,
-    {
-        self
-    }
 
     /// Commit every store.
     fn commit(&mut self) -> Result<(), <Self as StateView>::Error> {
@@ -450,16 +353,6 @@ pub trait StateView:
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
-
-/// Mints [`StateView`]s.
-pub trait StateManager {
-    type Error: Debug;
-    type View: StateView<Error = Self::Error>;
-
-    /// Open a view over the state as committed through `at`, with a fresh
-    /// [`SessionId`].
-    fn view(&self, at: BlockRef) -> Result<Self::View, Self::Error>;
-}
 
 #[cfg(test)]
 mod tests {

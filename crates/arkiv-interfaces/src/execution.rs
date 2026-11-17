@@ -1,4 +1,4 @@
-//! Running transactions and blocks.
+//! Running transactions.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -6,7 +6,6 @@ use core::fmt;
 use crate::entity::{Attribute, AttributeValue, CreationFlags};
 use crate::gas::GasBreakdown;
 use crate::primitives::{BlockNumber, EntityAddress, Gas, UserAddress};
-use crate::statemanager::{BlockRef, StateCommit, StateView};
 
 /// What a transaction executor needs to know about its context. No EVM call
 /// types — just these fields.
@@ -302,55 +301,4 @@ pub enum OpKind {
     ExtendExpiry,
     Transfer,
     Delete,
-}
-
-/// Runs one transaction: decode its operations, check them, and stage the
-/// resulting changes into the block's [`StateView`].
-///
-/// There is no separate draft: the view's overlay **is** the block's
-/// changes-in-progress. Reads through the view
-/// ([`ViewWithOverlay`](crate::statemanager::ReadMode::ViewWithOverlay)) see the
-/// committed base plus whatever earlier transactions in the same block already
-/// staged; nothing reaches the base until the block commits the view.
-///
-/// A transaction is all-or-nothing: if any operation fails, the overlay must be
-/// left exactly as it was. How — validating every operation before staging any
-/// write, or working a scratch view and folding it in on success — is the
-/// implementor's choice.
-pub trait TransactionExecutor {
-    /// The view this executor reads and stages through.
-    type State: StateView;
-    /// Error type — your choice; it only has to be `Debug`.
-    type Error: core::fmt::Debug;
-
-    /// Run `op_bytes` under `env`, reading `state` and staging this
-    /// transaction's changes into its overlay.
-    fn execute(
-        &self,
-        env: &ExecEnv,
-        state: &mut Self::State,
-        op_bytes: &[u8],
-    ) -> Result<ExecOutput, Self::Error>;
-}
-
-/// Runs a block of transactions and, on commit, produces its commitments.
-///
-/// One block, one view: `begin_block` opens a [`StateView`] at the parent,
-/// every transaction stages into it, and `commit_block` commits the view and
-/// graduates it into the block's [`StateCommit`]. There is no rollback — a
-/// reorg is served by opening a view at the surviving block, never by undoing
-/// this one.
-pub trait BlockExecutor {
-    /// Error type — your choice; it only has to be `Debug`.
-    type Error: core::fmt::Debug;
-
-    /// Start a new block on top of `parent`.
-    fn begin_block(&mut self, parent: BlockRef) -> Result<(), Self::Error>;
-
-    /// Run one transaction in the current block.
-    fn execute_tx(&mut self, env: &ExecEnv, op_bytes: &[u8]) -> Result<ExecOutput, Self::Error>;
-
-    /// Finish the block: commit the view, seal the block, and graduate the
-    /// view into its [`StateCommit`].
-    fn commit_block(&mut self) -> Result<StateCommit, Self::Error>;
 }

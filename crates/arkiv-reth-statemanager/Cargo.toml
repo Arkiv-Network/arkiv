@@ -10,7 +10,7 @@ license.workspace = true
 # commits.
 
 [dependencies]
-# The StateManager trait family this crate implements.
+# The StateView traits this crate implements.
 arkiv-interfaces.workspace = true
 arkiv-golemdb-state.workspace = true
 

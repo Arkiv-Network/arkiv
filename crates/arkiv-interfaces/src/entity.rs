@@ -41,18 +41,6 @@ impl Entity {
     }
 }
 
-/// An [`Entity`] without its attributes — enough for a query that only needs
-/// identity and lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct EntityMeta {
-    pub key: EntityAddress,
-    pub creator: UserAddress,
-    pub owner: UserAddress,
-    pub created_at: BlockNumber,
-    pub updated_at: BlockNumber,
-    pub expires_at: BlockNumber,
-}
-
 /// A `(key, value, indexed)` attribute. The value carries its own type — see
 /// [`AttributeValue`].
 ///
