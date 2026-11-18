@@ -70,14 +70,30 @@ struct ArkivConfig {
     prefilled_block_zero_state_root: Option<B256>,
 }
 
-/// A state root as the genesis file spells it. serde's own error does not name
-/// the field, so this one does.
+/// A state root as the genesis file spells it: `0x` and 64 hex digits.
+///
+/// Read as a string first, because `B256`'s own deserializer also takes the
+/// digits without `0x`. serde's error does not name the field, so this one
+/// does.
 fn state_root<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<B256>, D::Error> {
-    B256::deserialize(d).map(Some).map_err(|e| {
-        serde::de::Error::custom(format!(
-            "prefilledBlockZeroStateRoot must be 32 bytes of hex, 0x and 64 digits: {e}"
+    use serde::de::Error;
+    let refuse = |detail: String| {
+        D::Error::custom(format!(
+            "prefilledBlockZeroStateRoot must be 32 bytes of hex, 0x and 64 digits: {detail}"
         ))
-    })
+    };
+    let text = String::deserialize(d).map_err(|e| refuse(e.to_string()))?;
+    let digits = text
+        .strip_prefix("0x")
+        .ok_or_else(|| refuse(format!("{text:?} does not start with 0x")))?;
+    // `parse` would strip a second `0x` too.
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(refuse(format!("{text:?} has a non-hex digit")));
+    }
+    digits
+        .parse::<B256>()
+        .map(Some)
+        .map_err(|e| refuse(e.to_string()))
 }
 
 /// Arkiv's pricing weights (`host.arkiv.*`), as GolemDB declares them: the
@@ -646,6 +662,11 @@ mod tests {
         for wrong in [
             json!("0x5e9c"),
             json!(format!("0x{}", "5e".repeat(33))),
+            // 64 good digits, but no `0x`, or a capital `0X`.
+            json!("5e".repeat(32)),
+            json!(format!("0X{}", "5e".repeat(32))),
+            // `0x` twice: the digits after the first must not take another.
+            json!(format!("0x0x{}", "5e".repeat(32))),
             json!("hello"),
             json!(42),
             json!(null),
