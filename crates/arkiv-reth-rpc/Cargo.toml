@@ -14,7 +14,7 @@ arkiv-rpc-types.workspace = true
 # The committed stores a read goes through, plus the query-language parser.
 arkiv-query.workspace = true
 arkiv-interfaces.workspace = true
-# The `StateProvider` snapshot each call is served from.
+# `BlockNumReader` and `HeaderProvider`: the chain's head and its headers.
 reth-storage-api.workspace = true
 jsonrpsee.workspace = true
 alloy-primitives.workspace = true
@@ -29,3 +29,9 @@ base64 = "0.23"
 tokio.workspace = true
 eyre.workspace = true
 arkiv-reth-statemanager.workspace = true
+
+[dev-dependencies]
+# `MemStore`, the in-memory reference store.
+arkiv-interfaces = { workspace = true, features = ["conformance"] }
+# `ChainInfo`, which the test chain's `BlockNumReader` returns.
+reth-chainspec.workspace = true

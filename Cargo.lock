@@ -1719,6 +1719,7 @@ dependencies = [
  "base64 0.23.1",
  "eyre",
  "jsonrpsee",
+ "reth-chainspec",
  "reth-storage-api",
  "serde_json",
  "tokio",
