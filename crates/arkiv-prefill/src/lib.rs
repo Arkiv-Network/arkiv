@@ -1,4 +1,5 @@
-//! Chain prefill input: the archive format and the archive hash.
+//! Chain prefill input: the archive format, the archive hash and the
+//! streaming reader ([`Archive::entities`]).
 //!
 //! # Archives
 //!
@@ -79,6 +80,9 @@ use std::path::{Path, PathBuf};
 use alloy_primitives::{B256, Keccak256};
 use eyre::{Result, WrapErr, ensure};
 use serde::Deserialize;
+
+mod reader;
+pub use reader::Entities;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
