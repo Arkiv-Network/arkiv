@@ -139,6 +139,12 @@ fn parse_line(line: &str) -> Result<(UserAddress, Vec<Op>), String> {
             .as_u64()
             .ok_or_else(|| format!("\"$expiresAt\" is not a number: {v}"))?,
     };
+    // Prefilled entities exist at block 0, so one expiring at 0 would never be
+    // live. There is no upper limit: `max_lifetime` limits transactions, not
+    // prefilled data.
+    if expires_at == 0 {
+        return Err("\"$expiresAt\" is 0: the entity would already be expired at block 0".into());
+    }
 
     let mut flags = CreationFlags::NONE.bits();
     if let Some(value) = fields.get("$creationFlags") {
@@ -336,6 +342,14 @@ mod tests {
             (
                 serde_json::json!({ "$expiresAt": null }),
                 r#"missing field "$expiresAt""#,
+            ),
+            (
+                serde_json::json!({ "$expiresAt": 0 }),
+                r#""$expiresAt" is 0: the entity would already be expired at block 0"#,
+            ),
+            (
+                serde_json::json!({ "$expiresAt": "0" }),
+                r#""$expiresAt" is 0: the entity would already be expired at block 0"#,
             ),
             (
                 serde_json::json!({ "$colour": "red" }),
