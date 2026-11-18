@@ -5,6 +5,8 @@
 //!
 //! The root is computed in memory with the code that seeds the store, before
 //! any store opens: reth needs the genesis hash as soon as it reads `--chain`.
+//! A prefilled chain's file states the root in
+//! `config.arkiv.prefilledBlockZeroStateRoot`, and nothing is rebuilt.
 
 use std::sync::Arc;
 
@@ -29,7 +31,12 @@ impl ChainSpecParser for NodeChainSpecParser {
         if spec.golemdb().is_none() {
             return Ok(spec);
         }
-        let root = genesis_root(&spec)?;
+        // A prefilled chain's store holds more than the alloc, so its root comes
+        // from the file instead of being rebuilt here.
+        let root = match spec.prefilled_block_zero_state_root() {
+            Some(root) => root,
+            None => genesis_root(&spec)?,
+        };
         Ok(Arc::new(
             Arc::unwrap_or_clone(spec).with_genesis_state_root(root),
         ))
@@ -115,6 +122,54 @@ mod tests {
             });
             assert_ne!(changed.0.genesis_hash(), genesis, "{name}");
         }
+    }
+
+    fn prefilled(root: &str) -> impl FnOnce(&mut Value) {
+        let root = root.to_owned();
+        move |g| g["config"]["arkiv"]["prefilledBlockZeroStateRoot"] = root.into()
+    }
+
+    const ROOT_A: &str = "0x5e9c000000000000000000000000000000000000000000000000000000000001";
+    const ROOT_B: &str = "0x5e9c000000000000000000000000000000000000000000000000000000000002";
+
+    /// A prefilled chain's block 0 carries the file's root, not the alloc's.
+    #[test]
+    fn prefilled_block_0_carries_the_files_root() {
+        let (node, file) = specs(prefilled(ROOT_A));
+        let root = node.genesis_header().state_root;
+        assert_eq!(root, ROOT_A.parse::<B256>().unwrap());
+        assert_ne!(root, genesis_root(&file).unwrap(), "not the alloc's root");
+        assert_eq!(
+            node.genesis_hash(),
+            specs(prefilled(ROOT_A)).0.genesis_hash(),
+            "the same file, the same genesis"
+        );
+        assert_ne!(
+            node.genesis_hash(),
+            specs(prefilled(ROOT_B)).0.genesis_hash(),
+            "another root, another genesis"
+        );
+    }
+
+    /// With the field set nothing is rebuilt: limits the in-memory store
+    /// rejects still parse.
+    #[test]
+    fn prefilled_skips_the_in_memory_rebuild() {
+        let odd_limits = |g: &mut Value| {
+            g["config"]["arkiv"]["golemdb"]["cell_limits"]["max_str_len"] = 1.into()
+        };
+        let text = |edit: &dyn Fn(&mut Value)| {
+            let mut genesis: Value =
+                serde_json::from_str(&std::fs::read_to_string(EXAMPLE).unwrap()).unwrap();
+            edit(&mut genesis);
+            genesis.to_string()
+        };
+        assert!(NodeChainSpecParser::parse(&text(&odd_limits)).is_err());
+        let both = |g: &mut Value| {
+            odd_limits(g);
+            prefilled(ROOT_A)(g);
+        };
+        assert!(NodeChainSpecParser::parse(&text(&both)).is_ok());
     }
 
     /// A file for an experimental store, without GolemDB's settings, keeps
