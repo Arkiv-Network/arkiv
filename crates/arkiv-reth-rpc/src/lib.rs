@@ -22,13 +22,14 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query};
-use arkiv_interfaces::store::{CommitId, Sort, Store, StoreError, StoreExt};
-use arkiv_reth_statemanager::HostStore;
+use arkiv_interfaces::store::{CommitId, Sort, StoreError, StoreExt};
+use arkiv_reth_statemanager::{BlockSeals, CommitWaitError, HostStore};
 use arkiv_rpc_types::entity::{EntityData, Projection, entity_data_from};
 use arkiv_rpc_types::method::{BlockTimingView, CountRequest, QueryOptions, QueryResponse};
 use jsonrpsee::RpcModule;
 use jsonrpsee::types::ErrorObjectOwned;
-use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, HeaderProvider};
+use std::cell::Cell;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -38,6 +39,9 @@ use crate::store_reads::ReadError;
 /// Why a past block cannot be read: the store no longer holds its state.
 const NOT_RETAINED: &str = "state for this block is not retained";
 
+/// Why the tip cannot be read: its state will not reach the store.
+const NOT_COMMITTED: &str = "state for this block is not committed";
+
 /// How many `arkiv_*` reads run at once unless the node is told otherwise.
 /// Each read holds one GolemDB read slot at a time. The node shares a fixed
 /// number of slots, block import included, and with none left every read fails.
@@ -45,25 +49,29 @@ pub const DEFAULT_MAX_CONCURRENT_READS: usize = 32;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.
 ///
-/// `provider` hands out a fresh state snapshot per call (`StateProviderFactory`) and
-/// answers block-header/number reads for `arkiv_getBlockTiming`. At most
-/// `max_concurrent_reads` reads run at once; further calls wait for a turn.
+/// `provider` names the chain's head and answers block-header/number reads for
+/// `arkiv_getBlockTiming`; entity state is read from `store`. `seals` signals
+/// when a block's state is committed to `store`, which a read at the tip waits
+/// for. At most `max_concurrent_reads` reads run at once; further calls wait
+/// for a turn.
 pub fn arkiv_module<Provider>(
     provider: Provider,
     store: HostStore,
+    seals: Arc<BlockSeals>,
     max_concurrent_reads: usize,
 ) -> eyre::Result<RpcModule<Semaphore>>
 where
-    Provider:
-        StateProviderFactory + HeaderProvider + BlockNumReader + Clone + Send + Sync + 'static,
+    Provider: HeaderProvider + BlockNumReader + Clone + Send + Sync + 'static,
 {
     let mut module = RpcModule::new(Semaphore::new(max_concurrent_reads));
 
     let p = provider.clone();
     let st = store.clone();
+    let se = seals.clone();
     module.register_async_method("arkiv_getEntity", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
+        let seals = se.clone();
         async move {
             // `[key]` at the tip, or `[key, block]` as of a past block.
             let mut seq = params.sequence();
@@ -73,15 +81,20 @@ where
             let block: Option<u64> = seq
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
-            run_read(permits, move || read_entity(&provider, &store, key, block)).await
+            run_read(permits, move || {
+                read_entity(&provider, &store, &seals, key, block)
+            })
+            .await
         }
     })?;
 
     let p = provider.clone();
     let st = store.clone();
+    let se = seals.clone();
     module.register_async_method("arkiv_debugEntityExists", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
+        let seals = se.clone();
         async move {
             let mut seq = params.sequence();
             let key: B256 = seq
@@ -91,7 +104,7 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid block param: {e}")))?;
             run_read(permits, move || {
-                entity_exists_unfiltered(&provider, &store, key, block)
+                entity_exists_unfiltered(&provider, &store, &seals, key, block)
             })
             .await
         }
@@ -99,9 +112,11 @@ where
 
     let p = provider.clone();
     let st = store.clone();
+    let se = seals.clone();
     module.register_async_method("arkiv_query", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
+        let seals = se.clone();
         async move {
             // Positional `[q]` or `[q, options]` — the SDK's wire format.
             let mut seq = params.sequence();
@@ -112,7 +127,10 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid options param: {e}")))?
                 .unwrap_or_default();
-            run_read(permits, move || run_query(&provider, &store, &q, &options)).await
+            run_read(permits, move || {
+                run_query(&provider, &store, &seals, &q, &options)
+            })
+            .await
         }
     })?;
 
@@ -121,6 +139,7 @@ where
     module.register_async_method("arkiv_getEntityCount", move |params, permits, _ext| {
         let provider = p.clone();
         let store = st.clone();
+        let seals = seals.clone();
         async move {
             // Optional `[{ query?, block? }]`; absent means "all, at the tip".
             let request: CountRequest = params
@@ -128,7 +147,10 @@ where
                 .optional_next()
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?
                 .unwrap_or_default();
-            run_read(permits, move || entity_count(&provider, &store, request)).await
+            run_read(permits, move || {
+                entity_count(&provider, &store, &seals, request)
+            })
+            .await
         }
     })?;
 
@@ -164,27 +186,51 @@ where
 /// The block a read answers for and the store commit that holds its state:
 /// the tip when `block` is `None`, else that block.
 ///
-/// Each adopted commit is tagged with its block hash, so a past block resolves
-/// to a past commit — history without any per-store history machinery, and
+/// Each adopted commit is tagged with its block hash, so a block resolves to
+/// its own commit — history without any per-store history machinery, and
 /// bounded by the store's retention rather than by reth's pruning.
+///
+/// reth makes a block canonical a moment before adoption commits it, so a read
+/// at the tip waits for the tip's commit. If that commit is not coming the read
+/// is refused: the store's head holds an earlier block's state.
 fn resolve_at<Provider>(
     provider: &Provider,
     store: &HostStore,
+    seals: &BlockSeals,
     block: Option<u64>,
 ) -> Result<(BlockNumber, CommitId), ErrorObjectOwned>
 where
-    Provider: BlockNumReader + HeaderProvider,
+    Provider: BlockNumReader,
 {
-    let tip = provider
-        .best_block_number()
-        .map_err(|e| internal_error(format!("best_block_number: {e:?}")))?;
+    let head = provider
+        .chain_info()
+        .map_err(|e| internal_error(format!("chain_info: {e:?}")))?;
+    let tip = head.best_number;
     let number = match block {
         None => tip,
         Some(n) if n <= tip => n,
         Some(n) => return Err(block_unavailable(n, tip, "ahead of the chain tip")),
     };
     if number == tip {
-        return Ok((number, store.head()));
+        // A head lookup that fails during the wait, kept to report as itself.
+        let lookup_failure = Cell::new(None);
+        let is_head = || match provider.chain_info() {
+            Ok(info) => info.best_hash == head.best_hash,
+            Err(error) => {
+                lookup_failure.set(Some(error));
+                false
+            }
+        };
+        return match seals.wait_for_commit(store, head.best_hash.0, is_head) {
+            Ok(commit) => Ok((number, commit)),
+            Err(CommitWaitError::NotComing(_)) => Err(match lookup_failure.take() {
+                Some(error) => internal_error(format!("chain_info: {error:?}")),
+                None => block_unavailable(number, tip, NOT_COMMITTED),
+            }),
+            Err(error) => Err(internal_error(format!(
+                "resolve commit for block {number}: {error}"
+            ))),
+        };
     }
     let hash = provider
         .block_hash(number)
@@ -277,14 +323,15 @@ fn live_at(query: Query, block: BlockNumber) -> Query {
 fn read_entity<Provider>(
     provider: &Provider,
     store: &HostStore,
+    seals: &BlockSeals,
     key: B256,
     block: Option<u64>,
 ) -> Result<Option<EntityData>, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
+    Provider: BlockNumReader,
 {
     read_at(
-        || resolve_at(provider, store, block),
+        || resolve_at(provider, store, seals, block),
         |block_number, at| {
             let entity =
                 store_reads::entity(&**store, at, key.0).map_err(store_failure("get entity"))?;
@@ -299,14 +346,15 @@ where
 fn entity_exists_unfiltered<Provider>(
     provider: &Provider,
     store: &HostStore,
+    seals: &BlockSeals,
     key: B256,
     block: Option<u64>,
 ) -> Result<bool, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
+    Provider: BlockNumReader,
 {
     read_at(
-        || resolve_at(provider, store, block),
+        || resolve_at(provider, store, seals, block),
         |_, at| {
             Ok(store_reads::entity(&**store, at, key.0)
                 .map_err(store_failure("get entity"))?
@@ -328,11 +376,12 @@ where
 fn run_query<Provider>(
     provider: &Provider,
     store: &HostStore,
+    seals: &BlockSeals,
     q: &str,
     options: &QueryOptions,
 ) -> Result<QueryResponse, ErrorObjectOwned>
 where
-    Provider: BlockNumReader + HeaderProvider,
+    Provider: BlockNumReader,
 {
     let statement = arkiv_query::parse_statement(q).map_err(|e| query_error(&e))?;
     let sort = statement.order.as_ref().map(Sort::from);
@@ -353,7 +402,7 @@ where
         }
     };
     read_at(
-        || resolve_at(provider, store, at_block),
+        || resolve_at(provider, store, seals, at_block),
         |block_number, at| {
             let binding = cursor::binding(q, block_number, &projection.fingerprint());
             let offset = match options.cursor.as_deref() {
@@ -417,10 +466,11 @@ where
 fn entity_count<Provider>(
     provider: &Provider,
     store: &HostStore,
+    seals: &BlockSeals,
     request: CountRequest,
 ) -> Result<u64, ErrorObjectOwned>
 where
-    Provider: StateProviderFactory + BlockNumReader + HeaderProvider,
+    Provider: BlockNumReader,
 {
     let query = match &request.query {
         // A count has no order, so an `ORDER BY` is read and set aside: the
@@ -433,7 +483,7 @@ where
         None => Query::All,
     };
     read_at(
-        || resolve_at(provider, store, request.block),
+        || resolve_at(provider, store, seals, request.block),
         |block_number, at| {
             store_reads::count(&**store, at, &live_at(query.clone(), block_number))
                 .map_err(store_failure("count"))
@@ -479,7 +529,6 @@ mod tests {
     use super::*;
     use crate::error::rpc_error_codes;
     use jsonrpsee::types::error::INTERNAL_ERROR_CODE;
-    use std::cell::Cell;
 
     /// Finds block `first` and its commit, then the next block on each call, as
     /// a chain that moves on between calls would.
@@ -552,5 +601,268 @@ mod tests {
             read.await.unwrap().unwrap();
         }
         assert_eq!(most.load(Ordering::SeqCst), 2);
+    }
+
+    use arkiv_interfaces::entity::Entity;
+    use arkiv_interfaces::entity_records;
+    use arkiv_interfaces::store::reference::MemStore;
+    use arkiv_interfaces::store::{RecordKey, Store};
+    use arkiv_reth_statemanager::{ExecutionKey, OwnedBranch};
+    use reth_storage_api::BlockHashReader;
+    use reth_storage_api::errors::provider::{ProviderError, ProviderResult};
+    use std::fmt::Debug;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    /// The entity block 2 creates.
+    const ENTITY: [u8; 32] = [0x11; 32];
+
+    /// Block `n`'s hash.
+    fn hash(n: u64) -> B256 {
+        B256::repeat_byte(n as u8 + 1)
+    }
+
+    /// reth, as far as a read can tell: block `n` is `hash(n)`, and block 2 is
+    /// the head.
+    #[derive(Default)]
+    struct Chain {
+        /// How often the head was asked for.
+        asked: AtomicU64,
+        /// Run when the head is asked for a second time. A read asks again
+        /// only after finding its block uncommitted, just before it waits.
+        about_to_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Whether asking for the head fails.
+        broken: AtomicBool,
+    }
+
+    impl BlockHashReader for Chain {
+        fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
+            Ok((number <= 2).then(|| hash(number)))
+        }
+
+        fn canonical_hashes_range(&self, start: u64, end: u64) -> ProviderResult<Vec<B256>> {
+            Ok((start..end).map(hash).collect())
+        }
+    }
+
+    impl BlockNumReader for Chain {
+        fn chain_info(&self) -> ProviderResult<reth_chainspec::ChainInfo> {
+            // The answer is settled before `about_to_wait` runs, so what that
+            // sets off reaches a read only once it is waiting.
+            let head = if self.broken.load(Ordering::SeqCst) {
+                Err(ProviderError::BestBlockNotFound)
+            } else {
+                Ok(reth_chainspec::ChainInfo {
+                    best_hash: hash(2),
+                    best_number: 2,
+                })
+            };
+            if self.asked.fetch_add(1, Ordering::SeqCst) > 0
+                && let Some(about_to_wait) = self.about_to_wait.lock().unwrap().take()
+            {
+                about_to_wait();
+            }
+            head
+        }
+
+        fn best_block_number(&self) -> ProviderResult<u64> {
+            Ok(2)
+        }
+
+        fn last_block_number(&self) -> ProviderResult<u64> {
+            Ok(2)
+        }
+
+        fn block_number(&self, block: B256) -> ProviderResult<Option<u64>> {
+            Ok((0..=2).find(|&n| hash(n) == block))
+        }
+    }
+
+    /// A node between reth making block 2 canonical and adoption committing
+    /// it. The store holds blocks 0 and 1. Block 2 created [`ENTITY`] and is
+    /// sealed, and reth already reports it as the head and serves its receipt.
+    struct BeforeAdoption {
+        chain: Chain,
+        store: HostStore,
+        seals: BlockSeals,
+        /// The state root block 2 sealed.
+        state_root: [u8; 32],
+    }
+
+    impl BeforeAdoption {
+        fn new() -> Self {
+            let store: HostStore = Arc::new(MemStore::new());
+            for n in 0..=1 {
+                let branch = store.begin(None).expect("begin");
+                store.commit_tagged(branch, hash(n).0).expect("commit");
+            }
+            let entity = Entity {
+                key: ENTITY,
+                created_at: 2,
+                updated_at: 2,
+                expires_at: 1_000,
+                ..Entity::default()
+            };
+            let branch = OwnedBranch::begin(&store).expect("begin");
+            store
+                .create(
+                    branch.id(),
+                    RecordKey::from_entity(ENTITY),
+                    entity_records::to_cells(&entity).expect("cells"),
+                    None,
+                )
+                .expect("create");
+            let seals = BlockSeals::default();
+            let state_root = seals
+                .seal(ExecutionKey::new(2, vec![]), branch)
+                .expect("seal")
+                .state_root;
+            Self {
+                chain: Chain::default(),
+                store,
+                seals,
+                state_root,
+            }
+        }
+
+        /// Adoption commits block 2.
+        fn adopt(&self) {
+            self.seals
+                .adopt(&self.store, 2, hash(2).0, self.state_root, &[])
+                .expect("adopt")
+                .expect("block 2 was sealed");
+            self.seals.finish_adoption(hash(2).0);
+        }
+
+        /// Adoption finishes with block 2 without committing it.
+        fn finish_without_commit(&self) {
+            self.seals.finish_adoption(hash(2).0);
+        }
+
+        /// What `read` answers when `adoption` runs only once the read has
+        /// found block 2 uncommitted and is about to wait for it. Nothing here
+        /// depends on timing: a read that answers without waiting fails.
+        fn read_during<T: Debug + Send + 'static>(
+            &self,
+            read: impl FnOnce(&Self) -> T + Send,
+            adoption: impl FnOnce(&Self),
+        ) -> T {
+            // `None` when the read is about to wait, then `Some` of its answer.
+            let (events, seen) = mpsc::channel();
+            let waiting = events.clone();
+            *self.chain.about_to_wait.lock().unwrap() = Some(Box::new(move || {
+                let _ = waiting.send(None);
+            }));
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let _ = events.send(Some(read(self)));
+                });
+                if let Some(answer) = seen.recv().expect("the read reports") {
+                    panic!("the read answered before block 2 was adopted: {answer:?}");
+                }
+                adoption(self);
+                seen.recv()
+                    .expect("the read reports")
+                    .expect("the read waits once")
+            })
+        }
+
+        /// `arkiv_query` for everything at the tip: the block it answers for
+        /// and how many entities it returns.
+        fn query_all(&self) -> Result<(u64, usize), i32> {
+            run_query(
+                &self.chain,
+                &self.store,
+                &self.seals,
+                "*",
+                &QueryOptions::default(),
+            )
+            .map(|answer| (answer.block_number, answer.data.len()))
+            .map_err(|error| error.code())
+        }
+
+        /// `arkiv_getEntity` for [`ENTITY`], at the tip or as of `block`.
+        fn entity(&self, block: Option<u64>) -> Result<bool, i32> {
+            read_entity(
+                &self.chain,
+                &self.store,
+                &self.seals,
+                B256::from(ENTITY),
+                block,
+            )
+            .map(|entity| entity.is_some())
+            .map_err(|error| error.code())
+        }
+
+        /// `arkiv_getEntityCount` of everything at the tip.
+        fn count_all(&self) -> Result<u64, i32> {
+            let everything = CountRequest::default();
+            entity_count(&self.chain, &self.store, &self.seals, everything)
+                .map_err(|error| error.code())
+        }
+    }
+
+    /// A query at the tip waits for adoption to commit block 2, so it answers
+    /// for block 2 with block 2's entity. Without the wait it would answer for
+    /// block 2 with the state of block 1.
+    #[test]
+    fn a_query_at_the_tip_waits_for_the_tips_commit() {
+        let node = BeforeAdoption::new();
+        let answer = node.read_during(BeforeAdoption::query_all, BeforeAdoption::adopt);
+        assert_eq!(answer, Ok((2, 1)));
+    }
+
+    /// The same for one entity, read at the tip and read as of the tip's
+    /// number: a client that reads on seeing a receipt finds what it created.
+    #[test]
+    fn an_entity_read_at_the_tip_waits_for_the_tips_commit() {
+        for block in [None, Some(2)] {
+            let node = BeforeAdoption::new();
+            let found = node.read_during(|node| node.entity(block), BeforeAdoption::adopt);
+            assert_eq!(found, Ok(true), "as of {block:?}");
+        }
+    }
+
+    /// And for a count, whose answer is a bare number.
+    #[test]
+    fn a_count_at_the_tip_waits_for_the_tips_commit() {
+        let node = BeforeAdoption::new();
+        let count = node.read_during(BeforeAdoption::count_all, BeforeAdoption::adopt);
+        assert_eq!(count, Ok(1));
+    }
+
+    /// Adoption can finish with a block without committing it. No read at the
+    /// tip then answers from the store's head, which holds block 1. An entity
+    /// or a count carries no block number, so block 1's answer would pass for
+    /// the state the receipt describes.
+    #[test]
+    fn a_read_at_a_tip_that_is_not_committed_is_refused() {
+        type Read = fn(&BeforeAdoption) -> Option<i32>;
+        let reads: [(&str, Read); 4] = [
+            ("an entity at latest", |node| node.entity(None).err()),
+            ("an entity as of block 2", |node| node.entity(Some(2)).err()),
+            ("a query at latest", |node| node.query_all().err()),
+            ("a count at latest", |node| node.count_all().err()),
+        ];
+        for (name, read) in reads {
+            let node = BeforeAdoption::new();
+            let error = node.read_during(read, BeforeAdoption::finish_without_commit);
+            assert_eq!(error, Some(rpc_error_codes::BLOCK_UNAVAILABLE), "{name}");
+        }
+    }
+
+    /// A head lookup that fails while a read waits is reported as that
+    /// failure, not as a block the store will not commit.
+    #[test]
+    fn a_head_lookup_that_fails_during_the_wait_is_an_internal_error() {
+        let node = BeforeAdoption::new();
+        let failed = node.read_during(BeforeAdoption::query_all, |node| {
+            node.chain.broken.store(true, Ordering::SeqCst);
+            // Adoption finishing with any block wakes the read, which asks for
+            // the head again.
+            node.seals.finish_adoption(hash(1).0);
+        });
+        assert_eq!(failed, Err(INTERNAL_ERROR_CODE));
     }
 }
