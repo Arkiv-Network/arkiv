@@ -17,8 +17,10 @@
 //! under it, so every node on the chain must run it.
 //!
 //! The spec also carries GolemDB's settings for the chain, from the genesis
-//! file's `config.arkiv.golemdb` (see [`ArkivChainSpec::golemdb`]), and the
-//! pricing model from `config.arkiv.golemdb.metering`.
+//! file's `config.arkiv.golemdb` (see [`ArkivChainSpec::golemdb`]), the
+//! pricing model from `config.arkiv.golemdb.metering`, and, for a prefilled
+//! chain, block 0's state root from `config.arkiv.prefilledBlockZeroStateRoot`
+//! (see [`ArkivChainSpec::prefilled_block_zero_state_root`]).
 
 mod parser;
 
@@ -50,6 +52,9 @@ pub struct ArkivChainSpec {
     min_base_fee: u64,
     /// The genesis file's `config.arkiv.golemdb`, if it has one.
     golemdb: Option<golemdb_api::Genesis>,
+    /// The genesis file's `config.arkiv.prefilledBlockZeroStateRoot`, if it
+    /// has one.
+    prefilled_block_zero_state_root: Option<B256>,
 }
 
 /// GolemDB owns the model's persisted records and JSON schema.
@@ -57,6 +62,38 @@ pub struct ArkivChainSpec {
 #[serde(deny_unknown_fields, expecting = "an object with a `golemdb` section")]
 struct ArkivConfig {
     golemdb: golemdb_api::Genesis,
+    #[serde(
+        default,
+        rename = "prefilledBlockZeroStateRoot",
+        deserialize_with = "state_root"
+    )]
+    prefilled_block_zero_state_root: Option<B256>,
+}
+
+/// A state root as the genesis file spells it: `0x` and 64 hex digits.
+///
+/// Read as a string first, because `B256`'s own deserializer also takes the
+/// digits without `0x`. serde's error does not name the field, so this one
+/// does.
+fn state_root<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<B256>, D::Error> {
+    use serde::de::Error;
+    let refuse = |detail: String| {
+        D::Error::custom(format!(
+            "prefilledBlockZeroStateRoot must be 32 bytes of hex, 0x and 64 digits: {detail}"
+        ))
+    };
+    let text = String::deserialize(d).map_err(|e| refuse(e.to_string()))?;
+    let digits = text
+        .strip_prefix("0x")
+        .ok_or_else(|| refuse(format!("{text:?} does not start with 0x")))?;
+    // `parse` would strip a second `0x` too.
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(refuse(format!("{text:?} has a non-hex digit")));
+    }
+    digits
+        .parse::<B256>()
+        .map(Some)
+        .map_err(|e| refuse(e.to_string()))
 }
 
 /// Arkiv's pricing weights (`host.arkiv.*`), as GolemDB declares them: the
@@ -74,13 +111,17 @@ impl ArkivChainSpec {
     /// GolemDB's settings from its genesis `config.arkiv`, which must be valid.
     pub fn new(inner: ChainSpec) -> eyre::Result<Self> {
         let min_base_fee = inner.initial_base_fee().unwrap_or_default();
-        let golemdb = inner
+        let config = inner
             .genesis()
             .config
             .extra_fields
             .get_deserialized::<ArkivConfig>("arkiv")
             .transpose()
-            .map_err(|e| eyre::eyre!("genesis config.arkiv: {e}"))?
+            .map_err(|e| eyre::eyre!("genesis config.arkiv: {e}"))?;
+        let prefilled_block_zero_state_root = config
+            .as_ref()
+            .and_then(|config| config.prefilled_block_zero_state_root);
+        let golemdb = config
             .map(|config| -> eyre::Result<_> {
                 let pricing = &config.golemdb.metering;
                 eyre::ensure!(
@@ -109,6 +150,7 @@ impl ArkivChainSpec {
             inner,
             min_base_fee,
             golemdb,
+            prefilled_block_zero_state_root,
         })
     }
 
@@ -141,6 +183,17 @@ impl ArkivChainSpec {
     /// `genesis/example.json` in the repository shows the format.
     pub fn golemdb(&self) -> Option<&golemdb_api::Genesis> {
         self.golemdb.as_ref()
+    }
+
+    /// Block 0's state root as the genesis file's
+    /// `config.arkiv.prefilledBlockZeroStateRoot` states it, or `None` if it
+    /// does not.
+    ///
+    /// Only a prefilled chain has one. Its block 0 holds entities from archive
+    /// files, not from the genesis file, so the root cannot be rebuilt from the
+    /// file: the prefill asks GolemDB for it once and writes it here.
+    pub fn prefilled_block_zero_state_root(&self) -> Option<B256> {
+        self.prefilled_block_zero_state_root
     }
 }
 
@@ -575,6 +628,65 @@ mod tests {
                 limit / 10
             );
         }
+    }
+
+    /// `config.arkiv` with `prefilledBlockZeroStateRoot` set to `root`.
+    fn prefilled(root: Value) -> eyre::Result<ArkivChainSpec> {
+        let mut config = arkiv(|_| {});
+        config["prefilledBlockZeroStateRoot"] = root;
+        with_arkiv(config)
+    }
+
+    /// A chain without the field is not prefilled; one with it reads back the
+    /// root as written.
+    #[test]
+    fn the_prefilled_root_comes_from_config_arkiv() {
+        assert_eq!(
+            with_arkiv(arkiv(|_| {}))
+                .unwrap()
+                .prefilled_block_zero_state_root(),
+            None
+        );
+        let root = B256::repeat_byte(0x5e);
+        assert_eq!(
+            prefilled(json!(root.to_string()))
+                .unwrap()
+                .prefilled_block_zero_state_root(),
+            Some(root)
+        );
+    }
+
+    /// Anything but 32 bytes of hex is refused, and the error names the field.
+    #[test]
+    fn a_malformed_prefilled_root_is_refused() {
+        for wrong in [
+            json!("0x5e9c"),
+            json!(format!("0x{}", "5e".repeat(33))),
+            // 64 good digits, but no `0x`, or a capital `0X`.
+            json!("5e".repeat(32)),
+            json!(format!("0X{}", "5e".repeat(32))),
+            // `0x` twice: the digits after the first must not take another.
+            json!(format!("0x0x{}", "5e".repeat(32))),
+            json!("hello"),
+            json!(42),
+            json!(null),
+        ] {
+            let error = prefilled(wrong.clone()).unwrap_err().to_string();
+            assert!(
+                error.starts_with("genesis config.arkiv")
+                    && error.contains("prefilledBlockZeroStateRoot must be 32 bytes of hex"),
+                "{wrong}: {error}"
+            );
+        }
+    }
+
+    /// The field is only a value the spec carries for now: block 0's header,
+    /// and so the genesis hash, stay as they were.
+    #[test]
+    fn the_prefilled_root_leaves_the_genesis_hash_alone() {
+        let plain = with_arkiv(arkiv(|_| {})).unwrap();
+        let prefilled = prefilled(json!(B256::repeat_byte(0x5e).to_string())).unwrap();
+        assert_eq!(prefilled.genesis_hash(), plain.genesis_hash());
     }
 
     #[test]
