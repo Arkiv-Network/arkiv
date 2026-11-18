@@ -37,7 +37,7 @@
 //! | `$key`           | yes      | the entity key, 32 bytes hex                                  |
 //! | `$creator`       | yes      | the creating account, 20 bytes hex                            |
 //! | `$owner`         | yes      | the owner; when it is not `$creator` the entity is transferred |
-//! | `$expiresAt`     | yes      | the expiry block, a decimal number or string                  |
+//! | `$expiresAt`     | yes      | the expiry block, a decimal number or string; not 0           |
 //! | `$contentType`   | no       | a string, stored as the unindexed `str` attribute `contentType` |
 //! | `$payload`       | no       | base64, stored as the unindexed `bytes` attribute `payload`   |
 //! | `$creationFlags` | no       | an array of `"readonly"`, `"permissionlessExtension"`         |
