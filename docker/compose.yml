@@ -19,9 +19,10 @@ services:
       # The node needs a store named. This dev stack runs on GolemDB, kept in
       # the node-data volume next to the datadir.
       ARKIV_STORE_PATH: /data/golemdb
-      # How much history GolemDB keeps: `head-only` (the default), a number of
-      # past blocks besides the head, or `archive` for every block.
-      ARKIV_STORE_HISTORY: head-only
+      # How much history GolemDB keeps: `min-retention` (the default, the
+      # genesis minimum), `head-only`, a number of past blocks besides the head,
+      # or `archive` for every block.
+      ARKIV_STORE_HISTORY: min-retention
     command:
       - node
       - --dev

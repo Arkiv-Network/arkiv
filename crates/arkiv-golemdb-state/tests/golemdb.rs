@@ -41,6 +41,7 @@ fn config_with(pricing: arkiv_golemdb::PricingConfig) -> GolemDbConfig {
             record_limits,
             None,
             pricing,
+            0,
         ),
         segments: vec![],
     }

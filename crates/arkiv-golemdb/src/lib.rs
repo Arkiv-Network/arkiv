@@ -33,7 +33,7 @@ use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
 
 pub use golemdb_api::{
-    CellLimits, Genesis, HashAlgorithm, HostMeteringSchema, OpenError, PricingConfig,
+    CellLimits, Genesis, HashAlgorithm, HostMeteringSchema, OpenError, PricingConfig, Pruning,
     PruningConfig, RecordLimits,
 };
 
@@ -68,9 +68,11 @@ pub struct SegmentSpec {
 const SHARD_SPAN: u64 = 500_000;
 
 impl GolemDbConfig {
+    /// Keeps every commit unless the caller picks a window.
     fn open_config(&self) -> Result<golemdb::OpenConfig, OpenError> {
         Ok(golemdb::OpenConfig::new(self.full_genesis()?)
-            .with_host_schemas(self.host_schemas.clone()))
+            .with_host_schemas(self.host_schemas.clone())
+            .without_pruning())
     }
 
     /// [`genesis`](Self::genesis) with the host's segments, as LZ4-compressed
@@ -119,16 +121,15 @@ impl core::fmt::Debug for GolemDbStore {
 impl GolemDbStore {
     /// Open `directory`, creating it with `config` if it is new. Only one
     /// process may open a directory. `pruning` is how many past commits to
-    /// keep, `None` all; it may change between opens.
+    /// keep, never fewer than the genesis `min_retention`; it may change
+    /// between opens.
     pub fn open(
         directory: &Path,
         config: &GolemDbConfig,
-        pruning: Option<PruningConfig>,
+        pruning: Pruning,
     ) -> Result<Self, OpenError> {
         let mut open = config.open_config()?;
-        if let Some(pruning) = pruning {
-            open = open.with_pruning(pruning);
-        }
+        open.pruning = pruning;
         let database = golemdb::Database::open(directory, &open)?;
         Ok(Self {
             database,

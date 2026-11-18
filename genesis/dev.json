@@ -31,6 +31,7 @@
           "max_cells": 39,
           "max_indexed_cells": 36
         },
+        "min_retention": 0,
         "metering": {
           "golemdb_code_version": 1,
           "host_code_version": 1,
