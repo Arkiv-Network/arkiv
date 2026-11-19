@@ -8,9 +8,10 @@
 # `arkiv-reth` rather than recompiling the reth tree inside BuildKit. Dispatched
 # on its own it builds from source, which is slow but self-contained.
 #
-# Everything runs verbose on purpose: `set -x` on each step, the node at debug,
-# and container logs dumped whether or not the run passed. A smoke test you
-# cannot read is a smoke test you will not trust.
+# Everything runs verbose on purpose: every command echoed (just prints each
+# recipe line it runs), the node at debug, and container logs dumped whether or
+# not the run passed. A smoke test you cannot read is a smoke test you will not
+# trust.
 name: docker-stack
 
 on:
@@ -46,27 +47,23 @@ jobs:
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
       ARKIV_LOG_FILTER: ${{ inputs.log_filter || 'debug' }}
-      COMPOSE: docker/compose.yml
+      # Two compile jobs keep a from-source image build within the runner's
+      # memory; `just image_build` passes this into the Docker build.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v7
+      # The image and stack steps are just recipes (just/docker.just), the same
+      # ones used locally.
+      - uses: taiki-e/install-action@just
 
+      # Nothing compiles on the runner: the from-source path builds the image
+      # inside Docker.
       - name: Fetch the prebuilt arkiv-reth
         if: inputs.artifact != ''
         uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.artifact }}
           path: prebuilt
-
-      # Only the from-source path compiles anything on the runner.
-      - name: Install native build dependencies
-        if: inputs.artifact == ''
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
-
-      - uses: foundry-rs/foundry-toolchain@v1
-        if: inputs.artifact == ''
 
       - name: Verify CI runtime
         run: |
@@ -75,48 +72,33 @@ jobs:
           docker compose version
           python3 --version
 
-      # Same two paths as scripts/kurtosis/up.py, and the same image tag the
-      # compose file expects.
+      # The same two image recipes `just kurtosis_up` and
+      # `kurtosis_up_prebuilt` use, and the same image tag the compose file
+      # expects.
       - name: Build the arkiv-reth:dev image
         run: |
           set -euxo pipefail
           if [ -n "$ARTIFACT" ]; then
-            chmod +x prebuilt/arkiv-reth
-            docker build -t arkiv-reth:dev \
-              -f docker/arkiv-reth-prebuilt.Dockerfile \
-              prebuilt
+            just image_prebuilt_build prebuilt/arkiv-reth
           else
-            docker buildx build -t arkiv-reth:dev \
-              -f docker/arkiv-reth.Dockerfile \
-              --build-arg CARGO_BUILD_JOBS=2 \
-              --load .
+            just image_build
           fi
           docker image inspect arkiv-reth:dev --format '{{.Id}} {{.Size}} bytes'
 
+      # `up --wait` blocks on both healthchecks, so a failure here means a
+      # container never became healthy rather than a race in a later step.
       - name: Bring up the stack
-        run: |
-          set -euxo pipefail
-          # --wait blocks on both healthchecks, so a failure here means a
-          # container never became healthy rather than a race in a later step.
-          docker compose -f "$COMPOSE" up -d --wait
-          docker compose -f "$COMPOSE" ps
+        run: just docker_compose_up
 
       # The node's own startup logs, before anything else touches it: this is
       # where a bad genesis or a refused flag shows up.
       - name: Node startup logs
-        run: docker compose -f "$COMPOSE" logs --no-color arkiv-reth
+        run: just docker_compose_logs arkiv-reth
 
+      # No --follower-rpc: one node, so the cross-node agreement checks are
+      # skipped and this verifies RPC reachability and block production.
       - name: Check the node is producing blocks
-        run: |
-          set -euxo pipefail
-          # No --follower-rpc: one node, so the cross-node agreement checks are
-          # skipped and this verifies RPC reachability and block production.
-          python3 scripts/kurtosis/check.py \
-            --no-enclave \
-            --sequencer-rpc http://127.0.0.1:8545 \
-            --wait 60 \
-            --samples 3 \
-            --no-color
+        run: just docker_compose_check --wait 60 --samples 3 --no-color
 
       - name: Show a block and the arkiv_* namespace
         run: |
@@ -136,15 +118,8 @@ jobs:
       # not only to debug failures.
       - name: Container logs
         if: always()
-        run: |
-          set +e
-          echo '--- compose ps ---'
-          docker compose -f "$COMPOSE" ps -a
-          echo '--- arkiv-reth ---'
-          docker compose -f "$COMPOSE" logs --no-color --tail 400 arkiv-reth
+        run: just docker_compose_logs --tail 400 arkiv-reth
 
       - name: Tear down
         if: always()
-        run: |
-          set +e
-          docker compose -f "$COMPOSE" down -v
+        run: just docker_compose_down

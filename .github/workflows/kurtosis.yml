@@ -33,29 +33,26 @@ jobs:
       CI: "true"
       RUST_BACKTRACE: "1"
       ARTIFACT: ${{ inputs.artifact }}
+      # Two compile jobs keep a from-source image build within the runner's
+      # memory; `just image_build` passes this into the Docker build.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Only the from-source path compiles anything on the runner.
-      - name: Install native build dependencies
-        if: inputs.artifact == ''
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libclang-dev clang cmake build-essential
+      # The devnet and SDK test steps are just recipes (just/kurtosis.just), the
+      # same ones used locally.
+      - uses: taiki-e/install-action@just
 
-      - name: Fetch the prebuilt arkiv-reth and arkiv-cli
+      # Nothing compiles on the runner: the from-source path builds the image
+      # inside Docker. The artifact also carries arkiv-cli, which the devnet
+      # does not use.
+      - name: Fetch the prebuilt arkiv-reth
         if: inputs.artifact != ''
         uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.artifact }}
           path: prebuilt
-
-      # Seeding runs arkiv-cli on the runner; the from-source path builds it
-      # with cargo, which needs the same native deps as the node.
-      - uses: foundry-rs/foundry-toolchain@v1
-        if: inputs.artifact == ''
 
       - name: Install Kurtosis CLI
         run: |
@@ -76,14 +73,11 @@ jobs:
       - name: Start sequencer and follower and run health check
         run: |
           set -euxo pipefail
-          # up.py packages this binary when the variable is set, and builds the
-          # image from source when it is empty.
           if [ -n "$ARTIFACT" ]; then
-            chmod +x prebuilt/arkiv-reth prebuilt/arkiv-cli
-            export ARKIV_RETH_BINARY="$PWD/prebuilt/arkiv-reth"
-            export ARKIV_CLI_BINARY="$PWD/prebuilt/arkiv-cli"
+            just kurtosis_up_prebuilt prebuilt/arkiv-reth
+          else
+            just kurtosis_up
           fi
-          python3 scripts/kurtosis/up.py arkiv-harness
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
@@ -93,34 +87,18 @@ jobs:
       # Drives the running enclave through the Arkiv SDK; see
       # kurtosis/integration/README.md for what is covered.
       - name: Run SDK integration tests
-        working-directory: kurtosis/integration
-        run: |
-          set -euxo pipefail
-          bun install --frozen-lockfile
-          bun test
+        run: just test_kurtosis_sdk
 
       # After the other tests, and whether or not they passed: these stop and
       # start the follower, and one that fails to catch up stays behind.
       - name: Restart the follower and check it catches up
         if: success() || failure()
-        working-directory: kurtosis/integration
-        env:
-          ARKIV_RESTART_TESTS: "1"
-        run: bun test follower-restart
+        run: just test_kurtosis_sdk_restart
 
       - name: Collect Kurtosis diagnostics
         if: always()
-        run: |
-          set +e
-          echo '--- Kurtosis enclaves ---'
-          kurtosis enclave ls
-          echo '--- Arkiv enclave ---'
-          kurtosis enclave inspect arkiv-harness
-          echo '--- Arkiv service logs ---'
-          kurtosis service logs --all-services --num 200 arkiv-harness
+        run: just kurtosis_logs --no-follow
 
       - name: Tear down Kurtosis enclave
         if: always()
-        run: |
-          set +e
-          python3 scripts/kurtosis/down.py arkiv-harness
+        run: just kurtosis_down

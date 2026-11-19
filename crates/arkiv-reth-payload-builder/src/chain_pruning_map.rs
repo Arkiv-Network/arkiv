@@ -603,7 +603,7 @@ mod bench {
 
     /// `BENCH_PREFILL=4000000 cargo test -p arkiv-reth-payload-builder bench_bootstrap_batch --release -- --ignored --nocapture`
     #[tokio::test]
-    #[ignore]
+    #[ignore = "benchmark: run by hand, see the doc comment"]
     async fn bench_bootstrap_batch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pruning.db");

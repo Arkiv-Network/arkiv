@@ -50,16 +50,26 @@ arkiv/
 > **Prerequisites:**
 >
 > - [Rust](https://rust-lang.org/tools/install/) installed
+> - [just](https://just.systems/man/en/packages.html) 1.46 or newer, the command runner
 > - [Docker](https://www.docker.com/)
 > - [Kurtosis](https://docs.kurtosis.com/install)  CLI
 
+Every task is a [just](https://just.systems) recipe; `just` on its own lists
+them all.
+
 ```sh
-cargo build --workspace        # build
-scripts/kurtosis/up.py         # build arkiv-reth image, run devnet
-scripts/kurtosis/down.py       # tear down
+just build                     # build the workspace
+just test                      # nextest, then the doc tests
+just check_code                # rustfmt check + clippy, as CI gates them
+just kurtosis_up               # build arkiv-reth image, run devnet
+just kurtosis_up_prebuilt      # the same, on the binary `just build` made
+just kurtosis_down             # tear down
 ```
 
-`up.py` builds the `arkiv-reth` image and brings up a two-node Arkiv-only
+The recipes build with cargo's default profile. Set `PROFILE` to change it,
+as CI does: `PROFILE=dev-fast just build`, or `just profile=dev-fast build`.
+
+`just kurtosis_up` builds the `arkiv-reth` image and brings up a two-node Arkiv-only
 network in one enclave via `ethereum-package`: one Lighthouse participant with
 one validator (the sequencer) and one with zero validators (the follower).
 There is no L1/L2 or settlement-chain coordination.
@@ -75,6 +85,11 @@ CI runs three workflows:
 - `[lint.yml](./.github/workflows/lint.yml)`: 🐍 Linting and formatting with [Black]((https://black.readthedocs.io)) over the Python scripts, using configs from `[pyproject.toml](./pyproject.toml)`.
 - `[kurtosis.yml](./.github/workflows/kurtosis.yml)`: 🧪 the two-node sequencer/follower smoke test, followed by the SDK integration tests in `kurtosis/integration`.
 
+The workflows run the same `just` recipes you run locally, so a green
+`just check_code` and `just test` mean the same as CI's checks. Only the CI
+plumbing — runner setup, the shared build caches, artifacts and image
+publishing — lives in the workflow files.
+
 Enable the local pre-commit hook with `pip install pre-commit && pre-commit install` — black then runs on staged Python before each commit.
 
 ### Dev container (optional)
@@ -87,7 +102,7 @@ them. The container has no Docker access, so Kurtosis runs stay on the host.
 
 ```sh
 # Run the arkiv-interfaces unit tests
-cargo test -p arkiv-interfaces
+just nextest -p arkiv-interfaces
 ```
 
 ## Releasing

@@ -2,7 +2,8 @@
 # GitHub's runner images ship rustup, and rustup installs the channel and the
 # components named here on the first cargo invocation, so CI jobs need no
 # toolchain-setup step of their own. The one exception is `rust.yml`'s udeps
-# job, which needs a nightly rustc this file deliberately does not pin.
+# job, which needs a nightly rustc this file deliberately does not pin; that
+# one is pinned next to its recipe, in just/code_check.just.
 [toolchain]
 channel = "1.97"
 components = ["rustfmt", "clippy"]
