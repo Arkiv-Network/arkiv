@@ -165,11 +165,14 @@ pub enum StoreState {
     ArkivPrefilling { done: u64, total: u64 },
     /// A prefill has committed every archive, but block 0 is not finalized.
     ArkivPrefillDone,
-    /// A commit is tagged with this chain's block 0. `prefilled` says whether
-    /// a prefill produced it.
-    ArkivInitialized { prefilled: bool },
-    /// Anything else, such as another chain's store.
-    Unknown,
+    /// A commit is tagged with this chain's block 0.
+    ArkivInitialized,
+    /// Anything else, such as another chain's store. `prefilled` says whether
+    /// the store holds a prefill record, as a store prefilled for this chain
+    /// does when the node is started with a genesis file other than the one
+    /// its prefill finalized: that file gives block 0 another hash, so no
+    /// commit carries it.
+    Unknown { prefilled: bool },
 }
 
 /// Which [`StoreState`] `store` is in, for the chain whose block 0 hashes to
@@ -183,7 +186,8 @@ pub enum StoreState {
 ///    `1 + $prefillCommits` (commit 1 is the alloc, then one per archive) and
 ///    no more committed than the total → [`StoreState::ArkivPrefilling`], or
 ///    [`StoreState::ArkivPrefillDone`] once every archive is in;
-/// 4. anything else → [`StoreState::Unknown`].
+/// 4. anything else → [`StoreState::Unknown`], saying whether the store has a
+///    prefill record.
 ///
 /// The head check in 3 is what tells this chain's unfinished prefill from
 /// another prefilled chain that went on to produce blocks.
@@ -198,9 +202,7 @@ pub fn classify(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<Store
         .map_err(|e| read("genesis", &e))?
         .is_some()
     {
-        return Ok(StoreState::ArkivInitialized {
-            prefilled: prefill.is_some(),
-        });
+        return Ok(StoreState::ArkivInitialized);
     }
     if head == CommitId::GENESIS {
         return Ok(StoreState::GolemDbInitialized);
@@ -219,7 +221,9 @@ pub fn classify(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<Store
                 StoreState::ArkivPrefillDone
             }
         }
-        _ => StoreState::Unknown,
+        _ => StoreState::Unknown {
+            prefilled: prefill.is_some(),
+        },
     })
 }
 
@@ -519,7 +523,6 @@ mod classify_tests {
             build(&store);
             classify(&store, OURS).unwrap()
         };
-        let initialized = |prefilled| StoreState::ArkivInitialized { prefilled };
         let cases: [Case; 9] = [
             ("fresh", &|_| {}, StoreState::GolemDbInitialized),
             (
@@ -544,7 +547,7 @@ mod classify_tests {
                     commit_something(s, Some(OURS));
                     commit_something(s, Some([0xb1; 32]));
                 },
-                initialized(true),
+                StoreState::ArkivInitialized,
             ),
             (
                 "not prefilled, running",
@@ -552,7 +555,7 @@ mod classify_tests {
                     commit_something(s, Some(OURS));
                     commit_something(s, Some([0xb1; 32]));
                 },
-                initialized(false),
+                StoreState::ArkivInitialized,
             ),
             (
                 "another chain",
@@ -560,16 +563,19 @@ mod classify_tests {
                     commit_something(s, Some(OTHER));
                     commit_something(s, Some([0xb1; 32]));
                 },
-                StoreState::Unknown,
+                StoreState::Unknown { prefilled: false },
             ),
             (
+                // Block 0 tagged with a hash other than the one asked for: the
+                // same store, whether it is another prefilled chain's or this
+                // chain's under a genesis file without its prefilled root.
                 "another prefilled chain, running",
                 &|s| {
                     prefill(s, 2, 2);
                     commit_something(s, Some(OTHER));
                     commit_something(s, Some([0xb1; 32]));
                 },
-                StoreState::Unknown,
+                StoreState::Unknown { prefilled: true },
             ),
             (
                 "a record that counts past its total",
@@ -595,7 +601,7 @@ mod classify_tests {
                         commit_something(s, None);
                     }
                 },
-                StoreState::Unknown,
+                StoreState::Unknown { prefilled: true },
             ),
         ];
         for (name, build, expected) in cases {
