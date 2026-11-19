@@ -109,9 +109,14 @@ pub fn seed_genesis(
 /// written to, with `alloc` as its genesis commit (see [`seed_genesis`]); the
 /// commit is returned then. A store that already runs this chain is left as it
 /// is. Every other [`StoreState`] is refused: an empty store for a prefilled
-/// chain, an unfinished prefill, a prefill whose block 0 is not finalized, a
-/// prefilled store under a genesis file that does not say so, and another
-/// chain's store, such as a GolemDB directory kept across a chain reset.
+/// chain, an unfinished prefill, a prefill whose block 0 is not finalized, and
+/// another chain's store, such as a GolemDB directory kept across a chain
+/// reset.
+///
+/// A prefilled store started with a genesis file that lacks the field is one
+/// of the last: without it, block 0's root is rebuilt from the alloc, so block
+/// 0 hashes differently and no commit carries that hash. It looks like any
+/// other prefilled chain's store, so the refusal names both.
 pub fn prepare_genesis(
     store: &HostStore,
     genesis_hash: [u8; 32],
@@ -134,13 +139,15 @@ pub fn prepare_genesis(
             "the Arkiv store holds a finished prefill whose block 0 is not finalized yet. Run \
              `arkiv-reth prefill --finalize`"
         ),
-        StoreState::ArkivInitialized { prefilled: true } if !prefilled => eyre::bail!(
+        StoreState::ArkivInitialized => Ok(None),
+        StoreState::Unknown { prefilled: true } if !prefilled => eyre::bail!(
             "the Arkiv store was prefilled, but the genesis file has no \
-             config.arkiv.prefilledBlockZeroStateRoot. Use the genesis file the prefill \
-             finalized"
+             config.arkiv.prefilledBlockZeroStateRoot, so none of the store's commits is this \
+             file's block 0 {}. Use the genesis file the prefill finalized, or a new store if \
+             this one belongs to another chain",
+            B256::from(genesis_hash)
         ),
-        StoreState::ArkivInitialized { .. } => Ok(None),
-        StoreState::Unknown => eyre::bail!(
+        StoreState::Unknown { .. } => eyre::bail!(
             "the Arkiv store holds another chain: none of its commits is this chain's genesis \
              block {}. Use a new store, such as a new GolemDB directory",
             B256::from(genesis_hash)
@@ -720,13 +727,24 @@ mod classify_tests {
             true,
             "Run `arkiv-reth prefill --finalize`",
         );
+        // A store prefilled and finalized as block 0 `OTHER` (its genesis
+        // file has the prefilled root), started with a file without the field:
+        // that file's block 0 is `OURS`.
+        let finalized_elsewhere = |s: &HostStore| {
+            prefill(s, 3, 3);
+            commit_something(s, Some(OTHER));
+        };
         refused(
-            &|s| {
-                prefill(s, 3, 3);
-                commit_something(s, Some(OURS));
-            },
+            &finalized_elsewhere,
             false,
-            "the genesis file has no config.arkiv.prefilledBlockZeroStateRoot",
+            "the Arkiv store was prefilled, but the genesis file has no \
+             config.arkiv.prefilledBlockZeroStateRoot",
+        );
+        // With the field, but another root, it is another chain's store.
+        refused(
+            &finalized_elsewhere,
+            true,
+            "the Arkiv store holds another chain",
         );
         refused(
             &|s| commit_something(s, Some(OTHER)),
@@ -741,7 +759,7 @@ mod classify_tests {
         assert_eq!(store.commit_by_tag(OURS).unwrap(), commit);
         assert_eq!(
             classify(&store, OURS).unwrap(),
-            StoreState::ArkivInitialized { prefilled: false }
+            StoreState::ArkivInitialized
         );
         assert_eq!(prepare_genesis(&store, OURS, false, alice()).unwrap(), None);
         assert_eq!(store.head(), commit.unwrap(), "the restart wrote nothing");
