@@ -75,6 +75,7 @@ pub fn run_part_one<S: StoreExt>(store_generator: &dyn Fn() -> S) {
     query_range_follows_each_types_order(store_generator);
     query_prefix_on_a_type_without_one_is_invalid(store_generator);
     query_between_includes_both_bounds(store_generator);
+    cells_named_like_query_words_are_ordinary_cells(store_generator);
     genesis_lands_as_the_first_commit(store_generator);
     genesis_refuses_to_apply_twice(store_generator);
     genesis_is_all_or_nothing(store_generator);
@@ -1260,6 +1261,152 @@ fn query_between_includes_both_bounds<S: Store>(store_generator: &dyn Fn() -> S)
         StoreError::InvalidQuery,
         "a type without a range has no between"
     );
+}
+
+// ---------------------------------------------------------------------------
+// names
+// ---------------------------------------------------------------------------
+
+/// Every word Arkiv's query language gives a meaning to: its keywords, its
+/// type tags and the words of `ORDER BY`.
+const QUERY_WORDS: [&str; 22] = [
+    "and",
+    "or",
+    "not",
+    "true",
+    "false",
+    "between",
+    "startswith",
+    "exists",
+    "typeof",
+    "i32",
+    "u64",
+    "u256",
+    "dec",
+    "str",
+    "addr",
+    "key",
+    "bytes32",
+    "bool",
+    "order",
+    "by",
+    "asc",
+    "desc",
+];
+
+/// The store reserves `#` names and nothing else, so a cell named like a word
+/// of the query language, in any case, is written, read, matched, sorted and
+/// projected like any other, as an attribute or as a field.
+///
+/// Records 1 to 3 carry every word as an indexed `u64` holding their ordinal.
+/// Record 4 carries every word as a field, holding 2, which no query sees.
+/// Record 5 carries every word uppercased, a different name, as an indexed
+/// `str` holding that name.
+fn cells_named_like_query_words_are_ordinary_cells<S: Store>(store_generator: &dyn Fn() -> S) {
+    let mut store = store_generator();
+    let branch = store.begin(None).unwrap();
+    for ordinal in 1..=3u8 {
+        let cells: Vec<(&str, Cell)> = QUERY_WORDS
+            .iter()
+            .map(|word| (*word, u64_attribute(u64::from(ordinal))))
+            .collect();
+        create_record(&mut store, branch, record_key(ordinal), &cells);
+    }
+    let field = Cell::field(TypeId::U64, 2u64.to_be_bytes().to_vec());
+    let fields: Vec<(&str, Cell)> = QUERY_WORDS
+        .iter()
+        .map(|word| (*word, field.clone()))
+        .collect();
+    create_record(&mut store, branch, record_key(4), &fields);
+    let upper: Vec<String> = QUERY_WORDS
+        .iter()
+        .map(|word| word.to_ascii_uppercase())
+        .collect();
+    let upper_cells: Vec<(&str, Cell)> = upper
+        .iter()
+        .map(|name| (name.as_str(), str_attribute(name)))
+        .collect();
+    create_record(&mut store, branch, record_key(5), &upper_cells);
+    let at = store.commit(branch).unwrap();
+
+    let record = |ordinal| {
+        read_record(&store, ReadTarget::Commit(at), record_key(ordinal)).expect("record is there")
+    };
+    let (attributes, fields, uppercased) = (record(2), record(4), record(5));
+    let keys = |query: &Query| matched_keys(&store, at, query);
+    for (word, upper) in QUERY_WORDS.iter().zip(&upper) {
+        assert_eq!(attributes.cell(word), Some(&u64_attribute(2)), "{word}");
+        assert_eq!(fields.cell(word), Some(&field), "{word}");
+        assert_eq!(
+            uppercased.cell(upper),
+            Some(&str_attribute(upper)),
+            "{upper}"
+        );
+        assert_eq!(
+            uppercased.cell(word),
+            None,
+            "{word}: names are case-sensitive"
+        );
+
+        assert_eq!(
+            keys(&paged_query(
+                equals_filter(word, TypeId::U64, 2u64.to_be_bytes().to_vec()),
+                0,
+                10
+            )),
+            vec![record_key(2)],
+            "{word}: the attribute matches, and the field of the same name is invisible"
+        );
+        assert_eq!(
+            keys(&paged_query(carrying(word), 0, 10)),
+            vec![record_key(1), record_key(2), record_key(3)],
+            "{word}: presence"
+        );
+        assert_eq!(
+            keys(&paged_query(
+                equals_filter(upper, TypeId::STR, upper.as_bytes().to_vec()),
+                0,
+                10
+            )),
+            vec![record_key(5)],
+            "{upper}"
+        );
+        assert_eq!(
+            keys(&paged_query(
+                equals_filter(word, TypeId::STR, upper.as_bytes().to_vec()),
+                0,
+                10
+            )),
+            Vec::<RecordKey>::new(),
+            "{word} is not {upper}"
+        );
+        let descending = Query {
+            sort: Some(Sort {
+                cell: word.to_string(),
+                type_id: TypeId::U64,
+                direction: SortDirection::Descending,
+            }),
+            ..paged_query(carrying(word), 0, 10)
+        };
+        assert_eq!(
+            keys(&descending),
+            vec![record_key(3), record_key(2), record_key(1)],
+            "{word}: sorted by"
+        );
+    }
+
+    let wanted: Vec<CellName> = QUERY_WORDS[..3].iter().map(|w| w.to_string()).collect();
+    let projected = store
+        .get(ReadTarget::Commit(at), record_key(4), Some(&wanted), None)
+        .unwrap()
+        .into_value()
+        .expect("the record is present");
+    for word in &QUERY_WORDS[..3] {
+        assert_eq!(projected.cell(word), Some(&field), "{word}: projected");
+    }
+    for word in &QUERY_WORDS[3..] {
+        assert_eq!(projected.cell(word), None, "{word}: projected away");
+    }
 }
 
 // ---------------------------------------------------------------------------

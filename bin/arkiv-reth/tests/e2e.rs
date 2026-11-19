@@ -694,7 +694,7 @@ async fn query_operator_classes_over_a_live_node() {
         ("rank != u256(30)", "-32002"),                       // != is not in the language
         ("rank STARTSWITH u256(1)", "-32002"),                // a prefix needs a str
         ("rank BETWEEN u256(1) AND i32(5)", "-32002"),        // bounds of two types
-        ("between = true", "-32001"),                         // a reserved word
+        ("between = true", "-32001"),                         // a bare keyword: quote it
         ("exists($owner)", "-32002"),                         // presence takes a user attribute
         ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
         ("rank = i32(2147483648)", "-32003"), // literal out of range
@@ -982,6 +982,316 @@ async fn query_operator_classes_over_a_live_node() {
         .to_string();
     assert!(untyped.contains("-32002"), "a type error: {untyped}");
     assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);
+}
+
+/// Every word the query language gives a meaning to: its keywords, its type
+/// tags and the words of `ORDER BY`.
+const QUERY_WORDS: [&str; 22] = [
+    "and",
+    "or",
+    "not",
+    "true",
+    "false",
+    "between",
+    "startswith",
+    "exists",
+    "typeof",
+    "i32",
+    "u64",
+    "u256",
+    "dec",
+    "str",
+    "addr",
+    "key",
+    "bytes32",
+    "bool",
+    "order",
+    "by",
+    "asc",
+    "desc",
+];
+
+/// Of [`QUERY_WORDS`], the keywords: a query names an attribute after one
+/// only quoted. The rest are read by position, so they name one bare too.
+const KEYWORDS: usize = 9;
+
+/// The type the attribute named after word `index` holds, so the words cover
+/// three: `u64`, `str` and `i32` in turn.
+fn word_tag(index: usize) -> &'static str {
+    ["u64", "str", "i32"][index % 3]
+}
+
+/// The value the attribute named after word `index` holds on the `n`th
+/// entity.
+fn word_value(index: usize, n: u8) -> AttributeValue {
+    match word_tag(index) {
+        "u64" => AttributeValue::U64(u64::from(n)),
+        "str" => AttributeValue::Str(format!("v{n}")),
+        _ => AttributeValue::Int(i32::from(n)),
+    }
+}
+
+/// That value as a query literal.
+fn word_literal(index: usize, n: u8) -> String {
+    match word_tag(index) {
+        "str" => format!("str('v{n}')"),
+        tag => format!("{tag}({n})"),
+    }
+}
+
+/// That value as the RPC encodes it.
+fn word_json(index: usize, n: u8) -> serde_json::Value {
+    match word_tag(index) {
+        "u64" => serde_json::json!(format!("{n:#x}")),
+        "str" => serde_json::json!(format!("v{n}")),
+        _ => serde_json::json!(n),
+    }
+}
+
+/// The attribute `name`, holding word `index`'s value for the `n`th entity.
+fn word_attr(name: &str, index: usize, n: u8, indexed: bool) -> Attribute {
+    Attribute::from_value(
+        Ident32::encode(name).unwrap(),
+        &word_value(index, n),
+        indexed,
+    )
+    .unwrap()
+}
+
+/// No attribute name is reserved, end to end: entities are written with the
+/// query language's own words as attribute names, indexed and not, read back
+/// whole and projected by name, queried with every name quoted (and bare,
+/// where a word needs no quotes), sorted, counted, patched and unset.
+///
+/// Entities 0 to 2 carry every word as an indexed attribute holding the
+/// values for 1 to 3. Entity 3 carries every word as an unindexed field,
+/// holding entity 1's values, which no query sees. Entity 4 carries every
+/// word uppercased, holding entity 1's values: a different name, since names
+/// are case-sensitive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_words_as_attribute_names_over_a_live_node() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let indexed = |n: u8| -> Vec<Attribute> {
+        QUERY_WORDS
+            .iter()
+            .enumerate()
+            .map(|(index, word)| word_attr(word, index, n, true))
+            .collect()
+    };
+    let fields: Vec<Attribute> = QUERY_WORDS
+        .iter()
+        .enumerate()
+        .map(|(index, word)| word_attr(word, index, 2, false))
+        .collect();
+    let uppercased: Vec<Attribute> = QUERY_WORDS
+        .iter()
+        .enumerate()
+        .map(|(index, word)| word_attr(&word.to_ascii_uppercase(), index, 2, true))
+        .collect();
+    let create = |attrs: Vec<Attribute>| Operation::create(0, 0, 1000, 0, attrs);
+    client
+        .execute(vec![
+            create(indexed(1)),
+            create(indexed(2)),
+            create(indexed(3)),
+            create(fields),
+            create(uppercased),
+        ])
+        .await;
+
+    let key = |i: u64| {
+        B256::from(derive_entity_address(
+            DEV_CHAIN_ID,
+            &caller.into_array(),
+            EntityCreationNonce::new(i),
+            0,
+        ))
+    };
+    let expect = |idxs: &[u64]| -> BTreeSet<String> {
+        idxs.iter().map(|i| format!("{:#x}", key(*i))).collect()
+    };
+    let in_order = |page: &serde_json::Value| -> Vec<String> {
+        page["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|entity| entity["key"].as_str().expect("key").to_string())
+            .collect()
+    };
+    let names_of = |entity: &serde_json::Value, field: &str| -> Vec<String> {
+        entity[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} array: {entity}"))
+            .iter()
+            .map(|a| a["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    let mut sorted_words: Vec<(usize, &str)> = QUERY_WORDS.iter().copied().enumerate().collect();
+    sorted_words.sort_by_key(|(_, word)| *word);
+
+    // Read back whole: every attribute keeps its name, type and value, and
+    // every field its indexed flag.
+    assert_eq!(
+        client.get_entity(key(1)).await["attributes"],
+        serde_json::Value::Array(
+            sorted_words
+                .iter()
+                .map(|(index, word)| serde_json::json!({
+                    "name": word, "type": word_tag(*index), "value": word_json(*index, 2),
+                }))
+                .collect()
+        )
+    );
+    let schema = client
+        .query_raw(
+            &format!("$key = key({:#x})", key(3)),
+            serde_json::json!({ "select": { "attributeSchema": true } }),
+        )
+        .await
+        .expect("the fields' schema");
+    assert_eq!(
+        schema["data"][0]["attributeSchema"],
+        serde_json::Value::Array(
+            sorted_words
+                .iter()
+                .map(|(index, word)| serde_json::json!({
+                    "name": word, "type": word_tag(*index), "indexed": false,
+                }))
+                .collect()
+        )
+    );
+
+    // Projected by name: `select` takes the words as names, attributes and
+    // fields alike.
+    for entity in [key(1), key(3)] {
+        let subset = client
+            .query_raw(
+                &format!("$key = key({entity:#x})"),
+                serde_json::json!({ "select": { "attributes": {
+                    "and": true, "typeof": true, "desc": true, "str": true, "not": false,
+                } } }),
+            )
+            .await
+            .expect("a named attribute subset");
+        assert_eq!(
+            names_of(&subset["data"][0], "attributes"),
+            ["and", "desc", "str", "typeof"]
+        );
+    }
+
+    // Quoted, every word is reachable by every operator, presence test and
+    // sort; the field and the uppercased word are other names.
+    for (index, word) in QUERY_WORDS.iter().enumerate() {
+        let name = format!("\"{word}\"");
+        let upper = format!("\"{}\"", word.to_ascii_uppercase());
+        let (tag, one, two) = (
+            word_tag(index),
+            word_literal(index, 1),
+            word_literal(index, 2),
+        );
+        for (text, matched) in [
+            (format!("{name} = {two}"), expect(&[1])),
+            (format!("{name} BETWEEN {one} AND {two}"), expect(&[0, 1])),
+            (format!("exists({name})"), expect(&[0, 1, 2])),
+            (format!("typeof({name}) = {tag}"), expect(&[0, 1, 2])),
+            (format!("NOT {name} = {two}"), expect(&[0, 2, 3, 4])),
+            (format!("{upper} = {two}"), expect(&[4])),
+        ] {
+            assert_eq!(
+                result_keys(&client.query(&text, 100, None).await),
+                matched,
+                "{text}"
+            );
+        }
+        let sorted = client
+            .query_raw(
+                &format!("exists({name}) ORDER BY {name}:{tag} DESC"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("sorted by a word");
+        assert_eq!(
+            in_order(&sorted),
+            [key(2), key(1), key(0)].map(|k| format!("{k:#x}")),
+            "{word}: sorted by"
+        );
+
+        // Bare, a keyword is the keyword, and the error says how to quote it;
+        // every other word names the attribute bare too.
+        let bare = format!("{word} = {two}");
+        if index < KEYWORDS {
+            let err = client
+                .query_raw(&bare, serde_json::json!({}))
+                .await
+                .expect_err(&bare)
+                .to_string();
+            assert!(err.contains("-32001"), "{bare}: {err}");
+            assert!(err.contains("quote it"), "{bare}: {err}");
+        } else {
+            assert_eq!(
+                result_keys(&client.query(&bare, 100, None).await),
+                expect(&[1]),
+                "{bare}"
+            );
+        }
+    }
+
+    // Every word in one query, and a count over two spellings of one word.
+    let all = QUERY_WORDS
+        .iter()
+        .enumerate()
+        .map(|(index, word)| format!("\"{word}\" = {}", word_literal(index, 2)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    assert_eq!(
+        result_keys(&client.query(&all, 100, None).await),
+        expect(&[1])
+    );
+    assert_eq!(
+        client
+            .entity_count(Some("exists(\"and\") OR exists(\"AND\")"), None)
+            .await,
+        4
+    );
+
+    // The registry's view takes the words as names too: an attribute, a
+    // field, and a name entity 4 carries only uppercased.
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+    let and_type = word_value(0, 2).attr_type().id();
+    for (entity, type_id) in [
+        (key(1), and_type | arkiv_bindings::INDEXED_FLAG),
+        (key(3), and_type),
+        (key(4), 0x00),
+    ] {
+        let got = registry
+            .attributeTypeId(entity, Ident32::encode("and").unwrap().into_word())
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(got, type_id, "{entity:#x}");
+    }
+
+    // Patched and unset by name: `or` takes a new value, `not` goes.
+    client
+        .execute(vec![Operation::patch(
+            key(0),
+            vec![
+                word_attr("or", 1, 9, true),
+                Attribute::tombstone(Ident32::encode("not").unwrap()),
+            ],
+        )])
+        .await;
+    assert_eq!(
+        result_keys(&client.query("\"or\" = str('v9')", 100, None).await),
+        expect(&[0])
+    );
+    assert_eq!(
+        result_keys(&client.query("exists(\"not\")", 100, None).await),
+        expect(&[1, 2])
+    );
+    let patched = client.get_entity(key(0)).await;
+    assert_eq!(attr_value(&patched, "or"), "v9");
+    assert!(attr_value(&patched, "not").is_null(), "unset: {patched}");
 }
 
 /// Every mutating op — update, extend, transfer, delete — driven over a live node

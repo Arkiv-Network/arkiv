@@ -22,7 +22,7 @@ use super::{Parser, TagSite, builtin_type};
 use crate::error::ParseError;
 use crate::lexer::Token;
 
-impl Parser {
+impl Parser<'_> {
     /// The clause, from its `ORDER` to the end of the query.
     pub(super) fn parse_order_by(&mut self) -> Result<OrderBy, ParseError> {
         let order_at = self.next_position();

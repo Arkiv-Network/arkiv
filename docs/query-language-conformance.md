@@ -29,6 +29,7 @@ changing the code and changing the spec).
 | [Q6](#q6--untagged-quoted-strings-accepted-for-system-attributes) | Untagged quoted strings accepted for `$owner` `$creator` `$key` | parser | P3 | decision |
 | [Q7](#q7--type-tags-are-case-insensitive) | Type tags are case-insensitive | lexer, parser | P3 | decision |
 | [Q8](#q8--andor-nesting-capped-at-4-levels) | `AND`/`OR` nesting capped at 4 levels | parser limits | P3 | decision |
+| [Q9](#q9--attributes-named-like-keywords-or-type-tags-could-not-be-queried) | Attributes named like keywords or type tags could not be queried | lexer, parser, spec | P2 | done |
 | [S1–S6](#spec-text-issues) | Problems in the spec text itself | spec | P2 | open |
 | [D1–D2](#out-of-date-crate-docs) | Out-of-date crate docs | docs | P3 | in progress |
 
@@ -223,7 +224,7 @@ indexed `i32` `a` other than 3, on both stores.
 - `lo > hi` matches nothing.
 - The `AND` inside `BETWEEN` belongs to it:
   `a BETWEEN 1 AND 5 AND b = 2` is `(a BETWEEN 1 AND 5) AND b = 2`.
-- `BETWEEN` is a reserved word.
+- `BETWEEN` is a keyword.
 
 **Before:** it wasn't a keyword in the lexer and had no AST variant.
 `a BETWEEN i32(1) AND i32(5)` failed with `-32001 expected a comparison
@@ -258,7 +259,7 @@ operator`, and `between = true` was accepted as an attribute name.
   `between_bounds_of_two_types_are_a_type_error`,
   `between_on_a_system_attribute_takes_its_type` and
   `between_needs_its_full_shape`; `between = true` in
-  `keywords_and_type_names_cannot_be_attributes`; the spec's full worked
+  `a_bare_keyword_is_not_a_name_but_a_bare_type_name_is`; the spec's full worked
   example in `the_specs_example_query_parses`.
 - Lowering: `between_is_one_test_with_both_bounds`,
   `between_includes_both_ends_and_orders_negatives` and
@@ -318,18 +319,16 @@ stated (see S5).
 
 **Code:**
 - `I32(10)` and `typeof(x) = I32` are accepted.
-- The reserved-name check uses the same case-insensitive match, so `Key`,
-  `Str` and `KEY` are rejected as attribute names, even though `Key` ≠ `key`
-  under case-sensitive names.
+- Tag names no longer collide with attribute names in any case: a tag is a
+  tag only where one stands, so `Key`, `Str` and `KEY` are names (Q9).
 
 **Where:**
 - [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:42-57](../crates/arkiv-query/src/lexer.rs#L42-L57)
-- [`validate_user_name`, crates/arkiv-query/src/parse.rs:657-674](../crates/arkiv-query/src/parse.rs#L657-L674)
 
 **Tasks:**
 - [ ] Decide whether tags are case-sensitive, and write it into the spec.
-- [ ] If they are, match tags exactly and allow `Key`, `Str` and similar as
-      names.
+- [x] Allow `Key`, `Str` and similar as names (done in Q9, whatever the
+      decision on tags).
 
 ---
 
@@ -353,6 +352,58 @@ levels of parentheses or `NOT`.
 
 ---
 
+## Q9 — Attributes named like keywords or type tags could not be queried
+
+**Status:** done · **Priority:** P2
+
+**Spec (before):** keywords and type tags "are not allowed as names". The
+write path never enforced that: it checks the `Ident32` charset and the `$`
+prefix, nothing else. So an entity could carry `key`, `addr`, `true` or
+`Exists`, but the parser refused every query naming one, in a comparison,
+`exists`, `typeof` or `ORDER BY`, and the language had no way to quote a
+name.
+
+**Resolution:** no word is reserved, anywhere.
+- Lexer: `"…"` is a quoted user attribute name (`Token::QuotedName`): never a
+  keyword, a type tag or an `ORDER BY` word, with a bare name's characters
+  between the quotes, so nothing needs escaping
+  ([`take_quoted_name`, crates/arkiv-query/src/lexer.rs:477](../crates/arkiv-query/src/lexer.rs#L477)).
+- Parser: a quoted name stands wherever a user attribute does. Quotes are
+  optional: `"level"` and `level` are the same query. The type-name check is
+  gone from
+  [`validate_user_name`, crates/arkiv-query/src/parse.rs:789](../crates/arkiv-query/src/parse.rs#L789),
+  so `str = str('x')` names an attribute `str`. A bare keyword where a name
+  belongs is still `-32001`, and the message shows the quoted form in the
+  spelling written
+  ([`keyword_as_name`, crates/arkiv-query/src/parse.rs:501](../crates/arkiv-query/src/parse.rs#L501)).
+  `name = "Bob"` says how a string is written instead.
+- Write path: no change. It never checked words. The `$` check stays: it keeps
+  the engine-owned system cells out of clients' reach
+  ([`check_triple_list`, crates/arkiv-reth-executor/src/decode.rs:244](../crates/arkiv-reth-executor/src/decode.rs#L244)).
+- Spec: the grammar gains `userName = name | quotedName`, and the
+  attribute-names section says no word is reserved.
+
+**Tests:**
+- Lexer: `a_quoted_word_is_always_a_name`,
+  `a_quoted_name_takes_a_bare_names_characters`.
+- Parser: the attribute-name tests in
+  [crates/arkiv-query/src/parse.rs:1762](../crates/arkiv-query/src/parse.rs#L1762)
+  walk every keyword, tag and `ORDER BY` word, in three spellings, through
+  every predicate, presence test and sort, alone and combined, quoted and
+  bare.
+- Executor: `the_query_languages_words_are_ordinary_attribute_names` decodes
+  them in creates, patches and tombstones.
+- Store conformance suite (in-memory and GolemDB):
+  `cells_named_like_query_words_are_ordinary_cells`.
+- GolemDB on disk, through the parser:
+  `attributes_named_like_query_words_are_queried_by_quoting_them` in
+  [crates/arkiv-golemdb/tests/query.rs](../crates/arkiv-golemdb/tests/query.rs).
+- Live node: `query_words_as_attribute_names_over_a_live_node` writes them as
+  attributes and fields, reads them whole and through `select`, queries,
+  sorts, counts, patches and unsets them.
+
+---
+
 ## Spec text issues
 
 Problems in [api-spec.md §4](api-spec.md#4-read-path--the-arkiv_query-language)
@@ -365,9 +416,9 @@ itself, to fix in the spec.
       which the §2 table forbids ("bare `true` / `false` (no wrapper)").
 - [ ] **S3.** `numLit`, `literalBody`, `letter`, `digit` and `utf8Char` are
       used in the grammar but never defined.
-- [ ] **S4.** The grammar section says type tags are "not globally reserved",
-      but the attribute-names section bans them as names. The parser follows
-      the stricter rule.
+- [x] **S4.** The grammar section said type tags are "not globally reserved",
+      but the attribute-names section banned them as names. Both now say no
+      word is reserved (Q9).
 - [ ] **S5.** Whether type tags are case-sensitive isn't stated (see Q7).
 - [ ] **S6.** §6 gives parse-error `data` as `{ position, expected, got }`.
       The node sends `{ position, message }`
@@ -398,7 +449,10 @@ takes 40 hex digits, and `key` and `bytes32` take 64.
 | `a BETWEEN 1 AND 5 AND b = 2` | OK, `(a BETWEEN 1 AND 5) AND b = 2` | as the spec (was `-32001`) | tests | Q5 ✓ |
 | `a BETWEEN i32(1) AND u64(5)` | `-32002` | `-32002` (was `-32001`) | tests | Q5 ✓ |
 | `a BETWEEN 5 AND 1` | matches nothing | matches nothing (was `-32001`) | tests | Q5 ✓ |
-| `between = true` | error (reserved word) | `-32001` (was OK) | tests | Q5 ✓ |
+| `between = true` | error (a bare keyword) | `-32001` (was OK) | tests | Q5 ✓ |
+| `"between" = true` | OK | OK (was `-32001`) | tests | Q9 ✓ |
+| `str = str('x')` | OK | OK (was `-32001`) | tests | Q9 ✓ |
+| `* ORDER BY "and":str` | OK | OK (was `-32001`) | tests | Q9 ✓ |
 | `a != i32(3)` | OK | `-32002` | parser | Q4 |
 | `name >= str('a')` | OK | OK (was `-32002`) | tests | Q3 ✓ |
 | `flag > false` | OK | OK (was `-32002`) | tests | Q3 ✓ |
@@ -410,7 +464,7 @@ takes 40 hex digits, and `key` and `bytes32` take 64.
 | `typeof(x) = key`, GolemDB node | `key`-typed `x` only | also finds `bytes32`-typed `x` (was `-32603`) | code | Q2 |
 | `$owner = '0x…'` | error (must be tagged) | OK | parser | Q6 |
 | `level = I32(10)` | unspecified | OK | parser | Q7 |
-| `Key = true` | OK (names are case-sensitive) | `-32001` | parser | Q7 |
+| `Key = true` | OK (names are case-sensitive) | OK (was `-32001`) | tests | Q9 ✓ |
 | `a = 1 AND (b = 1 OR (c = 1 AND (d = 1 OR (e = 1 AND f = 1))))` | OK (no limit stated) | `-32004` | parser | Q8 |
 | `desc STARTSWITH 'ab'` | OK per grammar | `-32002` | parser | S1 |
 
@@ -434,7 +488,8 @@ Behavior that matches §4; keep it that way while fixing the items above.
   bounds, and nothing matched when `lo > hi`; one GolemDB range (Q5).
 - `exists` and `typeof` see only indexed user attributes and refuse `$` names.
 - Names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, case-sensitive; `$`
-  and `#` rejected.
+  and `#` rejected; no word reserved, a keyword-named attribute written
+  quoted (Q9).
 - Exact-type, indexed-only matching (in-memory store; see Q2 for GolemDB).
 - `$createdAt`, `$updatedAt` and `$creationFlags` are refused with a clear
   message.

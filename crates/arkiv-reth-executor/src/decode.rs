@@ -920,6 +920,108 @@ mod tests {
         }
     }
 
+    /// No name is reserved: the query language's keywords, type tags and
+    /// clause words, in any case, are attribute names like any other —
+    /// indexed or not, set or unset. A query reaches them quoted.
+    #[test]
+    fn the_query_languages_words_are_ordinary_attribute_names() {
+        let words = [
+            "and",
+            "or",
+            "not",
+            "true",
+            "false",
+            "between",
+            "startswith",
+            "exists",
+            "typeof",
+            "i32",
+            "u64",
+            "u256",
+            "dec",
+            "str",
+            "addr",
+            "key",
+            "bytes32",
+            "bool",
+            "order",
+            "by",
+            "asc",
+            "desc",
+        ];
+        let upper: Vec<String> = words.iter().map(|w| w.to_ascii_uppercase()).collect();
+        let created: Vec<_> = words
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let value = AttributeValue::Str((*name).into());
+                if index % 2 == 0 {
+                    attr(name, &value)
+                } else {
+                    stored(name, &value)
+                }
+            })
+            .collect();
+        let cd = calldata(vec![
+            create_in(1, created),
+            Operation::patch(
+                B256::repeat_byte(1),
+                upper
+                    .iter()
+                    .map(|name| attr(name, &AttributeValue::Bool(true)))
+                    .collect(),
+            ),
+            Operation::patch(
+                B256::repeat_byte(1),
+                words
+                    .iter()
+                    .map(|name| AbiAttribute::tombstone(ident(name)))
+                    .collect(),
+            ),
+        ]);
+        let ops = decode_ops(&env([0xAA; 20], 1, 1), &cd, EntityCreationNonce::ZERO)
+            .expect("every word is a valid attribute name");
+
+        // Ops carry their triples sorted by name.
+        fn sorted<S: AsRef<str>>(names: &[S]) -> Vec<Vec<u8>> {
+            let mut bytes: Vec<Vec<u8>> = names
+                .iter()
+                .map(|name| name.as_ref().as_bytes().to_vec())
+                .collect();
+            bytes.sort();
+            bytes
+        }
+        let expected = sorted(&words);
+        let Op::Create { attributes, .. } = &ops[0] else {
+            panic!("expected create")
+        };
+        assert_eq!(
+            attributes.iter().map(|a| a.key.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        for attribute in attributes {
+            assert_eq!(
+                attribute.value,
+                AttributeValue::Str(String::from_utf8(attribute.key.clone()).unwrap())
+            );
+        }
+        let Op::Patch { mutations, .. } = &ops[1] else {
+            panic!("expected patch")
+        };
+        assert_eq!(
+            mutations.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
+            sorted(&upper)
+        );
+        let Op::Patch { mutations, .. } = &ops[2] else {
+            panic!("expected patch")
+        };
+        assert_eq!(
+            mutations.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(mutations.iter().all(|m| m.value.is_none()));
+    }
+
     /// Report the position and value of an invalid name byte.
     #[test]
     fn rejects_invalid_attribute_name() {

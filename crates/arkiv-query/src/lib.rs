@@ -47,6 +47,24 @@
 //! `AND` inside it is its own, so `a BETWEEN 1 AND 5 AND b = 2` is
 //! `(a BETWEEN 1 AND 5) AND b = 2`.
 //!
+//! ## Attribute names
+//!
+//! **No attribute name is reserved**: whatever name an entity can be written
+//! with, a query can reach. A bare keyword is always the keyword, so an
+//! attribute named like one is double-quoted wherever it stands —
+//! `"and" = true`, `exists("typeof")`, `ORDER BY "not":str`. Any other name
+//! may be quoted or not, to the same effect, and a quoted name keeps its case
+//! as every name does. Type tags and the words of `ORDER BY` are read where
+//! they stand, so `str = str('x')` and `desc = i32(1)` need no quotes.
+//!
+//! ```
+//! use arkiv_query::parse;
+//!
+//! assert!(parse("and = true").is_err());
+//! assert!(parse("\"and\" = true AND str = str('x')").is_ok());
+//! assert_eq!(parse("\"level\" = 1").unwrap(), parse("level = 1").unwrap());
+//! ```
+//!
 //! ## Sorting
 //!
 //! A query may end with `ORDER BY attr[:tag] [ASC | DESC]`, which sorts its

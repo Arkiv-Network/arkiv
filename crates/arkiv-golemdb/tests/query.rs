@@ -13,7 +13,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::query::Query as ArkivQuery;
-use arkiv_interfaces::store::{Filter, Page, Query, Sort, Store, StoreError};
+use arkiv_interfaces::store::{Filter, Page, Query, ReadTarget, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
 
@@ -593,4 +593,225 @@ fn order_by_sorts_by_one_attribute_read_as_one_type() {
         sorted_page(&store, &red("$owner DESC"), 0, 10),
         [6, 5, 4, 3, 2, 1]
     );
+}
+
+/// Every word the query language gives a meaning to: its keywords, its type
+/// tags and the words of `ORDER BY`.
+const QUERY_WORDS: [&str; 22] = [
+    "and",
+    "or",
+    "not",
+    "true",
+    "false",
+    "between",
+    "startswith",
+    "exists",
+    "typeof",
+    "i32",
+    "u64",
+    "u256",
+    "dec",
+    "str",
+    "addr",
+    "key",
+    "bytes32",
+    "bool",
+    "order",
+    "by",
+    "asc",
+    "desc",
+];
+
+/// The words a query may write bare: the type tags and the words of
+/// `ORDER BY`, which are read by position.
+const POSITIONAL_WORDS: [&str; 13] = [
+    "i32", "u64", "u256", "dec", "str", "addr", "key", "bytes32", "bool", "order", "by", "asc",
+    "desc",
+];
+
+/// The type the attribute named after word `index` holds, so the words cover
+/// three: `u64`, `str` and `i32` in turn.
+fn word_tag(index: usize) -> &'static str {
+    ["u64", "str", "i32"][index % 3]
+}
+
+/// The value the attribute named after word `index` holds on entity `n`.
+fn word_value(index: usize, n: u8) -> AttributeValue {
+    match word_tag(index) {
+        "u64" => AttributeValue::U64(u64::from(n)),
+        "str" => AttributeValue::Str(format!("v{n}")),
+        _ => AttributeValue::Int(i32::from(n)),
+    }
+}
+
+/// That value as a query literal.
+fn word_literal(index: usize, n: u8) -> String {
+    match word_tag(index) {
+        "str" => format!("str('v{n}')"),
+        tag => format!("{tag}({n})"),
+    }
+}
+
+/// No attribute name is reserved, through the parser and on disk. Entities 1
+/// to 3 carry every word as an indexed attribute; entity 4 carries every word
+/// as an unindexed field, holding entity 2's values, which no query sees;
+/// entity 5 carries every word uppercased, holding entity 2's values: a
+/// different name, as names are case-sensitive.
+///
+/// Quoted, every word is reachable by every operator, presence test and sort;
+/// a type tag or a clause word is reachable bare too, to the same effect.
+#[test]
+fn attributes_named_like_query_words_are_queried_by_quoting_them() {
+    let indexed = |n: u8| -> Vec<Attribute> {
+        QUERY_WORDS
+            .iter()
+            .enumerate()
+            .map(|(index, word)| Attribute::new(*word, word_value(index, n)))
+            .collect()
+    };
+    let fields: Vec<Attribute> = QUERY_WORDS
+        .iter()
+        .enumerate()
+        .map(|(index, word)| Attribute::unindexed(*word, word_value(index, 2)))
+        .collect();
+    let uppercased: Vec<Attribute> = QUERY_WORDS
+        .iter()
+        .enumerate()
+        .map(|(index, word)| Attribute::new(word.to_ascii_uppercase(), word_value(index, 2)))
+        .collect();
+    let entities = [
+        entity_with(1, indexed(1)),
+        entity_with(2, indexed(2)),
+        entity_with(3, indexed(3)),
+        entity_with(4, fields),
+        entity_with(5, uppercased),
+    ];
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, &entities);
+
+    for (index, word) in QUERY_WORDS.iter().enumerate() {
+        let name = format!("\"{word}\"");
+        let upper = format!("\"{}\"", word.to_ascii_uppercase());
+        let (tag, one, two, three) = (
+            word_tag(index),
+            word_literal(index, 1),
+            word_literal(index, 2),
+            word_literal(index, 3),
+        );
+        let mut cases = vec![
+            (format!("{name} = {two}"), vec![2]),
+            (format!("{name} >= {two}"), vec![2, 3]),
+            (format!("{name} < {two}"), vec![1]),
+            (format!("{name} BETWEEN {one} AND {two}"), vec![1, 2]),
+            (format!("{name} = {one} OR {name} = {three}"), vec![1, 3]),
+            (format!("exists({name})"), vec![1, 2, 3]),
+            (format!("typeof({name}) = {tag}"), vec![1, 2, 3]),
+            (format!("exists({name}) AND {name} > {one}"), vec![2, 3]),
+            (format!("{upper} = {two}"), vec![5]),
+            (format!("exists({upper})"), vec![5]),
+        ];
+        if tag == "str" {
+            cases.push((format!("{name} STARTSWITH str('v')"), vec![1, 2, 3]));
+        }
+        for (text, expected) in cases {
+            assert_eq!(matched(&store, filter(&text)), expected, "{text}");
+        }
+        assert_eq!(
+            sorted_page(
+                &store,
+                &format!("exists({name}) ORDER BY {name}:{tag} DESC"),
+                0,
+                10
+            ),
+            [3, 2, 1],
+            "{word}: sorted by"
+        );
+        assert_eq!(
+            store
+                .count(None, &filter(&format!("{name} > {one}")), None)
+                .map(|n| n.into_value()),
+            Ok(2),
+            "{word}: counted"
+        );
+    }
+
+    // Bare, the words read by position name the same attributes.
+    for word in POSITIONAL_WORDS {
+        let index = QUERY_WORDS.iter().position(|w| *w == word).unwrap();
+        let (tag, two) = (word_tag(index), word_literal(index, 2));
+        assert_eq!(
+            matched(&store, filter(&format!("{word} = {two}"))),
+            [2],
+            "{word}"
+        );
+        assert_eq!(
+            matched(&store, filter(&format!("typeof({word}) = {tag}"))),
+            [1, 2, 3],
+            "{word}"
+        );
+        assert_eq!(
+            sorted_page(
+                &store,
+                &format!("{word} >= {two} ORDER BY {word}:{tag} DESC"),
+                0,
+                10
+            ),
+            [3, 2],
+            "{word}"
+        );
+    }
+
+    // Every word in one query, each matched on entity 2's value, sorted by a
+    // keyword-named attribute.
+    let all = QUERY_WORDS
+        .iter()
+        .enumerate()
+        .map(|(index, word)| format!("\"{word}\" = {}", word_literal(index, 2)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    assert_eq!(matched(&store, filter(&all)), [2]);
+    let every_entity = format!(
+        "exists(\"and\") AND exists(\"or\") AND typeof(\"typeof\") = {} \
+         ORDER BY \"and\":{} DESC",
+        word_tag(8),
+        word_tag(0),
+    );
+    assert_eq!(sorted_page(&store, &every_entity, 0, 10), [3, 2, 1]);
+
+    // Read back whole, every attribute and field keeps its name, value and
+    // kind; projected, a record returns just the names asked for.
+    for entity in &entities {
+        let record = store
+            .get(
+                ReadTarget::Commit(store.head()),
+                entity_records::record_key(entity.key).unwrap(),
+                None,
+                None,
+            )
+            .unwrap()
+            .into_value()
+            .expect("the entity is stored");
+        let mut read = entity_records::from_record(&record).unwrap().attributes;
+        let mut written = entity.attributes.clone();
+        read.sort_by(|a, b| a.key.cmp(&b.key));
+        written.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(read, written, "entity {}", entity.key[0]);
+    }
+    let wanted: Vec<String> = ["and", "typeof", "desc"].map(String::from).to_vec();
+    let projected = store
+        .get(
+            ReadTarget::Commit(store.head()),
+            entity_records::record_key(entities[3].key).unwrap(),
+            Some(&wanted),
+            None,
+        )
+        .unwrap()
+        .into_value()
+        .expect("the entity is stored");
+    let names: Vec<&str> = projected
+        .cells
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, ["and", "desc", "typeof"]);
 }

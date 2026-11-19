@@ -4,13 +4,14 @@
 //! - grouping and comparison: `(` `)` `=` `!=` `<` `<=` `>` `>=`
 //! - `:`, which joins an `ORDER BY` attribute to the type it sorts as
 //! - keywords, case-insensitive: `AND` `OR` `NOT` `TRUE` `FALSE` `BETWEEN`
-//!   `STARTSWITH` `EXISTS` `TYPEOF`. A keyword is never an attribute name.
+//!   `STARTSWITH` `EXISTS` `TYPEOF`. Bare, a keyword is always the keyword;
+//!   quoted, `"and"`, it is an attribute name.
 //! - typed literals: a [`TypeTag`] immediately followed by `(`, whose body is
 //!   captured **raw** and validated later by [`literal`](crate::literal). Keeping
 //!   the body raw is what lets one lexer handle bodies as different as `-5`,
 //!   `3.5`, `0xAbC…` and `'it''s'` without a token per shape.
-//! - `name` and `$sysName` identifiers, `'single-quoted'` strings, bare integers,
-//!   and `*` (the all-selector).
+//! - `name`, `"quotedName"` and `$sysName` identifiers, `'single-quoted'`
+//!   strings, bare integers, and `*` (the all-selector).
 //!
 //! Whitespace is insignificant and `--` runs to end of line. Zero external deps:
 //! this is part of the host-agnostic spec, so hex and string decoding are done by
@@ -102,8 +103,12 @@ pub(crate) enum Token {
     Colon,
     True,
     False,
-    /// A user attribute name.
+    /// A user attribute name, or a word read by position: a type tag where one
+    /// stands, or one of `ORDER BY ASC DESC`.
     Name(String),
+    /// A `"…"`-quoted user attribute name, carrying the name without its
+    /// quotes. Always a name: never a keyword, a type tag or a clause word.
+    QuotedName(String),
     /// A `$`-prefixed system attribute, carrying the name after the `$`.
     SysName(String),
     /// A typed literal: the tag, and the raw text between its parentheses.
@@ -117,6 +122,71 @@ pub(crate) enum Token {
     Int(String),
     /// A `'…'` string with `''` escapes already resolved.
     Str(String),
+}
+
+impl Token {
+    /// Whether this is a keyword: a bare word that is never an attribute name.
+    pub(crate) const fn is_keyword(&self) -> bool {
+        match self {
+            Self::And
+            | Self::Or
+            | Self::Not
+            | Self::True
+            | Self::False
+            | Self::Between
+            | Self::StartsWith
+            | Self::Exists
+            | Self::TypeOf => true,
+            Self::LParen
+            | Self::RParen
+            | Self::Eq
+            | Self::Neq
+            | Self::Lt
+            | Self::Lte
+            | Self::Gt
+            | Self::Gte
+            | Self::Star
+            | Self::Colon
+            | Self::Name(_)
+            | Self::QuotedName(_)
+            | Self::SysName(_)
+            | Self::Tagged { .. }
+            | Self::Int(_)
+            | Self::Str(_) => false,
+        }
+    }
+
+    /// Whether this is what follows a predicate's attribute: a comparison,
+    /// `BETWEEN` or `STARTSWITH`.
+    pub(crate) const fn is_operator(&self) -> bool {
+        match self {
+            Self::Eq
+            | Self::Neq
+            | Self::Lt
+            | Self::Lte
+            | Self::Gt
+            | Self::Gte
+            | Self::Between
+            | Self::StartsWith => true,
+            Self::LParen
+            | Self::RParen
+            | Self::And
+            | Self::Or
+            | Self::Not
+            | Self::True
+            | Self::False
+            | Self::Exists
+            | Self::TypeOf
+            | Self::Star
+            | Self::Colon
+            | Self::Name(_)
+            | Self::QuotedName(_)
+            | Self::SysName(_)
+            | Self::Tagged { .. }
+            | Self::Int(_)
+            | Self::Str(_) => false,
+        }
+    }
 }
 
 /// A token and where it started, so every error can point at its cause.
@@ -271,6 +341,7 @@ impl<'a> Lexer<'a> {
                 self.pos = end;
                 Token::Str(content)
             }
+            '"' => Token::QuotedName(self.take_quoted_name(start)?),
             '$' => {
                 self.read_char();
                 let name = self.take_name_chars();
@@ -332,7 +403,8 @@ impl<'a> Lexer<'a> {
     fn lex_word(&mut self, start: usize) -> Result<Token, ParseError> {
         let word = self.take_name_chars();
 
-        // Keywords win over everything, so they can never be attribute names.
+        // A bare keyword is always the keyword. Quoting it, `"and"`, is how an
+        // attribute of that name is written.
         if let Some(keyword) = keyword_token(&word) {
             return Ok(keyword);
         }
@@ -396,6 +468,35 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A `"…"` attribute name, from its opening quote at `open`.
+    ///
+    /// The quotes only stop the word being read as a keyword, a type tag or an
+    /// `ORDER BY` word. What stands between them is an attribute name, with a
+    /// bare name's characters, and a `"` is not one of them, so there is
+    /// nothing to escape.
+    fn take_quoted_name(&mut self, open: usize) -> Result<String, ParseError> {
+        const CHARSET: &str = "a quoted attribute name is a letter followed by letters, digits, \
+                               _ . or -";
+        self.read_char();
+        match self.peek_char() {
+            Some(ch) if is_name_start(ch) => {}
+            Some('"') => {
+                return Err(ParseError::syntax(open, "empty quoted attribute name"));
+            }
+            Some(_) => return Err(ParseError::syntax(self.pos, CHARSET)),
+            None => return Err(unterminated_quoted_name(open)),
+        }
+        let name = self.take_name_chars();
+        match self.peek_char() {
+            Some('"') => {
+                self.read_char();
+                Ok(name)
+            }
+            Some(_) => Err(ParseError::syntax(self.pos, CHARSET)),
+            None => Err(unterminated_quoted_name(open)),
+        }
+    }
+
     /// Consume a run of attribute-name characters.
     fn take_name_chars(&mut self) -> String {
         let start = self.pos;
@@ -426,7 +527,15 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// The reserved word `word` spells, if it is one. Case-insensitive.
+/// A quoted name that reached the end of input before its closing quote.
+fn unterminated_quoted_name(open: usize) -> ParseError {
+    ParseError::syntax(
+        open,
+        "unterminated quoted attribute name — expected a closing \"",
+    )
+}
+
+/// The keyword `word` spells, if it is one. Case-insensitive.
 fn keyword_token(word: &str) -> Option<Token> {
     if word.eq_ignore_ascii_case("and") {
         Some(Token::And)
@@ -457,7 +566,7 @@ fn is_name_start(ch: char) -> bool {
 }
 
 /// Whether `ch` may continue an attribute name: `[A-Za-z0-9_.\-]`.
-fn is_name_char(ch: char) -> bool {
+pub(crate) fn is_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-')
 }
 
@@ -512,7 +621,7 @@ mod tests {
                 ..
             }]
         ));
-        // …without one it is just a word (the parser rejects it as reserved).
+        // …without one it is just a word, which may name an attribute.
         assert_eq!(kinds("i32"), vec![Token::Name("i32".into())]);
         // Whitespace between tag and paren is allowed.
         assert!(matches!(
@@ -554,6 +663,60 @@ mod tests {
         );
         // A name may not start with a digit or a dash.
         assert!(tokenize("-name").is_err());
+    }
+
+    /// Quoting turns any word, keyword or tag included, into a name, and keeps
+    /// its case.
+    #[test]
+    fn a_quoted_word_is_always_a_name() {
+        for word in ["and", "AND", "Or", "not", "true", "between", "typeof"] {
+            assert_eq!(
+                kinds(&alloc::format!("\"{word}\"")),
+                vec![Token::QuotedName(word.into())],
+                "{word}"
+            );
+        }
+        // A tag followed by `(` is still a name when quoted, not a literal.
+        assert_eq!(
+            kinds("\"str\"('x')"),
+            vec![
+                Token::QuotedName("str".into()),
+                Token::LParen,
+                Token::Str("x".into()),
+                Token::RParen,
+            ]
+        );
+        // The quotes end the token, so no whitespace is needed around them.
+        assert_eq!(
+            kinds("\"my.attr-name_2\"=\"b\""),
+            vec![
+                Token::QuotedName("my.attr-name_2".into()),
+                Token::Eq,
+                Token::QuotedName("b".into()),
+            ]
+        );
+    }
+
+    /// Between the quotes stands a name's characters and nothing else.
+    #[test]
+    fn a_quoted_name_takes_a_bare_names_characters() {
+        for (src, position) in [
+            ("\"\"", 0),
+            ("\"a b\"", 2),
+            ("\"1a\"", 1),
+            ("\"-a\"", 1),
+            ("\"$owner\"", 1),
+            ("\"a'b\"", 2),
+            ("\"é\"", 1),
+        ] {
+            let err = tokenize(src).unwrap_err();
+            assert_eq!(err.kind, ParseErrorKind::MalformedInputError, "{src}");
+            assert_eq!(err.failure_position, Some(position), "{src}: {err}");
+        }
+        for src in ["\"", "\"abc", "a = \"abc"] {
+            let err = tokenize(src).unwrap_err();
+            assert!(err.message.contains("closing \""), "{src}: {err}");
+        }
     }
 
     /// A name takes no `:`, so `rank:u256` is the name, the colon and the tag.
