@@ -855,7 +855,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use alloc::string::ToString;
-    use arkiv_interfaces::query::{Direction, OrderBy};
+    use arkiv_interfaces::query::{Direction, OrderBy, words};
 
     fn user(name: &str) -> AnnotKey {
         AnnotKey::User(name.to_string())
@@ -1769,42 +1769,8 @@ mod tests {
     // under `NOT`, in a group, joined by `AND` and `OR`, and all at once.
     //
     // A query has no `select`: the projection is a JSON map of names beside the
-    // query, never lexed, so its names are covered where the RPC is.
-
-    /// The keywords. Bare, each is the keyword, so only quoted is it a name.
-    const KEYWORDS: [&str; 9] = [
-        "and",
-        "or",
-        "not",
-        "true",
-        "false",
-        "between",
-        "startswith",
-        "exists",
-        "typeof",
-    ];
-
-    /// The type tags, read by position: a name bare or quoted.
-    const TYPE_TAGS: [&str; 9] = [
-        "i32", "u64", "u256", "dec", "str", "addr", "key", "bytes32", "bool",
-    ];
-
-    /// The words of `ORDER BY`, read by position too.
-    const CLAUSE_WORDS: [&str; 4] = ["order", "by", "asc", "desc"];
-
-    /// Every word the language gives a meaning to.
-    fn every_word() -> impl Iterator<Item = &'static str> {
-        KEYWORDS
-            .iter()
-            .chain(TYPE_TAGS.iter())
-            .chain(CLAUSE_WORDS.iter())
-            .copied()
-    }
-
-    /// The words that need no quotes to be a name.
-    fn positional_words() -> impl Iterator<Item = &'static str> {
-        TYPE_TAGS.iter().chain(CLAUSE_WORDS.iter()).copied()
-    }
+    // query, never lexed, so its names are covered where the RPC is. The words
+    // come from `words`, the lists the lexer is held to.
 
     /// `word` lowercase, uppercase and capitalized, each once: `i32` capitalizes
     /// to its uppercase. The language's words match in any case, but names are
@@ -1916,7 +1882,7 @@ mod tests {
     /// is the word exactly as written between the quotes.
     #[test]
     fn every_word_quoted_names_an_attribute_in_every_position() {
-        for word in every_word() {
+        for word in words::all() {
             for spelling in spellings(word) {
                 for text in every_position(&quoted(&spelling)) {
                     let mut expected = BTreeSet::from([spelling.clone()]);
@@ -1933,7 +1899,7 @@ mod tests {
     /// nothing, down to the last node of the tree.
     #[test]
     fn quoting_a_name_that_needs_no_quotes_changes_nothing() {
-        let names = positional_words().chain(["level", "my.attr-name_2", "set", "andy", "notes"]);
+        let names = words::positional().chain(["level", "my.attr-name_2", "set", "andy", "notes"]);
         for word in names {
             for spelling in spellings(word) {
                 for (bare, quoted) in every_position(&spelling)
@@ -1964,7 +1930,7 @@ mod tests {
             ("* ORDER BY ", ":i32"),
             ("a = 1 ORDER BY ", ":str DESC"),
         ];
-        for word in KEYWORDS {
+        for word in words::KEYWORDS {
             for spelling in spellings(word) {
                 for (before, after) in around {
                     let text = format!("{before}{spelling}{after}");
@@ -1981,7 +1947,7 @@ mod tests {
     /// word is a different attribute.
     #[test]
     fn a_quoted_name_keeps_its_case() {
-        for word in every_word() {
+        for word in words::all() {
             let queries: Vec<Query> = spellings(word)
                 .iter()
                 .map(|name| filter(&format!("{} = 1", quoted(name))))
@@ -2323,7 +2289,7 @@ mod tests {
 
         assert_eq!(
             user_names(&parsed),
-            every_word().map(String::from).collect::<BTreeSet<_>>()
+            words::all().map(String::from).collect::<BTreeSet<_>>()
         );
         assert_eq!(
             parsed.order,
@@ -2361,7 +2327,7 @@ mod tests {
         );
         // Quoting the names written bare gives the same statement. The keywords
         // are quoted already, and their words also stand bare as values.
-        let all_quoted = positional_words().fold(text.to_string(), |text, word| {
+        let all_quoted = words::positional().fold(text.to_string(), |text, word| {
             text.replace(&format!(" {word} "), &format!(" \"{word}\" "))
                 .replace(&format!("({word} "), &format!("(\"{word}\" "))
                 .replace(&format!("({word})"), &format!("(\"{word}\")"))

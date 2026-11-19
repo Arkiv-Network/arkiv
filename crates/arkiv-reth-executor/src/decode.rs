@@ -400,6 +400,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes, FixedBytes};
     use arkiv_bindings::{AttributeType, Ident32};
+    use arkiv_interfaces::query::words;
 
     fn calldata(ops: Vec<Operation>) -> Vec<u8> {
         IEntityRegistry::executeCall { ops }.abi_encode()
@@ -925,32 +926,9 @@ mod tests {
     /// indexed or not, set or unset. A query reaches them quoted.
     #[test]
     fn the_query_languages_words_are_ordinary_attribute_names() {
-        let words = [
-            "and",
-            "or",
-            "not",
-            "true",
-            "false",
-            "between",
-            "startswith",
-            "exists",
-            "typeof",
-            "i32",
-            "u64",
-            "u256",
-            "dec",
-            "str",
-            "addr",
-            "key",
-            "bytes32",
-            "bool",
-            "order",
-            "by",
-            "asc",
-            "desc",
-        ];
-        let upper: Vec<String> = words.iter().map(|w| w.to_ascii_uppercase()).collect();
-        let created: Vec<_> = words
+        let names: Vec<&str> = words::all().collect();
+        let upper: Vec<String> = names.iter().map(|w| w.to_ascii_uppercase()).collect();
+        let created: Vec<_> = names
             .iter()
             .enumerate()
             .map(|(index, name)| {
@@ -973,7 +951,7 @@ mod tests {
             ),
             Operation::patch(
                 B256::repeat_byte(1),
-                words
+                names
                     .iter()
                     .map(|name| AbiAttribute::tombstone(ident(name)))
                     .collect(),
@@ -991,7 +969,7 @@ mod tests {
             bytes.sort();
             bytes
         }
-        let expected = sorted(&words);
+        let expected = sorted(&names);
         let Op::Create { attributes, .. } = &ops[0] else {
             panic!("expected create")
         };

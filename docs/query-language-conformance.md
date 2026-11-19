@@ -382,6 +382,10 @@ name.
   ([`check_triple_list`, crates/arkiv-reth-executor/src/decode.rs:244](../crates/arkiv-reth-executor/src/decode.rs#L244)).
 - Spec: the grammar gains `userName = name | quotedName`, and the
   attribute-names section says no word is reserved.
+- The words themselves are listed once, in
+  [`arkiv_interfaces::query::words`](../crates/arkiv-interfaces/src/query/words.rs).
+  The lexer's own keyword and tag tables are held to those lists by
+  `the_keywords_and_tags_are_the_specs_lists`, and every test below reads them.
 
 **Tests:**
 - Lexer: `a_quoted_word_is_always_a_name`,

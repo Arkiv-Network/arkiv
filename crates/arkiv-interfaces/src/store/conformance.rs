@@ -39,6 +39,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::*;
+use crate::query::words;
 
 /// Run the assertions every store passes, GolemDB included, against stores
 /// built by `new_store`.
@@ -1267,35 +1268,8 @@ fn query_between_includes_both_bounds<S: Store>(store_generator: &dyn Fn() -> S)
 // names
 // ---------------------------------------------------------------------------
 
-/// Every word Arkiv's query language gives a meaning to: its keywords, its
-/// type tags and the words of `ORDER BY`.
-const QUERY_WORDS: [&str; 22] = [
-    "and",
-    "or",
-    "not",
-    "true",
-    "false",
-    "between",
-    "startswith",
-    "exists",
-    "typeof",
-    "i32",
-    "u64",
-    "u256",
-    "dec",
-    "str",
-    "addr",
-    "key",
-    "bytes32",
-    "bool",
-    "order",
-    "by",
-    "asc",
-    "desc",
-];
-
 /// The store reserves `#` names and nothing else, so a cell named like a word
-/// of the query language, in any case, is written, read, matched, sorted and
+/// of the query language ([`words`]), in any case, is written, read, matched, sorted and
 /// projected like any other, as an attribute or as a field.
 ///
 /// Records 1 to 3 carry every word as an indexed `u64` holding their ordinal.
@@ -1304,21 +1278,22 @@ const QUERY_WORDS: [&str; 22] = [
 /// `str` holding that name.
 fn cells_named_like_query_words_are_ordinary_cells<S: Store>(store_generator: &dyn Fn() -> S) {
     let mut store = store_generator();
+    let query_words: Vec<&str> = words::all().collect();
     let branch = store.begin(None).unwrap();
     for ordinal in 1..=3u8 {
-        let cells: Vec<(&str, Cell)> = QUERY_WORDS
+        let cells: Vec<(&str, Cell)> = query_words
             .iter()
             .map(|word| (*word, u64_attribute(u64::from(ordinal))))
             .collect();
         create_record(&mut store, branch, record_key(ordinal), &cells);
     }
     let field = Cell::field(TypeId::U64, 2u64.to_be_bytes().to_vec());
-    let fields: Vec<(&str, Cell)> = QUERY_WORDS
+    let fields: Vec<(&str, Cell)> = query_words
         .iter()
         .map(|word| (*word, field.clone()))
         .collect();
     create_record(&mut store, branch, record_key(4), &fields);
-    let upper: Vec<String> = QUERY_WORDS
+    let upper: Vec<String> = query_words
         .iter()
         .map(|word| word.to_ascii_uppercase())
         .collect();
@@ -1334,7 +1309,7 @@ fn cells_named_like_query_words_are_ordinary_cells<S: Store>(store_generator: &d
     };
     let (attributes, fields, uppercased) = (record(2), record(4), record(5));
     let keys = |query: &Query| matched_keys(&store, at, query);
-    for (word, upper) in QUERY_WORDS.iter().zip(&upper) {
+    for (word, upper) in query_words.iter().zip(&upper) {
         assert_eq!(attributes.cell(word), Some(&u64_attribute(2)), "{word}");
         assert_eq!(fields.cell(word), Some(&field), "{word}");
         assert_eq!(
@@ -1395,16 +1370,16 @@ fn cells_named_like_query_words_are_ordinary_cells<S: Store>(store_generator: &d
         );
     }
 
-    let wanted: Vec<CellName> = QUERY_WORDS[..3].iter().map(|w| w.to_string()).collect();
+    let wanted: Vec<CellName> = query_words[..3].iter().map(|w| w.to_string()).collect();
     let projected = store
         .get(ReadTarget::Commit(at), record_key(4), Some(&wanted), None)
         .unwrap()
         .into_value()
         .expect("the record is present");
-    for word in &QUERY_WORDS[..3] {
+    for word in &query_words[..3] {
         assert_eq!(projected.cell(word), Some(&field), "{word}: projected");
     }
-    for word in &QUERY_WORDS[3..] {
+    for word in &query_words[3..] {
         assert_eq!(projected.cell(word), None, "{word}: projected away");
     }
 }

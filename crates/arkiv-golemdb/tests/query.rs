@@ -12,7 +12,7 @@ use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN,
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
-use arkiv_interfaces::query::Query as ArkivQuery;
+use arkiv_interfaces::query::{Query as ArkivQuery, words};
 use arkiv_interfaces::store::{Filter, Page, Query, ReadTarget, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
@@ -595,40 +595,6 @@ fn order_by_sorts_by_one_attribute_read_as_one_type() {
     );
 }
 
-/// Every word the query language gives a meaning to: its keywords, its type
-/// tags and the words of `ORDER BY`.
-const QUERY_WORDS: [&str; 22] = [
-    "and",
-    "or",
-    "not",
-    "true",
-    "false",
-    "between",
-    "startswith",
-    "exists",
-    "typeof",
-    "i32",
-    "u64",
-    "u256",
-    "dec",
-    "str",
-    "addr",
-    "key",
-    "bytes32",
-    "bool",
-    "order",
-    "by",
-    "asc",
-    "desc",
-];
-
-/// The words a query may write bare: the type tags and the words of
-/// `ORDER BY`, which are read by position.
-const POSITIONAL_WORDS: [&str; 13] = [
-    "i32", "u64", "u256", "dec", "str", "addr", "key", "bytes32", "bool", "order", "by", "asc",
-    "desc",
-];
-
 /// The type the attribute named after word `index` holds, so the words cover
 /// three: `u64`, `str` and `i32` in turn.
 fn word_tag(index: usize) -> &'static str {
@@ -662,19 +628,20 @@ fn word_literal(index: usize, n: u8) -> String {
 /// a type tag or a clause word is reachable bare too, to the same effect.
 #[test]
 fn attributes_named_like_query_words_are_queried_by_quoting_them() {
+    let query_words: Vec<&str> = words::all().collect();
     let indexed = |n: u8| -> Vec<Attribute> {
-        QUERY_WORDS
+        query_words
             .iter()
             .enumerate()
             .map(|(index, word)| Attribute::new(*word, word_value(index, n)))
             .collect()
     };
-    let fields: Vec<Attribute> = QUERY_WORDS
+    let fields: Vec<Attribute> = query_words
         .iter()
         .enumerate()
         .map(|(index, word)| Attribute::unindexed(*word, word_value(index, 2)))
         .collect();
-    let uppercased: Vec<Attribute> = QUERY_WORDS
+    let uppercased: Vec<Attribute> = query_words
         .iter()
         .enumerate()
         .map(|(index, word)| Attribute::new(word.to_ascii_uppercase(), word_value(index, 2)))
@@ -689,7 +656,7 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
     let dir = TempDir::new().unwrap();
     let store = store_with(&dir, &entities);
 
-    for (index, word) in QUERY_WORDS.iter().enumerate() {
+    for (index, word) in query_words.iter().enumerate() {
         let name = format!("\"{word}\"");
         let upper = format!("\"{}\"", word.to_ascii_uppercase());
         let (tag, one, two, three) = (
@@ -736,8 +703,8 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
     }
 
     // Bare, the words read by position name the same attributes.
-    for word in POSITIONAL_WORDS {
-        let index = QUERY_WORDS.iter().position(|w| *w == word).unwrap();
+    for word in words::positional() {
+        let index = query_words.iter().position(|w| *w == word).unwrap();
         let (tag, two) = (word_tag(index), word_literal(index, 2));
         assert_eq!(
             matched(&store, filter(&format!("{word} = {two}"))),
@@ -763,7 +730,7 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
 
     // Every word in one query, each matched on entity 2's value, sorted by a
     // keyword-named attribute.
-    let all = QUERY_WORDS
+    let all = query_words
         .iter()
         .enumerate()
         .map(|(index, word)| format!("\"{word}\" = {}", word_literal(index, 2)))

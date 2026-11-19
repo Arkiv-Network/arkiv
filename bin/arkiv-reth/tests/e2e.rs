@@ -24,6 +24,7 @@ use arkiv_harness::{
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::MAX_STR_BYTES;
+use arkiv_interfaces::query::words;
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -984,37 +985,6 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);
 }
 
-/// Every word the query language gives a meaning to: its keywords, its type
-/// tags and the words of `ORDER BY`.
-const QUERY_WORDS: [&str; 22] = [
-    "and",
-    "or",
-    "not",
-    "true",
-    "false",
-    "between",
-    "startswith",
-    "exists",
-    "typeof",
-    "i32",
-    "u64",
-    "u256",
-    "dec",
-    "str",
-    "addr",
-    "key",
-    "bytes32",
-    "bool",
-    "order",
-    "by",
-    "asc",
-    "desc",
-];
-
-/// Of [`QUERY_WORDS`], the keywords: a query names an attribute after one
-/// only quoted. The rest are read by position, so they name one bare too.
-const KEYWORDS: usize = 9;
-
 /// The type the attribute named after word `index` holds, so the words cover
 /// three: `u64`, `str` and `i32` in turn.
 fn word_tag(index: usize) -> &'static str {
@@ -1071,19 +1041,20 @@ fn word_attr(name: &str, index: usize, n: u8, indexed: bool) -> Attribute {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_words_as_attribute_names_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let query_words: Vec<&str> = words::all().collect();
     let indexed = |n: u8| -> Vec<Attribute> {
-        QUERY_WORDS
+        query_words
             .iter()
             .enumerate()
             .map(|(index, word)| word_attr(word, index, n, true))
             .collect()
     };
-    let fields: Vec<Attribute> = QUERY_WORDS
+    let fields: Vec<Attribute> = query_words
         .iter()
         .enumerate()
         .map(|(index, word)| word_attr(word, index, 2, false))
         .collect();
-    let uppercased: Vec<Attribute> = QUERY_WORDS
+    let uppercased: Vec<Attribute> = query_words
         .iter()
         .enumerate()
         .map(|(index, word)| word_attr(&word.to_ascii_uppercase(), index, 2, true))
@@ -1126,7 +1097,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
             .map(|a| a["name"].as_str().expect("name").to_string())
             .collect()
     };
-    let mut sorted_words: Vec<(usize, &str)> = QUERY_WORDS.iter().copied().enumerate().collect();
+    let mut sorted_words: Vec<(usize, &str)> = query_words.iter().copied().enumerate().collect();
     sorted_words.sort_by_key(|(_, word)| *word);
 
     // Read back whole: every attribute keeps its name, type and value, and
@@ -1181,7 +1152,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
 
     // Quoted, every word is reachable by every operator, presence test and
     // sort; the field and the uppercased word are other names.
-    for (index, word) in QUERY_WORDS.iter().enumerate() {
+    for (index, word) in query_words.iter().enumerate() {
         let name = format!("\"{word}\"");
         let upper = format!("\"{}\"", word.to_ascii_uppercase());
         let (tag, one, two) = (
@@ -1219,7 +1190,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
         // Bare, a keyword is the keyword, and the error says how to quote it;
         // every other word names the attribute bare too.
         let bare = format!("{word} = {two}");
-        if index < KEYWORDS {
+        if words::KEYWORDS.contains(word) {
             let err = client
                 .query_raw(&bare, serde_json::json!({}))
                 .await
@@ -1237,7 +1208,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
     }
 
     // Every word in one query, and a count over two spellings of one word.
-    let all = QUERY_WORDS
+    let all = query_words
         .iter()
         .enumerate()
         .map(|(index, word)| format!("\"{word}\" = {}", word_literal(index, 2)))

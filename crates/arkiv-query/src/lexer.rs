@@ -42,17 +42,6 @@ pub(crate) enum TypeTag {
 impl TypeTag {
     /// The tag this name denotes, if any. Case-insensitive, like the keywords.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        const TAGS: [(&str, TypeTag); 9] = [
-            ("i32", TypeTag::I32),
-            ("u64", TypeTag::U64),
-            ("u256", TypeTag::U256),
-            ("dec", TypeTag::Dec),
-            ("str", TypeTag::Str),
-            ("addr", TypeTag::Addr),
-            ("key", TypeTag::Key),
-            ("bytes32", TypeTag::Bytes32),
-            ("bool", TypeTag::Bool),
-        ];
         TAGS.iter()
             .find(|(text, _)| name.eq_ignore_ascii_case(text))
             .map(|(_, tag)| *tag)
@@ -535,29 +524,42 @@ fn unterminated_quoted_name(open: usize) -> ParseError {
     )
 }
 
+/// Each type tag's spelling, in the order of
+/// [`words::TYPE_TAGS`](arkiv_interfaces::query::words::TYPE_TAGS), which a
+/// test holds this list to.
+const TAGS: [(&str, TypeTag); 9] = [
+    ("i32", TypeTag::I32),
+    ("u64", TypeTag::U64),
+    ("u256", TypeTag::U256),
+    ("dec", TypeTag::Dec),
+    ("str", TypeTag::Str),
+    ("addr", TypeTag::Addr),
+    ("key", TypeTag::Key),
+    ("bytes32", TypeTag::Bytes32),
+    ("bool", TypeTag::Bool),
+];
+
+/// Each keyword's spelling, in the order of
+/// [`words::KEYWORDS`](arkiv_interfaces::query::words::KEYWORDS), which a
+/// test holds this list to.
+const KEYWORDS: [(&str, Token); 9] = [
+    ("and", Token::And),
+    ("or", Token::Or),
+    ("not", Token::Not),
+    ("true", Token::True),
+    ("false", Token::False),
+    ("between", Token::Between),
+    ("startswith", Token::StartsWith),
+    ("exists", Token::Exists),
+    ("typeof", Token::TypeOf),
+];
+
 /// The keyword `word` spells, if it is one. Case-insensitive.
 fn keyword_token(word: &str) -> Option<Token> {
-    if word.eq_ignore_ascii_case("and") {
-        Some(Token::And)
-    } else if word.eq_ignore_ascii_case("or") {
-        Some(Token::Or)
-    } else if word.eq_ignore_ascii_case("not") {
-        Some(Token::Not)
-    } else if word.eq_ignore_ascii_case("true") {
-        Some(Token::True)
-    } else if word.eq_ignore_ascii_case("false") {
-        Some(Token::False)
-    } else if word.eq_ignore_ascii_case("between") {
-        Some(Token::Between)
-    } else if word.eq_ignore_ascii_case("startswith") {
-        Some(Token::StartsWith)
-    } else if word.eq_ignore_ascii_case("exists") {
-        Some(Token::Exists)
-    } else if word.eq_ignore_ascii_case("typeof") {
-        Some(Token::TypeOf)
-    } else {
-        None
-    }
+    KEYWORDS
+        .iter()
+        .find(|(text, _)| word.eq_ignore_ascii_case(text))
+        .map(|(_, token)| token.clone())
 }
 
 /// Whether `ch` may start an attribute name: `[A-Za-z]`, per the spec.
@@ -592,6 +594,23 @@ mod tests {
         );
         // A comment with no trailing newline ends the input cleanly.
         assert_eq!(kinds("a -- trailing"), vec![Token::Name("a".into())]);
+    }
+
+    /// The keywords and tags the lexer knows are the spec's lists, word for
+    /// word, which every test naming attributes after them reads.
+    #[test]
+    fn the_keywords_and_tags_are_the_specs_lists() {
+        use arkiv_interfaces::query::words;
+
+        assert_eq!(KEYWORDS.map(|(word, _)| word), words::KEYWORDS);
+        assert_eq!(TAGS.map(|(word, _)| word), words::TYPE_TAGS);
+        for (word, tag) in TAGS {
+            assert_eq!(tag.name(), word);
+        }
+        // The clause's words are neither: they are read where they stand.
+        for word in words::ORDER_BY {
+            assert_eq!(kinds(word), vec![Token::Name(word.into())]);
+        }
     }
 
     #[test]
