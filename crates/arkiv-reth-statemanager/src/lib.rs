@@ -28,7 +28,7 @@ pub mod segments;
 pub use accounts::{BalanceAccess, NonceAccess};
 pub use branch::OwnedBranch;
 pub use genesis::{
-    GenesisAccount, StoreState, check_chain, check_genesis_root, classify, seed_genesis,
+    GenesisAccount, StoreState, check_genesis_root, classify, prepare_genesis, seed_genesis,
 };
 pub use host::{
     BlockSeals, CommitWaitError, ExecutionKey, HostError, HostStateView, HostStore, host_manager,
