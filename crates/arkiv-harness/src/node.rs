@@ -8,8 +8,9 @@
 //! (state resumes after a restart).
 //!
 //! The datadir is only reth's half. Arkiv's own state lives in the store, which
-//! by default is the in-process one (`memory`) and so goes with the process —
-//! a test that wants to watch state survive a restart needs
+//! is GolemDB, in a directory inside the datadir, as in production.
+//! `ARKIV_EXPERIMENTAL_STORE=memory`, on the test process or a node, swaps in
+//! the in-process store instead, except for a node that asks for
 //! [`NodeBuilder::golemdb_store`].
 
 use std::fs::File;
@@ -47,23 +48,24 @@ const PORT_RANGE: Range<u16> = 20_000..23_000;
 pub struct NodeBuilder {
     binary: PathBuf,
     dev: bool,
-    block_time: String,
+    /// The `--dev.block-time`. `None` mines a block per transaction instead.
+    block_time: Option<String>,
     http_api: String,
     chain: Option<PathBuf>,
     extra_args: Vec<String>,
     env: Vec<(String, String)>,
-    /// Whether this node's Arkiv state is in GolemDB, inside its datadir.
+    /// Whether the node stays on GolemDB when the test process names another store.
     golemdb: bool,
 }
 
 impl NodeBuilder {
     /// A dev-mode node from the `arkiv-reth` binary at `binary` (tests pass
-    /// `env!("CARGO_BIN_EXE_arkiv-reth")`).in while needing some port coordination between the tests
+    /// `env!("CARGO_BIN_EXE_arkiv-reth")`).
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
             dev: true,
-            block_time: "250ms".to_string(),
+            block_time: Some("250ms".to_string()),
             http_api: "eth,net,web3,txpool".to_string(),
             chain: None,
             extra_args: Vec::new(),
@@ -88,7 +90,15 @@ impl NodeBuilder {
 
     /// The `--dev.block-time` (only applied in dev mode).
     pub fn block_time(mut self, block_time: impl Into<String>) -> Self {
-        self.block_time = block_time.into();
+        self.block_time = Some(block_time.into());
+        self
+    }
+
+    /// Mine a block when a transaction arrives, and none in between (only
+    /// applied in dev mode). The head then stays where a test's last
+    /// transaction left it, so the test decides where each block ends.
+    pub fn mine_on_transaction(mut self) -> Self {
+        self.block_time = None;
         self
     }
 
@@ -117,13 +127,16 @@ impl NodeBuilder {
         self
     }
 
-    /// Put the node's Arkiv state in GolemDB, in a directory inside its datadir.
-    ///
-    /// It survives a kill and a restart, and it goes with the datadir when the
-    /// [`Node`] drops.
+    /// Keep the node on GolemDB even when the test process names another store:
+    /// for a test that needs GolemDB itself, such as state surviving a restart.
     pub fn golemdb_store(mut self) -> Self {
         self.golemdb = true;
         self
+    }
+
+    /// Run the node on the in-process store instead of GolemDB.
+    pub fn memory_store(self) -> Self {
+        self.env("ARKIV_EXPERIMENTAL_STORE", "memory")
     }
 
     /// Launch the node.
@@ -184,8 +197,10 @@ impl Node {
         let mut cmd = Command::new(&self.config.binary);
         cmd.arg("node");
         if self.config.dev {
-            cmd.arg("--dev")
-                .args(["--dev.block-time", &self.config.block_time]);
+            cmd.arg("--dev");
+            if let Some(block_time) = &self.config.block_time {
+                cmd.args(["--dev.block-time", block_time]);
+            }
         }
         if let Some(chain) = &self.config.chain {
             cmd.arg("--chain").arg(chain);
@@ -228,15 +243,17 @@ impl Node {
             "16MB",
         ]);
         cmd.args(&self.config.extra_args);
-        // The node refuses to start without a store. Tests run on the
-        // in-process one unless the test process names another. A node has one
-        // store, so a GolemDB path the test process carries is not passed on.
-        if std::env::var_os("ARKIV_EXPERIMENTAL_STORE").is_none() {
-            cmd.env("ARKIV_EXPERIMENTAL_STORE", "memory");
-        }
+        // GolemDB in the datadir, unless the test process or this node names
+        // another store. A GolemDB path the test process carries is not passed on.
+        let experimental = std::env::var_os("ARKIV_EXPERIMENTAL_STORE").is_some()
+            || self
+                .config
+                .env
+                .iter()
+                .any(|(key, _)| key == "ARKIV_EXPERIMENTAL_STORE");
         cmd.env_remove("ARKIV_STORE_PATH");
         cmd.envs(self.config.env.iter().map(|(k, v)| (k, v)));
-        if self.config.golemdb {
+        if self.config.golemdb || !experimental {
             cmd.env("ARKIV_STORE_PATH", self.datadir.join("golemdb"))
                 .env_remove("ARKIV_EXPERIMENTAL_STORE");
         }

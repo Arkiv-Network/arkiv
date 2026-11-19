@@ -130,10 +130,10 @@ async fn wait_for_physical_purge(
 ///
 /// Two things this needs that the rest of the file does not:
 ///
-/// * **A store that outlives the process.** Arkiv's state is not in the
-///   datadir; by default it is in-process, so after a restart there is simply
-///   nothing to find and the question the test asks is unanswerable. Hence
-///   GolemDB on disk, which is also what a real deployment runs.
+/// * **A store that outlives the process.** The in-process store is gone
+///   with it, so after a restart there is simply nothing to find and the
+///   question the test asks is unanswerable. Hence GolemDB on disk, which is
+///   also what a real deployment runs.
 /// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50. Below
 ///   it reth has written nothing to its own database, and a restart therefore
 ///   never reaches the startup checks or the catch-up this is here to cover —
@@ -240,8 +240,7 @@ async fn state_and_index_survive_shutdown_and_restart() {
 /// node goes on producing blocks and taking writes afterwards.
 ///
 /// Like the restart above, and past the persistence threshold for the same
-/// reasons, but GolemDB needs no server, so this one always runs. It reads
-/// entities by key: GolemDB does not answer queries or counts yet.
+/// reasons, but GolemDB needs no server, so this one always runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
     let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
@@ -376,7 +375,9 @@ async fn golemdb_state_and_balances_survive_shutdown_and_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_schedule_survives_kill_and_restart() {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
@@ -406,6 +407,11 @@ async fn pruning_schedule_survives_kill_and_restart() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     node.restart();
     node.wait_ready(&client, READY).await;
+    // The record survived the kill, so its purge is the restarted node's work.
+    assert!(
+        client.debug_entity_exists(key).await,
+        "the record survives the kill"
+    );
     client
         .wait_for_block(expires_at + 5, Duration::from_secs(30))
         .await;
@@ -414,7 +420,9 @@ async fn pruning_schedule_survives_kill_and_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pruning_schedule_rebuilds_from_chain_history() {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
@@ -450,6 +458,11 @@ async fn pruning_schedule_rebuilds_from_chain_history() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     node.restart();
     node.wait_ready(&client, READY).await;
+    // The record survived the kill, so its purge is the restarted node's work.
+    assert!(
+        client.debug_entity_exists(key).await,
+        "the record survives the kill"
+    );
     client
         .wait_for_block(expires_at + 5, Duration::from_secs(30))
         .await;

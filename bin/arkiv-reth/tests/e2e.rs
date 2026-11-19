@@ -17,7 +17,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent};
 use arkiv_bindings::{
     Attribute, AttributeType, AttributeValue, ENTITY_MAX_ATTRIBUTES, IEntityRegistry, Ident32,
-    MAX_PURGE_KEYS, Operation, protocol::purgeExpiredCall,
+    MAX_PURGE_KEYS, Operation, PURGE_CALLER, protocol::purgeExpiredCall,
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
@@ -36,7 +36,31 @@ async fn spawn_dev(
     ArkivClient<impl Provider + Clone>,
     Address,
 ) {
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).spawn();
+    spawn_dev_on(NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")), key).await
+}
+
+/// [`spawn_dev`] on the in-process store, for a test GolemDB can't pass yet.
+/// Each caller says why.
+async fn spawn_dev_in_memory(
+    key: &str,
+) -> (
+    arkiv_harness::Node,
+    ArkivClient<impl Provider + Clone>,
+    Address,
+) {
+    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).memory_store();
+    spawn_dev_on(builder, key).await
+}
+
+async fn spawn_dev_on(
+    builder: NodeBuilder,
+    key: &str,
+) -> (
+    arkiv_harness::Node,
+    ArkivClient<impl Provider + Clone>,
+    Address,
+) {
+    let mut node = builder.spawn();
     let signer: PrivateKeySigner = key.parse().unwrap();
     let caller = signer.address();
     let client = connect(&node.http_url(), signer);
@@ -44,58 +68,100 @@ async fn spawn_dev(
     (node, client, caller)
 }
 
-async fn physical_entity_count_at(
-    client: &ArkivClient<impl Provider>,
-    keys: &[B256],
-    block: u64,
-) -> usize {
-    let mut count = 0;
+/// A node that mines a block when a transaction arrives and none in between,
+/// so the test decides where each block ends. GolemDB keeps only the head's
+/// state, and this is how a test reads the state between two blocks on it.
+async fn spawn_dev_mining_on_demand(
+    key: &str,
+) -> (
+    arkiv_harness::Node,
+    ArkivClient<impl Provider + Clone>,
+    Address,
+) {
+    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).mine_on_transaction();
+    spawn_dev_on(builder, key).await
+}
+
+/// Mine one block on such a node, with a transfer, and return its number.
+async fn mine_block(client: &ArkivClient<impl Provider>) -> u64 {
+    let transfer = TransactionRequest::default()
+        .with_to(Address::repeat_byte(0xee))
+        .with_value(U256::from(1))
+        .with_gas_limit(21_000)
+        .with_max_fee_per_gas(3_000_000_000)
+        .with_max_priority_fee_per_gas(1_000_000_000)
+        .with_chain_id(DEV_CHAIN_ID);
+    client
+        .provider()
+        .send_transaction(transfer)
+        .await
+        .expect("the pool accepts the transfer")
+        .get_receipt()
+        .await
+        .expect("mined")
+        .block_number
+        .expect("mined")
+}
+
+/// The keys the producer's purge transaction in block `number` names. Every
+/// block opens with one.
+async fn purged_in_block(client: &ArkivClient<impl Provider>, number: u64) -> Vec<B256> {
+    let block = client
+        .provider()
+        .get_block_by_number(number.into())
+        .full()
+        .await
+        .expect("eth_getBlockByNumber")
+        .unwrap_or_else(|| panic!("block {number} exists"));
+    let purge = block
+        .transactions
+        .txns()
+        .find(|transaction| transaction.inner.signer() == PURGE_CALLER)
+        .unwrap_or_else(|| panic!("block {number} has no purge transaction"));
+    let purge = purge.inner.inner();
+    let input = &purge
+        .as_eip1559()
+        .expect("the purge is an EIP-1559 transaction")
+        .tx()
+        .input;
+    let call = purgeExpiredCall::abi_decode(input).expect("purgeExpired calldata");
+    let receipt = client
+        .provider()
+        .get_transaction_receipt(*purge.tx_hash())
+        .await
+        .expect("eth_getTransactionReceipt")
+        .expect("the purge transaction has a receipt");
+    assert!(receipt.status(), "the purge in block {number} failed");
+    call.entityKeys
+}
+
+/// How many of `keys` hold a record at the tip, expired or not.
+async fn records_left(client: &ArkivClient<impl Provider>, keys: &[B256]) -> usize {
+    let mut left = 0;
     for key in keys {
-        count += usize::from(client.debug_entity_exists_at(*key, block).await);
+        left += usize::from(client.debug_entity_exists(*key).await);
     }
-    count
+    left
 }
 
-async fn wait_for_first_purge(
-    client: &ArkivClient<impl Provider>,
-    keys: &[B256],
-    first_block: u64,
-) -> (u64, usize) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut block = first_block;
-    loop {
-        let tip = client.block_number().await;
-        while block <= tip {
-            let remaining = physical_entity_count_at(client, keys, block).await;
-            if remaining < keys.len() {
-                return (block, remaining);
-            }
-            block += 1;
+/// Mine blocks one at a time until the purge of one names any of `keys`, and
+/// return its number and how many of `keys` it names. Until then every record
+/// is still there.
+async fn mine_to_first_purge(client: &ArkivClient<impl Provider>, keys: &[B256]) -> (u64, usize) {
+    for _ in 0..40 {
+        let block = mine_block(client).await;
+        let purged = purged_in_block(client, block).await;
+        let named = keys.iter().filter(|key| purged.contains(key)).count();
+        if named > 0 {
+            return (block, named);
         }
-        assert!(
-            Instant::now() < deadline,
-            "no physical purge occurred within 30 seconds"
+        assert_eq!(
+            records_left(client, keys).await,
+            keys.len(),
+            "a record is gone after block {block}, whose purge names none of them"
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-async fn wait_for_all_purged(client: &ArkivClient<impl Provider>, keys: &[B256]) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut remaining = 0;
-        for key in keys {
-            remaining += usize::from(client.debug_entity_exists(*key).await);
-        }
-        if remaining == 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "physical pruning did not finish within 30 seconds"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
+    panic!("no purge named the entities within 40 blocks");
 }
 
 /// A create carrying `payload` under `text/plain`, with a purely relative
@@ -434,13 +500,12 @@ async fn estimated_gas_is_accepted_by_the_pool() {
     assert!(receipt.status(), "delete must succeed");
 }
 
-/// Every query-operator class — eq, IN, ranges, glob, boolean, negation, built-in
-/// fields, `$all`, pagination — plus the RPC error contract, against a live node.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn query_operator_classes_over_a_live_node() {
-    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
-
-    // Five entities in one batch — the i-th create mints its key from nonce i.
+/// The query tests' entities: five in one batch, ranks 10 to 50 over three
+/// teams. Returns their keys, the i-th minted from nonce i.
+async fn create_ranked_entities(
+    client: &ArkivClient<impl Provider + Clone>,
+    caller: Address,
+) -> Vec<String> {
     let payload = Bytes::from_static(b"x");
     client
         .execute(vec![
@@ -451,8 +516,7 @@ async fn query_operator_classes_over_a_live_node() {
             create_op(1000, payload.clone(), attrs(50, "green")),
         ])
         .await;
-
-    let k: Vec<String> = (0..5)
+    (0..5)
         .map(|i| {
             format!(
                 "{:#x}",
@@ -464,7 +528,44 @@ async fn query_operator_classes_over_a_live_node() {
                 ))
             )
         })
-        .collect();
+        .collect()
+}
+
+/// The keys of a query response's entities, in the order it gave them.
+fn keys_in_order(page: &serde_json::Value) -> Vec<String> {
+    page["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|entity| entity["key"].as_str().expect("key").to_string())
+        .collect()
+}
+
+/// The page after `page` of `query`: `options` with its cursor. A cursor is
+/// bound to its page's block without carrying it, so the request names that
+/// block; left to the tip, it is refused once the chain has moved on.
+async fn next_page(
+    client: &ArkivClient<impl Provider>,
+    query: &str,
+    mut options: serde_json::Value,
+    page: &serde_json::Value,
+) -> serde_json::Value {
+    options["cursor"] = page["cursor"].clone();
+    options["atBlock"] = page["blockNumber"].clone();
+    client
+        .query_raw(query, options)
+        .await
+        .unwrap_or_else(|e| panic!("the next page of {query:?}: {e}"))
+}
+
+/// Every query-operator class but negation — eq, IN, ranges, glob, boolean,
+/// built-in fields, `$all` — with projections, counts, ordering and the RPC
+/// error contract, against a live node. Negation and paging by cursor have
+/// tests of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_operator_classes_over_a_live_node() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let k = create_ranked_entities(&client, caller).await;
     let expect =
         |idxs: &[usize]| -> BTreeSet<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
 
@@ -605,26 +706,6 @@ async fn query_operator_classes_over_a_live_node() {
         "an i32 predicate must not match a u256 attribute",
     );
 
-    // Pagination: two per page partitions $all over three pages. The cursor is
-    // an opaque hex string echoed back verbatim.
-    let mut seen = BTreeSet::new();
-    let mut cursor: Option<String> = None;
-    let mut pages = 0;
-    loop {
-        let page = client.query("*", 2, cursor.as_deref()).await;
-        let keys = result_keys(&page);
-        assert!(keys.len() <= 2, "page larger than resultsPerPage");
-        seen.extend(keys);
-        pages += 1;
-        assert!(pages <= 5, "pagination did not terminate");
-        match page["cursor"].as_str() {
-            Some(next) => cursor = Some(next.to_string()),
-            None => break,
-        }
-    }
-    assert_eq!(seen, expect(&[0, 1, 2, 3, 4]), "pages must partition $all");
-    assert_eq!(pages, 3, "5 entities at 2/page is 3 pages");
-
     // Built-in fields beyond $owner (all share creator/content-type/create-block).
     assert_eq!(
         result_keys(
@@ -648,28 +729,6 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(
         result_keys(&client.query("$expiresAt >= u64(1)", 100, None).await),
         expect(&[0, 1, 2, 3, 4]),
-    );
-
-    // NOT is the only negation, and it is the full complement.
-    assert_eq!(
-        result_keys(
-            &client
-                .query("NOT (rank = u256(10) OR rank = u256(50))", 100, None)
-                .await
-        ),
-        expect(&[1, 2, 3])
-    );
-    assert_eq!(
-        result_keys(
-            &client
-                .query("NOT team STARTSWITH str('re')", 100, None)
-                .await
-        ),
-        expect(&[2, 3, 4])
-    );
-    assert_eq!(
-        result_keys(&client.query("NOT (rank = u256(30))", 100, None).await),
-        expect(&[0, 1, 3, 4])
     );
 
     // The exact-type rule, end to end: `rank` is stored as u256, so an untagged
@@ -884,60 +943,40 @@ async fn query_operator_classes_over_a_live_node() {
         "no page, so no next one"
     );
 
-    // Beside a field, it comes with every page, unchanged by the paging.
-    let counted = serde_json::json!({ "select": { "key": true, "count": true }, "limit": 3 });
+    // Beside a field, it is still the match set, not the page.
     let counted_page = client
-        .query_raw("rank >= u256(20)", counted.clone())
+        .query_raw(
+            "rank >= u256(20)",
+            serde_json::json!({ "select": { "key": true, "count": true }, "limit": 3 }),
+        )
         .await
-        .expect("first counted page");
+        .expect("a counted page");
     assert_eq!(counted_page["count"], "0x4");
     assert_eq!(result_keys(&counted_page).len(), 3);
-    let mut rest = counted;
-    rest["cursor"] = counted_page["cursor"].clone();
-    let counted_rest = client
-        .query_raw("rank >= u256(20)", rest)
-        .await
-        .expect("second counted page");
-    assert_eq!(counted_rest["count"], "0x4", "the match set, not the page");
-    assert_eq!(result_keys(&counted_rest).len(), 1);
-    assert!(counted_rest.get("cursor").is_none());
 
     // `ORDER BY` sorts by one attribute, read as the type it names. Ranks 20
     // to 50 are entities 1 to 4.
-    let in_order = |page: &serde_json::Value| -> Vec<String> {
-        page["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|entity| entity["key"].as_str().expect("key").to_string())
-            .collect()
-    };
     let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
     let ascending = client
         .query_raw("rank >= u256(20) ORDER BY rank:u256", serde_json::json!({}))
         .await
         .expect("ascending by rank");
-    assert_eq!(in_order(&ascending), keys(&[1, 2, 3, 4]), "ASC by default");
+    assert_eq!(
+        keys_in_order(&ascending),
+        keys(&[1, 2, 3, 4]),
+        "ASC by default"
+    );
 
-    // A cursor carries on through the sorted matches.
+    // A page is cut from the sorted matches.
     let by_rank_desc = "rank >= u256(20) ORDER BY rank:u256 DESC";
     let sorted_page = client
         .query_raw(by_rank_desc, serde_json::json!({ "limit": 3 }))
         .await
         .expect("first page by rank, descending");
-    assert_eq!(in_order(&sorted_page), keys(&[4, 3, 2]));
-    let sorted_rest = client
-        .query_raw(
-            by_rank_desc,
-            serde_json::json!({ "limit": 3, "cursor": sorted_page["cursor"] }),
-        )
-        .await
-        .expect("second page by rank, descending");
-    assert_eq!(in_order(&sorted_rest), keys(&[1]));
-    assert!(sorted_rest.get("cursor").is_none());
+    assert_eq!(keys_in_order(&sorted_page), keys(&[4, 3, 2]));
 
-    // An offset starts the page-through further in, and its cursor carries on
-    // from there. The count is still the whole match set.
+    // An offset starts the page further in. The count is still the whole
+    // match set.
     let skipped = client
         .query_raw(
             by_rank_desc,
@@ -949,21 +988,8 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("a page past the first match");
-    assert_eq!(in_order(&skipped), keys(&[3, 2]));
+    assert_eq!(keys_in_order(&skipped), keys(&[3, 2]));
     assert_eq!(skipped["count"], "0x4", "the match set, not the offset");
-    let skipped_rest = client
-        .query_raw(
-            by_rank_desc,
-            serde_json::json!({
-                "select": { "key": true, "count": true },
-                "limit": 2,
-                "cursor": skipped["cursor"],
-            }),
-        )
-        .await
-        .expect("the page after an offset one");
-    assert_eq!(in_order(&skipped_rest), keys(&[1]));
-    assert!(skipped_rest.get("cursor").is_none());
 
     // Past the last match, the page is empty and there is no next one.
     let past_end = client
@@ -982,6 +1008,136 @@ async fn query_operator_classes_over_a_live_node() {
         .to_string();
     assert!(untyped.contains("-32002"), "a type error: {untyped}");
     assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);
+}
+
+/// `NOT` is the only negation, and it is the full complement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn not_queries_over_a_live_node() {
+    // In memory: GolemDB has no NOT.
+    let (_node, client, caller) = spawn_dev_in_memory(DEV_KEY_0).await;
+    let k = create_ranked_entities(&client, caller).await;
+    let expect =
+        |idxs: &[usize]| -> BTreeSet<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
+
+    for (query, matches) in [
+        ("NOT (rank = u256(10) OR rank = u256(50))", &[1, 2, 3][..]),
+        ("NOT team STARTSWITH str('re')", &[2, 3, 4]),
+        ("NOT (rank = u256(30))", &[0, 1, 3, 4]),
+    ] {
+        assert_eq!(
+            result_keys(&client.query(query, 100, None).await),
+            expect(matches),
+            "{query}"
+        );
+    }
+}
+
+/// A cursor carries a query on from the page it came with: through `$all`, a
+/// counted query, a sorted one and one begun at an offset. Once the chain has
+/// moved on, GolemDB refuses the cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cursors_page_through_the_matches_over_a_live_node() {
+    // A later page is read at the first page's block, and GolemDB keeps only
+    // the head's state. So blocks come only with a transaction here, and the
+    // head stands still while a query is paged through.
+    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .mine_on_transaction();
+    let (_node, client, caller) = spawn_dev_on(builder, DEV_KEY_0).await;
+    let k = create_ranked_entities(&client, caller).await;
+    let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
+
+    // Two per page partitions $all over three pages.
+    let two = serde_json::json!({ "limit": 2 });
+    let mut page = client
+        .query_raw("*", two.clone())
+        .await
+        .expect("the first page");
+    let mut seen = BTreeSet::new();
+    let mut pages = 1;
+    loop {
+        let on_page = result_keys(&page);
+        assert!(on_page.len() <= 2, "page larger than the limit");
+        seen.extend(on_page);
+        if page["cursor"].is_null() {
+            break;
+        }
+        assert!(pages < 5, "pagination did not terminate");
+        page = next_page(&client, "*", two.clone(), &page).await;
+        pages += 1;
+    }
+    assert_eq!(
+        seen,
+        k.iter().cloned().collect(),
+        "pages must partition $all"
+    );
+    assert_eq!(pages, 3, "5 entities at 2/page is 3 pages");
+
+    // A selected count comes with every page, unchanged by the paging.
+    let counted = serde_json::json!({ "select": { "key": true, "count": true }, "limit": 3 });
+    let first = client
+        .query_raw("rank >= u256(20)", counted.clone())
+        .await
+        .expect("first counted page");
+    assert_eq!(first["count"], "0x4");
+    assert_eq!(result_keys(&first).len(), 3);
+    let rest = next_page(&client, "rank >= u256(20)", counted, &first).await;
+    assert_eq!(rest["count"], "0x4", "the match set, not the page");
+    assert_eq!(result_keys(&rest).len(), 1);
+    assert!(rest.get("cursor").is_none());
+
+    // A cursor carries on through the sorted matches.
+    let by_rank_desc = "rank >= u256(20) ORDER BY rank:u256 DESC";
+    let three = serde_json::json!({ "limit": 3 });
+    let first = client
+        .query_raw(by_rank_desc, three.clone())
+        .await
+        .expect("first page by rank, descending");
+    assert_eq!(keys_in_order(&first), keys(&[4, 3, 2]));
+    let rest = next_page(&client, by_rank_desc, three, &first).await;
+    assert_eq!(keys_in_order(&rest), keys(&[1]));
+    assert!(rest.get("cursor").is_none());
+
+    // The cursor of a page begun at an offset carries on from there.
+    let two_counted = serde_json::json!({ "select": { "key": true, "count": true }, "limit": 2 });
+    let mut from_second = two_counted.clone();
+    from_second["offset"] = "0x1".into();
+    let first = client
+        .query_raw(by_rank_desc, from_second)
+        .await
+        .expect("a page past the first match");
+    assert_eq!(keys_in_order(&first), keys(&[3, 2]));
+    let rest = next_page(&client, by_rank_desc, two_counted, &first).await;
+    assert_eq!(keys_in_order(&rest), keys(&[1]));
+    assert!(rest.get("cursor").is_none());
+
+    // The next block takes the first page's state with it. The cursor is then
+    // refused, not answered from the new head: with its block named, that
+    // block is unavailable, and left to the tip, the cursor is not the tip's.
+    let first = client
+        .query_raw("*", two.clone())
+        .await
+        .expect("the first page");
+    mine_block(&client).await;
+    // A read at the tip waits for the store to commit the new block. Until
+    // then the store still holds the first page's state.
+    assert_eq!(client.entity_count(None, None).await, 5);
+    let mut at_its_block = two.clone();
+    at_its_block["cursor"] = first["cursor"].clone();
+    at_its_block["atBlock"] = first["blockNumber"].clone();
+    let mut at_the_tip = two;
+    at_the_tip["cursor"] = first["cursor"].clone();
+    for (options, code) in [(at_its_block, "-32006"), (at_the_tip, "-32005")] {
+        let refused = client
+            .query_raw("*", options.clone())
+            .await
+            .expect_err("a cursor from a block that is gone")
+            .to_string();
+        assert!(
+            refused.contains(code),
+            "{options} should be {code}, got: {refused}"
+        );
+    }
 }
 
 /// Every mutating op — update, extend, transfer, delete — driven over a live node
@@ -1094,26 +1250,40 @@ async fn write_path_ops_over_a_live_node() {
 /// Historical reads (`arkiv_getEntity` / `arkiv_query` as of a past block) and
 /// `arkiv_getBlockTiming`: an entity updated at the tip still reads its original
 /// value, and matches its original query, as of the block it was created in.
+/// A cursor carries on at its page's block after the chain has moved on, and
+/// an entity that has expired still reads as it was in the blocks before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn historical_reads_and_block_timing_over_a_live_node() {
-    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    // In memory: it reads older blocks, and GolemDB keeps only the head's state.
+    let (_node, client, caller) = spawn_dev_in_memory(DEV_KEY_0).await;
 
-    let key = B256::from(derive_entity_address(
-        DEV_CHAIN_ID,
-        &caller.into_array(),
-        EntityCreationNonce::new(0),
-        0,
-    ));
+    let entity_key = |nonce| {
+        B256::from(derive_entity_address(
+            DEV_CHAIN_ID,
+            &caller.into_array(),
+            EntityCreationNonce::new(nonce),
+            0,
+        ))
+    };
+    let key = entity_key(0);
     let ks = format!("{key:#x}");
+    // Lives 8 blocks, so it expires and is purged while the test runs.
+    let brief = entity_key(1);
 
     client
-        .execute(vec![create_op(
-            1000,
-            Bytes::from_static(b"v1"),
-            attrs(10, "red"),
-        )])
+        .execute(vec![
+            create_op(1000, Bytes::from_static(b"v1"), attrs(10, "red")),
+            create_op(8, Bytes::from_static(b"brief"), vec![]),
+        ])
         .await;
     let created = hex_quantity(&client.get_entity(key).await["createdAt"]);
+    let expires_at = hex_quantity(&client.get_entity(brief).await["expiresAt"]);
+    // The first of two pages, read before the chain moves on.
+    let one = serde_json::json!({ "limit": 1 });
+    let first_page = client
+        .query_raw("*", one.clone())
+        .await
+        .expect("the first page");
 
     client
         .execute(vec![{
@@ -1147,6 +1317,34 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
     assert!(
         result_keys(&client.query_at("rank = u256(100)", created).await).is_empty(),
         "the updated rank did not exist yet at the create block",
+    );
+
+    // A cursor carries on at its page's block, though the chain has moved on.
+    let second_page = next_page(&client, "*", one, &first_page).await;
+    let mut paged = result_keys(&first_page);
+    paged.extend(result_keys(&second_page));
+    assert_eq!(
+        paged,
+        BTreeSet::from([ks.clone(), format!("{brief:#x}")]),
+        "the two pages hold the two entities of the first page's block"
+    );
+
+    // Past its expiry block the short-lived entity is gone from the tip, and
+    // history has it still: at its last live block it is live, record and all.
+    client
+        .wait_for_block(expires_at, Duration::from_secs(30))
+        .await;
+    assert!(
+        client.get_entity(brief).await.is_null(),
+        "expired entity is absent at the tip"
+    );
+    assert!(
+        !client.get_entity_at(brief, expires_at - 1).await.is_null(),
+        "a historical read before the expiry block still sees it",
+    );
+    assert!(
+        client.debug_entity_exists_at(brief, expires_at - 1).await,
+        "and its record"
     );
 
     // Block timing is sane.
@@ -1267,19 +1465,13 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
         "past-BTL entity leaves queries",
     );
     assert_eq!(client.entity_count(None, None).await, 0, "and the count");
-
-    // History still sees it: at its last live block it was live.
-    assert!(
-        !client.get_entity_at(key, expires_at - 1).await.is_null(),
-        "a historical read before the expiry block still sees it",
-    );
 }
 
 /// The producer's protocol transaction physically removes a short-lived entity;
 /// this uses the debug read because the public read hides expiry even without a purge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_entity_is_physically_purged() {
-    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let (_node, client, caller) = spawn_dev_mining_on_demand(DEV_KEY_0).await;
     client
         .execute(vec![create_op(8, Bytes::from_static(b"purge-me"), vec![])])
         .await;
@@ -1320,26 +1512,26 @@ async fn expired_entity_is_physically_purged() {
         "simulation does not delete canonical state"
     );
 
-    let (purged_at, remaining) = wait_for_first_purge(&client, &[key], expires_at).await;
-    assert_eq!(remaining, 0, "the entity is physically purged");
+    // The record is there after every block until a purge names it.
+    let (purged_at, _) = mine_to_first_purge(&client, &[key]).await;
+    assert!(
+        purged_at >= expires_at,
+        "purged in block {purged_at}, before its expiry block {expires_at}"
+    );
     assert!(
         client.get_entity(key).await.is_null(),
         "expired entity is logically absent"
     );
     assert!(
-        !client.debug_entity_exists_at(key, purged_at).await,
+        !client.debug_entity_exists(key).await,
         "expired entity record was physically purged"
-    );
-    assert!(
-        client.debug_entity_exists_at(key, purged_at - 1).await,
-        "record existed before the purge block"
     );
 }
 
 /// The count cap drains one common-expiry cohort over successive blocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn purge_respects_max_keys_per_block() {
-    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let (_node, client, caller) = spawn_dev_mining_on_demand(DEV_KEY_0).await;
     let entity_count = u64::try_from(MAX_PURGE_KEYS).unwrap() + 1;
     client
         .execute(
@@ -1358,17 +1550,26 @@ async fn purge_respects_max_keys_per_block() {
             ))
         })
         .collect();
-    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
 
-    let (_, remaining) = wait_for_first_purge(&client, &keys, expires_at).await;
-    assert_eq!(remaining, 1, "the per-block key limit is enforced");
-    wait_for_all_purged(&client, &keys).await;
+    let (_, named) = mine_to_first_purge(&client, &keys).await;
+    assert_eq!(named, MAX_PURGE_KEYS, "the first purge names a full block");
+    assert_eq!(
+        records_left(&client, &keys).await,
+        1,
+        "the per-block key limit is enforced"
+    );
+    mine_block(&client).await;
+    assert_eq!(
+        records_left(&client, &keys).await,
+        0,
+        "the next block's purge removes the last one"
+    );
 }
 
 /// Patch-expanded entities obey the strict purge transaction gas limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn purge_respects_strict_gas_limit_after_attribute_patches() {
-    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let (_node, client, caller) = spawn_dev_mining_on_demand(DEV_KEY_0).await;
     let keys: Vec<_> = (0..6)
         .map(|nonce| {
             B256::from(derive_entity_address(
@@ -1401,7 +1602,6 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
         ops.push(Operation::patch(*key, attributes));
     }
     client.execute(ops).await;
-    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
     for key in &keys {
         assert_eq!(
             client.get_entity(*key).await["attributes"]
@@ -1412,12 +1612,19 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
         );
     }
 
-    let (_, remaining) = wait_for_first_purge(&client, &keys, expires_at).await;
+    let (_, named) = mine_to_first_purge(&client, &keys).await;
+    assert_eq!(named, 5, "the first purge names the five that fit");
     assert_eq!(
-        remaining, 1,
+        records_left(&client, &keys).await,
+        1,
         "the sixth purge does not exceed the gas limit"
     );
-    wait_for_all_purged(&client, &keys).await;
+    mine_block(&client).await;
+    assert_eq!(
+        records_left(&client, &keys).await,
+        0,
+        "the next block's purge removes the last one"
+    );
 }
 
 /// How many creates [`no_transaction_is_included_twice_over_a_live_node`] fires.
@@ -2111,23 +2318,6 @@ async fn a_bad_arkiv_section_stops_the_node() {
     }
 }
 
-/// A chain without a pricing model stops at startup on any store, not only on
-/// GolemDB, which needs `config.arkiv` for its own settings first: here the
-/// node runs in memory and only the schedule is missing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chain_without_a_pricing_model_stops_the_node() {
-    let genesis_path = genesis_file(&genesis_json());
-    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
-        .chain(&genesis_path)
-        .spawn();
-    let log = refusal(&mut node).await;
-    let _ = std::fs::remove_file(&genesis_path);
-    assert!(
-        log.contains("no usable pricing model"),
-        "the node names the missing pricing model: {log}"
-    );
-}
-
 /// On GolemDB, the store's genesis must have block 0's `stateRoot`. A store
 /// with this chain's settings and genesis tag, but other accounts, has another
 /// root and is refused.
@@ -2530,7 +2720,7 @@ async fn spawn_on(
     let builder = if golemdb {
         builder.golemdb_store()
     } else {
-        builder
+        builder.memory_store()
     };
     let mut node = builder.spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
@@ -2843,9 +3033,9 @@ async fn storage_that_does_not_fit_runs_a_create_out_of_gas() {
 /// * **A restart.** `eth_getTransactionByHash` consults reth's in-memory RPC
 ///   cache first and only calls the provider on a miss, so a freshly mined
 ///   transaction is always a cache hit.
-/// * **A store that outlives the process.** The default in-process store does
-///   not, so after a restart the tier would be empty and the provider would
-///   fall back to reth. Hence GolemDB on disk.
+/// * **A store that outlives the process.** The in-process store does not,
+///   so after a restart the tier would be empty and the provider would fall
+///   back to reth. Hence GolemDB on disk.
 /// * **More than `DEFAULT_PERSISTENCE_THRESHOLD` blocks**, which is 50.
 ///   Below it reth has written nothing to its own database, so a restart
 ///   loses the block entirely and there is nothing to read either way.
