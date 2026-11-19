@@ -1735,6 +1735,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "arkiv-golemdb",
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "eyre",

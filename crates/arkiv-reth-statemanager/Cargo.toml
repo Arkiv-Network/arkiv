@@ -32,3 +32,5 @@ eyre.workspace = true
 
 [dev-dependencies]
 arkiv-interfaces = { workspace = true, features = ["conformance"] }
+# The real engine, so the store states are checked on it as well as on MemStore.
+arkiv-golemdb.workspace = true
