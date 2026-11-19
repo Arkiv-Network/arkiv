@@ -7,11 +7,16 @@ license.workspace = true
 description = "Prefill an Arkiv chain: the archive format, its hash and its reader"
 
 [dependencies]
+# `Op`, the entity types and the decoder's attribute count limit.
+arkiv-interfaces.workspace = true
+# `Ident32`: attribute names the node's decoder would accept.
+arkiv-bindings.workspace = true
 # `Keccak256`, the archive hash.
 alloy-primitives.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 eyre.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile.workspace = true

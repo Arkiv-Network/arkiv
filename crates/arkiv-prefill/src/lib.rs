@@ -1,4 +1,5 @@
-//! Chain prefill input: the archive format and the archive hash.
+//! Chain prefill input: the archive format, the archive hash and the
+//! streaming reader ([`Archive::entities`]).
 //!
 //! # Archives
 //!
@@ -36,7 +37,7 @@
 //! | `$key`           | yes      | the entity key, 32 bytes hex                                  |
 //! | `$creator`       | yes      | the creating account, 20 bytes hex                            |
 //! | `$owner`         | yes      | the owner; when it is not `$creator` the entity is transferred |
-//! | `$expiresAt`     | yes      | the expiry block, a decimal number or string                  |
+//! | `$expiresAt`     | yes      | the expiry block, a decimal number or string; not 0           |
 //! | `$contentType`   | no       | a string, stored as the unindexed `str` attribute `contentType` |
 //! | `$payload`       | no       | base64, stored as the unindexed `bytes` attribute `payload`   |
 //! | `$creationFlags` | no       | an array of `"readonly"`, `"permissionlessExtension"`         |
@@ -79,6 +80,9 @@ use std::path::{Path, PathBuf};
 use alloy_primitives::{B256, Keccak256};
 use eyre::{Result, WrapErr, ensure};
 use serde::Deserialize;
+
+mod reader;
+pub use reader::Entities;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
