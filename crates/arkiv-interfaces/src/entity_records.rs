@@ -115,9 +115,30 @@ pub const fn record_key(key: EntityAddress) -> Option<RecordKey> {
     }
 }
 
-/// Account records must never be interpreted as entities.
+/// Account records and the prefill record must never be interpreted as
+/// entities.
 pub const fn is_reserved_key(key: EntityAddress) -> bool {
-    is_account_key(key)
+    is_account_key(key) || is_prefill_key(key)
+}
+
+/// The key of the record a prefilled chain keeps its prefill progress in:
+/// `keccak256("arkiv.prefill")`. A fixed hash rather than a padded address, so
+/// that no transfer to some "address" can land a balance on it.
+pub const PREFILL_RECORD_KEY: EntityAddress = [
+    0xd3, 0xca, 0x57, 0xaf, 0xdc, 0xac, 0x72, 0x12, 0x0f, 0x2b, 0x37, 0xae, 0xc6, 0x33, 0x13, 0x97,
+    0xb7, 0xc0, 0xd9, 0xe1, 0x5a, 0xa9, 0x38, 0x6a, 0xda, 0x2c, 0x45, 0x1d, 0x6e, 0xd0, 0x85, 0x5e,
+];
+
+/// Whether `key` is the prefill record's, [`PREFILL_RECORD_KEY`].
+pub const fn is_prefill_key(key: EntityAddress) -> bool {
+    let mut byte = 0;
+    while byte < 32 {
+        if key[byte] != PREFILL_RECORD_KEY[byte] {
+            return false;
+        }
+        byte += 1;
+    }
+    true
 }
 
 /// Whether `key` is an account's: an address left-padded with twelve zero bytes.
@@ -530,17 +551,21 @@ mod tests {
         assert_ne!(level.value, AttributeValue::Int(-7).index_bytes());
     }
 
-    /// No entity is read or written at a reserved key: an account's, or the fee
-    /// schedule's. Any other key is an entity's own.
+    /// No entity is read or written at a reserved key: an account's, or the
+    /// prefill record's. Any other key is an entity's own.
     #[test]
     fn reserved_keys_have_no_entity_record() {
         let mut account = [0u8; 32];
         account[12..].copy_from_slice(&[0xaa; 20]);
-        assert!(is_reserved_key(account));
-        assert_eq!(record_key(account), None);
+        for reserved in [account, PREFILL_RECORD_KEY] {
+            assert!(is_reserved_key(reserved));
+            assert_eq!(record_key(reserved), None);
+        }
         let mut near = [0x7b; 32];
         near[31] ^= 1;
-        for key in [[0x11; 32], near] {
+        let mut near_prefill = PREFILL_RECORD_KEY;
+        near_prefill[31] ^= 1;
+        for key in [[0x11; 32], near, near_prefill] {
             assert!(!is_reserved_key(key));
             assert_eq!(record_key(key), Some(RecordKey::from_entity(key)));
         }

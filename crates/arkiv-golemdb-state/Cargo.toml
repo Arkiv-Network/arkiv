@@ -13,6 +13,8 @@ license.workspace = true
 arkiv-interfaces.workspace = true
 
 [dev-dependencies]
+# keccak256, to check the reserved prefill key is the hash it says it is.
+alloy-primitives.workspace = true
 # The real engine, so the shared view contract runs against GolemDB too.
 arkiv-golemdb.workspace = true
 arkiv-interfaces = { workspace = true, features = ["conformance"] }

@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod accounts;
 pub mod entities;
 pub mod indices;
+pub mod prefill;
 pub mod view;
 
 pub use view::{GolemStateView, ViewError};
