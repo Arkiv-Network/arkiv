@@ -9,11 +9,19 @@
 //! primary    → '(' expr ')' | predicate
 //! predicate  → attrRef compOp value | attrRef BETWEEN value AND value
 //!            | attrRef STARTSWITH strValue
-//!            | EXISTS '(' name ')' | TYPEOF '(' name ')' '=' typeTag
+//!            | EXISTS '(' userName ')' | TYPEOF '(' userName ')' '=' typeTag
+//! attrRef    → userName | '$' name
+//! userName   → name | '"' name '"'
 //! ```
 //!
 //! Precedence, tightest first: `NOT`, `AND`, `OR`. The `AND` inside a
 //! `BETWEEN` is the predicate's own, not a conjunction.
+//!
+//! **No name is reserved.** A bare keyword is always the keyword, so an
+//! attribute named like one is written quoted, `"and" = true`; any other name
+//! may be quoted or not, to the same effect. Type tags and the words of
+//! `ORDER BY` are read by position, so `str = str('x')` and `desc = 1` need no
+//! quotes at all.
 //!
 //! Two jobs beyond shape. First, **typing**: a value carries its own type, and
 //! this is where a value is checked against the attribute it is compared to
@@ -36,10 +44,10 @@ use alloc::vec::Vec;
 mod order;
 
 use arkiv_interfaces::entity::{AttributeType, AttributeValue};
-use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, Statement, ValueRange};
+use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, Statement, ValueRange, words};
 
 use crate::error::{ParseError, ParseErrorKind};
-use crate::lexer::{SpannedToken, Token, TypeTag, tokenize};
+use crate::lexer::{SpannedToken, Token, TypeTag, is_name_char, tokenize};
 use crate::limits;
 use crate::literal;
 
@@ -74,7 +82,9 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
     Ok(Statement { filter, order })
 }
 
-struct Parser {
+struct Parser<'a> {
+    /// The query text, for errors that quote what was written.
+    src: &'a str,
     tokens: Vec<SpannedToken>,
     pos: usize,
     /// Byte offset one past the input, for "unexpected end of query" errors.
@@ -83,9 +93,9 @@ struct Parser {
     predicates: usize,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// A parser over `input`'s tokens, once it is within the length cap.
-    fn new(input: &str) -> Result<Self, ParseError> {
+    fn new(input: &'a str) -> Result<Self, ParseError> {
         if input.len() > limits::MAX_QUERY_BYTES {
             return Err(ParseError::whole(
                 ParseErrorKind::QueryLimitError,
@@ -93,6 +103,7 @@ impl Parser {
             ));
         }
         Ok(Self {
+            src: input,
             tokens: tokenize(input)?,
             pos: 0,
             end: input.len(),
@@ -156,7 +167,8 @@ impl Parser {
 
     /// Where the next token starts, when it is the bare word `word`, in any
     /// case. The words of `ORDER BY` are read this way, where the clause
-    /// stands, so none of them is reserved.
+    /// stands, so none of them is reserved. A quoted word is a name, so
+    /// `"order"` never opens the clause.
     fn word_at(&self, word: &str) -> Option<usize> {
         match self.peek() {
             Some(SpannedToken {
@@ -225,6 +237,9 @@ impl Parser {
         }
         let start = spanned.start;
         self.advance();
+        if self.operator_follows_keyword() {
+            return Err(self.keyword_as_name(start));
+        }
         self.descend(start)?;
         // NOT binds tighter than AND, so it takes the next unary, not the
         // whole conjunction: `NOT a = true AND b = true` is `(NOT a) AND b`.
@@ -349,14 +364,17 @@ impl Parser {
         Ok(Query::Between { key, bounds })
     }
 
-    /// `existsTest = EXISTS , "(" , name , ")"` and
-    /// `typeTest = TYPEOF , "(" , name , ")" , "=" , typeTag`, per the spec's
+    /// `existsTest = EXISTS , "(" , userName , ")"` and
+    /// `typeTest = TYPEOF , "(" , userName , ")" , "=" , typeTag`, per the spec's
     /// grammar (`docs/api-spec.md` §4).
     ///
-    /// Both take `name`, not `attrRef`: a system attribute is carried by every
-    /// entity, so asking whether it is there would be a constant.
+    /// Both take `userName`, not `attrRef`: a system attribute is carried by
+    /// every entity, so asking whether it is there would be a constant.
     fn parse_presence(&mut self, which: Presence) -> Result<Query, ParseError> {
         let keyword = self.advance().expect("the caller peeked EXISTS or TYPEOF");
+        if self.operator_follows_keyword() {
+            return Err(self.keyword_as_name(keyword.start));
+        }
         self.expect(
             &Token::LParen,
             keyword.start,
@@ -390,26 +408,18 @@ impl Parser {
 
     /// The `name` inside `exists(…)` / `typeof(…)`: a user attribute only.
     fn parse_presence_name(&mut self) -> Result<String, ParseError> {
-        let Some(spanned) = self.advance() else {
-            return Err(ParseError::syntax(self.end, "expected an attribute name"));
-        };
-        match spanned.token {
-            Token::Name(name) => {
-                validate_user_name(&name, spanned.start)?;
-                Ok(name)
-            }
-            Token::SysName(name) => Err(ParseError::type_error(
-                spanned.start,
-                alloc::format!(
-                    "${name} is a system attribute, which every entity carries — \
-                     exists and typeof take a user attribute"
-                ),
-            )),
-            _ => Err(ParseError::syntax(
-                spanned.start,
-                "expected an attribute name",
-            )),
-        }
+        self.parse_name(
+            |name| name,
+            |name, start| {
+                Err(ParseError::type_error(
+                    start,
+                    alloc::format!(
+                        "${name} is a system attribute, which every entity carries — \
+                         exists and typeof take a user attribute"
+                    ),
+                ))
+            },
+        )
     }
 
     /// A bare type tag, not a literal: `typeof`'s right-hand side, or the type
@@ -427,12 +437,12 @@ impl Parser {
         };
         match spanned.token {
             Token::Name(name) => match TypeTag::from_name(&name) {
-                Some(tag) => Ok(attr_type_of(tag)),
+                Some(tag) => Ok(tag.attr_type()),
                 None => Err(ParseError::type_error(
                     spanned.start,
                     alloc::format!(
-                        "{name} is not a type tag — one of \
-                         i32 u64 u256 dec str addr key bytes32 bool"
+                        "{name} is not a type tag — one of {}",
+                        words::TYPE_TAGS.join(" ")
                     ),
                 )),
             },
@@ -444,11 +454,48 @@ impl Parser {
                     site.form(tag.name())
                 ),
             )),
+            Token::QuotedName(name) => Err(ParseError::syntax(
+                spanned.start,
+                alloc::format!(
+                    "\"{name}\" is quoted, so it is an attribute name — a type tag is \
+                     written bare: {}",
+                    site.form(TypeTag::from_name(&name).map_or("i32", TypeTag::name))
+                ),
+            )),
             _ => Err(ParseError::syntax(
                 spanned.start,
                 alloc::format!("expected a type tag, e.g. {}", site.form("i32")),
             )),
         }
+    }
+
+    /// Whether the keyword just read, `NOT`, `EXISTS` or `TYPEOF`, was meant
+    /// as an attribute name, because an operator follows it: `not = true`.
+    /// Not when that operator is `BETWEEN` or `STARTSWITH` and is itself
+    /// followed by an operator, as in `NOT between = true`: then it is the
+    /// operator's word that was meant as the name.
+    fn operator_follows_keyword(&self) -> bool {
+        let token = |offset: usize| self.tokens.get(self.pos + offset).map(|t| &t.token);
+        match token(0) {
+            Some(next) if next.is_operator() => {
+                !(next.is_keyword() && token(1).is_some_and(Token::is_operator))
+            }
+            Some(_) | None => false,
+        }
+    }
+
+    /// A keyword standing where an attribute name belongs. Bare, it can only
+    /// be the keyword, so the error shows the quoted form, which keeps the
+    /// spelling it was written in: names are case-sensitive.
+    fn keyword_as_name(&self, start: usize) -> ParseError {
+        let rest = &self.src[start..];
+        let word = &rest[..rest.find(|ch| !is_name_char(ch)).unwrap_or(rest.len())];
+        ParseError::syntax(
+            start,
+            alloc::format!(
+                "{word} is a keyword — to name an attribute {word}, quote it: \"{word}\""
+            ),
+        )
     }
 
     /// Consume `expected`, or report `message` against `position`.
@@ -466,27 +513,29 @@ impl Parser {
     }
 
     fn parse_attr_ref(&mut self) -> Result<AnnotKey, ParseError> {
+        self.parse_name(AnnotKey::User, |name, start| {
+            builtin_from_name(name, start).map(AnnotKey::BuiltIn)
+        })
+    }
+
+    /// An attribute name. A user attribute's, bare or quoted, goes to `user`;
+    /// a `$name`, with where it starts, to `system`, which each caller takes
+    /// its own way.
+    fn parse_name<T>(
+        &mut self,
+        user: impl FnOnce(String) -> T,
+        system: impl FnOnce(&str, usize) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
         let Some(spanned) = self.advance() else {
             return Err(ParseError::syntax(self.end, "expected an attribute name"));
         };
         match spanned.token {
-            Token::Name(name) => {
+            Token::Name(name) | Token::QuotedName(name) => {
                 validate_user_name(&name, spanned.start)?;
-                Ok(AnnotKey::User(name))
+                Ok(user(name))
             }
-            Token::SysName(name) => builtin_from_name(&name, spanned.start).map(AnnotKey::BuiltIn),
-            Token::And
-            | Token::Or
-            | Token::Not
-            | Token::True
-            | Token::False
-            | Token::Between
-            | Token::StartsWith
-            | Token::Exists
-            | Token::TypeOf => Err(ParseError::syntax(
-                spanned.start,
-                "a reserved word cannot be used as an attribute name",
-            )),
+            Token::SysName(name) => system(&name, spanned.start),
+            token if token.is_keyword() => Err(self.keyword_as_name(spanned.start)),
             _ => Err(ParseError::syntax(
                 spanned.start,
                 "expected an attribute name",
@@ -514,6 +563,16 @@ impl Parser {
             Token::False => AttributeValue::Bool(false),
             Token::Int(text) => bare_int_value(key, &text, position)?,
             Token::Str(content) => bare_str_value(key, content, position)?,
+            // `name = "Bob"` is an easy slip: here double quotes make a name.
+            Token::QuotedName(name) => {
+                return Err(ParseError::syntax(
+                    position,
+                    alloc::format!(
+                        "\"{name}\" is an attribute name — a string value is single-quoted \
+                         and tagged: str('{name}')"
+                    ),
+                ));
+            }
             _ => {
                 return Err(ParseError::syntax(
                     position,
@@ -561,24 +620,6 @@ enum Presence {
     Exists,
     /// `typeof(name) = tag`: the attribute, under exactly one type.
     TypeOf,
-}
-
-/// The attribute type a type tag names.
-///
-/// Total: every tag in the language denotes an entity attribute type. `bytes`
-/// has no tag, which is how the one never-indexed type stays out of `typeof`.
-const fn attr_type_of(tag: TypeTag) -> AttributeType {
-    match tag {
-        TypeTag::Bool => AttributeType::Bool,
-        TypeTag::I32 => AttributeType::Int,
-        TypeTag::U64 => AttributeType::U64,
-        TypeTag::U256 => AttributeType::U256,
-        TypeTag::Dec => AttributeType::Decimal,
-        TypeTag::Bytes32 => AttributeType::Bytes32,
-        TypeTag::Str => AttributeType::Str,
-        TypeTag::Addr => AttributeType::EthereumAddress,
-        TypeTag::Key => AttributeType::EntityKey,
-    }
 }
 
 /// Build the comparison node for an already-validated operator.
@@ -724,27 +765,18 @@ fn and_or_depth(query: &Query) -> usize {
     }
 }
 
-/// User attribute names: `[A-Za-z][A-Za-z0-9_.\-]*`, at most 32 bytes, and
-/// never a type name.
+/// User attribute names, bare or quoted: `[A-Za-z][A-Za-z0-9_.\-]*`, at most
+/// 32 bytes.
 ///
-/// The charset is the lexer's business, and so are the keywords, which arrive
-/// as tokens of their own; what is left is the length cap and the type names.
-/// Type tags are only tags in front of a `(`, so a bare `str` arrives here as
-/// an ordinary name and has to be rejected by hand.
+/// The charset is the lexer's business, so what is left is the length cap.
+/// No name is reserved: a type tag is a tag only where one stands, so a bare
+/// `str` here is an attribute named `str`, and a keyword reaches here only
+/// quoted, as the name it then is.
 fn validate_user_name(name: &str, position: usize) -> Result<(), ParseError> {
     if name.len() > limits::MAX_ATTRIBUTE_NAME_BYTES {
         return Err(ParseError::syntax(
             position,
             "attribute names are limited to 32 bytes",
-        ));
-    }
-    if let Some(tag) = TypeTag::from_name(name) {
-        return Err(ParseError::syntax(
-            position,
-            alloc::format!(
-                "{} is a type name and cannot be an attribute name",
-                tag.name()
-            ),
         ));
     }
     Ok(())
@@ -806,8 +838,10 @@ fn builtin_from_name(name: &str, position: usize) -> Result<BuiltIn, ParseError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeSet;
     use alloc::format;
     use alloc::string::ToString;
+    use arkiv_interfaces::query::{Direction, OrderBy};
 
     fn user(name: &str) -> AnnotKey {
         AnnotKey::User(name.to_string())
@@ -1091,15 +1125,19 @@ mod tests {
     fn between_owns_its_and() {
         assert_eq!(
             parse("a BETWEEN 1 AND 5 AND b = true").unwrap(),
-            Query::And(vec![between_ints("a", 1, 5), is_true("b")])
+            Query::And(vec![between_ints("a", 1, 5), is_bool("b", true)])
         );
         assert_eq!(
             parse("b = true AND a BETWEEN 1 AND 5 AND c = true").unwrap(),
-            Query::And(vec![is_true("b"), between_ints("a", 1, 5), is_true("c")])
+            Query::And(vec![
+                is_bool("b", true),
+                between_ints("a", 1, 5),
+                is_bool("c", true)
+            ])
         );
         assert_eq!(
             parse("b = true OR a BETWEEN 1 AND 5").unwrap(),
-            Query::Or(vec![is_true("b"), between_ints("a", 1, 5)])
+            Query::Or(vec![is_bool("b", true), between_ints("a", 1, 5)])
         );
         // NOT takes the whole predicate, bounds and all.
         assert_eq!(
@@ -1352,11 +1390,16 @@ mod tests {
                 },
                 "{tag}"
             );
-            // This parser is stricter than the spec's "tags are positional,
-            // not globally reserved": `validate_user_name` refuses a type
-            // name as an attribute name, so a tag cannot be the name either.
-            let err = parse(&format!("typeof({tag}) = i32")).unwrap_err();
-            assert!(err.message.contains("is a type name"), "{tag}: {err}");
+            // Tags are read by position, so inside the parentheses a tag is
+            // just the attribute's name.
+            assert_eq!(
+                parse(&format!("typeof({tag}) = {tag}")).unwrap(),
+                Query::Exists {
+                    name: tag.into(),
+                    attr_type: Some(attr_type),
+                },
+                "{tag}"
+            );
         }
         assert_eq!(
             parse("TYPEOF(level) = I32").unwrap(),
@@ -1454,11 +1497,11 @@ mod tests {
 
     // ── boolean structure ───────────────────────────────────────────────
 
-    /// `name = true`, the predicate the structure tests are built from.
-    fn is_true(name: &str) -> Query {
+    /// `name = value`, the predicate the structure tests are built from.
+    fn is_bool(name: &str, value: bool) -> Query {
         Query::Eq {
             key: user(name),
-            value: AttributeValue::Bool(true),
+            value: AttributeValue::Bool(value),
         }
     }
 
@@ -1468,21 +1511,24 @@ mod tests {
         assert_eq!(
             parse("a = true OR b = true AND c = true").unwrap(),
             Query::Or(vec![
-                is_true("a"),
-                Query::And(vec![is_true("b"), is_true("c")])
+                is_bool("a", true),
+                Query::And(vec![is_bool("b", true), is_bool("c", true)])
             ])
         );
         // NOT binds tighter than AND, and needs no parentheses.
         assert_eq!(
             parse("NOT a = true AND b = true").unwrap(),
-            Query::And(vec![Query::Not(Box::new(is_true("a"))), is_true("b")])
+            Query::And(vec![
+                Query::Not(Box::new(is_bool("a", true))),
+                is_bool("b", true)
+            ])
         );
         // Parentheses override.
         assert_eq!(
             parse("(a = true OR b = true) AND c = true").unwrap(),
             Query::And(vec![
-                Query::Or(vec![is_true("a"), is_true("b")]),
-                is_true("c")
+                Query::Or(vec![is_bool("a", true), is_bool("b", true)]),
+                is_bool("c", true)
             ])
         );
     }
@@ -1493,19 +1539,27 @@ mod tests {
     fn a_chain_of_one_connective_is_one_node() {
         assert_eq!(
             parse("a = true AND b = true AND c = true").unwrap(),
-            Query::And(vec![is_true("a"), is_true("b"), is_true("c")])
+            Query::And(vec![
+                is_bool("a", true),
+                is_bool("b", true),
+                is_bool("c", true)
+            ])
         );
         assert_eq!(
             parse("a = true OR b = true OR c = true").unwrap(),
-            Query::Or(vec![is_true("a"), is_true("b"), is_true("c")])
+            Query::Or(vec![
+                is_bool("a", true),
+                is_bool("b", true),
+                is_bool("c", true)
+            ])
         );
         // A parenthesized chain is a group of its own, not merged into the
         // chain around it.
         assert_eq!(
             parse("a = true AND (b = true AND c = true)").unwrap(),
             Query::And(vec![
-                is_true("a"),
-                Query::And(vec![is_true("b"), is_true("c")])
+                is_bool("a", true),
+                Query::And(vec![is_bool("b", true), is_bool("c", true)])
             ])
         );
     }
@@ -1599,20 +1653,24 @@ mod tests {
         );
     }
 
+    /// A bare keyword is the keyword, so an attribute named like one is
+    /// quoted; a type name is a tag only before `(`, so it needs no quotes.
+    /// The quoted names are covered in full below.
     #[test]
-    fn keywords_and_type_names_cannot_be_attributes() {
-        // Keywords lex as keywords, so they never reach an attribute position.
+    fn a_bare_keyword_is_not_a_name_but_a_bare_type_name_is() {
         assert_eq!(kind_of("and = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(kind_of("not = true"), ParseErrorKind::MalformedInputError);
         assert_eq!(
             kind_of("between = true"),
             ParseErrorKind::MalformedInputError
         );
-        // A type name is only a tag before `(`; bare, it is rejected by name.
-        let err = parse("str = true").unwrap_err();
-        assert!(err.message.contains("type name"), "{err}");
+        assert_eq!(
+            parse("\"between\" = true").unwrap(),
+            is_bool("between", true)
+        );
+        assert_eq!(parse("str = true").unwrap(), is_bool("str", true));
         // Any other word is a name, `set` included.
-        assert_eq!(parse("set = true").unwrap(), is_true("set"));
+        assert_eq!(parse("set = true").unwrap(), is_bool("set", true));
     }
 
     #[test]
@@ -1703,5 +1761,575 @@ mod tests {
             addr_hex("ab"),
         );
         assert!(parse(&query).is_ok(), "{:?}", parse(&query).unwrap_err());
+    }
+
+    // ── attribute names spelled like the language's words ────────────────
+    //
+    // No name is reserved. A bare keyword is always the keyword, so an attribute
+    // named like one is written quoted, `"and"`. A type tag or an `ORDER BY` word
+    // is read by position, so it names an attribute bare or quoted alike. Every
+    // such word, in every spelling, is walked through every place a name stands:
+    // a comparison, `BETWEEN`, `STARTSWITH`, `exists`, `typeof` and `ORDER BY`,
+    // under `NOT`, in a group, joined by `AND` and `OR`, and all at once.
+    //
+    // A query has no `select`: the projection is a JSON map of names beside the
+    // query, never lexed, so its names are covered where the RPC is. The words
+    // come from `words`, the lists the lexer is held to.
+
+    /// `word` lowercase, uppercase and capitalized, each once: `i32` capitalizes
+    /// to its uppercase. The language's words match in any case, but names are
+    /// case-sensitive, so each spelling is its own name.
+    fn spellings(word: &str) -> Vec<String> {
+        let mut capitalized = word.to_string();
+        capitalized[..1].make_ascii_uppercase();
+        let mut all = vec![word.to_string(), word.to_ascii_uppercase(), capitalized];
+        all.dedup();
+        all
+    }
+
+    fn quoted(name: &str) -> String {
+        format!("\"{name}\"")
+    }
+
+    fn statement(text: &str) -> Statement {
+        parse_statement(text).unwrap_or_else(|err| panic!("`{text}` should parse: {err}"))
+    }
+
+    fn filter(text: &str) -> Query {
+        parse(text).unwrap_or_else(|err| panic!("`{text}` should parse: {err}"))
+    }
+
+    /// Every query shape `name` can stand in, as text: each comparison under
+    /// each kind of value, `BETWEEN`, `STARTSWITH`, the presence operators, a
+    /// negation, a group, both connectives, and `ORDER BY` with and without a
+    /// filter on the same name. `name` is spliced in as given, bare or quoted.
+    fn every_position(name: &str) -> Vec<String> {
+        vec![
+            format!("{name} = i32(7)"),
+            format!("{name} = 7"),
+            format!("{name} < u64(7)"),
+            format!("{name} <= u256(7)"),
+            format!("{name} > dec(7.5)"),
+            format!("{name} >= str('x')"),
+            format!("{name} = true"),
+            format!("{name} = false"),
+            format!("{name} BETWEEN 1 AND 5"),
+            format!("{name} BETWEEN str('a') AND str('z') AND a = 1"),
+            format!("{name} STARTSWITH str('x')"),
+            format!("exists({name})"),
+            format!("typeof({name}) = str"),
+            format!("typeof({name}) = bool"),
+            format!("NOT {name} = true"),
+            format!("NOT exists({name})"),
+            format!("({name} = true)"),
+            format!("a = 1 AND {name} = true"),
+            format!("{name} = true OR a = 1"),
+            format!("(a = 1 OR {name} < 3) AND NOT ({name} = 2)"),
+            format!("* ORDER BY {name}:i32"),
+            format!("* ORDER BY {name}:str ASC"),
+            format!("* ORDER BY {name}:u256 DESC"),
+            format!("{name} > 1 ORDER BY {name}:i32 DESC"),
+            format!("exists({name}) ORDER BY {name}:str"),
+        ]
+    }
+
+    /// Every user attribute a statement names: in its predicates, and the one it
+    /// sorts by.
+    fn user_names(statement: &Statement) -> BTreeSet<String> {
+        fn walk(query: &Query, names: &mut BTreeSet<String>) {
+            match query {
+                Query::All => {}
+                Query::Eq { key, .. }
+                | Query::Gt { key, .. }
+                | Query::Gte { key, .. }
+                | Query::Lt { key, .. }
+                | Query::Lte { key, .. }
+                | Query::Between { key, .. }
+                | Query::StartsWith { key, .. } => {
+                    if let AnnotKey::User(name) = key {
+                        names.insert(name.clone());
+                    }
+                }
+                Query::Exists { name, .. } => {
+                    names.insert(name.clone());
+                }
+                Query::And(operands) | Query::Or(operands) => {
+                    for operand in operands {
+                        walk(operand, names);
+                    }
+                }
+                Query::Not(inner) => walk(inner, names),
+            }
+        }
+        let mut names = BTreeSet::new();
+        walk(&statement.filter, &mut names);
+        if let Some(OrderBy {
+            key: AnnotKey::User(name),
+            ..
+        }) = &statement.order
+        {
+            names.insert(name.clone());
+        }
+        names
+    }
+
+    // ── every word, every spelling, every position ──────────────────────────
+
+    /// Quoted, every word names an attribute wherever one stands, and the name
+    /// is the word exactly as written between the quotes.
+    #[test]
+    fn every_word_quoted_names_an_attribute_in_every_position() {
+        for word in words::all() {
+            for spelling in spellings(word) {
+                for text in every_position(&quoted(&spelling)) {
+                    let mut expected = BTreeSet::from([spelling.clone()]);
+                    if text.contains("a = 1") {
+                        expected.insert("a".to_string());
+                    }
+                    assert_eq!(user_names(&statement(&text)), expected, "{text}");
+                }
+            }
+        }
+    }
+
+    /// Quotes are optional: wherever a word needs none, quoting it changes
+    /// nothing, down to the last node of the tree.
+    #[test]
+    fn quoting_a_name_that_needs_no_quotes_changes_nothing() {
+        let names = words::positional().chain(["level", "my.attr-name_2", "set", "andy", "notes"]);
+        for word in names {
+            for spelling in spellings(word) {
+                for (bare, quoted) in every_position(&spelling)
+                    .into_iter()
+                    .zip(every_position(&quoted(&spelling)))
+                {
+                    assert_eq!(statement(&bare), statement(&quoted), "{bare}");
+                }
+            }
+        }
+    }
+
+    /// Bare, a keyword can only be the keyword. Wherever it stands for a name, the
+    /// error is at the keyword and shows the quoted form, in the spelling written.
+    #[test]
+    fn a_bare_keyword_is_refused_with_its_quoted_form() {
+        let around: [(&str, &str); 12] = [
+            ("", " = true"),
+            ("", " < 3"),
+            ("", " BETWEEN 1 AND 5"),
+            ("", " STARTSWITH str('x')"),
+            ("a = 1 AND ", " = true"),
+            ("a = 1 OR ", " = true"),
+            ("NOT ", " = true"),
+            ("(", " = true)"),
+            ("exists(", ")"),
+            ("typeof(", ") = str"),
+            ("* ORDER BY ", ":i32"),
+            ("a = 1 ORDER BY ", ":str DESC"),
+        ];
+        for word in words::KEYWORDS {
+            for spelling in spellings(word) {
+                for (before, after) in around {
+                    let text = format!("{before}{spelling}{after}");
+                    let err = parse_statement(&text).expect_err(&text);
+                    assert_eq!(err.kind, ParseErrorKind::MalformedInputError, "{text}");
+                    assert_eq!(err.failure_position, Some(before.len()), "{text}: {err}");
+                    assert!(err.message.contains(&quoted(&spelling)), "{text}: {err}");
+                }
+            }
+        }
+    }
+
+    /// The words match in any case, but a name keeps its own: each spelling of a
+    /// word is a different attribute.
+    #[test]
+    fn a_quoted_name_keeps_its_case() {
+        for word in words::all() {
+            let queries: Vec<Query> = spellings(word)
+                .iter()
+                .map(|name| filter(&format!("{} = 1", quoted(name))))
+                .collect();
+            for (index, query) in queries.iter().enumerate() {
+                for other in &queries[index + 1..] {
+                    assert_ne!(query, other, "{word}");
+                }
+            }
+        }
+        assert_eq!(
+            filter("\"Key\" = 1"),
+            Query::Eq {
+                key: user("Key"),
+                value: AttributeValue::Int(1),
+            }
+        );
+    }
+
+    // ── each construct, pinned exactly ──────────────────────────────────────
+
+    /// The connectives' own words as names, under the connectives: the tree is
+    /// what the same query over plain names gives.
+    #[test]
+    fn keyword_names_sit_under_the_connectives_they_spell() {
+        assert_eq!(
+            filter("\"and\" = true AND \"or\" = false OR NOT \"not\" = true"),
+            Query::Or(vec![
+                Query::And(vec![is_bool("and", true), is_bool("or", false)]),
+                Query::Not(Box::new(is_bool("not", true))),
+            ])
+        );
+        assert_eq!(
+            filter("NOT (\"AND\" = true OR \"Or\" = true)"),
+            Query::Not(Box::new(Query::Or(vec![
+                is_bool("AND", true),
+                is_bool("Or", true),
+            ])))
+        );
+    }
+
+    /// `true` and `false` as names, compared with the values they spell.
+    #[test]
+    fn the_boolean_words_name_attributes_holding_booleans() {
+        assert_eq!(filter("\"true\" = true"), is_bool("true", true));
+        assert_eq!(filter("\"false\" = FALSE"), is_bool("false", false));
+        assert_eq!(
+            filter("\"TRUE\" BETWEEN false AND true"),
+            Query::Between {
+                key: user("TRUE"),
+                bounds: ValueRange::new(AttributeValue::Bool(false), AttributeValue::Bool(true))
+                    .expect("one type"),
+            }
+        );
+    }
+
+    /// A `BETWEEN` still owns its `AND` when the attribute is named `between`
+    /// or `and`, and the conjunction after it is still a conjunction.
+    #[test]
+    fn between_owns_its_and_whatever_the_attribute_is_named() {
+        assert_eq!(
+            filter("\"between\" BETWEEN 1 AND 5 AND \"and\" BETWEEN 2 AND 3"),
+            Query::And(vec![
+                between_ints("between", 1, 5),
+                between_ints("and", 2, 3)
+            ])
+        );
+        assert_eq!(
+            filter("\"and\" BETWEEN 1 AND 5 OR \"or\" = true"),
+            Query::Or(vec![between_ints("and", 1, 5), is_bool("or", true)])
+        );
+    }
+
+    #[test]
+    fn startswith_tests_an_attribute_named_startswith() {
+        assert_eq!(
+            filter("\"startswith\" STARTSWITH str('s')"),
+            Query::StartsWith {
+                key: user("startswith"),
+                value: AttributeValue::Str("s".into()),
+            }
+        );
+    }
+
+    /// The presence operators take their own words as names, and a type tag both
+    /// as the name and as the type asked for.
+    #[test]
+    fn presence_operators_take_their_own_words_as_names() {
+        assert_eq!(
+            filter("exists(\"exists\") AND typeof(\"typeof\") = str"),
+            Query::And(vec![
+                Query::Exists {
+                    name: "exists".into(),
+                    attr_type: None,
+                },
+                Query::Exists {
+                    name: "typeof".into(),
+                    attr_type: Some(AttributeType::Str),
+                },
+            ])
+        );
+        assert_eq!(filter("typeof(str) = str"), filter("typeof(\"str\") = str"),);
+        assert_eq!(
+            filter("typeof(bool) = key"),
+            Query::Exists {
+                name: "bool".into(),
+                attr_type: Some(AttributeType::EntityKey),
+            }
+        );
+    }
+
+    /// A type tag names an attribute bare, and is still a literal's tag after
+    /// the operator: `str = str('x')`.
+    #[test]
+    fn a_type_tag_names_an_attribute_and_tags_its_value() {
+        assert_eq!(
+            filter("str = str('x')"),
+            Query::Eq {
+                key: user("str"),
+                value: AttributeValue::Str("x".into()),
+            }
+        );
+        assert_eq!(
+            filter("u64 >= u64(3)"),
+            Query::Gte {
+                key: user("u64"),
+                value: AttributeValue::U64(3),
+            }
+        );
+        let key = format!("0x{}", "ab".repeat(32));
+        assert_eq!(
+            filter(&format!("key = key({key}) AND KEY = key({key})")),
+            Query::And(vec![
+                Query::Eq {
+                    key: user("key"),
+                    value: AttributeValue::EntityKey([0xab; 32]),
+                },
+                Query::Eq {
+                    key: user("KEY"),
+                    value: AttributeValue::EntityKey([0xab; 32]),
+                },
+            ])
+        );
+        assert_eq!(filter("bool = true"), is_bool("bool", true));
+        // Whitespace before a `(` still makes a tag a literal's, never a name's.
+        assert_eq!(filter("dec = dec (3)"), filter("dec = dec(3)"));
+    }
+
+    /// `ORDER BY` sorts by a keyword-named attribute quoted, and by a tag-named
+    /// or clause-word-named one bare.
+    #[test]
+    fn order_by_sorts_by_a_name_spelled_like_any_word() {
+        let order = |key: &str, attr_type, direction| {
+            Some(OrderBy {
+                key: user(key),
+                attr_type,
+                direction,
+            })
+        };
+        assert_eq!(
+            statement("\"desc\" > 1 ORDER BY \"desc\":i32 DESC"),
+            Statement {
+                filter: Query::Gt {
+                    key: user("desc"),
+                    value: AttributeValue::Int(1),
+                },
+                order: order("desc", AttributeType::Int, Direction::Descending),
+            }
+        );
+        for (text, key, attr_type, direction) in [
+            (
+                "* ORDER BY \"and\":str",
+                "and",
+                AttributeType::Str,
+                Direction::Ascending,
+            ),
+            (
+                "* ORDER BY \"NOT\":u64 desc",
+                "NOT",
+                AttributeType::U64,
+                Direction::Descending,
+            ),
+            (
+                "* ORDER BY str:str",
+                "str",
+                AttributeType::Str,
+                Direction::Ascending,
+            ),
+            (
+                "* ORDER BY Key:key DESC",
+                "Key",
+                AttributeType::EntityKey,
+                Direction::Descending,
+            ),
+            (
+                "* ORDER BY desc:i32 asc",
+                "desc",
+                AttributeType::Int,
+                Direction::Ascending,
+            ),
+            (
+                "* ORDER BY asc:i32 desc",
+                "asc",
+                AttributeType::Int,
+                Direction::Descending,
+            ),
+            (
+                "* ORDER BY order:bool",
+                "order",
+                AttributeType::Bool,
+                Direction::Ascending,
+            ),
+            (
+                "* ORDER BY \"by\":dec",
+                "by",
+                AttributeType::Decimal,
+                Direction::Ascending,
+            ),
+        ] {
+            assert_eq!(
+                statement(text).order,
+                order(key, attr_type, direction),
+                "{text}"
+            );
+        }
+    }
+
+    // ── quotes make a name, and only a name ─────────────────────────────────
+
+    /// A quoted word is never a word of the clause, so it cannot open, continue
+    /// or end one, but it can stand anywhere a name does.
+    #[test]
+    fn a_quoted_clause_word_is_a_name_not_the_clause() {
+        assert_eq!(
+            filter("\"order\" = 1 AND \"ORDER\" = 2"),
+            Query::And(vec![
+                Query::Eq {
+                    key: user("order"),
+                    value: AttributeValue::Int(1),
+                },
+                Query::Eq {
+                    key: user("ORDER"),
+                    value: AttributeValue::Int(2),
+                },
+            ])
+        );
+        for text in [
+            "* \"ORDER\" BY a:i32",
+            "* ORDER \"BY\" a:i32",
+            "* ORDER BY a:i32 \"DESC\"",
+            "* ORDER BY a:i32 \"asc\"",
+            "a = 1 \"order\" BY a:i32",
+        ] {
+            let err = parse_statement(text).expect_err(text);
+            assert_eq!(err.kind, ParseErrorKind::MalformedInputError, "{text}");
+        }
+    }
+
+    /// Quotes make a name, so a quoted tag is never a tag: not a literal's, not
+    /// `typeof`'s and not the type `ORDER BY` sorts as.
+    #[test]
+    fn a_quoted_tag_is_never_a_tag() {
+        for (text, hint) in [
+            ("typeof(a) = \"str\"", "typeof(name) = str"),
+            ("typeof(a) = \"rank\"", "typeof(name) = i32"),
+            ("* ORDER BY a:\"u256\"", "ORDER BY name:u256"),
+        ] {
+            let err = parse_statement(text).expect_err(text);
+            assert_eq!(err.kind, ParseErrorKind::MalformedInputError, "{text}");
+            assert!(err.message.contains(hint), "{text}: {err}");
+        }
+        assert!(parse("a = \"str\"('x')").is_err());
+    }
+
+    /// Double quotes make a name, never a string, and the error says how a
+    /// string is written.
+    #[test]
+    fn a_double_quoted_value_is_refused_with_the_string_form() {
+        let err = parse("name = \"Bob\"").unwrap_err();
+        assert_eq!(err.kind, ParseErrorKind::MalformedInputError);
+        assert_eq!(err.failure_position, Some("name = ".len()));
+        assert!(err.message.contains("str('Bob')"), "{err}");
+    }
+
+    /// A quoted name is held to the same rules as a bare one: a bare name's
+    /// characters, at most 32 bytes, and never a system attribute.
+    #[test]
+    fn a_quoted_name_obeys_the_name_rules() {
+        let at_limit = "a".repeat(limits::MAX_ATTRIBUTE_NAME_BYTES);
+        assert_eq!(
+            filter(&format!("{} = true", quoted(&at_limit))),
+            is_bool(&at_limit, true)
+        );
+        let over = "a".repeat(limits::MAX_ATTRIBUTE_NAME_BYTES + 1);
+        let err = parse(&format!("{} = true", quoted(&over))).unwrap_err();
+        assert!(err.message.contains("32 bytes"), "{err}");
+
+        for text in [
+            "\"\" = true",
+            "\"a b\" = true",
+            "\"1a\" = true",
+            "\"$owner\" = addr(0x0000000000000000000000000000000000000000)",
+            "\"and = true",
+            "\"a\"\"b\" = true",
+            "a\"b\" = true",
+            "exists(\"\")",
+            "* ORDER BY \"\":i32",
+        ] {
+            let err = parse_statement(text).expect_err(text);
+            assert_eq!(err.kind, ParseErrorKind::MalformedInputError, "{text}");
+        }
+    }
+
+    // ── all of them at once ─────────────────────────────────────────────────
+
+    /// One query naming an attribute after every word the language has, in every
+    /// construct, joined every way, and sorted by a keyword-named attribute.
+    #[test]
+    fn one_query_names_every_word_at_once() {
+        let text = "\
+            (\"and\" = true OR \"or\" = false OR NOT \"not\" = true)
+            AND \"true\" BETWEEN false AND true
+            AND \"false\" = false
+            AND \"between\" BETWEEN 1 AND 5
+            AND \"startswith\" STARTSWITH str('s')
+            AND exists(\"exists\")
+            AND typeof(\"typeof\") = str
+            AND (i32 >= i32(-1) OR u64 < u64(9) OR \"u256\" > u256(0x10))
+            AND NOT (dec = dec(1.5) OR str = str('x'))
+            AND addr = addr(0x0000000000000000000000000000000000000001)
+            AND \"key\" = key(0x0000000000000000000000000000000000000000000000000000000000000002)
+            AND bytes32 = bytes32(0x0000000000000000000000000000000000000000000000000000000000000003)
+            AND typeof(bool) = bool
+            AND (order = 1 OR \"by\" = 2)
+            AND asc STARTSWITH str('a')
+            AND exists(desc)
+            ORDER BY \"and\":bool DESC";
+        let parsed = statement(text);
+
+        assert_eq!(
+            user_names(&parsed),
+            words::all().map(String::from).collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            parsed.order,
+            Some(OrderBy {
+                key: user("and"),
+                attr_type: AttributeType::Bool,
+                direction: Direction::Descending,
+            })
+        );
+        let Query::And(operands) = &parsed.filter else {
+            panic!("a conjunction at the top: {:?}", parsed.filter);
+        };
+        assert_eq!(operands.len(), 16);
+        assert_eq!(
+            operands[0],
+            Query::Or(vec![
+                is_bool("and", true),
+                is_bool("or", false),
+                Query::Not(Box::new(is_bool("not", true))),
+            ])
+        );
+        assert_eq!(operands[3], between_ints("between", 1, 5));
+        assert_eq!(
+            operands[13],
+            Query::Or(vec![
+                Query::Eq {
+                    key: user("order"),
+                    value: AttributeValue::Int(1),
+                },
+                Query::Eq {
+                    key: user("by"),
+                    value: AttributeValue::Int(2),
+                },
+            ])
+        );
+        // Quoting the names written bare gives the same statement. The keywords
+        // are quoted already, and their words also stand bare as values.
+        let all_quoted = words::positional().fold(text.to_string(), |text, word| {
+            text.replace(&format!(" {word} "), &format!(" \"{word}\" "))
+                .replace(&format!("({word} "), &format!("(\"{word}\" "))
+                .replace(&format!("({word})"), &format!("(\"{word}\")"))
+        });
+        assert_ne!(all_quoted, text);
+        assert_eq!(statement(&all_quoted), parsed);
     }
 }

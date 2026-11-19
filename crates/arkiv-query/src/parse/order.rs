@@ -20,9 +20,9 @@ use arkiv_interfaces::query::{AnnotKey, Direction, OrderBy};
 
 use super::{Parser, TagSite, builtin_type};
 use crate::error::ParseError;
-use crate::lexer::Token;
+use crate::lexer::{Token, keyword_token};
 
-impl Parser {
+impl Parser<'_> {
     /// The clause, from its `ORDER` to the end of the query.
     pub(super) fn parse_order_by(&mut self) -> Result<OrderBy, ParseError> {
         let order_at = self.next_position();
@@ -70,11 +70,16 @@ impl Parser {
         };
         match key {
             AnnotKey::User(name) => named.map(|(attr_type, _)| attr_type).ok_or_else(|| {
+                // The fix names the attribute as a query must: a keyword quoted.
+                let written = match keyword_token(name) {
+                    Some(_) => format!("\"{name}\""),
+                    None => name.clone(),
+                };
                 ParseError::type_error(
                     key_at,
                     format!(
-                        "{name} can hold any type, so ORDER BY names the one to sort it \
-                         as — write ORDER BY {name}:str, or another tag"
+                        "{written} can hold any type, so ORDER BY names the one to sort \
+                         it as — write ORDER BY {written}:str, or another tag"
                     ),
                 )
             }),
@@ -220,6 +225,25 @@ mod tests {
             assert_eq!(err.kind, ParseErrorKind::TypeError, "{text}");
             assert!(err.message.contains("ORDER BY rank:str"), "{err}");
             assert_eq!(err.failure_position, Some("* ORDER BY ".len()), "{text}");
+        }
+    }
+
+    /// The fix the error suggests parses: it quotes a keyword-named
+    /// attribute, which only quoted is a name, and leaves any other bare.
+    #[test]
+    fn the_suggested_type_parses() {
+        for (text, suggested) in [
+            ("* ORDER BY \"and\" DESC", "ORDER BY \"and\":str"),
+            ("* ORDER BY \"TypeOf\"", "ORDER BY \"TypeOf\":str"),
+            ("* ORDER BY \"rank\"", "ORDER BY rank:str"),
+            ("* ORDER BY \"str\"", "ORDER BY str:str"),
+            ("* ORDER BY desc", "ORDER BY desc:str"),
+        ] {
+            let err = err_of(text);
+            assert_eq!(err.kind, ParseErrorKind::TypeError, "{text}");
+            assert!(err.message.contains(suggested), "{text}: {err}");
+            let fixed = alloc::format!("* {suggested}");
+            assert!(parse_statement(&fixed).is_ok(), "{fixed}");
         }
     }
 

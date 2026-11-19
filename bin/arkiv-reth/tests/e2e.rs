@@ -21,9 +21,10 @@ use arkiv_bindings::{
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
-    NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
+    NodeBuilder, connect, derive_entity_address, hex_quantity, ordered_keys, result_keys,
 };
 use arkiv_interfaces::constants::MAX_STR_BYTES;
+use arkiv_interfaces::query::words::{self, sample};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -694,7 +695,7 @@ async fn query_operator_classes_over_a_live_node() {
         ("rank != u256(30)", "-32002"),                       // != is not in the language
         ("rank STARTSWITH u256(1)", "-32002"),                // a prefix needs a str
         ("rank BETWEEN u256(1) AND i32(5)", "-32002"),        // bounds of two types
-        ("between = true", "-32001"),                         // a reserved word
+        ("between = true", "-32001"),                         // a bare keyword: quote it
         ("exists($owner)", "-32002"),                         // presence takes a user attribute
         ("typeof(rank) = bytes", "-32002"), // bytes is never indexed, so not a tag
         ("rank = i32(2147483648)", "-32003"), // literal out of range
@@ -904,20 +905,16 @@ async fn query_operator_classes_over_a_live_node() {
 
     // `ORDER BY` sorts by one attribute, read as the type it names. Ranks 20
     // to 50 are entities 1 to 4.
-    let in_order = |page: &serde_json::Value| -> Vec<String> {
-        page["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|entity| entity["key"].as_str().expect("key").to_string())
-            .collect()
-    };
     let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
     let ascending = client
         .query_raw("rank >= u256(20) ORDER BY rank:u256", serde_json::json!({}))
         .await
         .expect("ascending by rank");
-    assert_eq!(in_order(&ascending), keys(&[1, 2, 3, 4]), "ASC by default");
+    assert_eq!(
+        ordered_keys(&ascending),
+        keys(&[1, 2, 3, 4]),
+        "ASC by default"
+    );
 
     // A cursor carries on through the sorted matches.
     let by_rank_desc = "rank >= u256(20) ORDER BY rank:u256 DESC";
@@ -925,7 +922,7 @@ async fn query_operator_classes_over_a_live_node() {
         .query_raw(by_rank_desc, serde_json::json!({ "limit": 3 }))
         .await
         .expect("first page by rank, descending");
-    assert_eq!(in_order(&sorted_page), keys(&[4, 3, 2]));
+    assert_eq!(ordered_keys(&sorted_page), keys(&[4, 3, 2]));
     let sorted_rest = client
         .query_raw(
             by_rank_desc,
@@ -933,7 +930,7 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("second page by rank, descending");
-    assert_eq!(in_order(&sorted_rest), keys(&[1]));
+    assert_eq!(ordered_keys(&sorted_rest), keys(&[1]));
     assert!(sorted_rest.get("cursor").is_none());
 
     // An offset starts the page-through further in, and its cursor carries on
@@ -949,7 +946,7 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("a page past the first match");
-    assert_eq!(in_order(&skipped), keys(&[3, 2]));
+    assert_eq!(ordered_keys(&skipped), keys(&[3, 2]));
     assert_eq!(skipped["count"], "0x4", "the match set, not the offset");
     let skipped_rest = client
         .query_raw(
@@ -962,7 +959,7 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("the page after an offset one");
-    assert_eq!(in_order(&skipped_rest), keys(&[1]));
+    assert_eq!(ordered_keys(&skipped_rest), keys(&[1]));
     assert!(skipped_rest.get("cursor").is_none());
 
     // Past the last match, the page is empty and there is no next one.
@@ -982,6 +979,251 @@ async fn query_operator_classes_over_a_live_node() {
         .to_string();
     assert!(untyped.contains("-32002"), "a type error: {untyped}");
     assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);
+}
+
+/// [`sample::value`] as the RPC encodes it.
+fn word_json(word: &str, n: u8) -> serde_json::Value {
+    match sample::value(word, n) {
+        AttributeValue::U64(value) => serde_json::json!(format!("{value:#x}")),
+        AttributeValue::Str(text) => serde_json::json!(text),
+        AttributeValue::Int(value) => serde_json::json!(value),
+        other => unreachable!("a sample is a u64, a str or an i32: {other:?}"),
+    }
+}
+
+/// The attribute `name`, holding what the one named `word` holds on the `n`th
+/// entity.
+fn word_attr(name: &str, word: &str, n: u8, indexed: bool) -> Attribute {
+    Attribute::from_value(
+        Ident32::encode(name).unwrap(),
+        &sample::value(word, n),
+        indexed,
+    )
+    .unwrap()
+}
+
+/// No attribute name is reserved, end to end: entities are written with the
+/// query language's own words as attribute names, indexed and not, read back
+/// whole and projected by name, queried with every name quoted (and bare,
+/// where a word needs no quotes), sorted, counted, patched and unset.
+///
+/// Entities 0 to 2 carry every word as an indexed attribute holding the
+/// values for 1 to 3. Entity 3 carries every word as an unindexed field,
+/// holding entity 1's values, which no query sees. Entity 4 carries every
+/// word uppercased, holding entity 1's values: a different name, since names
+/// are case-sensitive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_words_as_attribute_names_over_a_live_node() {
+    let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
+    let indexed = |n: u8| -> Vec<Attribute> {
+        words::all()
+            .map(|word| word_attr(word, word, n, true))
+            .collect()
+    };
+    let fields: Vec<Attribute> = words::all()
+        .map(|word| word_attr(word, word, 2, false))
+        .collect();
+    let uppercased: Vec<Attribute> = words::all()
+        .map(|word| word_attr(&word.to_ascii_uppercase(), word, 2, true))
+        .collect();
+    let create = |attrs: Vec<Attribute>| Operation::create(0, 0, 1000, 0, attrs);
+    client
+        .execute(vec![
+            create(indexed(1)),
+            create(indexed(2)),
+            create(indexed(3)),
+            create(fields),
+            create(uppercased),
+        ])
+        .await;
+
+    let key = |i: u64| {
+        B256::from(derive_entity_address(
+            DEV_CHAIN_ID,
+            &caller.into_array(),
+            EntityCreationNonce::new(i),
+            0,
+        ))
+    };
+    let expect = |idxs: &[u64]| -> BTreeSet<String> {
+        idxs.iter().map(|i| format!("{:#x}", key(*i))).collect()
+    };
+    let names_of = |entity: &serde_json::Value, field: &str| -> Vec<String> {
+        entity[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} array: {entity}"))
+            .iter()
+            .map(|a| a["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    let sorted_words: Vec<&str> = {
+        let mut sorted: Vec<&str> = words::all().collect();
+        sorted.sort_unstable();
+        sorted
+    };
+
+    // Read back whole: every attribute keeps its name, type and value, and
+    // every field its indexed flag.
+    assert_eq!(
+        client.get_entity(key(1)).await["attributes"],
+        serde_json::Value::Array(
+            sorted_words
+                .iter()
+                .map(|word| serde_json::json!({
+                    "name": word, "type": sample::attr_type(word).name(),
+                    "value": word_json(word, 2),
+                }))
+                .collect()
+        )
+    );
+    let schema = client
+        .query_raw(
+            &format!("$key = key({:#x})", key(3)),
+            serde_json::json!({ "select": { "attributeSchema": true } }),
+        )
+        .await
+        .expect("the fields' schema");
+    assert_eq!(
+        schema["data"][0]["attributeSchema"],
+        serde_json::Value::Array(
+            sorted_words
+                .iter()
+                .map(|word| serde_json::json!({
+                    "name": word, "type": sample::attr_type(word).name(), "indexed": false,
+                }))
+                .collect()
+        )
+    );
+
+    // Projected by name: `select` takes the words as names, attributes and
+    // fields alike.
+    for entity in [key(1), key(3)] {
+        let subset = client
+            .query_raw(
+                &format!("$key = key({entity:#x})"),
+                serde_json::json!({ "select": { "attributes": {
+                    "and": true, "typeof": true, "desc": true, "str": true, "not": false,
+                } } }),
+            )
+            .await
+            .expect("a named attribute subset");
+        assert_eq!(
+            names_of(&subset["data"][0], "attributes"),
+            ["and", "desc", "str", "typeof"]
+        );
+    }
+
+    // Quoted, every word is reachable by every operator, presence test and
+    // sort; the field and the uppercased word are other names.
+    for word in words::all() {
+        let name = format!("\"{word}\"");
+        let upper = format!("\"{}\"", word.to_ascii_uppercase());
+        let (tag, one, two) = (
+            sample::attr_type(word).name(),
+            sample::literal(word, 1),
+            sample::literal(word, 2),
+        );
+        for (text, matched) in [
+            (format!("{name} = {two}"), expect(&[1])),
+            (format!("{name} BETWEEN {one} AND {two}"), expect(&[0, 1])),
+            (format!("exists({name})"), expect(&[0, 1, 2])),
+            (format!("typeof({name}) = {tag}"), expect(&[0, 1, 2])),
+            (format!("NOT {name} = {two}"), expect(&[0, 2, 3, 4])),
+            (format!("{upper} = {two}"), expect(&[4])),
+        ] {
+            assert_eq!(
+                result_keys(&client.query(&text, 100, None).await),
+                matched,
+                "{text}"
+            );
+        }
+        let sorted = client
+            .query_raw(
+                &format!("exists({name}) ORDER BY {name}:{tag} DESC"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("sorted by a word");
+        assert_eq!(
+            ordered_keys(&sorted),
+            [key(2), key(1), key(0)].map(|k| format!("{k:#x}")),
+            "{word}: sorted by"
+        );
+
+        // Bare, a keyword is the keyword, and the error says how to quote it;
+        // every other word names the attribute bare too.
+        let bare = format!("{word} = {two}");
+        if words::KEYWORDS.contains(&word) {
+            let err = client
+                .query_raw(&bare, serde_json::json!({}))
+                .await
+                .expect_err(&bare)
+                .to_string();
+            assert!(err.contains("-32001"), "{bare}: {err}");
+            assert!(err.contains("quote it"), "{bare}: {err}");
+        } else {
+            assert_eq!(
+                result_keys(&client.query(&bare, 100, None).await),
+                expect(&[1]),
+                "{bare}"
+            );
+        }
+    }
+
+    // Every word in one query, and a count over two spellings of one word.
+    let all = words::all()
+        .map(|word| format!("\"{word}\" = {}", sample::literal(word, 2)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    assert_eq!(
+        result_keys(&client.query(&all, 100, None).await),
+        expect(&[1])
+    );
+    assert_eq!(
+        client
+            .entity_count(Some("exists(\"and\") OR exists(\"AND\")"), None)
+            .await,
+        4
+    );
+
+    // The registry's view takes the words as names too: an attribute, a
+    // field, and a name entity 4 carries only uppercased.
+    let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
+    let and_type = sample::attr_type("and").id();
+    for (entity, type_id) in [
+        (key(1), and_type | arkiv_bindings::INDEXED_FLAG),
+        (key(3), and_type),
+        (key(4), 0x00),
+    ] {
+        let got = registry
+            .attributeTypeId(entity, Ident32::encode("and").unwrap().into_word())
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(got, type_id, "{entity:#x}");
+    }
+
+    // Patched and unset by name: `or` takes a new value, `not` goes.
+    client
+        .execute(vec![Operation::patch(
+            key(0),
+            vec![
+                word_attr("or", "or", 9, true),
+                Attribute::tombstone(Ident32::encode("not").unwrap()),
+            ],
+        )])
+        .await;
+    assert_eq!(
+        result_keys(&client.query("\"or\" = str('v9')", 100, None).await),
+        expect(&[0])
+    );
+    assert_eq!(
+        result_keys(&client.query("exists(\"not\")", 100, None).await),
+        expect(&[1, 2])
+    );
+    let patched = client.get_entity(key(0)).await;
+    assert_eq!(attr_value(&patched, "or"), "v9");
+    assert!(attr_value(&patched, "not").is_null(), "unset: {patched}");
 }
 
 /// Every mutating op — update, extend, transfer, delete — driven over a live node

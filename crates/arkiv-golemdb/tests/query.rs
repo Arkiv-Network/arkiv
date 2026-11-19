@@ -13,6 +13,7 @@ use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::query::Query as ArkivQuery;
+use arkiv_interfaces::query::words::{self, sample};
 use arkiv_interfaces::store::{Filter, Page, Query, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
@@ -593,4 +594,124 @@ fn order_by_sorts_by_one_attribute_read_as_one_type() {
         sorted_page(&store, &red("$owner DESC"), 0, 10),
         [6, 5, 4, 3, 2, 1]
     );
+}
+
+/// No attribute name is reserved, from the parser to GolemDB's indexes.
+/// Entities 1 to 3 carry every word as an indexed attribute; entity 4 carries
+/// every word as an unindexed field, holding entity 2's values, which no query
+/// sees; entity 5 carries every word uppercased, holding entity 2's values: a
+/// different name, as names are case-sensitive.
+///
+/// Quoted, every word is reachable by every operator, presence test and sort;
+/// a type tag or a clause word is reachable bare too, to the same effect.
+/// Reading the words back, whole and projected, is the store conformance
+/// suite's to check, which GolemDB runs.
+#[test]
+fn attributes_named_like_query_words_are_queried_by_quoting_them() {
+    let indexed = |n: u8| -> Vec<Attribute> {
+        words::all()
+            .map(|word| Attribute::new(word, sample::value(word, n)))
+            .collect()
+    };
+    let fields: Vec<Attribute> = words::all()
+        .map(|word| Attribute::unindexed(word, sample::value(word, 2)))
+        .collect();
+    let uppercased: Vec<Attribute> = words::all()
+        .map(|word| Attribute::new(word.to_ascii_uppercase(), sample::value(word, 2)))
+        .collect();
+    let entities = [
+        entity_with(1, indexed(1)),
+        entity_with(2, indexed(2)),
+        entity_with(3, indexed(3)),
+        entity_with(4, fields),
+        entity_with(5, uppercased),
+    ];
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, &entities);
+
+    for word in words::all() {
+        let name = format!("\"{word}\"");
+        let upper = format!("\"{}\"", word.to_ascii_uppercase());
+        let (tag, one, two, three) = (
+            sample::attr_type(word).name(),
+            sample::literal(word, 1),
+            sample::literal(word, 2),
+            sample::literal(word, 3),
+        );
+        let mut cases = vec![
+            (format!("{name} = {two}"), vec![2]),
+            (format!("{name} >= {two}"), vec![2, 3]),
+            (format!("{name} < {two}"), vec![1]),
+            (format!("{name} BETWEEN {one} AND {two}"), vec![1, 2]),
+            (format!("{name} = {one} OR {name} = {three}"), vec![1, 3]),
+            (format!("exists({name})"), vec![1, 2, 3]),
+            (format!("typeof({name}) = {tag}"), vec![1, 2, 3]),
+            (format!("exists({name}) AND {name} > {one}"), vec![2, 3]),
+            (format!("{upper} = {two}"), vec![5]),
+            (format!("exists({upper})"), vec![5]),
+        ];
+        if tag == "str" {
+            cases.push((format!("{name} STARTSWITH str('v')"), vec![1, 2, 3]));
+        }
+        for (text, expected) in cases {
+            assert_eq!(matched(&store, filter(&text)), expected, "{text}");
+        }
+        assert_eq!(
+            sorted_page(
+                &store,
+                &format!("exists({name}) ORDER BY {name}:{tag} DESC"),
+                0,
+                10
+            ),
+            [3, 2, 1],
+            "{word}: sorted by"
+        );
+        assert_eq!(
+            store
+                .count(None, &filter(&format!("{name} > {one}")), None)
+                .map(|n| n.into_value()),
+            Ok(2),
+            "{word}: counted"
+        );
+    }
+
+    // Bare, the words read by position name the same attributes.
+    for word in words::positional() {
+        let (tag, two) = (sample::attr_type(word).name(), sample::literal(word, 2));
+        assert_eq!(
+            matched(&store, filter(&format!("{word} = {two}"))),
+            [2],
+            "{word}"
+        );
+        assert_eq!(
+            matched(&store, filter(&format!("typeof({word}) = {tag}"))),
+            [1, 2, 3],
+            "{word}"
+        );
+        assert_eq!(
+            sorted_page(
+                &store,
+                &format!("{word} >= {two} ORDER BY {word}:{tag} DESC"),
+                0,
+                10
+            ),
+            [3, 2],
+            "{word}"
+        );
+    }
+
+    // Every word in one query, each matched on entity 2's value, sorted by a
+    // keyword-named attribute.
+    let all = words::all()
+        .map(|word| format!("\"{word}\" = {}", sample::literal(word, 2)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    assert_eq!(matched(&store, filter(&all)), [2]);
+    let every_entity = format!(
+        "exists(\"and\") AND exists(\"or\") AND typeof(\"typeof\") = {} \
+         ORDER BY \"and\":{} DESC",
+        sample::attr_type("typeof").name(),
+        sample::attr_type("and").name(),
+    );
+    assert_eq!(sorted_page(&store, &every_entity, 0, 10), [3, 2, 1]);
 }

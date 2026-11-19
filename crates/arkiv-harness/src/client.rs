@@ -428,6 +428,12 @@ pub fn hex_quantity(value: &serde_json::Value) -> u64 {
 /// The set of `key` strings in a query response — order-independent, since the
 /// index returns newest-first but tests assert on membership.
 pub fn result_keys(response: &serde_json::Value) -> BTreeSet<String> {
+    ordered_keys(response).into_iter().collect()
+}
+
+/// The `key` strings in a query response, in the order it returns them: for
+/// a sorted query, where the order is the answer.
+pub fn ordered_keys(response: &serde_json::Value) -> Vec<String> {
     response["data"]
         .as_array()
         .expect("data array")
