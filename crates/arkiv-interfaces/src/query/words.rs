@@ -7,6 +7,8 @@
 //! attribute bare too, `str = str('x')`. The words match in any case; names
 //! keep theirs.
 
+use crate::entity::AttributeType;
+
 /// The keywords.
 pub const KEYWORDS: [&str; 9] = [
     "and",
@@ -21,9 +23,19 @@ pub const KEYWORDS: [&str; 9] = [
 ];
 
 /// The type tags: a literal's (`i32(10)`), `typeof`'s right-hand side, and
-/// the type an `ORDER BY` attribute sorts as.
+/// the type an `ORDER BY` attribute sorts as. Each is the
+/// [`name`](AttributeType::name) of a type a query can test, which is every
+/// type but `bytes`, never indexed.
 pub const TYPE_TAGS: [&str; 9] = [
-    "i32", "u64", "u256", "dec", "str", "addr", "key", "bytes32", "bool",
+    AttributeType::Int.name(),
+    AttributeType::U64.name(),
+    AttributeType::U256.name(),
+    AttributeType::Decimal.name(),
+    AttributeType::Str.name(),
+    AttributeType::EthereumAddress.name(),
+    AttributeType::EntityKey.name(),
+    AttributeType::Bytes32.name(),
+    AttributeType::Bool.name(),
 ];
 
 /// The words of the `ORDER BY` clause.

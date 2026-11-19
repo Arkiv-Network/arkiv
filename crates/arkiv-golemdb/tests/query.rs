@@ -14,7 +14,7 @@ use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
 use arkiv_interfaces::query::Query as ArkivQuery;
 use arkiv_interfaces::query::words::{self, sample};
-use arkiv_interfaces::store::{Filter, Page, Query, ReadTarget, Sort, Store, StoreError};
+use arkiv_interfaces::store::{Filter, Page, Query, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
 
@@ -596,14 +596,16 @@ fn order_by_sorts_by_one_attribute_read_as_one_type() {
     );
 }
 
-/// No attribute name is reserved, through the parser and on disk. Entities 1
-/// to 3 carry every word as an indexed attribute; entity 4 carries every word
-/// as an unindexed field, holding entity 2's values, which no query sees;
-/// entity 5 carries every word uppercased, holding entity 2's values: a
+/// No attribute name is reserved, from the parser to GolemDB's indexes.
+/// Entities 1 to 3 carry every word as an indexed attribute; entity 4 carries
+/// every word as an unindexed field, holding entity 2's values, which no query
+/// sees; entity 5 carries every word uppercased, holding entity 2's values: a
 /// different name, as names are case-sensitive.
 ///
 /// Quoted, every word is reachable by every operator, presence test and sort;
 /// a type tag or a clause word is reachable bare too, to the same effect.
+/// Reading the words back, whole and projected, is the store conformance
+/// suite's to check, which GolemDB runs.
 #[test]
 fn attributes_named_like_query_words_are_queried_by_quoting_them() {
     let indexed = |n: u8| -> Vec<Attribute> {
@@ -712,41 +714,4 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
         sample::attr_type("and").name(),
     );
     assert_eq!(sorted_page(&store, &every_entity, 0, 10), [3, 2, 1]);
-
-    // Read back whole, every attribute and field keeps its name, value and
-    // kind; projected, a record returns just the names asked for.
-    for entity in &entities {
-        let record = store
-            .get(
-                ReadTarget::Commit(store.head()),
-                entity_records::record_key(entity.key).unwrap(),
-                None,
-                None,
-            )
-            .unwrap()
-            .into_value()
-            .expect("the entity is stored");
-        let mut read = entity_records::from_record(&record).unwrap().attributes;
-        let mut written = entity.attributes.clone();
-        read.sort_by(|a, b| a.key.cmp(&b.key));
-        written.sort_by(|a, b| a.key.cmp(&b.key));
-        assert_eq!(read, written, "entity {}", entity.key[0]);
-    }
-    let wanted: Vec<String> = ["and", "typeof", "desc"].map(String::from).to_vec();
-    let projected = store
-        .get(
-            ReadTarget::Commit(store.head()),
-            entity_records::record_key(entities[3].key).unwrap(),
-            Some(&wanted),
-            None,
-        )
-        .unwrap()
-        .into_value()
-        .expect("the entity is stored");
-    let names: Vec<&str> = projected
-        .cells
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
-    assert_eq!(names, ["and", "desc", "typeof"]);
 }

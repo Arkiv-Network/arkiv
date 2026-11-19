@@ -21,7 +21,7 @@ use arkiv_bindings::{
 };
 use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
-    NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
+    NodeBuilder, connect, derive_entity_address, hex_quantity, ordered_keys, result_keys,
 };
 use arkiv_interfaces::constants::MAX_STR_BYTES;
 use arkiv_interfaces::query::words::{self, sample};
@@ -905,20 +905,16 @@ async fn query_operator_classes_over_a_live_node() {
 
     // `ORDER BY` sorts by one attribute, read as the type it names. Ranks 20
     // to 50 are entities 1 to 4.
-    let in_order = |page: &serde_json::Value| -> Vec<String> {
-        page["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|entity| entity["key"].as_str().expect("key").to_string())
-            .collect()
-    };
     let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
     let ascending = client
         .query_raw("rank >= u256(20) ORDER BY rank:u256", serde_json::json!({}))
         .await
         .expect("ascending by rank");
-    assert_eq!(in_order(&ascending), keys(&[1, 2, 3, 4]), "ASC by default");
+    assert_eq!(
+        ordered_keys(&ascending),
+        keys(&[1, 2, 3, 4]),
+        "ASC by default"
+    );
 
     // A cursor carries on through the sorted matches.
     let by_rank_desc = "rank >= u256(20) ORDER BY rank:u256 DESC";
@@ -926,7 +922,7 @@ async fn query_operator_classes_over_a_live_node() {
         .query_raw(by_rank_desc, serde_json::json!({ "limit": 3 }))
         .await
         .expect("first page by rank, descending");
-    assert_eq!(in_order(&sorted_page), keys(&[4, 3, 2]));
+    assert_eq!(ordered_keys(&sorted_page), keys(&[4, 3, 2]));
     let sorted_rest = client
         .query_raw(
             by_rank_desc,
@@ -934,7 +930,7 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("second page by rank, descending");
-    assert_eq!(in_order(&sorted_rest), keys(&[1]));
+    assert_eq!(ordered_keys(&sorted_rest), keys(&[1]));
     assert!(sorted_rest.get("cursor").is_none());
 
     // An offset starts the page-through further in, and its cursor carries on
@@ -950,7 +946,7 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("a page past the first match");
-    assert_eq!(in_order(&skipped), keys(&[3, 2]));
+    assert_eq!(ordered_keys(&skipped), keys(&[3, 2]));
     assert_eq!(skipped["count"], "0x4", "the match set, not the offset");
     let skipped_rest = client
         .query_raw(
@@ -963,7 +959,7 @@ async fn query_operator_classes_over_a_live_node() {
         )
         .await
         .expect("the page after an offset one");
-    assert_eq!(in_order(&skipped_rest), keys(&[1]));
+    assert_eq!(ordered_keys(&skipped_rest), keys(&[1]));
     assert!(skipped_rest.get("cursor").is_none());
 
     // Past the last match, the page is empty and there is no next one.
@@ -1051,14 +1047,6 @@ async fn query_words_as_attribute_names_over_a_live_node() {
     };
     let expect = |idxs: &[u64]| -> BTreeSet<String> {
         idxs.iter().map(|i| format!("{:#x}", key(*i))).collect()
-    };
-    let in_order = |page: &serde_json::Value| -> Vec<String> {
-        page["data"]
-            .as_array()
-            .expect("data array")
-            .iter()
-            .map(|entity| entity["key"].as_str().expect("key").to_string())
-            .collect()
     };
     let names_of = |entity: &serde_json::Value, field: &str| -> Vec<String> {
         entity[field]
@@ -1157,7 +1145,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
             .await
             .expect("sorted by a word");
         assert_eq!(
-            in_order(&sorted),
+            ordered_keys(&sorted),
             [key(2), key(1), key(0)].map(|k| format!("{k:#x}")),
             "{word}: sorted by"
         );

@@ -20,6 +20,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use arkiv_interfaces::entity::AttributeType;
 use arkiv_interfaces::query::words;
 
 use crate::error::ParseError;
@@ -29,8 +30,8 @@ use crate::error::ParseError;
 /// Recognized **positionally** (before a `(`), not globally reserved, so the tag
 /// list can grow without stealing identifiers.
 ///
-/// Declared in the order of [`words::TYPE_TAGS`], which spells them: a tag's
-/// discriminant is the index of its spelling there.
+/// A tag is spelled as the [`AttributeType`] it writes, so the spelling lives
+/// in [`AttributeType::name`] alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeTag {
     I32,
@@ -45,8 +46,8 @@ pub(crate) enum TypeTag {
 }
 
 impl TypeTag {
-    /// Every tag, in declaration order.
-    const ALL: [Self; 9] = [
+    /// Every tag, one per word of [`words::TYPE_TAGS`].
+    const ALL: [Self; words::TYPE_TAGS.len()] = [
         Self::I32,
         Self::U64,
         Self::U256,
@@ -66,8 +67,26 @@ impl TypeTag {
     }
 
     /// The spec's spelling of this tag.
-    pub(crate) fn name(self) -> &'static str {
-        words::TYPE_TAGS[self as usize]
+    pub(crate) const fn name(self) -> &'static str {
+        self.attr_type().name()
+    }
+
+    /// The type this tag writes.
+    ///
+    /// Total: every tag denotes an entity attribute type. `bytes` has no tag,
+    /// which is how the one never-indexed type stays out of `typeof`.
+    pub(crate) const fn attr_type(self) -> AttributeType {
+        match self {
+            Self::Bool => AttributeType::Bool,
+            Self::I32 => AttributeType::Int,
+            Self::U64 => AttributeType::U64,
+            Self::U256 => AttributeType::U256,
+            Self::Dec => AttributeType::Decimal,
+            Self::Bytes32 => AttributeType::Bytes32,
+            Self::Str => AttributeType::Str,
+            Self::Addr => AttributeType::EthereumAddress,
+            Self::Key => AttributeType::EntityKey,
+        }
     }
 }
 
@@ -533,8 +552,9 @@ fn unterminated_quoted_name(open: usize) -> ParseError {
 }
 
 /// Each keyword's token, in the order of [`words::KEYWORDS`], which spells
-/// them.
-const KEYWORD_TOKENS: [Token; 9] = [
+/// them. Sized by that list, so a keyword added there without its token here
+/// does not build.
+const KEYWORD_TOKENS: [Token; words::KEYWORDS.len()] = [
     Token::And,
     Token::Or,
     Token::Not,
@@ -589,40 +609,44 @@ mod tests {
         assert_eq!(kinds("a -- trailing"), vec![Token::Name("a".into())]);
     }
 
-    /// The lexer spells its keywords and tags from the spec's lists, pairing
-    /// each spelling with a token or tag by position, so this pins every pair.
+    /// Each spelling, written out here rather than read from [`words`], is
+    /// the token or tag it should be. The lexer pairs a keyword's spelling
+    /// with its token by position in [`words::KEYWORDS`], so this is what
+    /// catches that list reordered.
     #[test]
     fn each_word_of_the_spec_is_its_own_token() {
-        assert_eq!(
-            words::KEYWORDS.map(keyword_token),
-            [
-                Token::And,
-                Token::Or,
-                Token::Not,
-                Token::True,
-                Token::False,
-                Token::Between,
-                Token::StartsWith,
-                Token::Exists,
-                Token::TypeOf,
-            ]
-            .map(Some)
-        );
-        assert_eq!(
-            words::TYPE_TAGS.map(TypeTag::from_name),
-            [
-                TypeTag::I32,
-                TypeTag::U64,
-                TypeTag::U256,
-                TypeTag::Dec,
-                TypeTag::Str,
-                TypeTag::Addr,
-                TypeTag::Key,
-                TypeTag::Bytes32,
-                TypeTag::Bool,
-            ]
-            .map(Some)
-        );
+        let keywords = [
+            ("and", Token::And),
+            ("or", Token::Or),
+            ("not", Token::Not),
+            ("true", Token::True),
+            ("false", Token::False),
+            ("between", Token::Between),
+            ("startswith", Token::StartsWith),
+            ("exists", Token::Exists),
+            ("typeof", Token::TypeOf),
+        ];
+        assert_eq!(keywords.clone().map(|(word, _)| word), words::KEYWORDS);
+        for (word, token) in keywords {
+            assert_eq!(keyword_token(word), Some(token), "{word}");
+        }
+
+        let tags = [
+            ("i32", TypeTag::I32),
+            ("u64", TypeTag::U64),
+            ("u256", TypeTag::U256),
+            ("dec", TypeTag::Dec),
+            ("str", TypeTag::Str),
+            ("addr", TypeTag::Addr),
+            ("key", TypeTag::Key),
+            ("bytes32", TypeTag::Bytes32),
+            ("bool", TypeTag::Bool),
+        ];
+        assert_eq!(tags.map(|(word, _)| word), words::TYPE_TAGS);
+        for (word, tag) in tags {
+            assert_eq!(TypeTag::from_name(word), Some(tag), "{word}");
+            assert_eq!(tag.name(), word);
+        }
         assert_eq!(TypeTag::ALL.map(TypeTag::name), words::TYPE_TAGS);
         // The clause's words are neither: they are read where they stand.
         for word in words::ORDER_BY {

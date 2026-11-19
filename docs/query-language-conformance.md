@@ -60,7 +60,7 @@ the test harness defaults to the in-memory store
 - [`node`, crates/arkiv-golemdb/src/convert/query.rs:125](../crates/arkiv-golemdb/src/convert/query.rs#L125)
 - [`store_failure`, crates/arkiv-reth-rpc/src/lib.rs:200-205](../crates/arkiv-reth-rpc/src/lib.rs#L200-L205)
 - [`spawn_process`, crates/arkiv-harness/src/node.rs:255-256](../crates/arkiv-harness/src/node.rs#L255-L256)
-- e2e `NOT` tests on the in-memory store: [bin/arkiv-reth/tests/e2e.rs:635-655](../bin/arkiv-reth/tests/e2e.rs#L635-L655)
+- e2e `NOT` tests on the in-memory store: [bin/arkiv-reth/tests/e2e.rs:654-674](../bin/arkiv-reth/tests/e2e.rs#L654-L674)
 
 **Tasks:**
 - [ ] Decide how GolemDB answers `NOT`: native support in GolemDB, or
@@ -232,13 +232,13 @@ operator`, and `between = true` was accepted as an attribute name.
 
 **Resolution:**
 - Lexer: `BETWEEN` is a case-insensitive keyword
-  ([`keyword_token`, crates/arkiv-query/src/lexer.rs:537-556](../crates/arkiv-query/src/lexer.rs#L537-L556)).
+  ([`keyword_token`, crates/arkiv-query/src/lexer.rs:557-576](../crates/arkiv-query/src/lexer.rs#L557-L576)).
 - Parser: after the attribute, `parse_between` takes `value AND value` itself,
   so the inner `AND` never reaches the conjunction
   ([`Parser::parse_between`, crates/arkiv-query/src/parse/mod.rs:345](../crates/arkiv-query/src/parse/mod.rs#L345)).
   Bounds of two types are `-32002` at the high bound, and each bound is held
-  to a system attribute's type as any value is. `between` is in the
-  reserved-word list.
+  to a system attribute's type as any value is. An attribute named
+  `between` is written quoted, `"between" = true`: no word is reserved (Q9).
 - AST: `Query::Between { key, bounds: ValueRange }`. `ValueRange` has private
   fields and a constructor that refuses two types, so mixed bounds cannot be
   represented
@@ -301,7 +301,7 @@ operator`, and `between = true` was accepted as an attribute name.
 **Code:** `$owner = '0x…'`, `$creator = '0x…'` and `$key = '0x…'` are
 accepted, for compatibility with how the JS SDK writes them.
 
-**Where:** [`bare_str_value`, crates/arkiv-query/src/parse/mod.rs:691-712](../crates/arkiv-query/src/parse/mod.rs#L691-L712)
+**Where:** [`bare_str_value`, crates/arkiv-query/src/parse/mod.rs:673-694](../crates/arkiv-query/src/parse/mod.rs#L673-L694)
 
 **Tasks:**
 - [ ] Decide: document this in the spec, or remove it once the SDK sends the
@@ -323,7 +323,7 @@ stated (see S5).
   tag only where one stands, so `Key`, `Str` and `KEY` are names (Q9).
 
 **Where:**
-- [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:62-66](../crates/arkiv-query/src/lexer.rs#L62-L66)
+- [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:63-67](../crates/arkiv-query/src/lexer.rs#L63-L67)
 
 **Tasks:**
 - [ ] Decide whether tags are case-sensitive, and write it into the spec.
@@ -367,11 +367,11 @@ name.
 - Lexer: `"…"` is a quoted user attribute name (`Token::QuotedName`): never a
   keyword, a type tag or an `ORDER BY` word, with a bare name's characters
   between the quotes, so nothing needs escaping
-  ([`take_quoted_name`, crates/arkiv-query/src/lexer.rs:474](../crates/arkiv-query/src/lexer.rs#L474)).
+  ([`take_quoted_name`, crates/arkiv-query/src/lexer.rs:493](../crates/arkiv-query/src/lexer.rs#L493)).
 - Parser: a quoted name stands wherever a user attribute does. Quotes are
   optional: `"level"` and `level` are the same query. The type-name check is
   gone from
-  [`validate_user_name`, crates/arkiv-query/src/parse/mod.rs:793](../crates/arkiv-query/src/parse/mod.rs#L793),
+  [`validate_user_name`, crates/arkiv-query/src/parse/mod.rs:775](../crates/arkiv-query/src/parse/mod.rs#L775),
   so `str = str('x')` names an attribute `str`. A bare keyword where a name
   belongs is still `-32001`, and the message shows the quoted form in the
   spelling written
@@ -384,24 +384,27 @@ name.
   attribute-names section says no word is reserved.
 - The words themselves are listed once, in
   [`arkiv_interfaces::query::words`](../crates/arkiv-interfaces/src/query/words.rs).
-  The lexer spells its keywords and tags from those lists, pairing each
-  spelling with its token by position, which
-  `each_word_of_the_spec_is_its_own_token` pins. Every test below reads the
-  lists, and the integration tests take each word's sample value from
+  A type tag is spelled as the type it writes, by `AttributeType::name`, so
+  the tag list is built from those names. The lexer pairs each keyword with
+  its token by position in the list, in an array sized by it, so a keyword
+  without a token does not build. `each_word_of_the_spec_is_its_own_token`
+  pins every spelling to its token or tag. Every test below reads the lists,
+  and the integration tests take each word's sample value from
   `words::sample`.
 
 **Tests:**
 - Lexer: `a_quoted_word_is_always_a_name`,
   `a_quoted_name_takes_a_bare_names_characters`.
 - Parser: the attribute-name tests in
-  [crates/arkiv-query/src/parse/mod.rs:1784](../crates/arkiv-query/src/parse/mod.rs#L1784)
+  [crates/arkiv-query/src/parse/mod.rs:1766](../crates/arkiv-query/src/parse/mod.rs#L1766)
   walk every keyword, tag and `ORDER BY` word, in three spellings, through
   every predicate, presence test and sort, alone and combined, quoted and
   bare.
 - Executor: `the_query_languages_words_are_ordinary_attribute_names` decodes
   them in creates, patches and tombstones.
 - Store conformance suite (in-memory and GolemDB):
-  `cells_named_like_query_words_are_ordinary_cells`.
+  `cells_named_like_query_words_are_ordinary_cells` writes, reads, projects,
+  matches and sorts them as cells.
 - GolemDB on disk, through the parser:
   `attributes_named_like_query_words_are_queried_by_quoting_them` in
   [crates/arkiv-golemdb/tests/query.rs](../crates/arkiv-golemdb/tests/query.rs).

@@ -437,7 +437,7 @@ impl<'a> Parser<'a> {
         };
         match spanned.token {
             Token::Name(name) => match TypeTag::from_name(&name) {
-                Some(tag) => Ok(attr_type_of(tag)),
+                Some(tag) => Ok(tag.attr_type()),
                 None => Err(ParseError::type_error(
                     spanned.start,
                     alloc::format!(
@@ -620,24 +620,6 @@ enum Presence {
     Exists,
     /// `typeof(name) = tag`: the attribute, under exactly one type.
     TypeOf,
-}
-
-/// The attribute type a type tag names.
-///
-/// Total: every tag in the language denotes an entity attribute type. `bytes`
-/// has no tag, which is how the one never-indexed type stays out of `typeof`.
-const fn attr_type_of(tag: TypeTag) -> AttributeType {
-    match tag {
-        TypeTag::Bool => AttributeType::Bool,
-        TypeTag::I32 => AttributeType::Int,
-        TypeTag::U64 => AttributeType::U64,
-        TypeTag::U256 => AttributeType::U256,
-        TypeTag::Dec => AttributeType::Decimal,
-        TypeTag::Bytes32 => AttributeType::Bytes32,
-        TypeTag::Str => AttributeType::Str,
-        TypeTag::Addr => AttributeType::EthereumAddress,
-        TypeTag::Key => AttributeType::EntityKey,
-    }
 }
 
 /// Build the comparison node for an already-validated operator.
