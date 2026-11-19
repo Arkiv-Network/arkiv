@@ -1536,6 +1536,41 @@ mod tests {
         );
     }
 
+    /// The prefill record's key is reserved like an account's: an op naming
+    /// it reverts, so no transaction can create, change or delete the record.
+    #[test]
+    fn an_op_on_the_prefill_key_reverts() {
+        let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
+        let mut view = fresh_view();
+        let key = entity_records::PREFILL_RECORD_KEY;
+        let not_found = RevertReason::NotFound { key };
+        for (op, reason) in [
+            (
+                Op::Create {
+                    key,
+                    expires_at: 50,
+                    creation_flags: CreationFlags::NONE,
+                    attributes: Vec::new(),
+                },
+                RevertReason::AlreadyExists { key },
+            ),
+            (
+                Op::Transfer {
+                    key,
+                    new_owner: [0xBB; 20],
+                },
+                not_found.clone(),
+            ),
+            (Op::Delete { key }, not_found),
+        ] {
+            let out = exec
+                .apply(&env([0xAA; 20], 10), &mut view, &[op])
+                .expect("a revert, not a fault");
+            assert_eq!(out.status, ExecStatus::Reverted);
+            assert_eq!(out.revert, Some(reason));
+        }
+    }
+
     #[test]
     fn transfer_requires_ownership_then_moves_owner() {
         let exec = ArkivExecutor::<View>::new(TEST_SCHEDULE);
