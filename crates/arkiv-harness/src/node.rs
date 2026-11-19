@@ -219,6 +219,13 @@ impl Node {
             // running side by side would collide on it. Callers reach the node
             // over HTTP.
             "--ipcdisable",
+            // reth grows its database in 4 GB steps, and where the temp
+            // directory is a RAM disk (tmpfs) every step takes real memory. A
+            // handful of nodes side by side then fill it, and any test writing
+            // to the temp directory at that moment fails. A test node's
+            // database stays small, so a small step costs nothing.
+            "--db.growth-step",
+            "16MB",
         ]);
         cmd.args(&self.config.extra_args);
         // The node refuses to start without a store. Tests run on the
