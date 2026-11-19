@@ -12,7 +12,8 @@ use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN,
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
 use arkiv_interfaces::entity_records;
 use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
-use arkiv_interfaces::query::{Query as ArkivQuery, words};
+use arkiv_interfaces::query::Query as ArkivQuery;
+use arkiv_interfaces::query::words::{self, sample};
 use arkiv_interfaces::store::{Filter, Page, Query, ReadTarget, Sort, Store, StoreError};
 use arkiv_rpc_types::method::MAX_PAGE_SIZE;
 use tempfile::TempDir;
@@ -595,29 +596,6 @@ fn order_by_sorts_by_one_attribute_read_as_one_type() {
     );
 }
 
-/// The type the attribute named after word `index` holds, so the words cover
-/// three: `u64`, `str` and `i32` in turn.
-fn word_tag(index: usize) -> &'static str {
-    ["u64", "str", "i32"][index % 3]
-}
-
-/// The value the attribute named after word `index` holds on entity `n`.
-fn word_value(index: usize, n: u8) -> AttributeValue {
-    match word_tag(index) {
-        "u64" => AttributeValue::U64(u64::from(n)),
-        "str" => AttributeValue::Str(format!("v{n}")),
-        _ => AttributeValue::Int(i32::from(n)),
-    }
-}
-
-/// That value as a query literal.
-fn word_literal(index: usize, n: u8) -> String {
-    match word_tag(index) {
-        "str" => format!("str('v{n}')"),
-        tag => format!("{tag}({n})"),
-    }
-}
-
 /// No attribute name is reserved, through the parser and on disk. Entities 1
 /// to 3 carry every word as an indexed attribute; entity 4 carries every word
 /// as an unindexed field, holding entity 2's values, which no query sees;
@@ -628,23 +606,16 @@ fn word_literal(index: usize, n: u8) -> String {
 /// a type tag or a clause word is reachable bare too, to the same effect.
 #[test]
 fn attributes_named_like_query_words_are_queried_by_quoting_them() {
-    let query_words: Vec<&str> = words::all().collect();
     let indexed = |n: u8| -> Vec<Attribute> {
-        query_words
-            .iter()
-            .enumerate()
-            .map(|(index, word)| Attribute::new(*word, word_value(index, n)))
+        words::all()
+            .map(|word| Attribute::new(word, sample::value(word, n)))
             .collect()
     };
-    let fields: Vec<Attribute> = query_words
-        .iter()
-        .enumerate()
-        .map(|(index, word)| Attribute::unindexed(*word, word_value(index, 2)))
+    let fields: Vec<Attribute> = words::all()
+        .map(|word| Attribute::unindexed(word, sample::value(word, 2)))
         .collect();
-    let uppercased: Vec<Attribute> = query_words
-        .iter()
-        .enumerate()
-        .map(|(index, word)| Attribute::new(word.to_ascii_uppercase(), word_value(index, 2)))
+    let uppercased: Vec<Attribute> = words::all()
+        .map(|word| Attribute::new(word.to_ascii_uppercase(), sample::value(word, 2)))
         .collect();
     let entities = [
         entity_with(1, indexed(1)),
@@ -656,14 +627,14 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
     let dir = TempDir::new().unwrap();
     let store = store_with(&dir, &entities);
 
-    for (index, word) in query_words.iter().enumerate() {
+    for word in words::all() {
         let name = format!("\"{word}\"");
         let upper = format!("\"{}\"", word.to_ascii_uppercase());
         let (tag, one, two, three) = (
-            word_tag(index),
-            word_literal(index, 1),
-            word_literal(index, 2),
-            word_literal(index, 3),
+            sample::attr_type(word).name(),
+            sample::literal(word, 1),
+            sample::literal(word, 2),
+            sample::literal(word, 3),
         );
         let mut cases = vec![
             (format!("{name} = {two}"), vec![2]),
@@ -704,8 +675,7 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
 
     // Bare, the words read by position name the same attributes.
     for word in words::positional() {
-        let index = query_words.iter().position(|w| *w == word).unwrap();
-        let (tag, two) = (word_tag(index), word_literal(index, 2));
+        let (tag, two) = (sample::attr_type(word).name(), sample::literal(word, 2));
         assert_eq!(
             matched(&store, filter(&format!("{word} = {two}"))),
             [2],
@@ -730,18 +700,16 @@ fn attributes_named_like_query_words_are_queried_by_quoting_them() {
 
     // Every word in one query, each matched on entity 2's value, sorted by a
     // keyword-named attribute.
-    let all = query_words
-        .iter()
-        .enumerate()
-        .map(|(index, word)| format!("\"{word}\" = {}", word_literal(index, 2)))
+    let all = words::all()
+        .map(|word| format!("\"{word}\" = {}", sample::literal(word, 2)))
         .collect::<Vec<_>>()
         .join(" AND ");
     assert_eq!(matched(&store, filter(&all)), [2]);
     let every_entity = format!(
         "exists(\"and\") AND exists(\"or\") AND typeof(\"typeof\") = {} \
          ORDER BY \"and\":{} DESC",
-        word_tag(8),
-        word_tag(0),
+        sample::attr_type("typeof").name(),
+        sample::attr_type("and").name(),
     );
     assert_eq!(sorted_page(&store, &every_entity, 0, 10), [3, 2, 1]);
 

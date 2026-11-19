@@ -18,6 +18,7 @@ license.workspace = true
 
 [features]
 # The store conformance suite and the reference `MemStore` it is proved
-# against. Off by default: both are test scaffolding, pulled in by whoever is
-# proving a `Store` implementation, never by production dependents.
+# against, and `query::words::sample`, the values tests store under the query
+# language's words. Off by default: all are test scaffolding, pulled in by
+# whoever is proving a `Store` implementation, never by production dependents.
 conformance = []

@@ -24,7 +24,7 @@ use arkiv_harness::{
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
 use arkiv_interfaces::constants::MAX_STR_BYTES;
-use arkiv_interfaces::query::words;
+use arkiv_interfaces::query::words::{self, sample};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
@@ -985,44 +985,22 @@ async fn query_operator_classes_over_a_live_node() {
     assert_eq!(client.entity_count(Some(by_rank_desc), None).await, 4);
 }
 
-/// The type the attribute named after word `index` holds, so the words cover
-/// three: `u64`, `str` and `i32` in turn.
-fn word_tag(index: usize) -> &'static str {
-    ["u64", "str", "i32"][index % 3]
+/// [`sample::value`] as the RPC encodes it.
+fn word_json(word: &str, n: u8) -> serde_json::Value {
+    match sample::value(word, n) {
+        AttributeValue::U64(value) => serde_json::json!(format!("{value:#x}")),
+        AttributeValue::Str(text) => serde_json::json!(text),
+        AttributeValue::Int(value) => serde_json::json!(value),
+        other => unreachable!("a sample is a u64, a str or an i32: {other:?}"),
+    }
 }
 
-/// The value the attribute named after word `index` holds on the `n`th
+/// The attribute `name`, holding what the one named `word` holds on the `n`th
 /// entity.
-fn word_value(index: usize, n: u8) -> AttributeValue {
-    match word_tag(index) {
-        "u64" => AttributeValue::U64(u64::from(n)),
-        "str" => AttributeValue::Str(format!("v{n}")),
-        _ => AttributeValue::Int(i32::from(n)),
-    }
-}
-
-/// That value as a query literal.
-fn word_literal(index: usize, n: u8) -> String {
-    match word_tag(index) {
-        "str" => format!("str('v{n}')"),
-        tag => format!("{tag}({n})"),
-    }
-}
-
-/// That value as the RPC encodes it.
-fn word_json(index: usize, n: u8) -> serde_json::Value {
-    match word_tag(index) {
-        "u64" => serde_json::json!(format!("{n:#x}")),
-        "str" => serde_json::json!(format!("v{n}")),
-        _ => serde_json::json!(n),
-    }
-}
-
-/// The attribute `name`, holding word `index`'s value for the `n`th entity.
-fn word_attr(name: &str, index: usize, n: u8, indexed: bool) -> Attribute {
+fn word_attr(name: &str, word: &str, n: u8, indexed: bool) -> Attribute {
     Attribute::from_value(
         Ident32::encode(name).unwrap(),
-        &word_value(index, n),
+        &sample::value(word, n),
         indexed,
     )
     .unwrap()
@@ -1041,23 +1019,16 @@ fn word_attr(name: &str, index: usize, n: u8, indexed: bool) -> Attribute {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_words_as_attribute_names_over_a_live_node() {
     let (_node, client, caller) = spawn_dev(DEV_KEY_0).await;
-    let query_words: Vec<&str> = words::all().collect();
     let indexed = |n: u8| -> Vec<Attribute> {
-        query_words
-            .iter()
-            .enumerate()
-            .map(|(index, word)| word_attr(word, index, n, true))
+        words::all()
+            .map(|word| word_attr(word, word, n, true))
             .collect()
     };
-    let fields: Vec<Attribute> = query_words
-        .iter()
-        .enumerate()
-        .map(|(index, word)| word_attr(word, index, 2, false))
+    let fields: Vec<Attribute> = words::all()
+        .map(|word| word_attr(word, word, 2, false))
         .collect();
-    let uppercased: Vec<Attribute> = query_words
-        .iter()
-        .enumerate()
-        .map(|(index, word)| word_attr(&word.to_ascii_uppercase(), index, 2, true))
+    let uppercased: Vec<Attribute> = words::all()
+        .map(|word| word_attr(&word.to_ascii_uppercase(), word, 2, true))
         .collect();
     let create = |attrs: Vec<Attribute>| Operation::create(0, 0, 1000, 0, attrs);
     client
@@ -1097,8 +1068,11 @@ async fn query_words_as_attribute_names_over_a_live_node() {
             .map(|a| a["name"].as_str().expect("name").to_string())
             .collect()
     };
-    let mut sorted_words: Vec<(usize, &str)> = query_words.iter().copied().enumerate().collect();
-    sorted_words.sort_by_key(|(_, word)| *word);
+    let sorted_words: Vec<&str> = {
+        let mut sorted: Vec<&str> = words::all().collect();
+        sorted.sort_unstable();
+        sorted
+    };
 
     // Read back whole: every attribute keeps its name, type and value, and
     // every field its indexed flag.
@@ -1107,8 +1081,9 @@ async fn query_words_as_attribute_names_over_a_live_node() {
         serde_json::Value::Array(
             sorted_words
                 .iter()
-                .map(|(index, word)| serde_json::json!({
-                    "name": word, "type": word_tag(*index), "value": word_json(*index, 2),
+                .map(|word| serde_json::json!({
+                    "name": word, "type": sample::attr_type(word).name(),
+                    "value": word_json(word, 2),
                 }))
                 .collect()
         )
@@ -1125,8 +1100,8 @@ async fn query_words_as_attribute_names_over_a_live_node() {
         serde_json::Value::Array(
             sorted_words
                 .iter()
-                .map(|(index, word)| serde_json::json!({
-                    "name": word, "type": word_tag(*index), "indexed": false,
+                .map(|word| serde_json::json!({
+                    "name": word, "type": sample::attr_type(word).name(), "indexed": false,
                 }))
                 .collect()
         )
@@ -1152,13 +1127,13 @@ async fn query_words_as_attribute_names_over_a_live_node() {
 
     // Quoted, every word is reachable by every operator, presence test and
     // sort; the field and the uppercased word are other names.
-    for (index, word) in query_words.iter().enumerate() {
+    for word in words::all() {
         let name = format!("\"{word}\"");
         let upper = format!("\"{}\"", word.to_ascii_uppercase());
         let (tag, one, two) = (
-            word_tag(index),
-            word_literal(index, 1),
-            word_literal(index, 2),
+            sample::attr_type(word).name(),
+            sample::literal(word, 1),
+            sample::literal(word, 2),
         );
         for (text, matched) in [
             (format!("{name} = {two}"), expect(&[1])),
@@ -1190,7 +1165,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
         // Bare, a keyword is the keyword, and the error says how to quote it;
         // every other word names the attribute bare too.
         let bare = format!("{word} = {two}");
-        if words::KEYWORDS.contains(word) {
+        if words::KEYWORDS.contains(&word) {
             let err = client
                 .query_raw(&bare, serde_json::json!({}))
                 .await
@@ -1208,10 +1183,8 @@ async fn query_words_as_attribute_names_over_a_live_node() {
     }
 
     // Every word in one query, and a count over two spellings of one word.
-    let all = query_words
-        .iter()
-        .enumerate()
-        .map(|(index, word)| format!("\"{word}\" = {}", word_literal(index, 2)))
+    let all = words::all()
+        .map(|word| format!("\"{word}\" = {}", sample::literal(word, 2)))
         .collect::<Vec<_>>()
         .join(" AND ");
     assert_eq!(
@@ -1228,7 +1201,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
     // The registry's view takes the words as names too: an attribute, a
     // field, and a name entity 4 carries only uppercased.
     let registry = IEntityRegistry::new(ARKIV_ADDRESS, client.provider());
-    let and_type = word_value(0, 2).attr_type().id();
+    let and_type = sample::attr_type("and").id();
     for (entity, type_id) in [
         (key(1), and_type | arkiv_bindings::INDEXED_FLAG),
         (key(3), and_type),
@@ -1247,7 +1220,7 @@ async fn query_words_as_attribute_names_over_a_live_node() {
         .execute(vec![Operation::patch(
             key(0),
             vec![
-                word_attr("or", 1, 9, true),
+                word_attr("or", "or", 9, true),
                 Attribute::tombstone(Ident32::encode("not").unwrap()),
             ],
         )])

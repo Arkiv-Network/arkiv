@@ -20,12 +20,17 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use arkiv_interfaces::query::words;
+
 use crate::error::ParseError;
 
 /// A literal's type tag — the `i32` in `i32(10)`.
 ///
 /// Recognized **positionally** (before a `(`), not globally reserved, so the tag
 /// list can grow without stealing identifiers.
+///
+/// Declared in the order of [`words::TYPE_TAGS`], which spells them: a tag's
+/// discriminant is the index of its spelling there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeTag {
     I32,
@@ -40,26 +45,29 @@ pub(crate) enum TypeTag {
 }
 
 impl TypeTag {
+    /// Every tag, in declaration order.
+    const ALL: [Self; 9] = [
+        Self::I32,
+        Self::U64,
+        Self::U256,
+        Self::Dec,
+        Self::Str,
+        Self::Addr,
+        Self::Key,
+        Self::Bytes32,
+        Self::Bool,
+    ];
+
     /// The tag this name denotes, if any. Case-insensitive, like the keywords.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        TAGS.iter()
-            .find(|(text, _)| name.eq_ignore_ascii_case(text))
-            .map(|(_, tag)| *tag)
+        Self::ALL
+            .into_iter()
+            .find(|tag| name.eq_ignore_ascii_case(tag.name()))
     }
 
     /// The spec's spelling of this tag.
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::I32 => "i32",
-            Self::U64 => "u64",
-            Self::U256 => "u256",
-            Self::Dec => "dec",
-            Self::Str => "str",
-            Self::Addr => "addr",
-            Self::Key => "key",
-            Self::Bytes32 => "bytes32",
-            Self::Bool => "bool",
-        }
+        words::TYPE_TAGS[self as usize]
     }
 }
 
@@ -524,42 +532,27 @@ fn unterminated_quoted_name(open: usize) -> ParseError {
     )
 }
 
-/// Each type tag's spelling, in the order of
-/// [`words::TYPE_TAGS`](arkiv_interfaces::query::words::TYPE_TAGS), which a
-/// test holds this list to.
-const TAGS: [(&str, TypeTag); 9] = [
-    ("i32", TypeTag::I32),
-    ("u64", TypeTag::U64),
-    ("u256", TypeTag::U256),
-    ("dec", TypeTag::Dec),
-    ("str", TypeTag::Str),
-    ("addr", TypeTag::Addr),
-    ("key", TypeTag::Key),
-    ("bytes32", TypeTag::Bytes32),
-    ("bool", TypeTag::Bool),
-];
-
-/// Each keyword's spelling, in the order of
-/// [`words::KEYWORDS`](arkiv_interfaces::query::words::KEYWORDS), which a
-/// test holds this list to.
-const KEYWORDS: [(&str, Token); 9] = [
-    ("and", Token::And),
-    ("or", Token::Or),
-    ("not", Token::Not),
-    ("true", Token::True),
-    ("false", Token::False),
-    ("between", Token::Between),
-    ("startswith", Token::StartsWith),
-    ("exists", Token::Exists),
-    ("typeof", Token::TypeOf),
+/// Each keyword's token, in the order of [`words::KEYWORDS`], which spells
+/// them.
+const KEYWORD_TOKENS: [Token; 9] = [
+    Token::And,
+    Token::Or,
+    Token::Not,
+    Token::True,
+    Token::False,
+    Token::Between,
+    Token::StartsWith,
+    Token::Exists,
+    Token::TypeOf,
 ];
 
 /// The keyword `word` spells, if it is one. Case-insensitive.
-fn keyword_token(word: &str) -> Option<Token> {
-    KEYWORDS
-        .iter()
+pub(crate) fn keyword_token(word: &str) -> Option<Token> {
+    words::KEYWORDS
+        .into_iter()
+        .zip(KEYWORD_TOKENS)
         .find(|(text, _)| word.eq_ignore_ascii_case(text))
-        .map(|(_, token)| token.clone())
+        .map(|(_, token)| token)
 }
 
 /// Whether `ch` may start an attribute name: `[A-Za-z]`, per the spec.
@@ -596,17 +589,41 @@ mod tests {
         assert_eq!(kinds("a -- trailing"), vec![Token::Name("a".into())]);
     }
 
-    /// The keywords and tags the lexer knows are the spec's lists, word for
-    /// word, which every test naming attributes after them reads.
+    /// The lexer spells its keywords and tags from the spec's lists, pairing
+    /// each spelling with a token or tag by position, so this pins every pair.
     #[test]
-    fn the_keywords_and_tags_are_the_specs_lists() {
-        use arkiv_interfaces::query::words;
-
-        assert_eq!(KEYWORDS.map(|(word, _)| word), words::KEYWORDS);
-        assert_eq!(TAGS.map(|(word, _)| word), words::TYPE_TAGS);
-        for (word, tag) in TAGS {
-            assert_eq!(tag.name(), word);
-        }
+    fn each_word_of_the_spec_is_its_own_token() {
+        assert_eq!(
+            words::KEYWORDS.map(keyword_token),
+            [
+                Token::And,
+                Token::Or,
+                Token::Not,
+                Token::True,
+                Token::False,
+                Token::Between,
+                Token::StartsWith,
+                Token::Exists,
+                Token::TypeOf,
+            ]
+            .map(Some)
+        );
+        assert_eq!(
+            words::TYPE_TAGS.map(TypeTag::from_name),
+            [
+                TypeTag::I32,
+                TypeTag::U64,
+                TypeTag::U256,
+                TypeTag::Dec,
+                TypeTag::Str,
+                TypeTag::Addr,
+                TypeTag::Key,
+                TypeTag::Bytes32,
+                TypeTag::Bool,
+            ]
+            .map(Some)
+        );
+        assert_eq!(TypeTag::ALL.map(TypeTag::name), words::TYPE_TAGS);
         // The clause's words are neither: they are read where they stand.
         for word in words::ORDER_BY {
             assert_eq!(kinds(word), vec![Token::Name(word.into())]);

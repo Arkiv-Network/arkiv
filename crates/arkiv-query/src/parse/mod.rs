@@ -44,7 +44,7 @@ use alloc::vec::Vec;
 mod order;
 
 use arkiv_interfaces::entity::{AttributeType, AttributeValue};
-use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, Statement, ValueRange};
+use arkiv_interfaces::query::{AnnotKey, AnnotVal, BuiltIn, Query, Statement, ValueRange, words};
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::lexer::{SpannedToken, Token, TypeTag, is_name_char, tokenize};
@@ -408,27 +408,18 @@ impl<'a> Parser<'a> {
 
     /// The `name` inside `exists(…)` / `typeof(…)`: a user attribute only.
     fn parse_presence_name(&mut self) -> Result<String, ParseError> {
-        let Some(spanned) = self.advance() else {
-            return Err(ParseError::syntax(self.end, "expected an attribute name"));
-        };
-        match spanned.token {
-            Token::Name(name) | Token::QuotedName(name) => {
-                validate_user_name(&name, spanned.start)?;
-                Ok(name)
-            }
-            Token::SysName(name) => Err(ParseError::type_error(
-                spanned.start,
-                alloc::format!(
-                    "${name} is a system attribute, which every entity carries — \
-                     exists and typeof take a user attribute"
-                ),
-            )),
-            token if token.is_keyword() => Err(self.keyword_as_name(spanned.start)),
-            _ => Err(ParseError::syntax(
-                spanned.start,
-                "expected an attribute name",
-            )),
-        }
+        self.parse_name(
+            |name| name,
+            |name, start| {
+                Err(ParseError::type_error(
+                    start,
+                    alloc::format!(
+                        "${name} is a system attribute, which every entity carries — \
+                         exists and typeof take a user attribute"
+                    ),
+                ))
+            },
+        )
     }
 
     /// A bare type tag, not a literal: `typeof`'s right-hand side, or the type
@@ -450,8 +441,8 @@ impl<'a> Parser<'a> {
                 None => Err(ParseError::type_error(
                     spanned.start,
                     alloc::format!(
-                        "{name} is not a type tag — one of \
-                         i32 u64 u256 dec str addr key bytes32 bool"
+                        "{name} is not a type tag — one of {}",
+                        words::TYPE_TAGS.join(" ")
                     ),
                 )),
             },
@@ -522,15 +513,28 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_attr_ref(&mut self) -> Result<AnnotKey, ParseError> {
+        self.parse_name(AnnotKey::User, |name, start| {
+            builtin_from_name(name, start).map(AnnotKey::BuiltIn)
+        })
+    }
+
+    /// An attribute name. A user attribute's, bare or quoted, goes to `user`;
+    /// a `$name`, with where it starts, to `system`, which each caller takes
+    /// its own way.
+    fn parse_name<T>(
+        &mut self,
+        user: impl FnOnce(String) -> T,
+        system: impl FnOnce(&str, usize) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
         let Some(spanned) = self.advance() else {
             return Err(ParseError::syntax(self.end, "expected an attribute name"));
         };
         match spanned.token {
             Token::Name(name) | Token::QuotedName(name) => {
                 validate_user_name(&name, spanned.start)?;
-                Ok(AnnotKey::User(name))
+                Ok(user(name))
             }
-            Token::SysName(name) => builtin_from_name(&name, spanned.start).map(AnnotKey::BuiltIn),
+            Token::SysName(name) => system(&name, spanned.start),
             token if token.is_keyword() => Err(self.keyword_as_name(spanned.start)),
             _ => Err(ParseError::syntax(
                 spanned.start,
@@ -855,7 +859,7 @@ mod tests {
     use alloc::collections::BTreeSet;
     use alloc::format;
     use alloc::string::ToString;
-    use arkiv_interfaces::query::{Direction, OrderBy, words};
+    use arkiv_interfaces::query::{Direction, OrderBy};
 
     fn user(name: &str) -> AnnotKey {
         AnnotKey::User(name.to_string())
@@ -1139,15 +1143,19 @@ mod tests {
     fn between_owns_its_and() {
         assert_eq!(
             parse("a BETWEEN 1 AND 5 AND b = true").unwrap(),
-            Query::And(vec![between_ints("a", 1, 5), is_true("b")])
+            Query::And(vec![between_ints("a", 1, 5), is_bool("b", true)])
         );
         assert_eq!(
             parse("b = true AND a BETWEEN 1 AND 5 AND c = true").unwrap(),
-            Query::And(vec![is_true("b"), between_ints("a", 1, 5), is_true("c")])
+            Query::And(vec![
+                is_bool("b", true),
+                between_ints("a", 1, 5),
+                is_bool("c", true)
+            ])
         );
         assert_eq!(
             parse("b = true OR a BETWEEN 1 AND 5").unwrap(),
-            Query::Or(vec![is_true("b"), between_ints("a", 1, 5)])
+            Query::Or(vec![is_bool("b", true), between_ints("a", 1, 5)])
         );
         // NOT takes the whole predicate, bounds and all.
         assert_eq!(
@@ -1507,11 +1515,11 @@ mod tests {
 
     // ── boolean structure ───────────────────────────────────────────────
 
-    /// `name = true`, the predicate the structure tests are built from.
-    fn is_true(name: &str) -> Query {
+    /// `name = value`, the predicate the structure tests are built from.
+    fn is_bool(name: &str, value: bool) -> Query {
         Query::Eq {
             key: user(name),
-            value: AttributeValue::Bool(true),
+            value: AttributeValue::Bool(value),
         }
     }
 
@@ -1521,21 +1529,24 @@ mod tests {
         assert_eq!(
             parse("a = true OR b = true AND c = true").unwrap(),
             Query::Or(vec![
-                is_true("a"),
-                Query::And(vec![is_true("b"), is_true("c")])
+                is_bool("a", true),
+                Query::And(vec![is_bool("b", true), is_bool("c", true)])
             ])
         );
         // NOT binds tighter than AND, and needs no parentheses.
         assert_eq!(
             parse("NOT a = true AND b = true").unwrap(),
-            Query::And(vec![Query::Not(Box::new(is_true("a"))), is_true("b")])
+            Query::And(vec![
+                Query::Not(Box::new(is_bool("a", true))),
+                is_bool("b", true)
+            ])
         );
         // Parentheses override.
         assert_eq!(
             parse("(a = true OR b = true) AND c = true").unwrap(),
             Query::And(vec![
-                Query::Or(vec![is_true("a"), is_true("b")]),
-                is_true("c")
+                Query::Or(vec![is_bool("a", true), is_bool("b", true)]),
+                is_bool("c", true)
             ])
         );
     }
@@ -1546,19 +1557,27 @@ mod tests {
     fn a_chain_of_one_connective_is_one_node() {
         assert_eq!(
             parse("a = true AND b = true AND c = true").unwrap(),
-            Query::And(vec![is_true("a"), is_true("b"), is_true("c")])
+            Query::And(vec![
+                is_bool("a", true),
+                is_bool("b", true),
+                is_bool("c", true)
+            ])
         );
         assert_eq!(
             parse("a = true OR b = true OR c = true").unwrap(),
-            Query::Or(vec![is_true("a"), is_true("b"), is_true("c")])
+            Query::Or(vec![
+                is_bool("a", true),
+                is_bool("b", true),
+                is_bool("c", true)
+            ])
         );
         // A parenthesized chain is a group of its own, not merged into the
         // chain around it.
         assert_eq!(
             parse("a = true AND (b = true AND c = true)").unwrap(),
             Query::And(vec![
-                is_true("a"),
-                Query::And(vec![is_true("b"), is_true("c")])
+                is_bool("a", true),
+                Query::And(vec![is_bool("b", true), is_bool("c", true)])
             ])
         );
     }
@@ -1663,10 +1682,13 @@ mod tests {
             kind_of("between = true"),
             ParseErrorKind::MalformedInputError
         );
-        assert_eq!(parse("\"between\" = true").unwrap(), is_true("between"));
-        assert_eq!(parse("str = true").unwrap(), is_true("str"));
+        assert_eq!(
+            parse("\"between\" = true").unwrap(),
+            is_bool("between", true)
+        );
+        assert_eq!(parse("str = true").unwrap(), is_bool("str", true));
         // Any other word is a name, `set` included.
-        assert_eq!(parse("set = true").unwrap(), is_true("set"));
+        assert_eq!(parse("set = true").unwrap(), is_bool("set", true));
     }
 
     #[test]
@@ -1793,13 +1815,6 @@ mod tests {
 
     fn filter(text: &str) -> Query {
         parse(text).unwrap_or_else(|err| panic!("`{text}` should parse: {err}"))
-    }
-
-    fn is_bool(name: &str, value: bool) -> Query {
-        Query::Eq {
-            key: user(name),
-            value: AttributeValue::Bool(value),
-        }
     }
 
     /// Every query shape `name` can stand in, as text: each comparison under

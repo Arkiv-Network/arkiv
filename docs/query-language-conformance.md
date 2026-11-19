@@ -160,7 +160,7 @@ as one byte, `0x00` or `0x01`. No adapter change was needed.
 - Parser, including `$owner`, `$creator` and `$key`:
   `ranges_are_allowed_on_every_type` and
   `ranges_are_allowed_on_the_system_attributes` in
-  [crates/arkiv-query/src/parse.rs](../crates/arkiv-query/src/parse.rs).
+  [crates/arkiv-query/src/parse/mod.rs](../crates/arkiv-query/src/parse/mod.rs).
 - Live node (in-memory store): `query_operator_classes_over_a_live_node` in
   [bin/arkiv-reth/tests/e2e.rs](../bin/arkiv-reth/tests/e2e.rs) asserts `str`
   and `$key` ranges. Its error list now checks `STARTSWITH` on a `u256`
@@ -191,10 +191,10 @@ that type, and its value differs. It is listed for every type except `bytes`.
 it.
 
 **Where:**
-- [`Parser::parse_predicate`, crates/arkiv-query/src/parse.rs:267-270](../crates/arkiv-query/src/parse.rs#L267-L270)
-- [`Query`, crates/arkiv-interfaces/src/query.rs:28-68](../crates/arkiv-interfaces/src/query.rs#L28-L68)
-- e2e test asserting the rejection: [bin/arkiv-reth/tests/e2e.rs:676](../bin/arkiv-reth/tests/e2e.rs#L676)
-- `cut_operators_name_their_replacement` in [crates/arkiv-query/src/parse.rs](../crates/arkiv-query/src/parse.rs)
+- [`Parser::parse_predicate`, crates/arkiv-query/src/parse/mod.rs:331-334](../crates/arkiv-query/src/parse/mod.rs#L331-L334)
+- [`Query`, crates/arkiv-interfaces/src/query.rs:30-70](../crates/arkiv-interfaces/src/query.rs#L30-L70)
+- e2e test asserting the rejection: [bin/arkiv-reth/tests/e2e.rs:695](../bin/arkiv-reth/tests/e2e.rs#L695)
+- `cut_operators_name_their_replacement` in [crates/arkiv-query/src/parse/mod.rs](../crates/arkiv-query/src/parse/mod.rs)
 
 **Suggested approach:** with Q3 done, `a != v` can be lowered to
 `a < v OR a > v`. That is exactly the spec's typed value-negation and needs
@@ -232,17 +232,17 @@ operator`, and `between = true` was accepted as an attribute name.
 
 **Resolution:**
 - Lexer: `BETWEEN` is a case-insensitive keyword
-  ([`keyword_token`, crates/arkiv-query/src/lexer.rs:423-445](../crates/arkiv-query/src/lexer.rs#L423-L445)).
+  ([`keyword_token`, crates/arkiv-query/src/lexer.rs:537-556](../crates/arkiv-query/src/lexer.rs#L537-L556)).
 - Parser: after the attribute, `parse_between` takes `value AND value` itself,
   so the inner `AND` never reaches the conjunction
-  ([`Parser::parse_between`, crates/arkiv-query/src/parse.rs:281](../crates/arkiv-query/src/parse.rs#L281)).
+  ([`Parser::parse_between`, crates/arkiv-query/src/parse/mod.rs:345](../crates/arkiv-query/src/parse/mod.rs#L345)).
   Bounds of two types are `-32002` at the high bound, and each bound is held
   to a system attribute's type as any value is. `between` is in the
   reserved-word list.
 - AST: `Query::Between { key, bounds: ValueRange }`. `ValueRange` has private
   fields and a constructor that refuses two types, so mixed bounds cannot be
   represented
-  ([`ValueRange`, crates/arkiv-interfaces/src/query.rs:108](../crates/arkiv-interfaces/src/query.rs#L108)).
+  ([`ValueRange`, crates/arkiv-interfaces/src/query.rs:110](../crates/arkiv-interfaces/src/query.rs#L110)).
 - Store: one `Test::Between { type_id, low, high }`, both bounds included,
   rather than a pair of comparisons. The in-memory and Valkey stores evaluate
   it with the shared matcher; a type without a range is `InvalidQuery`
@@ -301,7 +301,7 @@ operator`, and `between = true` was accepted as an attribute name.
 **Code:** `$owner = '0x…'`, `$creator = '0x…'` and `$key = '0x…'` are
 accepted, for compatibility with how the JS SDK writes them.
 
-**Where:** [`bare_str_value`, crates/arkiv-query/src/parse.rs:553-576](../crates/arkiv-query/src/parse.rs#L553-L576)
+**Where:** [`bare_str_value`, crates/arkiv-query/src/parse/mod.rs:691-712](../crates/arkiv-query/src/parse/mod.rs#L691-L712)
 
 **Tasks:**
 - [ ] Decide: document this in the spec, or remove it once the SDK sends the
@@ -323,7 +323,7 @@ stated (see S5).
   tag only where one stands, so `Key`, `Str` and `KEY` are names (Q9).
 
 **Where:**
-- [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:42-57](../crates/arkiv-query/src/lexer.rs#L42-L57)
+- [`TypeTag::from_name`, crates/arkiv-query/src/lexer.rs:62-66](../crates/arkiv-query/src/lexer.rs#L62-L66)
 
 **Tasks:**
 - [ ] Decide whether tags are case-sensitive, and write it into the spec.
@@ -367,15 +367,15 @@ name.
 - Lexer: `"…"` is a quoted user attribute name (`Token::QuotedName`): never a
   keyword, a type tag or an `ORDER BY` word, with a bare name's characters
   between the quotes, so nothing needs escaping
-  ([`take_quoted_name`, crates/arkiv-query/src/lexer.rs:477](../crates/arkiv-query/src/lexer.rs#L477)).
+  ([`take_quoted_name`, crates/arkiv-query/src/lexer.rs:474](../crates/arkiv-query/src/lexer.rs#L474)).
 - Parser: a quoted name stands wherever a user attribute does. Quotes are
   optional: `"level"` and `level` are the same query. The type-name check is
   gone from
-  [`validate_user_name`, crates/arkiv-query/src/parse.rs:789](../crates/arkiv-query/src/parse.rs#L789),
+  [`validate_user_name`, crates/arkiv-query/src/parse/mod.rs:793](../crates/arkiv-query/src/parse/mod.rs#L793),
   so `str = str('x')` names an attribute `str`. A bare keyword where a name
   belongs is still `-32001`, and the message shows the quoted form in the
   spelling written
-  ([`keyword_as_name`, crates/arkiv-query/src/parse.rs:501](../crates/arkiv-query/src/parse.rs#L501)).
+  ([`keyword_as_name`, crates/arkiv-query/src/parse/mod.rs:490](../crates/arkiv-query/src/parse/mod.rs#L490)).
   `name = "Bob"` says how a string is written instead.
 - Write path: no change. It never checked words. The `$` check stays: it keeps
   the engine-owned system cells out of clients' reach
@@ -384,14 +384,17 @@ name.
   attribute-names section says no word is reserved.
 - The words themselves are listed once, in
   [`arkiv_interfaces::query::words`](../crates/arkiv-interfaces/src/query/words.rs).
-  The lexer's own keyword and tag tables are held to those lists by
-  `the_keywords_and_tags_are_the_specs_lists`, and every test below reads them.
+  The lexer spells its keywords and tags from those lists, pairing each
+  spelling with its token by position, which
+  `each_word_of_the_spec_is_its_own_token` pins. Every test below reads the
+  lists, and the integration tests take each word's sample value from
+  `words::sample`.
 
 **Tests:**
 - Lexer: `a_quoted_word_is_always_a_name`,
   `a_quoted_name_takes_a_bare_names_characters`.
 - Parser: the attribute-name tests in
-  [crates/arkiv-query/src/parse.rs:1762](../crates/arkiv-query/src/parse.rs#L1762)
+  [crates/arkiv-query/src/parse/mod.rs:1784](../crates/arkiv-query/src/parse/mod.rs#L1784)
   walk every keyword, tag and `ORDER BY` word, in three spellings, through
   every predicate, presence test and sort, alone and combined, quoted and
   bare.
