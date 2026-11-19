@@ -386,9 +386,15 @@ fn main() {
                     info!(target: "arkiv-reth", "arkiv_* RPC namespace registered");
                     Ok(())
                 });
+            let prefilled = builder
+                .config()
+                .chain
+                .prefilled_block_zero_state_root()
+                .is_some();
             let launcher = builder.engine_api_launcher().with_provider_builder(
                 ArkivProviderBuilder::new(store.clone(), seals.clone())
-                    .check_genesis_root(on_golemdb),
+                    .check_genesis_root(on_golemdb)
+                    .prefilled(prefilled),
             );
             let handle = builder
                 .launch_with(DebugNodeLauncher::new(launcher))
