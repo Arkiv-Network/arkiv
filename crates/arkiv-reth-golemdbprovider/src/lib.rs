@@ -32,7 +32,7 @@ use arkiv_interfaces::store::{
     CommitId, SegmentAddress, SegmentKey, SegmentOrdinal, SegmentRow, Store,
 };
 use arkiv_reth_statemanager::{
-    BlockSeals, GolemAccounts, HostStore, check_chain, check_genesis_root, seed_genesis, segments,
+    BlockSeals, GolemAccounts, HostStore, check_genesis_root, prepare_genesis, segments,
 };
 use reth_chain_state::{
     CanonicalInMemoryState, CanonicalStateProvider, ExecutedBlock, ForkChoiceNotifications,
@@ -1972,6 +1972,8 @@ pub struct ArkivProviderBuilder {
     seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
     /// Whether the store's genesis commit must have block 0's `stateRoot`.
     check_genesis_root: bool,
+    /// Whether the chain's block 0 comes from a prefill.
+    prefilled: bool,
 }
 
 impl ArkivProviderBuilder {
@@ -1986,6 +1988,7 @@ impl ArkivProviderBuilder {
             store,
             seals,
             check_genesis_root: false,
+            prefilled: false,
         }
     }
 
@@ -1993,6 +1996,15 @@ impl ArkivProviderBuilder {
     /// `stateRoot`. For a store whose root block 0's header carries: GolemDB.
     pub const fn check_genesis_root(mut self, check: bool) -> Self {
         self.check_genesis_root = check;
+        self
+    }
+
+    /// Whether the chain's block 0 comes from a prefill: its genesis file sets
+    /// `config.arkiv.prefilledBlockZeroStateRoot`. A prefilled chain never has
+    /// its genesis written by the node; it runs only on the store the prefill
+    /// finalized.
+    pub const fn prefilled(mut self, prefilled: bool) -> Self {
+        self.prefilled = prefilled;
         self
     }
 }
@@ -2022,16 +2034,14 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
 
     fn build_provider(self, factory: ProviderFactory<N>) -> eyre::Result<Self::Provider> {
         // The one place that holds both the store and the chain spec, and it
-        // runs once before the chain moves. On a store that already has
-        // commits it only checks they are this chain's, so a restart costs a
-        // `head()` and one tag lookup.
+        // runs once before the chain moves. On a store that already runs this
+        // chain it only checks that, so a restart costs a `head()`, one record
+        // read and one tag lookup. Any store it cannot run on, such as an
+        // unfinished prefill or another chain's, is refused here.
         let spec = factory.chain_spec();
         let genesis_hash = spec.genesis_hash();
-        check_chain(&self.store, genesis_hash.0)?;
         let alloc = arkiv_reth_statemanager::GenesisAccount::from_alloc(&spec.genesis().alloc);
-        if let Some(commit) = seed_genesis(&self.store, genesis_hash.0, alloc)
-            .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}"))?
-        {
+        if let Some(commit) = prepare_genesis(&self.store, genesis_hash.0, self.prefilled, alloc)? {
             tracing::info!(
                 target: "arkiv-reth",
                 commit = commit.0,
