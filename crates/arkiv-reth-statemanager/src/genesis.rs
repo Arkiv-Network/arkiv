@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
 use arkiv_golemdb_state::accounts::{CELL_BALANCE, CELL_NONCE, record_key};
-use arkiv_interfaces::store::{Cell, CellName, CommitId, Store, StoreError, TypeId};
+use arkiv_interfaces::store::{Cell, CellName, CommitId, ReadTarget, Store, StoreError, TypeId};
 
 use crate::host::HostStore;
 
@@ -149,6 +149,82 @@ pub fn check_genesis_root(
         B256::from(state_root)
     );
     Ok(())
+}
+
+/// What a store holds, as far as starting this chain on it goes.
+///
+/// A prefill writes its archives as commits before block 0, so a store can be
+/// partway through one. These states tell that apart from a finished chain and
+/// from another chain's store; [`classify`] decides which one a store is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreState {
+    /// Only commit 0, GolemDB's own settings: nothing of Arkiv's yet.
+    GolemDbInitialized,
+    /// A prefill has committed `done` of its `total` archives and has more to
+    /// do.
+    ArkivPrefilling { done: u64, total: u64 },
+    /// A prefill has committed every archive, but block 0 is not finalized.
+    ArkivPrefillDone,
+    /// A commit is tagged with this chain's block 0.
+    ArkivInitialized,
+    /// Anything else, such as another chain's store. `prefilled` says whether
+    /// the store holds a prefill record, as a store prefilled for this chain
+    /// does when the node is started with a genesis file other than the one
+    /// its prefill finalized: that file gives block 0 another hash, so no
+    /// commit carries it.
+    Unknown { prefilled: bool },
+}
+
+/// Which [`StoreState`] `store` is in, for the chain whose block 0 hashes to
+/// `genesis_hash`.
+///
+/// Checked top to bottom:
+///
+/// 1. a commit tagged `genesis_hash` → [`StoreState::ArkivInitialized`];
+/// 2. only commit 0 → [`StoreState::GolemDbInitialized`];
+/// 3. the prefill record at the head, with the head at commit
+///    `1 + $prefillCommits` (commit 1 is the alloc, then one per archive) and
+///    no more committed than the total → [`StoreState::ArkivPrefilling`], or
+///    [`StoreState::ArkivPrefillDone`] once every archive is in;
+/// 4. anything else → [`StoreState::Unknown`], saying whether the store has a
+///    prefill record.
+///
+/// The head check in 3 is what tells this chain's unfinished prefill from
+/// another prefilled chain that went on to produce blocks.
+pub fn classify(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<StoreState> {
+    let read =
+        |what: &str, e: &dyn core::fmt::Debug| eyre::eyre!("read the Arkiv store's {what}: {e:?}");
+    let head = store.head();
+    let prefill = arkiv_golemdb_state::prefill::read(&**store, ReadTarget::Commit(head))
+        .map_err(|e| read("prefill record", &e))?;
+    if store
+        .commit_by_tag(genesis_hash)
+        .map_err(|e| read("genesis", &e))?
+        .is_some()
+    {
+        return Ok(StoreState::ArkivInitialized);
+    }
+    if head == CommitId::GENESIS {
+        return Ok(StoreState::GolemDbInitialized);
+    }
+    Ok(match prefill {
+        Some(counters)
+            if counters.commits <= counters.total
+                && Some(head.0) == counters.commits.checked_add(1) =>
+        {
+            if counters.commits < counters.total {
+                StoreState::ArkivPrefilling {
+                    done: counters.commits,
+                    total: counters.total,
+                }
+            } else {
+                StoreState::ArkivPrefillDone
+            }
+        }
+        _ => StoreState::Unknown {
+            prefilled: prefill.is_some(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -355,5 +431,191 @@ mod root_tests {
             idle_root, spent_root,
             "a moved balance has to move the sealed state root",
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arc_with_non_send_sync)] // MemStore is a RefCell; see its docs.
+mod classify_tests {
+    use super::*;
+    use arkiv_golemdb_state::prefill;
+    use arkiv_interfaces::store::reference::MemStore;
+    use std::sync::Arc;
+
+    /// This chain's block 0, and another chain's.
+    const OURS: [u8; 32] = [7; 32];
+    const OTHER: [u8; 32] = [8; 32];
+
+    fn memstore() -> HostStore {
+        Arc::new(MemStore::new())
+    }
+
+    /// GolemDB in memory, with Arkiv's limits.
+    fn golemdb() -> HostStore {
+        use arkiv_interfaces::constants::{
+            MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
+        };
+        use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
+        let limit = |bytes: usize| u32::try_from(bytes).unwrap();
+        let config = arkiv_golemdb::GolemDbConfig {
+            host_schemas: vec![],
+            genesis: arkiv_golemdb::Genesis::new(
+                arkiv_golemdb::HashAlgorithm::Keccak256,
+                arkiv_golemdb::CellLimits {
+                    max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
+                    max_str_len: limit(MAX_STR_BYTES),
+                    max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
+                },
+                arkiv_golemdb::RecordLimits {
+                    max_cells: MAX_RECORD_CELLS as u64,
+                    max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
+                },
+                None,
+                arkiv_golemdb::PricingConfig::zero(),
+            ),
+            segments: vec![],
+        };
+        Arc::new(arkiv_golemdb::GolemDbStore::open_memory(&config).unwrap())
+    }
+
+    /// One commit that writes a fresh account record: what any block does.
+    fn commit_something(store: &HostStore, tag: Option<[u8; 32]>) {
+        let branch = store.begin(None).unwrap();
+        let account = [store.head().0 as u8; 20];
+        store
+            .create(
+                branch,
+                record_key(account),
+                vec![(
+                    CellName::from(CELL_NONCE),
+                    Cell::field(TypeId::U64, 1u64.to_be_bytes().to_vec()),
+                )],
+                None,
+            )
+            .unwrap();
+        match tag {
+            Some(tag) => store.commit_tagged(branch, tag).map(|_| ()),
+            None => store.commit(branch).map(|_| ()),
+        }
+        .unwrap();
+    }
+
+    /// A prefill of `total` archives with `done` of them committed: the alloc
+    /// commit, then one commit per archive.
+    fn prefill(store: &HostStore, total: u64, done: u64) {
+        let alloc = store.begin(None).unwrap();
+        prefill::start(&**store, alloc, total, [0x4f; 32]).unwrap();
+        store.commit(alloc).unwrap();
+        for _ in 0..done {
+            let archive = store.begin(None).unwrap();
+            prefill::bump(&**store, archive).unwrap();
+            store.commit(archive).unwrap();
+        }
+    }
+
+    /// A named example store: how to build it, and the state it is in.
+    type Case<'a> = (&'a str, &'a dyn Fn(&HostStore), StoreState);
+
+    /// Every example store from #319, on `store`.
+    fn check_every_state(store: fn() -> HostStore) {
+        let state = |build: &dyn Fn(&HostStore)| {
+            let store = store();
+            build(&store);
+            classify(&store, OURS).unwrap()
+        };
+        let cases: [Case; 9] = [
+            ("fresh", &|_| {}, StoreState::GolemDbInitialized),
+            (
+                "alloc only",
+                &|s| prefill(s, 3, 0),
+                StoreState::ArkivPrefilling { done: 0, total: 3 },
+            ),
+            (
+                "crashed after A1",
+                &|s| prefill(s, 3, 2),
+                StoreState::ArkivPrefilling { done: 2, total: 3 },
+            ),
+            (
+                "every archive in",
+                &|s| prefill(s, 3, 3),
+                StoreState::ArkivPrefillDone,
+            ),
+            (
+                "prefilled, finalized and running",
+                &|s| {
+                    prefill(s, 3, 3);
+                    commit_something(s, Some(OURS));
+                    commit_something(s, Some([0xb1; 32]));
+                },
+                StoreState::ArkivInitialized,
+            ),
+            (
+                "not prefilled, running",
+                &|s| {
+                    commit_something(s, Some(OURS));
+                    commit_something(s, Some([0xb1; 32]));
+                },
+                StoreState::ArkivInitialized,
+            ),
+            (
+                "another chain",
+                &|s| {
+                    commit_something(s, Some(OTHER));
+                    commit_something(s, Some([0xb1; 32]));
+                },
+                StoreState::Unknown { prefilled: false },
+            ),
+            (
+                // Block 0 tagged with a hash other than the one asked for: the
+                // same store, whether it is another prefilled chain's or this
+                // chain's under a genesis file without its prefilled root.
+                "another prefilled chain, running",
+                &|s| {
+                    prefill(s, 2, 2);
+                    commit_something(s, Some(OTHER));
+                    commit_something(s, Some([0xb1; 32]));
+                },
+                StoreState::Unknown { prefilled: true },
+            ),
+            (
+                "a record that counts past its total",
+                &|s| {
+                    let branch = s.begin(None).unwrap();
+                    let count = |n: u64| Cell::field(TypeId::U64, n.to_be_bytes().to_vec());
+                    s.create(
+                        branch,
+                        prefill::RECORD_KEY,
+                        vec![
+                            (CellName::from(prefill::CELL_TOTAL), count(3)),
+                            (CellName::from(prefill::CELL_COMMITS), count(4)),
+                            (
+                                CellName::from(prefill::CELL_GENESIS_HASH),
+                                Cell::field(TypeId::BYTES32, vec![0x4f; 32]),
+                            ),
+                        ],
+                        None,
+                    )
+                    .unwrap();
+                    s.commit(branch).unwrap();
+                    for _ in 0..4 {
+                        commit_something(s, None);
+                    }
+                },
+                StoreState::Unknown { prefilled: true },
+            ),
+        ];
+        for (name, build, expected) in cases {
+            assert_eq!(state(build), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_state_on_memstore() {
+        check_every_state(memstore);
+    }
+
+    #[test]
+    fn every_state_on_golemdb() {
+        check_every_state(golemdb);
     }
 }
