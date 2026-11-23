@@ -1550,6 +1550,9 @@ name = "arkiv-prefill"
 version = "1.0.1"
 dependencies = [
  "alloy-primitives",
+ "arkiv-bindings",
+ "arkiv-interfaces",
+ "base64 0.22.1",
  "eyre",
  "serde",
  "serde_json",
