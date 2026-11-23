@@ -22,6 +22,14 @@ const IDENT_CHARSET: u128 = (1 << 0x2D)
 /// Leading byte bitmap: A-Z and a-z only.
 const IDENT_LEADING: u128 = (((1u128 << 26) - 1) << 0x41) | (((1u128 << 26) - 1) << 0x61);
 
+/// Whether byte `b` is in `charset`. A byte above 127 never is, and must be
+/// tested before the shift: shifting a `u128` by 128 or more panics with
+/// overflow checks on, and with them off (release builds) wraps around, which
+/// would take `0xC3`, the first byte of "É", for `0x43`, "C".
+const fn allowed(charset: u128, b: u8) -> bool {
+    b < 128 && (charset >> b) & 1 == 1
+}
+
 /// A structured Ident32 validation failure, carrying the evidence the
 /// `Ident32Empty` / `Ident32InvalidByte` ABI errors report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +59,7 @@ pub fn validate_ident32_bytes(bytes: &[u8; 32]) -> Result<(), Ident32ByteError> 
             } else {
                 IDENT_CHARSET
             };
-            let charset_bad = b > 127 || (charset >> b) & 1 == 0;
+            let charset_bad = !allowed(charset, b);
             if seen_zero || charset_bad {
                 return Err(Ident32ByteError::InvalidByte { position, value: b });
             }
@@ -131,14 +139,14 @@ impl Ident32 {
         if bytes.len() > 32 {
             bail!("Ident32 too long: {} bytes (max 32)", bytes.len());
         }
-        if (IDENT_LEADING >> bytes[0]) & 1 == 0 {
+        if !allowed(IDENT_LEADING, bytes[0]) {
             bail!(
                 "Ident32 invalid leading byte at position 0: 0x{:02x}",
                 bytes[0]
             );
         }
         for (i, &b) in bytes.iter().enumerate().skip(1) {
-            if (IDENT_CHARSET >> b) & 1 == 0 {
+            if !allowed(IDENT_CHARSET, b) {
                 bail!("Ident32 invalid byte at position {}: 0x{:02x}", i, b);
             }
         }
@@ -165,7 +173,7 @@ impl Ident32 {
         if bytes[0] == 0 {
             bail!("Ident32 cannot be empty");
         }
-        if (IDENT_LEADING >> bytes[0]) & 1 == 0 {
+        if !allowed(IDENT_LEADING, bytes[0]) {
             bail!(
                 "Ident32 invalid leading byte at position 0: 0x{:02x}",
                 bytes[0]
@@ -183,7 +191,7 @@ impl Ident32 {
                 }
             } else if b == 0 {
                 found_null = true;
-            } else if (IDENT_CHARSET >> b) & 1 == 0 {
+            } else if !allowed(IDENT_CHARSET, b) {
                 bail!("Ident32 invalid byte at position {}: 0x{:02x}", i, b);
             }
         }
@@ -286,5 +294,28 @@ mod tests {
         // remaining bytes are zero — valid
         let raw = FixedBytes::<32>::from(buf);
         assert!(Ident32(raw).validate().is_ok());
+    }
+
+    /// A byte above 127 is refused everywhere, in any position, rather than
+    /// panicking (overflow checks on) or being taken for another letter (off).
+    /// "É" is `0xC3 0x89`; `0xC3 % 128` is "C", `0x89 % 128` is a tab.
+    #[test]
+    fn a_byte_above_127_is_refused() {
+        for name in ["Énergie", "aÉ", "ab\u{80}"] {
+            assert!(Ident32::encode(name).is_err(), "{name:?}");
+            let mut word = [0u8; 32];
+            word[..name.len()].copy_from_slice(name.as_bytes());
+            assert!(validate_ident32_bytes(&word).is_err(), "{name:?}");
+            assert!(
+                Ident32(FixedBytes::from(word)).validate().is_err(),
+                "{name:?}"
+            );
+        }
+        for b in 128..=255u8 {
+            assert!(
+                !allowed(IDENT_LEADING, b) && !allowed(IDENT_CHARSET, b),
+                "{b}"
+            );
+        }
     }
 }
