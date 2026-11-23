@@ -88,29 +88,52 @@ struct Index {
 }
 
 /// An archive: its index file and the parts it names, in order.
+///
+/// The index is read once, by [`Archive::open`]: the part list and the bytes
+/// that go into the hash come from that one read, so an index edited later
+/// cannot pair a new index with the old part list.
 #[derive(Debug, Clone)]
 pub struct Archive {
     index: PathBuf,
+    index_bytes: Vec<u8>,
     parts: Vec<PathBuf>,
 }
 
 impl Archive {
-    /// Open the archive whose index file is `index`.
+    /// Open the archive whose index file is `index`. Part paths are relative
+    /// to the index's directory and must stay inside it, so the archive is one
+    /// directory that can be copied whole: an absolute path, or one with `..`,
+    /// is refused.
     pub fn open(index: impl Into<PathBuf>) -> Result<Self> {
         let index = index.into();
-        let parsed: Index = serde_json::from_reader(
-            File::open(&index).wrap_err_with(|| format!("open {}", index.display()))?,
-        )
-        .wrap_err_with(|| format!("parse {}", index.display()))?;
+        let index_bytes =
+            std::fs::read(&index).wrap_err_with(|| format!("open {}", index.display()))?;
+        let parsed: Index = serde_json::from_slice(&index_bytes)
+            .wrap_err_with(|| format!("parse {}", index.display()))?;
         ensure!(
             parsed.version == 1,
             "{}: unsupported archive version {}",
             index.display(),
             parsed.version
         );
+        for part in &parsed.parts {
+            ensure!(
+                !part.as_os_str().is_empty()
+                    && part
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "{}: part {} must be a path inside the archive's directory, with no `..`",
+                index.display(),
+                part.display()
+            );
+        }
         let root = index.parent().unwrap_or(Path::new("."));
         let parts = parsed.parts.iter().map(|part| root.join(part)).collect();
-        Ok(Self { index, parts })
+        Ok(Self {
+            index,
+            index_bytes,
+            parts,
+        })
     }
 
     /// The index file.
@@ -124,13 +147,27 @@ impl Archive {
     }
 
     /// The archive hash: see the [crate docs](crate#archive-hash). Reads every
-    /// file once, in fixed-size chunks.
+    /// part once, in fixed-size chunks; the index's bytes are the ones
+    /// [`Archive::open`] read.
+    ///
+    /// A writer importing the archive does not call this: reading the entities
+    /// computes the same hash from the very bytes it imports. This is for
+    /// checking an archive without importing it, as a resume does for the last
+    /// one committed.
     pub fn hash(&self) -> Result<B256> {
-        let mut hasher = Keccak256::new();
-        for path in std::iter::once(&self.index).chain(&self.parts) {
+        let mut hasher = self.hasher();
+        for path in &self.parts {
             hash_file(&mut hasher, path).wrap_err_with(|| format!("hash {}", path.display()))?;
         }
         Ok(hasher.finalize())
+    }
+
+    /// A hasher that has taken in the index, ready for the parts.
+    pub(crate) fn hasher(&self) -> Keccak256 {
+        let mut hasher = Keccak256::new();
+        hasher.update((self.index_bytes.len() as u64).to_be_bytes());
+        hasher.update(&self.index_bytes);
+        hasher
     }
 }
 
@@ -215,6 +252,69 @@ mod tests {
         for (i, other) in changed.iter().enumerate() {
             assert_ne!(base, *other, "change {i} kept the hash");
         }
+    }
+
+    /// The hash of one fixed archive, worked out by hand from the formula in
+    /// the crate docs (lengths as big-endian `u64`, then the bytes, index
+    /// first) and hashed outside this crate. A change to the formula, such as
+    /// leaving the index out, fails here even though every other test compares
+    /// two hashes of this code's own making.
+    #[test]
+    fn a_fixed_archive_has_a_fixed_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index.json");
+        std::fs::write(&index, r#"{"version":1,"parts":["a.jsonl","b.jsonl"]}"#).unwrap();
+        for (name, body) in PARTS {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        assert_eq!(
+            Archive::open(index).unwrap().hash().unwrap(),
+            "0xebc0fa9a977f9350127f74d29b815476b556422e46fa20f46fceaf7f6805b5d7"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    /// The index is read once: editing it after `open` changes neither the
+    /// part list nor the hash, which both describe what was opened.
+    #[test]
+    fn the_index_is_read_once() {
+        let (dir, archive) = archive(&PARTS, &["a.jsonl", "b.jsonl"]);
+        let before = archive.hash().unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            serde_json::json!({ "version": 1, "parts": ["a.jsonl"] }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(archive.parts().len(), 2);
+        assert_eq!(archive.hash().unwrap(), before);
+    }
+
+    /// Parts stay inside the archive's directory, so the archive can be
+    /// copied whole.
+    #[test]
+    fn a_part_outside_the_archive_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index.json");
+        for part in ["/etc/hosts", "../other/a.jsonl", "sub/../../a.jsonl", ""] {
+            std::fs::write(
+                &index,
+                serde_json::json!({ "version": 1, "parts": [part] }).to_string(),
+            )
+            .unwrap();
+            let error = Archive::open(&index).unwrap_err().to_string();
+            assert!(
+                error.contains("inside the archive's directory"),
+                "{part}: {error}"
+            );
+        }
+        // A subdirectory is fine.
+        std::fs::write(
+            &index,
+            serde_json::json!({ "version": 1, "parts": ["sub/a.jsonl"] }).to_string(),
+        )
+        .unwrap();
+        assert!(Archive::open(&index).is_ok());
     }
 
     #[test]
