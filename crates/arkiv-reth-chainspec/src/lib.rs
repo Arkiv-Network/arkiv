@@ -505,7 +505,8 @@ mod tests {
                 limits,
                 record_limits,
                 None,
-                serde_json::from_value(arkiv(|_| {})["golemdb"]["metering"].clone()).unwrap()
+                serde_json::from_value(arkiv(|_| {})["golemdb"]["metering"].clone()).unwrap(),
+                0,
             ))
         );
     }
@@ -770,6 +771,12 @@ mod tests {
                     g.as_object_mut().unwrap().remove("metering");
                 }),
                 "missing field `metering`",
+            ),
+            (
+                arkiv(|g| {
+                    g.as_object_mut().unwrap().remove("min_retention");
+                }),
+                "missing field `min_retention`",
             ),
             (
                 arkiv(|g| g["cell_limits"]["max_str_len"] = json!(-1)),

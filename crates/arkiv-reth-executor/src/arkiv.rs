@@ -786,6 +786,7 @@ mod tests {
             },
             None,
             pricing,
+            0,
         );
         GolemDbStore::open_memory(&GolemDbConfig {
             genesis,

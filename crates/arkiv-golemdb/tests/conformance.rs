@@ -33,6 +33,7 @@ fn config() -> GolemDbConfig {
             record_limits,
             None,
             PricingConfig::zero(),
+            0,
         ),
         segments: ["blocks", "receipts", "transactions"]
             .into_iter()

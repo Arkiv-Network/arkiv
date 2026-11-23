@@ -6,7 +6,8 @@
 //! block`: `a_count_combines_predicates` counts in that shape.
 
 use arkiv_golemdb::{
-    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PricingConfig, RecordLimits,
+    CellLimits, Genesis, GolemDbConfig, GolemDbStore, HashAlgorithm, PricingConfig, Pruning,
+    RecordLimits,
 };
 use arkiv_interfaces::constants::{MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, Entity};
@@ -37,6 +38,7 @@ fn config() -> GolemDbConfig {
             record_limits,
             None,
             PricingConfig::zero(),
+            0,
         ),
         segments: vec![],
     }
@@ -66,7 +68,7 @@ fn entity_with(n: u8, attributes: Vec<Attribute>) -> Entity {
 
 /// A store holding `entities`, committed.
 fn store_with(dir: &TempDir, entities: &[Entity]) -> GolemDbStore {
-    let store = GolemDbStore::open(dir.path(), &config(), None).unwrap();
+    let store = GolemDbStore::open(dir.path(), &config(), Pruning::Off).unwrap();
     let branch = store.begin(None).unwrap();
     for entity in entities {
         let cells = entity_records::to_cells(entity).unwrap();
