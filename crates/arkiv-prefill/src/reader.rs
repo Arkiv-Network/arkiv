@@ -97,6 +97,13 @@ impl Entities<'_> {
         self.hash
     }
 
+    /// Where the last line read is, as `file:line`, for an error about what
+    /// that line does rather than how it is written: the executor refusing it.
+    pub fn at(&self) -> Option<String> {
+        let part = self.current.as_ref()?;
+        Some(format!("{}:{}", part.path.display(), part.line))
+    }
+
     /// End the iteration: an archive with a bad line or part is never read past it.
     fn fail(&mut self, error: eyre::Report) -> Option<Result<(UserAddress, Vec<Op>)>> {
         self.parts = [].iter();

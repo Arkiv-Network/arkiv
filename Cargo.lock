@@ -1551,7 +1551,13 @@ version = "1.0.1"
 dependencies = [
  "alloy-primitives",
  "arkiv-bindings",
+ "arkiv-golemdb",
+ "arkiv-golemdb-state",
  "arkiv-interfaces",
+ "arkiv-reth-chainspec",
+ "arkiv-reth-executor",
+ "arkiv-reth-statemanager",
+ "arkiv-tokenomics",
  "base64 0.22.1",
  "eyre",
  "serde",
