@@ -83,9 +83,9 @@ pub fn read<S: Store + ?Sized>(
         return Ok(None);
     };
     Ok(Some(PrefillCounters {
-        total: u64::from_be_bytes(fixed(&record, CELL_TOTAL)?),
-        commits: u64::from_be_bytes(fixed(&record, CELL_COMMITS)?),
-        genesis_hash: fixed(&record, CELL_GENESIS_HASH)?,
+        total: u64::from_be_bytes(fixed(&record, CELL_TOTAL, TypeId::U64)?),
+        commits: u64::from_be_bytes(fixed(&record, CELL_COMMITS, TypeId::U64)?),
+        genesis_hash: fixed(&record, CELL_GENESIS_HASH, TypeId::BYTES32)?,
     }))
 }
 
@@ -138,10 +138,16 @@ fn u64_cell(value: u64) -> Cell {
     Cell::field(TypeId::U64, value.to_be_bytes().to_vec())
 }
 
-/// The fixed-width value of cell `name`.
-fn fixed<const N: usize>(record: &Record, name: &'static str) -> Result<[u8; N], PrefillError> {
+/// The value of cell `name`, which must be of type `type_id` and `N` bytes
+/// wide. The width alone is not enough: eight bytes of `BYTES` are not a `U64`.
+fn fixed<const N: usize>(
+    record: &Record,
+    name: &'static str,
+    type_id: TypeId,
+) -> Result<[u8; N], PrefillError> {
     record
         .cell(name)
+        .filter(|cell| cell.type_id == type_id)
         .and_then(|cell| cell.value.as_slice().try_into().ok())
         .ok_or(PrefillError::Malformed(name))
 }
@@ -214,8 +220,8 @@ mod tests {
         assert_eq!(bump(&store, branch), Err(PrefillError::NotStarted));
     }
 
-    /// A record missing a cell, or holding one of the wrong width, is refused
-    /// by name rather than read as a zero.
+    /// A record missing a cell, or holding one of the wrong width or type, is
+    /// refused by name rather than read as a number.
     #[test]
     fn a_malformed_record_is_refused() {
         for (cells, missing) in [
@@ -233,6 +239,21 @@ mod tests {
                     ),
                 ],
                 CELL_GENESIS_HASH,
+            ),
+            // The right width, the wrong type.
+            (
+                vec![
+                    (CellName::from(CELL_TOTAL), u64_cell(3)),
+                    (
+                        CellName::from(CELL_COMMITS),
+                        Cell::field(TypeId::BYTES, 2u64.to_be_bytes().to_vec()),
+                    ),
+                    (
+                        CellName::from(CELL_GENESIS_HASH),
+                        Cell::field(TypeId::BYTES32, HASH.to_vec()),
+                    ),
+                ],
+                CELL_COMMITS,
             ),
         ] {
             let store = MemStore::new();
