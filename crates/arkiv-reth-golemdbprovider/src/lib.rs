@@ -1972,8 +1972,9 @@ pub struct ArkivProviderBuilder {
     seals: std::sync::Arc<arkiv_reth_statemanager::BlockSeals>,
     /// Whether the store's genesis commit must have block 0's `stateRoot`.
     check_genesis_root: bool,
-    /// Whether the chain's block 0 comes from a prefill.
-    prefilled: bool,
+    /// For a chain whose block 0 comes from a prefill, its genesis file's
+    /// prefill hash; `None` otherwise.
+    prefill: Option<[u8; 32]>,
 }
 
 impl ArkivProviderBuilder {
@@ -1988,7 +1989,7 @@ impl ArkivProviderBuilder {
             store,
             seals,
             check_genesis_root: false,
-            prefilled: false,
+            prefill: None,
         }
     }
 
@@ -1999,12 +2000,13 @@ impl ArkivProviderBuilder {
         self
     }
 
-    /// Whether the chain's block 0 comes from a prefill: its genesis file sets
-    /// `config.arkiv.prefilledBlockZeroStateRoot`. A prefilled chain never has
-    /// its genesis written by the node; it runs only on the store the prefill
-    /// finalized.
-    pub const fn prefilled(mut self, prefilled: bool) -> Self {
-        self.prefilled = prefilled;
+    /// For a chain whose block 0 comes from a prefill (its genesis file sets
+    /// `config.arkiv.prefilledBlockZeroStateRoot`), the file's prefill hash,
+    /// `ArkivChainSpec::prefill_genesis_hash`. A prefilled chain never has its
+    /// genesis written by the node: it runs only on the store the prefill
+    /// finalized, and only under the genesis file the prefill ran with.
+    pub const fn prefill(mut self, prefill: Option<[u8; 32]>) -> Self {
+        self.prefill = prefill;
         self
     }
 }
@@ -2041,7 +2043,7 @@ impl<N: ProviderNodeTypes<Primitives = reth_ethereum::EthPrimitives>> EngineProv
         let spec = factory.chain_spec();
         let genesis_hash = spec.genesis_hash();
         let alloc = arkiv_reth_statemanager::GenesisAccount::from_alloc(&spec.genesis().alloc);
-        if let Some(commit) = prepare_genesis(&self.store, genesis_hash.0, self.prefilled, alloc)? {
+        if let Some(commit) = prepare_genesis(&self.store, genesis_hash.0, self.prefill, alloc)? {
             tracing::info!(
                 target: "arkiv-reth",
                 commit = commit.0,

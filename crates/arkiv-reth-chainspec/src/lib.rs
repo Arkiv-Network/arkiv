@@ -185,6 +185,30 @@ impl ArkivChainSpec {
         self.golemdb.as_ref()
     }
 
+    /// The genesis file's fingerprint for a prefill: keccak256 of the genesis
+    /// as JSON in a fixed form (parsed, keys sorted, no whitespace), with
+    /// `config.arkiv.prefilledBlockZeroStateRoot` left out.
+    ///
+    /// A prefill writes it into the store when it starts, and checks it on
+    /// every resume; a node on a prefilled chain checks it at start. Leaving the
+    /// field out makes the file before and after the prefill finalized hash the
+    /// same. The fixed form makes the hash depend on what the file says, not
+    /// how it is laid out: re-indenting or reordering keys changes nothing,
+    /// while changing any value (an `alloc` balance, the chain id) does.
+    pub fn prefill_genesis_hash(&self) -> B256 {
+        let mut genesis =
+            serde_json::to_value(self.inner.genesis()).expect("a parsed genesis serializes");
+        if let Some(arkiv) = genesis
+            .pointer_mut("/config/arkiv")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            arkiv.remove("prefilledBlockZeroStateRoot");
+        }
+        // `serde_json` keeps object keys sorted: no `preserve_order` feature
+        // is on in this workspace.
+        alloy_primitives::keccak256(serde_json::to_vec(&genesis).expect("JSON serializes"))
+    }
+
     /// Block 0's state root as the genesis file's
     /// `config.arkiv.prefilledBlockZeroStateRoot` states it, or `None` if it
     /// does not.
@@ -758,5 +782,40 @@ mod tests {
                 "{arkiv}: {error}"
             );
         }
+    }
+
+    /// The prefill's genesis fingerprint follows what the file says, not how
+    /// it is written, and leaves the prefilled root out.
+    #[test]
+    fn the_prefill_genesis_hash_covers_the_contents_not_the_layout() {
+        let spec = |genesis: &Value| {
+            ArkivChainSpec::from_genesis(serde_json::from_value(genesis.clone()).unwrap())
+                .unwrap()
+                .prefill_genesis_hash()
+        };
+        let mut base: Value =
+            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+        let hash = spec(&base);
+
+        // The same contents, written another way.
+        let pretty = serde_json::to_string_pretty(&base).unwrap();
+        let from_text = ArkivChainSpec::from_genesis(serde_json::from_str(&pretty).unwrap())
+            .unwrap()
+            .prefill_genesis_hash();
+        assert_eq!(from_text, hash, "layout");
+
+        // With the prefilled root, of any value.
+        for root in [B256::repeat_byte(1), B256::repeat_byte(2)] {
+            let mut with = base.clone();
+            with["config"]["arkiv"]["prefilledBlockZeroStateRoot"] = json!(root.to_string());
+            assert_eq!(spec(&with), hash, "the prefilled root is left out");
+        }
+
+        // Anything else the file says.
+        let mut funded = base.clone();
+        funded["alloc"]["0xb0b0000000000000000000000000000000000000"] = json!({ "balance": "0x1" });
+        assert_ne!(spec(&funded), hash, "alloc");
+        base["config"]["chainId"] = json!(1);
+        assert_ne!(spec(&base), hash, "chain id");
     }
 }

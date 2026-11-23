@@ -103,34 +103,38 @@ pub fn seed_genesis(
 /// Get `store` ready to run the chain whose block 0 hashes to `genesis_hash`,
 /// or refuse it with what to do instead.
 ///
-/// `prefilled` is whether the genesis file sets
-/// `config.arkiv.prefilledBlockZeroStateRoot`: whether this chain's block 0
-/// comes from a prefill. Only a fresh store of a chain that is not prefilled is
-/// written to, with `alloc` as its genesis commit (see [`seed_genesis`]); the
-/// commit is returned then. A store that already runs this chain is left as it
-/// is. Every other [`StoreState`] is refused: an empty store for a prefilled
-/// chain, an unfinished prefill, a prefill whose block 0 is not finalized, and
-/// another chain's store, such as a GolemDB directory kept across a chain
-/// reset.
+/// `prefill` is `None` for a chain whose genesis file has no
+/// `config.arkiv.prefilledBlockZeroStateRoot`. For a prefilled chain it is the
+/// genesis file's [prefill hash] (see `ArkivChainSpec::prefill_genesis_hash`),
+/// which must match the one the prefill recorded: otherwise the file was
+/// edited after the prefill. Such an edit, to `alloc` say, is invisible
+/// everywhere else, because a prefilled block 0 takes its root from the file
+/// rather than from `alloc`, so block 0's hash does not change.
 ///
-/// A prefilled store started with a genesis file that lacks the field is one
-/// of the last: without it, block 0's root is rebuilt from the alloc, so block
-/// 0 hashes differently and no commit carries that hash. It looks like any
-/// other prefilled chain's store, so the refusal names both.
+/// Only a fresh store of a chain that is not prefilled is written to, with
+/// `alloc` as its genesis commit (see [`seed_genesis`]); the commit is returned
+/// then. A store that already runs this chain is left as it is. Every other
+/// [`StoreState`] is refused, with what to do.
+///
+/// [prefill hash]: arkiv_golemdb_state::prefill::CELL_GENESIS_HASH
 pub fn prepare_genesis(
     store: &HostStore,
     genesis_hash: [u8; 32],
-    prefilled: bool,
+    prefill: Option<[u8; 32]>,
     alloc: impl IntoIterator<Item = GenesisAccount>,
 ) -> eyre::Result<Option<CommitId>> {
+    let block_zero = B256::from(genesis_hash);
     match classify(store, genesis_hash)? {
-        StoreState::GolemDbInitialized if !prefilled => seed_genesis(store, genesis_hash, alloc)
-            .map_err(|e| eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}")),
-        StoreState::GolemDbInitialized => eyre::bail!(
-            "the genesis file sets config.arkiv.prefilledBlockZeroStateRoot, so this chain's \
-             block 0 comes from a prefill, but the Arkiv store is empty. Run `arkiv-reth \
-             prefill` into this store first"
-        ),
+        StoreState::GolemDbInitialized => match prefill {
+            None => seed_genesis(store, genesis_hash, alloc).map_err(|e| {
+                eyre::eyre!("seed the Arkiv store with the genesis allocation: {e:?}")
+            }),
+            Some(_) => eyre::bail!(
+                "the genesis file sets config.arkiv.prefilledBlockZeroStateRoot, so this chain's \
+                 block 0 comes from a prefill, but the Arkiv store is empty. Run `arkiv-reth \
+                 prefill` into this store first"
+            ),
+        },
         StoreState::ArkivPrefilling { done, total } => eyre::bail!(
             "the Arkiv store holds an unfinished prefill: {done} of {total} archives are in. Run \
              `arkiv-reth prefill` again to resume it"
@@ -139,18 +143,50 @@ pub fn prepare_genesis(
             "the Arkiv store holds a finished prefill whose block 0 is not finalized yet. Run \
              `arkiv-reth prefill --finalize`"
         ),
-        StoreState::ArkivInitialized => Ok(None),
-        StoreState::Unknown { prefilled: true } if !prefilled => eyre::bail!(
-            "the Arkiv store was prefilled, but the genesis file has no \
-             config.arkiv.prefilledBlockZeroStateRoot, so none of the store's commits is this \
-             file's block 0 {}. Use the genesis file the prefill finalized, or a new store if \
-             this one belongs to another chain",
-            B256::from(genesis_hash)
+        StoreState::ArkivInitialized => {
+            let Some(file) = prefill else {
+                return Ok(None);
+            };
+            let recorded =
+                arkiv_golemdb_state::prefill::read(&**store, ReadTarget::Commit(store.head()))
+                    .map_err(|e| eyre::eyre!("read the Arkiv store's prefill record: {e:?}"))?;
+            match recorded {
+                Some(counters) if counters.genesis_hash == file => Ok(None),
+                Some(counters) => eyre::bail!(
+                    "the genesis file changed after the prefill: its contents hash to {}, but \
+                     the prefill ran with a file hashing to {}. An edit to alloc or any other \
+                     field does not reach a prefilled chain, whose block 0 is fixed. Use the \
+                     genesis file the prefill finalized",
+                    B256::from(file),
+                    B256::from(counters.genesis_hash)
+                ),
+                None => eyre::bail!(
+                    "the genesis file sets config.arkiv.prefilledBlockZeroStateRoot, but the Arkiv \
+                     store holds no prefill. Use the store the prefill finalized"
+                ),
+            }
+        }
+        StoreState::ArkivPrefilledOtherBlockZero => match prefill {
+            None => eyre::bail!(
+                "the Arkiv store was prefilled, but the genesis file has no \
+                 config.arkiv.prefilledBlockZeroStateRoot, so none of the store's commits is this \
+                 file's block 0 {block_zero}. Use the genesis file the prefill finalized"
+            ),
+            Some(_) => eyre::bail!(
+                "the Arkiv store's prefill was finalized as another block 0 than this genesis \
+                 file's {block_zero}: the file's prefilledBlockZeroStateRoot is not the store's \
+                 root. Use the genesis file the prefill finalized, or a new store if this one \
+                 belongs to another chain"
+            ),
+        },
+        StoreState::ArkivPrefillInconsistent { done, total, head } => eyre::bail!(
+            "the Arkiv store's prefill record does not fit its commits: it counts {done} of \
+             {total} archives, but the head is commit {head}. The store is damaged; prefill again \
+             into a new store"
         ),
-        StoreState::Unknown { .. } => eyre::bail!(
+        StoreState::ForeignChain => eyre::bail!(
             "the Arkiv store holds another chain: none of its commits is this chain's genesis \
-             block {}. Use a new store, such as a new GolemDB directory",
-            B256::from(genesis_hash)
+             block {block_zero}. Use a new store, such as a new GolemDB directory"
         ),
     }
 }
@@ -694,10 +730,13 @@ mod classify_tests {
         check_every_state(golemdb);
     }
 
-    /// What starting the node on each kind of store does, with the genesis
-    /// file saying the chain is `prefilled` or not.
+    /// What starting the node on each kind of store does. `PREFILLED` is a
+    /// genesis file with `prefilledBlockZeroStateRoot`, whose prefill hash is
+    /// the one [`prefill`] records; `PLAIN` is one without the field.
     #[test]
     fn the_node_starts_only_on_a_store_that_runs_this_chain() {
+        const PREFILLED: Option<[u8; 32]> = Some([0x4f; 32]);
+        const PLAIN: Option<[u8; 32]> = None;
         let alice = || {
             [GenesisAccount {
                 address: alloy_primitives::Address::repeat_byte(0xaa),
@@ -705,11 +744,11 @@ mod classify_tests {
                 nonce: 0,
             }]
         };
-        let refused = |build: &dyn Fn(&HostStore), prefilled, expected: &str| {
+        let refused = |build: &dyn Fn(&HostStore), prefill, expected: &str| {
             let store = memstore();
             build(&store);
             let head = store.head();
-            let error = prepare_genesis(&store, OURS, prefilled, alice())
+            let error = prepare_genesis(&store, OURS, prefill, alice())
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{expected}: {error}");
@@ -717,59 +756,84 @@ mod classify_tests {
         };
         refused(
             &|_| {},
-            true,
+            PREFILLED,
             "Run `arkiv-reth prefill` into this store first",
         );
-        refused(&|s| prefill(s, 3, 2), false, "2 of 3 archives are in");
-        refused(&|s| prefill(s, 3, 2), true, "2 of 3 archives are in");
+        refused(&|s| prefill(s, 3, 2), PLAIN, "2 of 3 archives are in");
+        refused(&|s| prefill(s, 3, 2), PREFILLED, "2 of 3 archives are in");
         refused(
             &|s| prefill(s, 3, 3),
-            true,
+            PREFILLED,
             "Run `arkiv-reth prefill --finalize`",
         );
-        // A store prefilled and finalized as block 0 `OTHER` (its genesis
-        // file has the prefilled root), started with a file without the field:
-        // that file's block 0 is `OURS`.
+
+        // A store prefilled and finalized as block 0 `OTHER`. Started with a
+        // file without the field, whose block 0 is `OURS`; or with one whose
+        // prefilled root is another.
         let finalized_elsewhere = |s: &HostStore| {
             prefill(s, 3, 3);
             commit_something(s, Some(OTHER));
         };
         refused(
             &finalized_elsewhere,
-            false,
+            PLAIN,
             "the Arkiv store was prefilled, but the genesis file has no \
              config.arkiv.prefilledBlockZeroStateRoot",
         );
-        // With the field, but another root, it is another chain's store.
         refused(
             &finalized_elsewhere,
-            true,
-            "the Arkiv store holds another chain",
+            PREFILLED,
+            "the Arkiv store's prefill was finalized as another block 0",
+        );
+
+        // A finalized prefill, started with a genesis file edited since: say an
+        // account added to alloc. Block 0's hash is the same, so only the
+        // recorded prefill hash tells.
+        let finalized = |s: &HostStore| {
+            prefill(s, 3, 3);
+            commit_something(s, Some(OURS));
+        };
+        refused(
+            &finalized,
+            Some([0x99; 32]),
+            "the genesis file changed after the prefill",
+        );
+
+        let damaged = |s: &HostStore| {
+            prefill(s, 3, 1);
+            commit_something(s, None);
+        };
+        refused(
+            &damaged,
+            PREFILLED,
+            "it counts 1 of 3 archives, but the head is commit 3",
         );
         refused(
             &|s| commit_something(s, Some(OTHER)),
-            false,
+            PLAIN,
             "the Arkiv store holds another chain",
         );
 
         // A fresh store of a chain without prefill gets its genesis commit, as
         // before; a restart then leaves it alone.
         let store = memstore();
-        let commit = prepare_genesis(&store, OURS, false, alice()).unwrap();
+        let commit = prepare_genesis(&store, OURS, PLAIN, alice()).unwrap();
         assert_eq!(store.commit_by_tag(OURS).unwrap(), commit);
         assert_eq!(
             classify(&store, OURS).unwrap(),
             StoreState::ArkivInitialized
         );
-        assert_eq!(prepare_genesis(&store, OURS, false, alice()).unwrap(), None);
+        assert_eq!(prepare_genesis(&store, OURS, PLAIN, alice()).unwrap(), None);
         assert_eq!(store.head(), commit.unwrap(), "the restart wrote nothing");
 
-        // A finalized prefill starts under the genesis file that says so.
+        // A finalized prefill starts under the genesis file it ran with.
         let store = memstore();
-        prefill(&store, 3, 3);
-        commit_something(&store, Some(OURS));
+        finalized(&store);
         let head = store.head();
-        assert_eq!(prepare_genesis(&store, OURS, true, alice()).unwrap(), None);
+        assert_eq!(
+            prepare_genesis(&store, OURS, PREFILLED, alice()).unwrap(),
+            None
+        );
         assert_eq!(store.head(), head);
     }
 }
