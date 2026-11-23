@@ -1,0 +1,17 @@
+[package]
+name = "arkiv-prefill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Prefill an Arkiv chain: the archive format, its hash and its reader"
+
+[dependencies]
+# `Keccak256`, the archive hash.
+alloy-primitives.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eyre.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

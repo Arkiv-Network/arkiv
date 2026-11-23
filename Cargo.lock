@@ -1546,6 +1546,17 @@ name = "arkiv-interfaces"
 version = "1.0.1"
 
 [[package]]
+name = "arkiv-prefill"
+version = "1.0.1"
+dependencies = [
+ "alloy-primitives",
+ "eyre",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "arkiv-query"
 version = "1.0.1"
 dependencies = [
