@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
 use arkiv_golemdb_state::accounts::{CELL_BALANCE, CELL_NONCE, record_key};
-use arkiv_interfaces::store::{Cell, CellName, CommitId, ReadTarget, Store, StoreError, TypeId};
+use arkiv_interfaces::store::{
+    BranchId, Cell, CellName, CommitId, ReadTarget, Store, StoreError, TypeId,
+};
 
 use crate::host::HostStore;
 
@@ -73,6 +75,25 @@ pub fn seed_genesis(
     }
 
     let branch = store.begin(None)?;
+    if let Err(error) = write_alloc(store, branch, alloc) {
+        // Leave nothing half-written for the next start-up to puzzle over.
+        let _ = store.discard(branch);
+        return Err(error);
+    }
+    store.commit_tagged(branch, genesis_hash).map(Some)
+}
+
+/// Write `alloc`'s accounts on `branch`, without committing: what
+/// [`seed_genesis`] commits as block 0, and what a prefill commits as its alloc
+/// commit, before its archives.
+///
+/// Both cells are written for every account, including a zero nonce: see
+/// [`seed_genesis`].
+pub fn write_alloc(
+    store: &HostStore,
+    branch: BranchId,
+    alloc: impl IntoIterator<Item = GenesisAccount>,
+) -> Result<(), StoreError> {
     for account in alloc {
         let cells = vec![
             (
@@ -86,18 +107,14 @@ pub fn seed_genesis(
         ];
         // Genesis is not a metered transaction; it is the state every metered
         // transaction starts from.
-        if let Err(error) = store.create(
+        store.create(
             branch,
             record_key(account.address.into_array()),
             cells,
             None,
-        ) {
-            // Leave nothing half-written for the next start-up to puzzle over.
-            let _ = store.discard(branch);
-            return Err(error);
-        }
+        )?;
     }
-    store.commit_tagged(branch, genesis_hash).map(Some)
+    Ok(())
 }
 
 /// Get `store` ready to run the chain whose block 0 hashes to `genesis_hash`,
