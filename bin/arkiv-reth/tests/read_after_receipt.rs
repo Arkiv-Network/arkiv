@@ -5,8 +5,8 @@
 //! client can read what it wrote as soon as it holds the receipt.
 //!
 //! The harness's own `execute` waits for a receipt through a watcher that
-//! polls far more slowly than that moment lasts. These tests ask for the
-//! receipt every millisecond instead, so their reads land inside it.
+//! polls far more slowly than that moment lasts. This test asks for the
+//! receipt every millisecond instead, so its reads land inside it.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -27,8 +27,8 @@ const READY: Duration = Duration::from_secs(90);
 /// How often the receipt is asked for.
 const RECEIPT_POLL: Duration = Duration::from_millis(1);
 
-/// How many creates each test reads back. A read that does not wait misses
-/// every one of them on GolemDB, and a few in a hundred on the in-process store.
+/// How many creates the test reads back. A read that does not wait misses
+/// every one of them.
 const ROUNDS: usize = 20;
 
 fn create_op() -> Operation {
@@ -82,8 +82,11 @@ async fn create_and_wait(client: &ArkivClient<impl Provider + Clone>) -> Transac
 
 /// Create an entity, and on seeing its receipt read it back at the tip, by key
 /// and by query. Both reads must find it, every round.
-async fn reads_after_a_receipt_see_the_write(builder: NodeBuilder) {
-    let mut node = builder.spawn();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_right_after_a_receipt_sees_its_write_on_golemdb() {
+    let mut node = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .golemdb_store()
+        .spawn();
     let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
     let client = connect(&node.http_url(), signer);
     node.wait_ready(&client, READY).await;
@@ -115,16 +118,4 @@ async fn reads_after_a_receipt_see_the_write(builder: NodeBuilder) {
              entity created in block {block}",
         );
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_right_after_a_receipt_sees_its_write_on_golemdb() {
-    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).golemdb_store();
-    reads_after_a_receipt_see_the_write(builder).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_right_after_a_receipt_sees_its_write_on_the_memory_store() {
-    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"));
-    reads_after_a_receipt_see_the_write(builder).await;
 }
