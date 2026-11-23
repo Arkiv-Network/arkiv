@@ -155,7 +155,11 @@ pub fn check_genesis_root(
 ///
 /// A prefill writes its archives as commits before block 0, so a store can be
 /// partway through one. These states tell that apart from a finished chain and
-/// from another chain's store; [`classify`] decides which one a store is in.
+/// from stores the chain cannot run on; [`classify`] decides which one a store
+/// is in.
+///
+/// A prefilled store has a fixed layout: commit 1 is the alloc, commits
+/// `2 ..= 1 + total` are the archives, and commit `2 + total` is block 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreState {
     /// Only commit 0, GolemDB's own settings: nothing of Arkiv's yet.
@@ -167,12 +171,18 @@ pub enum StoreState {
     ArkivPrefillDone,
     /// A commit is tagged with this chain's block 0.
     ArkivInitialized,
-    /// Anything else, such as another chain's store. `prefilled` says whether
-    /// the store holds a prefill record, as a store prefilled for this chain
-    /// does when the node is started with a genesis file other than the one
-    /// its prefill finalized: that file gives block 0 another hash, so no
-    /// commit carries it.
-    Unknown { prefilled: bool },
+    /// A finished prefill whose block 0 commit is tagged with another hash
+    /// than this chain's. Either the node was started with a genesis file other
+    /// than the one the prefill finalized, or the store belongs to another
+    /// prefilled chain.
+    ArkivPrefilledOtherBlockZero,
+    /// A prefill record that does not fit the store's commits: more archives
+    /// counted than the total, or a head the count does not explain. The store
+    /// is damaged.
+    ArkivPrefillInconsistent { done: u64, total: u64, head: u64 },
+    /// Commits beyond commit 0, none of them this chain's block 0, and no
+    /// prefill record: another chain's store.
+    ForeignChain,
 }
 
 /// Which [`StoreState`] `store` is in, for the chain whose block 0 hashes to
@@ -182,21 +192,20 @@ pub enum StoreState {
 ///
 /// 1. a commit tagged `genesis_hash` → [`StoreState::ArkivInitialized`];
 /// 2. only commit 0 → [`StoreState::GolemDbInitialized`];
-/// 3. the prefill record at the head, with the head at commit
-///    `1 + $prefillCommits` (commit 1 is the alloc, then one per archive) and
-///    no more committed than the total → [`StoreState::ArkivPrefilling`], or
-///    [`StoreState::ArkivPrefillDone`] once every archive is in;
-/// 4. anything else → [`StoreState::Unknown`], saying whether the store has a
-///    prefill record.
+/// 3. no prefill record → [`StoreState::ForeignChain`];
+/// 4. the head at commit `1 + done`, with `done` at most the total →
+///    [`StoreState::ArkivPrefilling`], or [`StoreState::ArkivPrefillDone`] once
+///    every archive is in;
+/// 5. every archive in and commit `2 + total` tagged →
+///    [`StoreState::ArkivPrefilledOtherBlockZero`];
+/// 6. anything else → [`StoreState::ArkivPrefillInconsistent`].
 ///
-/// The head check in 3 is what tells this chain's unfinished prefill from
-/// another prefilled chain that went on to produce blocks.
+/// The genesis tag is looked up first, so a store that already runs this
+/// chain is never held up by its prefill record, which no longer matters once
+/// block 0 exists.
 pub fn classify(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<StoreState> {
     let read =
         |what: &str, e: &dyn core::fmt::Debug| eyre::eyre!("read the Arkiv store's {what}: {e:?}");
-    let head = store.head();
-    let prefill = arkiv_golemdb_state::prefill::read(&**store, ReadTarget::Commit(head))
-        .map_err(|e| read("prefill record", &e))?;
     if store
         .commit_by_tag(genesis_hash)
         .map_err(|e| read("genesis", &e))?
@@ -204,26 +213,38 @@ pub fn classify(store: &HostStore, genesis_hash: [u8; 32]) -> eyre::Result<Store
     {
         return Ok(StoreState::ArkivInitialized);
     }
+    let head = store.head();
     if head == CommitId::GENESIS {
         return Ok(StoreState::GolemDbInitialized);
     }
-    Ok(match prefill {
-        Some(counters)
-            if counters.commits <= counters.total
-                && Some(head.0) == counters.commits.checked_add(1) =>
-        {
-            if counters.commits < counters.total {
-                StoreState::ArkivPrefilling {
-                    done: counters.commits,
-                    total: counters.total,
-                }
-            } else {
-                StoreState::ArkivPrefillDone
-            }
-        }
-        _ => StoreState::Unknown {
-            prefilled: prefill.is_some(),
-        },
+    let Some(counters) = arkiv_golemdb_state::prefill::read(&**store, ReadTarget::Commit(head))
+        .map_err(|e| read("prefill record", &e))?
+    else {
+        return Ok(StoreState::ForeignChain);
+    };
+    let (done, total) = (counters.commits, counters.total);
+    if done <= total && Some(head.0) == done.checked_add(1) {
+        return Ok(if done < total {
+            StoreState::ArkivPrefilling { done, total }
+        } else {
+            StoreState::ArkivPrefillDone
+        });
+    }
+    let block_zero = total.checked_add(2).map(CommitId);
+    if done == total
+        && let Some(block_zero) = block_zero
+        && head >= block_zero
+        && store
+            .tag_of(block_zero)
+            .map_err(|e| read("block 0 commit", &e))?
+            .is_some()
+    {
+        return Ok(StoreState::ArkivPrefilledOtherBlockZero);
+    }
+    Ok(StoreState::ArkivPrefillInconsistent {
+        done,
+        total,
+        head: head.0,
     })
 }
 
@@ -523,7 +544,7 @@ mod classify_tests {
             build(&store);
             classify(&store, OURS).unwrap()
         };
-        let cases: [Case; 9] = [
+        let cases: [Case; 11] = [
             ("fresh", &|_| {}, StoreState::GolemDbInitialized),
             (
                 "alloc only",
@@ -563,7 +584,7 @@ mod classify_tests {
                     commit_something(s, Some(OTHER));
                     commit_something(s, Some([0xb1; 32]));
                 },
-                StoreState::Unknown { prefilled: false },
+                StoreState::ForeignChain,
             ),
             (
                 // Block 0 tagged with a hash other than the one asked for: the
@@ -575,7 +596,7 @@ mod classify_tests {
                     commit_something(s, Some(OTHER));
                     commit_something(s, Some([0xb1; 32]));
                 },
-                StoreState::Unknown { prefilled: true },
+                StoreState::ArkivPrefilledOtherBlockZero,
             ),
             (
                 "a record that counts past its total",
@@ -601,7 +622,44 @@ mod classify_tests {
                         commit_something(s, None);
                     }
                 },
-                StoreState::Unknown { prefilled: true },
+                StoreState::ArkivPrefillInconsistent {
+                    done: 4,
+                    total: 3,
+                    head: 5,
+                },
+            ),
+            (
+                "commits the count does not explain",
+                &|s| {
+                    prefill(s, 3, 1);
+                    commit_something(s, None);
+                    commit_something(s, None);
+                },
+                StoreState::ArkivPrefillInconsistent {
+                    done: 1,
+                    total: 3,
+                    head: 4,
+                },
+            ),
+            (
+                // Once block 0 exists the record no longer matters, so even a
+                // damaged one cannot stop the node.
+                "running, with a damaged prefill record",
+                &|s| {
+                    let branch = s.begin(None).unwrap();
+                    s.create(
+                        branch,
+                        prefill::RECORD_KEY,
+                        vec![(
+                            CellName::from(prefill::CELL_TOTAL),
+                            Cell::field(TypeId::BYTES, vec![1]),
+                        )],
+                        None,
+                    )
+                    .unwrap();
+                    s.commit_tagged(branch, OURS).unwrap();
+                },
+                StoreState::ArkivInitialized,
             ),
         ];
         for (name, build, expected) in cases {
