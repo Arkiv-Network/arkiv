@@ -84,7 +84,11 @@ pub use arkiv::{ArkivExecutor, OpEffect};
 pub use decode::{DecodeError, decode_ops, derive_entity_address};
 
 use alloy_evm::eth::spec::EthExecutorSpec;
-use alloy_evm::{Evm, EvmFactory, eth::EthEvmContext, precompiles::PrecompilesMap};
+use alloy_evm::{
+    Evm, EvmFactory,
+    eth::{EthBlockExecutorFactory, EthEvmContext},
+    precompiles::PrecompilesMap,
+};
 use alloy_primitives::{Address, B256, Bytes, Log, TxKind, U256};
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use arkiv_bindings::{IEntityRegistry, protocol::purgeExpiredCall};
@@ -465,8 +469,9 @@ pub struct ArkivEvm<DB: Database, I = NoOpInspector> {
     inner: EthEvm<DB, I, PrecompilesMap>,
     /// Where Arkiv's own state lives. One erased handle, cloned per EVM.
     store: HostStore,
-    /// The sealed candidates, shared with the node that adopts one of them.
-    seals: Arc<BlockSeals>,
+    /// Where a finished block is sealed, for the node to adopt. `None` unless
+    /// the block is being built or validated: no other execution may seal.
+    seals: Option<Arc<BlockSeals>>,
     /// This block's branch, opened by the first transaction. Every transaction
     /// in the block runs on it, in order, so each sees the last one's writes.
     branch: Option<OwnedBranch>,
@@ -491,7 +496,7 @@ impl<DB: Database, I> ArkivEvm<DB, I> {
     fn new(
         inner: EthEvm<DB, I, PrecompilesMap>,
         store: HostStore,
-        seals: Arc<BlockSeals>,
+        seals: Option<Arc<BlockSeals>>,
         pricing: Result<BlockPricing, String>,
         op_cost: OpCost,
     ) -> Self {
@@ -682,7 +687,8 @@ where
     }
 
     /// Block execution is over. Seal the branch as a candidate at this height
-    /// if a real block ran on it; otherwise it is dropped, and discarded.
+    /// if a real block ran on it and this EVM may seal; otherwise it is
+    /// dropped, and discarded.
     ///
     /// Sealing computes the roots and writes nothing, so reth can execute this
     /// block again — to validate what it just built — and get the same answer.
@@ -690,10 +696,11 @@ where
     fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
         let height = self.inner.block().number.saturating_to::<u64>();
         if self.charged.get()
+            && let Some(seals) = self.seals
             && let Some(branch) = self.branch
         {
             let key = ExecutionKey::new(height, self.executed.into_inner());
-            if let Err(error) = self.seals.seal(key, branch) {
+            if let Err(error) = seals.seal(key, branch) {
                 tracing::error!(target: "arkiv::executor", ?error, height, "failed to seal the block's Arkiv state");
             }
         }
@@ -1512,20 +1519,46 @@ fn entity_operation_log(effect: &OpEffect) -> Log {
 #[derive(Debug, Clone)]
 pub struct ArkivEvmFactory {
     store: HostStore,
-    seals: Arc<BlockSeals>,
+    seals: Option<Arc<BlockSeals>>,
     op_cost: OpCost,
 }
 
 impl ArkivEvmFactory {
-    /// Build a factory over the store Arkiv's state lives in, parking each
-    /// block's sealed state in `seals` until one is adopted. `op_cost` is
-    /// what an op costs beyond that store's receipts.
-    pub const fn new(store: HostStore, seals: Arc<BlockSeals>, op_cost: OpCost) -> Self {
+    /// Build a factory over the store Arkiv's state lives in. `op_cost` is
+    /// what an op costs beyond that store's receipts. Its EVMs seal nothing:
+    /// see [`WithSeals`].
+    pub const fn new(store: HostStore, op_cost: OpCost) -> Self {
         Self {
             store,
-            seals,
+            seals: None,
             op_cost,
         }
+    }
+}
+
+/// An executor config that can be allowed to seal.
+///
+/// A block's state root is read from its seal. The node's own config seals
+/// nothing, so nothing RPC executes can stand in for a block's seal. The
+/// payload builder and the engine validator each take a copy that seals.
+pub trait WithSeals {
+    /// This config, parking each block it executes in `seals` until one is
+    /// adopted.
+    #[must_use]
+    fn with_seals(self, seals: Arc<BlockSeals>) -> Self;
+}
+
+impl<C> WithSeals for EthEvmConfig<C, ArkivEvmFactory> {
+    fn with_seals(mut self, seals: Arc<BlockSeals>) -> Self {
+        let mut evm_factory = self.executor_factory.evm_factory().clone();
+        evm_factory.seals = Some(seals);
+        // reth's `with_jit_support_enabled` swaps the EVM factory the same way.
+        self.executor_factory = EthBlockExecutorFactory::new(
+            *self.executor_factory.receipt_builder(),
+            self.executor_factory.spec().clone(),
+            evm_factory,
+        );
+        self
     }
 }
 
@@ -1585,19 +1618,14 @@ impl EvmFactory for ArkivEvmFactory {
 #[derive(Debug, Clone)]
 pub struct ArkivExecutorBuilder {
     store: HostStore,
-    seals: Arc<BlockSeals>,
     op_cost: OpCost,
 }
 
 impl ArkivExecutorBuilder {
     /// Build the executor over the store Arkiv's state lives in, with what an
     /// op costs beyond that store's receipts.
-    pub const fn new(store: HostStore, seals: Arc<BlockSeals>, op_cost: OpCost) -> Self {
-        Self {
-            store,
-            seals,
-            op_cost,
-        }
+    pub const fn new(store: HostStore, op_cost: OpCost) -> Self {
+        Self { store, op_cost }
     }
 }
 
@@ -1620,7 +1648,7 @@ where
         );
         Ok(EthEvmConfig::new_with_evm_factory(
             ctx.chain_spec(),
-            ArkivEvmFactory::new(self.store.clone(), self.seals.clone(), self.op_cost),
+            ArkivEvmFactory::new(self.store.clone(), self.op_cost),
         ))
     }
 }
@@ -1758,12 +1786,8 @@ mod tests {
         use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
         let store = host_store(1);
-        let mut evm = ArkivEvmFactory::new(
-            store.clone(),
-            Arc::new(BlockSeals::default()),
-            OpCost::Placeholder,
-        )
-        .create_evm(EmptyDB::default(), EvmEnv::default());
+        let mut evm = ArkivEvmFactory::new(store.clone(), OpCost::Placeholder)
+            .create_evm(EmptyDB::default(), EvmEnv::default());
         let pricing = evm.pricing.clone().unwrap();
         assert_eq!(pricing.commit_id, store.head());
         assert_eq!(pricing.schedule.capacity_rate, 14);
@@ -1787,12 +1811,8 @@ mod tests {
         use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
         let store = host_store(1);
-        let mut evm = ArkivEvmFactory::new(
-            store.clone(),
-            Arc::new(BlockSeals::default()),
-            OpCost::Placeholder,
-        )
-        .create_evm(EmptyDB::default(), EvmEnv::default());
+        let mut evm = ArkivEvmFactory::new(store.clone(), OpCost::Placeholder)
+            .create_evm(EmptyDB::default(), EvmEnv::default());
         let base = evm.pricing.clone().unwrap().commit_id;
 
         let advanced = store.begin(None).unwrap();
@@ -2368,7 +2388,13 @@ mod tests {
             basefee: 0,
             ..Default::default()
         };
-        let mut evm = ArkivEvmFactory::new(store, seals.clone(), OpCost::Placeholder).create_evm(
+        // A config that seals, made as the payload builder makes its own.
+        let config = EthEvmConfig::new_with_evm_factory(
+            reth_ethereum::chainspec::MAINNET.clone(),
+            ArkivEvmFactory::new(store, OpCost::Placeholder),
+        )
+        .with_seals(seals.clone());
+        let mut evm = config.executor_factory.evm_factory().create_evm(
             EmptyDB::default(),
             EvmEnv {
                 cfg_env: CfgEnv::default(),
@@ -2412,12 +2438,7 @@ mod tests {
         use reth_ethereum::evm::revm::database_interface::EmptyDB;
 
         let store = host_store(1);
-        let mut evm = ArkivEvmFactory::new(
-            store.clone(),
-            Arc::new(BlockSeals::default()),
-            OpCost::Placeholder,
-        )
-        .create_evm(
+        let mut evm = ArkivEvmFactory::new(store.clone(), OpCost::Placeholder).create_evm(
             EmptyDB::default(),
             EvmEnv {
                 cfg_env: CfgEnv::default(),
@@ -2442,17 +2463,30 @@ mod tests {
         assert_eq!(store.discard(branch), Err(StoreError::HandleInvalid));
     }
 
+    /// RPC executes with the node's own config, which has no seals. So when
+    /// `eth_simulateV1` runs a whole block, fees charged, and finishes it,
+    /// the branch is discarded all the same.
+    #[test]
+    fn an_evm_without_seals_discards_its_branch_on_finish() {
+        use arkiv_interfaces::store::{Store, StoreError};
+
+        let store = host_store(1);
+        let mut evm = evm_with(&store, CfgEnv::default());
+        evm.transact(transfer(0, None, ARKIV_TX_GAS))
+            .expect("transfer");
+        let branch = evm.branch.as_ref().expect("opened by the transfer").id();
+
+        evm.finish();
+
+        assert_eq!(store.discard(branch), Err(StoreError::HandleInvalid));
+    }
+
     /// An EVM for block 1 over `store`, configured by `cfg_env`.
     fn evm_with(
         store: &HostStore,
         cfg_env: CfgEnv,
     ) -> ArkivEvm<reth_ethereum::evm::revm::database_interface::EmptyDB> {
-        ArkivEvmFactory::new(
-            store.clone(),
-            Arc::new(BlockSeals::default()),
-            OpCost::Placeholder,
-        )
-        .create_evm(
+        ArkivEvmFactory::new(store.clone(), OpCost::Placeholder).create_evm(
             Default::default(),
             EvmEnv {
                 cfg_env,

@@ -9,7 +9,7 @@ use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes};
 use arkiv_interfaces::gas::OpCost;
 use arkiv_reth_chainspec::ArkivChainSpec;
-use arkiv_reth_executor::ArkivExecutorBuilder;
+use arkiv_reth_executor::{ArkivExecutorBuilder, WithSeals};
 use arkiv_reth_golemdbprovider::ArkivStateRootStrategy;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
 use arkiv_reth_statemanager::segments::rows_for_block;
@@ -30,6 +30,7 @@ use reth_engine_tree::tree::{
 };
 use reth_ethereum::{
     Block, EthPrimitives,
+    chainspec::EthChainSpec,
     engine::local::LocalPayloadAttributesBuilder,
     primitives::{Header, SealedBlock},
 };
@@ -38,9 +39,9 @@ use reth_node_api::{
     InvalidPayloadAttributesError, NewPayloadError, PayloadOrAttributes, PayloadValidator,
 };
 use reth_node_builder::ConfigureEngineEvm;
+use reth_node_builder::invalid_block_hook::InvalidBlockHookExt;
 use reth_node_builder::rpc::{
-    BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineValidatorBuilder,
-    PayloadValidatorBuilder, RpcAddOns,
+    BasicEngineApiBuilder, EngineValidatorBuilder, PayloadValidatorBuilder, RpcAddOns,
 };
 use reth_node_ethereum::{
     EthEngineTypes, EthereumAddOns, EthereumConsensusBuilder, EthereumEngineValidatorBuilder,
@@ -133,11 +134,7 @@ where
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         EthereumNode::components()
-            .executor(ArkivExecutorBuilder::new(
-                self.store.clone(),
-                self.seals.clone(),
-                self.op_cost,
-            ))
+            .executor(ArkivExecutorBuilder::new(self.store.clone(), self.op_cost))
             .payload(ArkivPayloadServiceBuilder::new(
                 self.store.clone(),
                 self.seals.clone(),
@@ -176,12 +173,14 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArkivNode {
     }
 }
 
-/// Builds the engine validator with Arkiv's state-root strategy installed.
+/// Builds the engine validator on an executor config that seals, with Arkiv's
+/// state-root strategy installed.
 ///
-/// `with_state_root_strategy` is a method on the built validator rather than
-/// something the add-ons expose, so the only way to reach it is to wrap the
-/// stock builder and call it on the way out. reth's
-/// `examples/custom-state-root` does the same.
+/// reth's `BasicEngineValidatorBuilder` hands the validator the node's own
+/// executor config, which seals nothing, and takes no other. So this builds
+/// the validator as that builder does, except for its pool prewarming.
+/// `with_state_root_strategy` is a method on the built validator, as in reth's
+/// `examples/custom-state-root`.
 ///
 /// It lives here, beside [`ArkivNode`], because the bounds only resolve against
 /// a concrete node type: `BasicEngineValidator`'s payload validator has to be
@@ -189,18 +188,13 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ArkivNode {
 /// supplies and a structural bound does not.
 #[derive(Clone)]
 pub struct ArkivEngineValidatorBuilder {
-    inner: BasicEngineValidatorBuilder<ArkivPayloadValidatorBuilder>,
     store: HostStore,
     seals: Arc<BlockSeals>,
 }
 
 impl ArkivEngineValidatorBuilder {
-    pub fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
-        Self {
-            inner: BasicEngineValidatorBuilder::new(ArkivPayloadValidatorBuilder),
-            store,
-            seals,
-        }
+    pub const fn new(store: HostStore, seals: Arc<BlockSeals>) -> Self {
+        Self { store, seals }
     }
 }
 
@@ -213,7 +207,7 @@ impl std::fmt::Debug for ArkivEngineValidatorBuilder {
 
 impl<N> EngineValidatorBuilder<N> for ArkivEngineValidatorBuilder
 where
-    N: FullNodeComponents<Types = ArkivNode, Evm: ConfigureEngineEvm<ExecutionData>>,
+    N: FullNodeComponents<Types = ArkivNode, Evm: ConfigureEngineEvm<ExecutionData> + WithSeals>,
 {
     type EngineValidator = ArkivEngineValidator<
         BasicEngineValidator<
@@ -229,10 +223,29 @@ where
         tree_config: TreeConfig,
         overlay_manager: OverlayManager<EthPrimitives>,
     ) -> eyre::Result<Self::EngineValidator> {
-        let validator = self
-            .inner
-            .build_tree_validator(ctx, tree_config, overlay_manager)
-            .await?;
+        // Not installed: reth's pool prewarmer reads reth's own database, which
+        // this node does not write, so it would warm nothing.
+        if tree_config.txpool_prewarming() {
+            warn!(target: "arkiv-reth", "--engine.txpool-prewarming is ignored: it has no effect on this node");
+        }
+        let payload_validator = ArkivPayloadValidatorBuilder.build(ctx).await?;
+        let data_dir = ctx
+            .config
+            .datadir
+            .clone()
+            .resolve_datadir(ctx.config.chain.chain());
+        let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
+        let validator = BasicEngineValidator::new(
+            ctx.node.provider().clone(),
+            Arc::new(ctx.node.consensus().clone()),
+            // A validated block's root is looked up from its seal.
+            ctx.node.evm_config().clone().with_seals(self.seals.clone()),
+            payload_validator,
+            tree_config,
+            invalid_block_hook,
+            overlay_manager,
+            ctx.node.task_executor().clone(),
+        );
         let strategy: Arc<dyn StateRootStrategy<EthPrimitives, N::Provider, N::Evm>> =
             Arc::new(ArkivStateRootStrategy::new(self.seals.clone()));
         Ok(ArkivEngineValidator {
