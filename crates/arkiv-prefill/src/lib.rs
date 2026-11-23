@@ -81,11 +81,13 @@ use alloy_primitives::{B256, Keccak256};
 use eyre::{Result, WrapErr, ensure};
 use serde::Deserialize;
 
+mod finalize;
 mod reader;
 mod run;
 #[cfg(test)]
 mod testkit;
 mod writer;
+pub use finalize::{Finalized, finalize, set_prefilled_root};
 pub use reader::{Entities, MAX_LINE_BYTES};
 pub use run::{Prefill, Ran, run};
 pub use writer::{Written, write_archive};
