@@ -23,12 +23,20 @@ use arkiv_harness::{
     ARKIV_ADDRESS, ArkivClient, DEV_CHAIN_ID, DEV_KEY_0, DEV_KEY_1, EntityCreationNonce,
     NodeBuilder, connect, derive_entity_address, hex_quantity, result_keys,
 };
-use arkiv_interfaces::constants::MAX_STR_BYTES;
+use arkiv_interfaces::constants::{MAX_STR_BYTES, rpc_error_codes};
 
 /// How long to wait for a freshly-spawned node's RPC to answer (debug reth is slow).
 const READY: Duration = Duration::from_secs(90);
 
+/// An entity lifetime, in blocks, short enough to expire and be purged within a test.
+const SHORT_LIFETIME: u64 = 8;
+
+/// How many blocks late a purge may come: the producer skips a block's purge
+/// while its pruning map is behind.
+const PURGE_SLACK: u64 = 32;
+
 /// Spawn an `arkiv-reth --dev` and a signing client for `key`, ready to drive.
+/// The store is GolemDB, unless the run sets `ARKIV_EXPERIMENTAL_STORE=memory`.
 async fn spawn_dev(
     key: &str,
 ) -> (
@@ -36,7 +44,7 @@ async fn spawn_dev(
     ArkivClient<impl Provider + Clone>,
     Address,
 ) {
-    spawn_dev_on(NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")), key).await
+    spawn_dev_with(NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")), key).await
 }
 
 /// [`spawn_dev`] on the in-process store, for a test GolemDB can't pass yet.
@@ -49,10 +57,11 @@ async fn spawn_dev_in_memory(
     Address,
 ) {
     let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).memory_store();
-    spawn_dev_on(builder, key).await
+    spawn_dev_with(builder, key).await
 }
 
-async fn spawn_dev_on(
+/// [`spawn_dev`] from a custom `builder`.
+async fn spawn_dev_with(
     builder: NodeBuilder,
     key: &str,
 ) -> (
@@ -79,18 +88,15 @@ async fn spawn_dev_mining_on_demand(
     Address,
 ) {
     let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth")).mine_on_transaction();
-    spawn_dev_on(builder, key).await
+    spawn_dev_with(builder, key).await
 }
 
 /// Mine one block on such a node, with a transfer, and return its number.
 async fn mine_block(client: &ArkivClient<impl Provider>) -> u64 {
+    // The client fills in gas, fees and nonce.
     let transfer = TransactionRequest::default()
         .with_to(Address::repeat_byte(0xee))
-        .with_value(U256::from(1))
-        .with_gas_limit(21_000)
-        .with_max_fee_per_gas(3_000_000_000)
-        .with_max_priority_fee_per_gas(1_000_000_000)
-        .with_chain_id(DEV_CHAIN_ID);
+        .with_value(U256::from(1));
     client
         .provider()
         .send_transaction(transfer)
@@ -146,13 +152,21 @@ async fn records_left(client: &ArkivClient<impl Provider>, keys: &[B256]) -> usi
 
 /// Mine blocks one at a time until the purge of one names any of `keys`, and
 /// return its number and how many of `keys` it names. Until then every record
-/// is still there.
-async fn mine_to_first_purge(client: &ArkivClient<impl Provider>, keys: &[B256]) -> (u64, usize) {
-    for _ in 0..40 {
+/// is still there. The purge comes at `expires_at` or up to [`PURGE_SLACK`] blocks later.
+async fn mine_to_first_purge(
+    client: &ArkivClient<impl Provider>,
+    keys: &[B256],
+    expires_at: u64,
+) -> (u64, usize) {
+    loop {
         let block = mine_block(client).await;
         let purged = purged_in_block(client, block).await;
         let named = keys.iter().filter(|key| purged.contains(key)).count();
         if named > 0 {
+            assert!(
+                block >= expires_at,
+                "purged in block {block}, before the expiry block {expires_at}"
+            );
             return (block, named);
         }
         assert_eq!(
@@ -160,8 +174,11 @@ async fn mine_to_first_purge(client: &ArkivClient<impl Provider>, keys: &[B256])
             keys.len(),
             "a record is gone after block {block}, whose purge names none of them"
         );
+        assert!(
+            block < expires_at + PURGE_SLACK,
+            "no purge named the entities by block {block}, expiry block {expires_at}"
+        );
     }
-    panic!("no purge named the entities within 40 blocks");
 }
 
 /// A create carrying `payload` under `text/plain`, with a purely relative
@@ -1043,7 +1060,7 @@ async fn cursors_page_through_the_matches_over_a_live_node() {
     let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
         .golemdb_store()
         .mine_on_transaction();
-    let (_node, client, caller) = spawn_dev_on(builder, DEV_KEY_0).await;
+    let (_node, client, caller) = spawn_dev_with(builder, DEV_KEY_0).await;
     let k = create_ranked_entities(&client, caller).await;
     let keys = |idxs: &[usize]| -> Vec<String> { idxs.iter().map(|i| k[*i].clone()).collect() };
 
@@ -1062,7 +1079,7 @@ async fn cursors_page_through_the_matches_over_a_live_node() {
         if page["cursor"].is_null() {
             break;
         }
-        assert!(pages < 5, "pagination did not terminate");
+        assert!(pages < k.len(), "pagination did not terminate");
         page = next_page(&client, "*", two.clone(), &page).await;
         pages += 1;
     }
@@ -1127,14 +1144,17 @@ async fn cursors_page_through_the_matches_over_a_live_node() {
     at_its_block["atBlock"] = first["blockNumber"].clone();
     let mut at_the_tip = two;
     at_the_tip["cursor"] = first["cursor"].clone();
-    for (options, code) in [(at_its_block, "-32006"), (at_the_tip, "-32005")] {
+    for (options, code) in [
+        (at_its_block, rpc_error_codes::BLOCK_UNAVAILABLE),
+        (at_the_tip, rpc_error_codes::CURSOR_ERROR),
+    ] {
         let refused = client
             .query_raw("*", options.clone())
             .await
             .expect_err("a cursor from a block that is gone")
             .to_string();
         assert!(
-            refused.contains(code),
+            refused.contains(&code.to_string()),
             "{options} should be {code}, got: {refused}"
         );
     }
@@ -1267,13 +1287,13 @@ async fn historical_reads_and_block_timing_over_a_live_node() {
     };
     let key = entity_key(0);
     let ks = format!("{key:#x}");
-    // Lives 8 blocks, so it expires and is purged while the test runs.
+    // Lives `SHORT_LIFETIME` blocks, so it expires and is purged during the test.
     let brief = entity_key(1);
 
     client
         .execute(vec![
             create_op(1000, Bytes::from_static(b"v1"), attrs(10, "red")),
-            create_op(8, Bytes::from_static(b"brief"), vec![]),
+            create_op(SHORT_LIFETIME, Bytes::from_static(b"brief"), vec![]),
         ])
         .await;
     let created = hex_quantity(&client.get_entity(key).await["createdAt"]);
@@ -1473,7 +1493,11 @@ async fn lapsed_btl_hides_an_entity_from_reads() {
 async fn expired_entity_is_physically_purged() {
     let (_node, client, caller) = spawn_dev_mining_on_demand(DEV_KEY_0).await;
     client
-        .execute(vec![create_op(8, Bytes::from_static(b"purge-me"), vec![])])
+        .execute(vec![create_op(
+            SHORT_LIFETIME,
+            Bytes::from_static(b"purge-me"),
+            vec![],
+        )])
         .await;
     let key = B256::from(derive_entity_address(
         DEV_CHAIN_ID,
@@ -1513,11 +1537,7 @@ async fn expired_entity_is_physically_purged() {
     );
 
     // The record is there after every block until a purge names it.
-    let (purged_at, _) = mine_to_first_purge(&client, &[key]).await;
-    assert!(
-        purged_at >= expires_at,
-        "purged in block {purged_at}, before its expiry block {expires_at}"
-    );
+    mine_to_first_purge(&client, &[key], expires_at).await;
     assert!(
         client.get_entity(key).await.is_null(),
         "expired entity is logically absent"
@@ -1536,7 +1556,7 @@ async fn purge_respects_max_keys_per_block() {
     client
         .execute(
             (0..entity_count)
-                .map(|_| create_op(8, Bytes::new(), vec![]))
+                .map(|_| create_op(SHORT_LIFETIME, Bytes::new(), vec![]))
                 .collect(),
         )
         .await;
@@ -1550,8 +1570,9 @@ async fn purge_respects_max_keys_per_block() {
             ))
         })
         .collect();
+    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
 
-    let (_, named) = mine_to_first_purge(&client, &keys).await;
+    let (_, named) = mine_to_first_purge(&client, &keys, expires_at).await;
     assert_eq!(named, MAX_PURGE_KEYS, "the first purge names a full block");
     assert_eq!(
         records_left(&client, &keys).await,
@@ -1583,7 +1604,7 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
 
     // Bare creates: the patches below use the whole attribute budget.
     let mut ops: Vec<_> = (0..6)
-        .map(|_| Operation::create(0, 0, 8, 0, vec![]))
+        .map(|_| Operation::create(0, 0, SHORT_LIFETIME, 0, vec![]))
         .collect();
     // Each patch grows the stored entity to the per-operation maximum. Six
     // purges would cost 1.02m gas, so only five fit in the 1m transaction.
@@ -1611,8 +1632,9 @@ async fn purge_respects_strict_gas_limit_after_attribute_patches() {
             ENTITY_MAX_ATTRIBUTES
         );
     }
+    let expires_at = hex_quantity(&client.get_entity(keys[0]).await["expiresAt"]);
 
-    let (_, named) = mine_to_first_purge(&client, &keys).await;
+    let (_, named) = mine_to_first_purge(&client, &keys, expires_at).await;
     assert_eq!(named, 5, "the first purge names the five that fit");
     assert_eq!(
         records_left(&client, &keys).await,
@@ -2717,22 +2739,13 @@ async fn spawn_on(
     &'static str,
 ) {
     let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"));
-    let builder = if golemdb {
-        builder.golemdb_store()
+    let (builder, store) = if golemdb {
+        (builder.golemdb_store(), "GolemDB")
     } else {
-        builder.memory_store()
+        (builder.memory_store(), "memory")
     };
-    let mut node = builder.spawn();
-    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
-    let caller = signer.address();
-    let client = connect(&node.http_url(), signer);
-    node.wait_ready(&client, READY).await;
-    (
-        node,
-        client,
-        caller,
-        if golemdb { "GolemDB" } else { "memory" },
-    )
+    let (node, client, caller) = spawn_dev_with(builder, DEV_KEY_0).await;
+    (node, client, caller, store)
 }
 
 /// The key `caller`'s next create mints, from its minting nonce, and the nonce.
