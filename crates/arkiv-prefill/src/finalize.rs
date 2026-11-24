@@ -63,8 +63,15 @@ pub fn finalize(
         StoreState::GolemDbInitialized => {
             bail!("the store is empty: run the prefill before finalizing")
         }
-        StoreState::ArkivInitialized | StoreState::ArkivPrefilledOtherBlockZero => {
-            bail!("the store's prefill is already finalized")
+        StoreState::ArkivInitialized => bail!("the store's prefill is already finalized"),
+        StoreState::ArkivPrefilledOtherBlockZero => {
+            // Name the root, so a run that died before writing it into the
+            // genesis file can still be finished without prefilling again.
+            let (root, block_zero) = finalized_block_zero(store)?;
+            bail!(
+                "the store's prefill is already finalized: block 0's root is {root}, its hash \
+                 {block_zero}"
+            )
         }
         StoreState::ArkivPrefillInconsistent { done, total, head } => bail!(
             "the store's prefill record does not fit its commits: it counts {done} of {total} \
@@ -87,6 +94,23 @@ pub fn finalize(
             Err(error)
         }
     }
+}
+
+/// A finalized store's block 0: its root and the hash it is tagged with. It is
+/// the commit after the last archive, `total + 2`.
+fn finalized_block_zero(store: &HostStore) -> Result<(B256, B256)> {
+    let counters = prefill::read(&**store, ReadTarget::Commit(store.head()))
+        .map_err(|e| eyre!("read the prefill record: {e:?}"))?
+        .ok_or_else(|| eyre!("the store has no prefill record"))?;
+    let commit = CommitId(counters.total + 2);
+    let root = store
+        .commit_hash(commit)
+        .map_err(|e| eyre!("read block 0's root: {e:?}"))?;
+    let tag = store
+        .tag_of(commit)
+        .map_err(|e| eyre!("read block 0's tag: {e:?}"))?
+        .ok_or_else(|| eyre!("commit {} has no block 0 tag", commit.0))?;
+    Ok((B256::from(root), B256::from(tag)))
 }
 
 fn seal_and_commit(
@@ -303,11 +327,18 @@ mod tests {
         );
 
         let (_dir, done) = prefilled(2, 2);
-        finalize(&done, GENESIS, None, block_zero).unwrap();
+        let finalized = finalize(&done, GENESIS, None, block_zero).unwrap();
         let error = finalize(&done, GENESIS, None, block_zero)
             .unwrap_err()
             .to_string();
-        assert_eq!(error, "the store's prefill is already finalized");
+        // The root is named, for a run that died before writing it out.
+        assert_eq!(
+            error,
+            format!(
+                "the store's prefill is already finalized: block 0's root is {}, its hash {}",
+                finalized.root, finalized.block_zero
+            )
+        );
 
         let error = finalize(&store(), GENESIS, None, block_zero)
             .unwrap_err()
