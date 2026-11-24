@@ -15,7 +15,11 @@
 //! - the genesis file still hashes to the recorded `$prefillGenesisHash`;
 //! - the number of archives is still the recorded `$prefillTotal`;
 //! - the last committed archive's tag is still the hash of the archive in that
-//!   place of the list, which catches a reordered or edited list.
+//!   place of the list. That catches a list reordered or edited at that place,
+//!   not before it: checking every earlier archive would read them all again.
+//!   An earlier archive moved later is still refused, by its keys already
+//!   existing; an earlier one edited in place goes unnoticed here, and shows
+//!   up as a root an audit run does not reproduce.
 //!
 //! The archive set and the genesis file are fixed by the first commit. Any
 //! change means starting again in an empty directory.
