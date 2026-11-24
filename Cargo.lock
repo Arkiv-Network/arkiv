@@ -1666,6 +1666,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
+ "arkiv-golemdb",
  "arkiv-interfaces",
  "arkiv-reth-statemanager",
  "eyre",
