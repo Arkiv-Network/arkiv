@@ -28,8 +28,10 @@
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, Bytes, StorageKey, StorageValue};
-use arkiv_interfaces::store::{SegmentAddress, SegmentOrdinal, SegmentRow, Store as _};
-use arkiv_reth_statemanager::{GolemAccounts, HostStore, StoredAccount, segments};
+use arkiv_interfaces::store::{SegmentAddress, SegmentOrdinal, SegmentRow, Store as _, StoreError};
+use arkiv_reth_statemanager::{
+    AccountReadError, GolemAccounts, HostStore, StoredAccount, segments,
+};
 use reth_primitives_traits::{Account, Bytecode};
 use reth_provider::{AccountReader, BlockHashReader};
 use reth_revm::db::BundleState;
@@ -53,6 +55,9 @@ use std::sync::{Arc, OnceLock};
 pub struct ArkivStateProvider {
     store: HostStore,
     accounts: GolemAccounts<HostStore>,
+    /// Whether this is the latest state, not one block's. See
+    /// [`following_head`](Self::following_head).
+    follows_head: bool,
     /// The block number of the `blocks` segment's first row, shared with the
     /// provider that built this so the lookup is resolved once per process.
     blocks_base: Arc<OnceLock<BlockNumber>>,
@@ -71,7 +76,29 @@ impl ArkivStateProvider {
         Self {
             store,
             accounts,
+            follows_head: false,
             blocks_base,
+        }
+    }
+
+    /// Mark this as the latest state, not one block's.
+    ///
+    /// GolemDB can read only its newest commit. When a block is committed
+    /// before an account read, the read fails. For the latest state it then
+    /// runs once more, at the new commit. For one block's state it stays failed.
+    pub const fn following_head(mut self) -> Self {
+        self.follows_head = true;
+        self
+    }
+
+    /// The account at `address`, read a second time as
+    /// [`following_head`](Self::following_head) describes.
+    fn stored_account(&self, address: Address) -> Result<Option<StoredAccount>, AccountReadError> {
+        match self.accounts.account(address) {
+            Err(AccountReadError::Store(StoreError::HandleInvalid)) if self.follows_head => {
+                GolemAccounts::new(self.store.clone(), self.store.head()).account(address)
+            }
+            read => read,
         }
     }
 
@@ -98,7 +125,7 @@ fn read_error(error: impl core::fmt::Display) -> ProviderError {
 
 impl AccountReader for ArkivStateProvider {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        Ok(self.accounts.account(*address).map_err(read_error)?.map(
+        Ok(self.stored_account(*address).map_err(read_error)?.map(
             |StoredAccount { balance, nonce }| Account {
                 nonce,
                 balance,
@@ -330,4 +357,85 @@ fn decode_row(row: &SegmentRow) -> ProviderResult<Header> {
                 "golemdb blocks row is malformed: {e}"
             )))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use arkiv_interfaces::constants::{
+        MAX_ATTRIBUTE_NAME_BYTES, MAX_BYTES_VALUE_LEN, MAX_STR_BYTES,
+    };
+    use arkiv_interfaces::entity_records::{MAX_RECORD_CELLS, MAX_RECORD_INDEXED_CELLS};
+    use arkiv_interfaces::store::CommitId;
+    use arkiv_reth_statemanager::{GenesisAccount, seed_genesis};
+
+    const ALICE: Address = Address::repeat_byte(0xaa);
+
+    /// A GolemDB store with Alice holding `balance`, and the commit it is at.
+    fn store_with_alice(balance: u64) -> (HostStore, CommitId) {
+        let limit = |bytes: usize| u32::try_from(bytes).unwrap();
+        let config = arkiv_golemdb::GolemDbConfig {
+            host_schemas: vec![],
+            genesis: arkiv_golemdb::Genesis::new(
+                arkiv_golemdb::HashAlgorithm::Keccak256,
+                arkiv_golemdb::CellLimits {
+                    max_cell_name_len: limit(MAX_ATTRIBUTE_NAME_BYTES),
+                    max_str_len: limit(MAX_STR_BYTES),
+                    max_bytes_len: limit(MAX_BYTES_VALUE_LEN),
+                },
+                arkiv_golemdb::RecordLimits {
+                    max_cells: MAX_RECORD_CELLS as u64,
+                    max_indexed_cells: MAX_RECORD_INDEXED_CELLS as u64,
+                },
+                None,
+                arkiv_golemdb::PricingConfig::zero(),
+            ),
+            segments: vec![],
+        };
+        let store: HostStore = Arc::new(arkiv_golemdb::GolemDbStore::open_memory(&config).unwrap());
+        let alice = GenesisAccount {
+            address: ALICE,
+            balance: U256::from(balance),
+            nonce: 0,
+        };
+        let commit = seed_genesis(&store, [7; 32], [alice]).unwrap().unwrap();
+        (store, commit)
+    }
+
+    /// Commit one more block.
+    fn commit_block(store: &HostStore) {
+        let branch = store.begin(None).unwrap();
+        store.commit(branch).unwrap();
+    }
+
+    fn state_at(store: &HostStore, commit: CommitId) -> ArkivStateProvider {
+        let accounts = GolemAccounts::new(store.clone(), commit);
+        ArkivStateProvider::new(store.clone(), accounts, Arc::default())
+    }
+
+    fn balance(state: &ArkivStateProvider) -> ProviderResult<U256> {
+        Ok(state.basic_account(&ALICE)?.expect("Alice exists").balance)
+    }
+
+    #[test]
+    fn the_latest_state_reads_at_the_new_head_when_a_block_lands_first() {
+        let (store, tip) = store_with_alice(5);
+        let latest = state_at(&store, tip).following_head();
+        assert_eq!(balance(&latest).unwrap(), U256::from(5));
+
+        commit_block(&store);
+        assert_eq!(balance(&latest).unwrap(), U256::from(5));
+    }
+
+    #[test]
+    fn one_blocks_state_is_refused_when_a_block_lands_first() {
+        let (store, commit) = store_with_alice(5);
+        let block = state_at(&store, commit);
+        assert_eq!(balance(&block).unwrap(), U256::from(5));
+
+        commit_block(&store);
+        let error = balance(&block).unwrap_err().to_string();
+        assert!(error.contains("HandleInvalid"), "{error}");
+    }
 }

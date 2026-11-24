@@ -1035,14 +1035,24 @@ impl<N: ProviderNodeTypes> ChainSpecProvider for ArkivProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> ArkivProvider<N> {
-    /// Wrap one of reth's state providers so its accounts come from the store
-    /// at `commit`.
-    fn with_accounts(&self, commit: CommitId) -> ProviderResult<StateProviderBox> {
-        Ok(Box::new(ArkivStateProvider::new(
+    /// A state provider whose accounts come from the store at `commit`.
+    fn state_provider(&self, commit: CommitId) -> ArkivStateProvider {
+        ArkivStateProvider::new(
             self.store.clone(),
             GolemAccounts::new(self.store.clone(), commit),
             Arc::clone(&self.blocks_base),
-        )))
+        )
+    }
+
+    /// One block's state: accounts as the store held them at `commit`.
+    fn with_accounts(&self, commit: CommitId) -> ProviderResult<StateProviderBox> {
+        Ok(Box::new(self.state_provider(commit)))
+    }
+
+    /// The latest state, which is at `commit` now. If a block is committed
+    /// before an account read, the read moves to the new commit.
+    fn latest_state(&self, commit: CommitId) -> ProviderResult<StateProviderBox> {
+        Ok(Box::new(self.state_provider(commit).following_head()))
     }
 
     /// A state view at `commit`, which [`commit_of`](Self::commit_of) has
@@ -1663,7 +1673,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     type Primitives = N::Primitives;
 
     fn latest(&self) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.tip_commit()?)
+        self.latest_state(self.tip_commit()?)
     }
 
     fn state_with_block_appended(
@@ -1675,21 +1685,20 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
         // state is still head -- and its own account writes were already
         // shadowed by that, back when reth's view was layered underneath.
         let _ = (parent_hash, block);
-        self.with_accounts(self.store.head())
+        self.latest_state(self.store.head())
     }
 
     fn state_by_block_number_or_tag(
         &self,
         number_or_tag: BlockNumberOrTag,
     ) -> ProviderResult<StateProviderBox> {
-        let commit = match number_or_tag {
-            BlockNumberOrTag::Number(number) => self.commit_of_number(number)?,
+        match number_or_tag {
+            BlockNumberOrTag::Number(number) => self.with_accounts(self.commit_of_number(number)?),
             // Every other tag resolves to a block the node considers current.
             // Arkiv commits only blocks it will not reorg, so latest, safe and
             // finalized are all reth's head, once committed.
-            _ => self.tip_commit()?,
-        };
-        self.with_accounts(commit)
+            _ => self.latest_state(self.tip_commit()?),
+        }
     }
 
     fn history_by_block_number(
@@ -1710,16 +1719,16 @@ impl<N: ProviderNodeTypes> StateProviderFactory for ArkivProvider<N> {
     }
 
     fn pending(&self) -> ProviderResult<StateProviderBox> {
-        self.with_accounts(self.tip_commit()?)
+        self.latest_state(self.tip_commit()?)
     }
 
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
         let _ = block_hash;
-        self.with_accounts(self.tip_commit()?).map(Some)
+        self.latest_state(self.tip_commit()?).map(Some)
     }
 
     fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
-        self.with_accounts(self.tip_commit()?).map(Some)
+        self.latest_state(self.tip_commit()?).map(Some)
     }
 }
 
