@@ -9,20 +9,29 @@ pub(crate) const CHAIN: u64 = 7_738_577;
 pub(crate) const ALICE: &str = "0x1111111111111111111111111111111111111111";
 pub(crate) const BOB: &str = "0x2222222222222222222222222222222222222222";
 
-/// GolemDB as the node opens it on the example genesis: its prices, and
-/// Arkiv's host weights.
-pub(crate) fn store() -> HostStore {
+/// GolemDB's config as the node opens it on the example genesis: its prices,
+/// and Arkiv's host weights.
+fn config() -> arkiv_golemdb::GolemDbConfig {
     let spec = arkiv_reth_chainspec::ArkivChainSpec::from_genesis(
         serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap(),
     )
     .unwrap();
-    let store = arkiv_golemdb::GolemDbStore::open_memory(&arkiv_golemdb::GolemDbConfig {
+    arkiv_golemdb::GolemDbConfig {
         genesis: spec.golemdb().unwrap().clone(),
         host_schemas: vec![arkiv_reth_chainspec::host_metering_schema()],
         segments: vec![],
-    })
-    .unwrap();
-    Arc::new(store)
+    }
+}
+
+/// That GolemDB, in memory.
+pub(crate) fn store() -> HostStore {
+    Arc::new(arkiv_golemdb::GolemDbStore::open_memory(&config()).unwrap())
+}
+
+/// That GolemDB, on disk in `directory`: opening it again finds what was
+/// committed before.
+pub(crate) fn store_at(directory: &std::path::Path) -> HostStore {
+    Arc::new(arkiv_golemdb::GolemDbStore::open(directory, &config(), None).unwrap())
 }
 
 /// One line: an entity `key` (a byte, repeated) created by `creator`, owned

@@ -129,15 +129,18 @@ fn start(store: &HostStore, prefill: &Prefill, total: u64) -> Result<()> {
         .and_then(|()| {
             prefill::start(&**store, branch, total, prefill.genesis_hash)
                 .map_err(|e| eyre!("write the prefill record: {e:?}"))
+        })
+        .and_then(|()| {
+            store
+                .commit(branch)
+                .map(|_| ())
+                .map_err(|e| eyre!("commit the alloc commit: {e:?}"))
         });
-    if let Err(error) = written {
+    if written.is_err() {
+        // A failed commit included: leave nothing staged behind.
         let _ = store.discard(branch);
-        return Err(error);
     }
-    store
-        .commit(branch)
-        .map_err(|e| eyre!("commit the alloc commit: {e:?}"))?;
-    Ok(())
+    written
 }
 
 /// That the store's prefill, with `done` archives in, is still this one: the
@@ -185,7 +188,7 @@ fn check(store: &HostStore, prefill: &Prefill, done: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{ALICE, CHAIN, line, store};
+    use crate::testkit::{ALICE, CHAIN, line, store, store_at};
     use alloy_primitives::U256;
     use std::path::{Path, PathBuf};
 
@@ -295,6 +298,32 @@ mod tests {
             assert_eq!(places, (stop..3).collect::<Vec<_>>(), "each archive once");
             assert_eq!(root(&store), clean, "stopped before A{stop}");
         }
+    }
+
+    /// A run stopped partway, on a store on disk that is then closed and opened
+    /// again, as after a crash, resumes from what was saved and ends at the
+    /// clean root.
+    #[test]
+    fn a_resumed_run_survives_reopening_the_store() {
+        let clean = clean_root();
+        let dir = tempfile::tempdir().unwrap();
+        let archives = archives(dir.path());
+        let alloc = alice();
+        let db = tempfile::tempdir().unwrap();
+        let (aside, part) = break_archive(dir.path(), 1);
+        {
+            let store = store_at(db.path());
+            assert!(run(&store, &plan(&alloc, &archives), |_, _| {}).is_err());
+        }
+        std::fs::rename(aside, part).unwrap();
+        let store = store_at(db.path());
+        assert_eq!(
+            classify(&store, NO_BLOCK_ZERO).unwrap(),
+            StoreState::ArkivPrefilling { done: 1, total: 3 }
+        );
+        let ran = run(&store, &plan(&alloc, &archives), |_, _| {}).unwrap();
+        assert_eq!((ran.resumed_from, ran.written.len()), (1, 2));
+        assert_eq!(root(&store), clean);
     }
 
     /// A prefill stopped after two archives, ready to resume.
