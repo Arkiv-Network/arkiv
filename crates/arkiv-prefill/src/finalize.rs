@@ -153,7 +153,7 @@ pub fn set_prefilled_root(genesis: &str, root: B256) -> Result<String> {
     let field = "prefilledBlockZeroStateRoot";
     if let Some(existing) = arkiv.get(field) {
         ensure!(
-            existing.as_str() == Some(root.to_string().as_str()),
+            existing.as_str().and_then(|s| s.parse::<B256>().ok()) == Some(root),
             "the genesis file's {field} is already {existing}, not {root}"
         );
     }
@@ -362,6 +362,13 @@ mod tests {
 
         // Again with the same root is fine; another root is refused.
         assert_eq!(set_prefilled_root(&written, root).unwrap(), written);
+        // The same root in capitals is the same root.
+        let upper = written.replace(
+            &root.to_string()[2..],
+            &root.to_string()[2..].to_uppercase(),
+        );
+        assert_ne!(upper, written);
+        assert_eq!(set_prefilled_root(&upper, root).unwrap(), written);
         let error = set_prefilled_root(&written, B256::repeat_byte(1))
             .unwrap_err()
             .to_string();
