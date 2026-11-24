@@ -328,7 +328,6 @@ fn main() {
             .clone()
     };
     let seals = Arc::new(BlockSeals::new());
-    let factory_seals = seals.clone();
     let factory_open = open.clone();
     // `run_with_components` rather than `run`: the latter is bound to reth's
     // `ChainSpec`. The components closure gives the non-`node` subcommands
@@ -343,7 +342,7 @@ fn main() {
             (
                 EthEvmConfig::new_with_evm_factory(
                     spec.clone(),
-                    ArkivEvmFactory::new(factory_open(&spec), factory_seals.clone(), op_cost),
+                    ArkivEvmFactory::new(factory_open(&spec), op_cost),
                 ),
                 Arc::new(EthBeaconConsensus::new(spec)),
             )

@@ -14,7 +14,7 @@ use arkiv_bindings::{
     IEntityRegistry, MAX_PURGE_KEYS, PURGE_CALLER, PURGE_GAS_LIMIT, protocol::purgeExpiredCall,
 };
 use arkiv_interfaces::store::Store;
-use arkiv_reth_executor::ARKIV_ADDRESS;
+use arkiv_reth_executor::{ARKIV_ADDRESS, WithSeals};
 use arkiv_reth_rpc::store_reads;
 use arkiv_reth_statemanager::{
     BlockSeals, ExecutionKey, HostStore, SegmentWrite, segments::rows_for_block,
@@ -128,6 +128,7 @@ where
         + 'static,
     Pool: TransactionPool<Transaction = EthPooledTransaction> + Unpin + 'static,
     Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>
+        + WithSeals
         + Send
         + 'static,
 {
@@ -149,7 +150,8 @@ where
         let payload_builder = ArkivPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
-            evm,
+            // A built block's root is looked up from its seal.
+            evm: evm.with_seals(self.seals.clone()),
             chain_id: ctx.chain_spec().chain().id(),
             pruning_map: pruning_map.clone(),
             store: self.store.clone(),

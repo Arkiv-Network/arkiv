@@ -2276,6 +2276,69 @@ async fn idle_dev_chain_holds_the_genesis_base_fee() {
         .await;
 }
 
+/// What the node logs, at debug, each time it seals a block's state.
+const SEAL_LOGGED: &str = "Arkiv state seal finished";
+
+/// The log spans a seal belongs in: a payload build, the validation of a
+/// payload, and the validation of a downloaded block.
+const SEALING_SPANS: [&str; 3] = ["payload_build{", "payload_validation{", "block_validation{"];
+
+/// `eth_simulateV1` executes a whole block with fees charged, as a build does.
+/// Its state must not be sealed: a seal is what a real block's root is read from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_simulated_block_is_not_sealed() {
+    // Seals are logged at debug; without colour codes the lines can be matched.
+    let builder = NodeBuilder::new(env!("CARGO_BIN_EXE_arkiv-reth"))
+        .arg("--log.stdout.filter")
+        .arg("info,arkiv::timing=debug")
+        .arg("--color")
+        .arg("never");
+    let (node, client, caller) = spawn_dev_with(builder, DEV_KEY_0).await;
+    client.wait_for_block(1, READY).await;
+
+    // Tracing transfers runs the block on the EVM's other constructor.
+    for trace_transfers in [false, true] {
+        let simulated: serde_json::Value = client
+            .provider()
+            .raw_request(
+                "eth_simulateV1".into(),
+                (
+                    serde_json::json!({
+                        "blockStateCalls": [{
+                            "calls": [{ "from": caller, "to": Address::repeat_byte(0xde) }],
+                        }],
+                        "traceTransfers": trace_transfers,
+                    }),
+                    "latest",
+                ),
+            )
+            .await
+            .expect("eth_simulateV1");
+        assert_eq!(
+            simulated[0]["calls"][0]["status"], "0x1",
+            "the simulated transfer ran: {simulated}"
+        );
+    }
+
+    let log = std::fs::read_to_string(node.log_path()).expect("read the node log");
+    let seals: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(SEAL_LOGGED))
+        .collect();
+    assert!(
+        !seals.is_empty(),
+        "the log shows the seals of real blocks: {log}"
+    );
+    let stray: Vec<&str> = seals
+        .into_iter()
+        .filter(|line| !SEALING_SPANS.iter().any(|span| line.contains(span)))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "sealed outside a build or a validation: {stray:#?}"
+    );
+}
+
 /// The chain ID of [`genesis_json`].
 const FILE_CHAIN_ID: u64 = 424242;
 
