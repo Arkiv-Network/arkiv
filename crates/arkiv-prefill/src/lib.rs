@@ -82,8 +82,12 @@ use eyre::{Result, WrapErr, ensure};
 use serde::Deserialize;
 
 mod reader;
+mod run;
+#[cfg(test)]
+mod testkit;
 mod writer;
 pub use reader::{Entities, MAX_LINE_BYTES};
+pub use run::{Prefill, Ran, run};
 pub use writer::{Written, write_archive};
 
 #[derive(Deserialize)]

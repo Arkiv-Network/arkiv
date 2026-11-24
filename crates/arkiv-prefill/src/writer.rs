@@ -157,27 +157,8 @@ mod tests {
     };
     use arkiv_interfaces::store::{ReadTarget, Store};
     use arkiv_reth_statemanager::{GenesisAccount, HostStore, seed_genesis};
-    use std::sync::Arc;
 
-    const CHAIN: u64 = 7_738_577;
-    const ALICE: &str = "0x1111111111111111111111111111111111111111";
-    const BOB: &str = "0x2222222222222222222222222222222222222222";
-
-    /// GolemDB as the node opens it on the example genesis: its prices, and
-    /// Arkiv's host weights.
-    fn store() -> HostStore {
-        let spec = arkiv_reth_chainspec::ArkivChainSpec::from_genesis(
-            serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap(),
-        )
-        .unwrap();
-        let store = arkiv_golemdb::GolemDbStore::open_memory(&arkiv_golemdb::GolemDbConfig {
-            genesis: spec.golemdb().unwrap().clone(),
-            host_schemas: vec![arkiv_reth_chainspec::host_metering_schema()],
-            segments: vec![],
-        })
-        .unwrap();
-        Arc::new(store)
-    }
+    use crate::testkit::{ALICE, BOB, CHAIN, line, store};
 
     /// A store with a funded Alice, as the alloc commit leaves it, and a
     /// started prefill of `total` archives.
@@ -198,15 +179,6 @@ mod tests {
         prefill::start(&*store, branch, total, [0x4f; 32]).unwrap();
         store.commit(branch).unwrap();
         store
-    }
-
-    /// One line: an entity `key` (a byte, repeated) created by `creator`,
-    /// owned by `owner`, expiring at `expires_at`, with `extra` fields.
-    fn line(key: u8, creator: &str, owner: &str, expires_at: u64, extra: &str) -> String {
-        format!(
-            r#"{{"$key":"0x{}","$creator":"{creator}","$owner":"{owner}","$expiresAt":{expires_at}{extra}}}"#,
-            format!("{key:02x}").repeat(32)
-        )
     }
 
     /// An archive of one part holding `lines`.

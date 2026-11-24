@@ -22,10 +22,11 @@ base64 = "0.22"
 arkiv-reth-executor.workspace = true
 arkiv-golemdb-state.workspace = true
 arkiv-tokenomics.workspace = true
+# The store's state, its alloc commit, and the store handle the node uses.
+arkiv-reth-statemanager.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 # The writer's tests run on real GolemDB, opened with the example genesis.
 arkiv-golemdb.workspace = true
 arkiv-reth-chainspec.workspace = true
-arkiv-reth-statemanager.workspace = true
