@@ -82,7 +82,9 @@ use eyre::{Result, WrapErr, ensure};
 use serde::Deserialize;
 
 mod reader;
-pub use reader::Entities;
+mod writer;
+pub use reader::{Entities, MAX_LINE_BYTES};
+pub use writer::{Written, write_archive};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

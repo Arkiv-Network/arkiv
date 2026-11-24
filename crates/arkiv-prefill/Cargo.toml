@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Prefill an Arkiv chain: the archive format, its hash and its reader"
+description = "Prefill an Arkiv chain: the archive format, its hash, its reader and its writer"
 
 [dependencies]
 # `Op`, the entity types and the decoder's attribute count limit.
@@ -17,6 +17,15 @@ serde.workspace = true
 serde_json.workspace = true
 eyre.workspace = true
 base64 = "0.22"
+# The writer runs every entity through the executor, on the store's own view,
+# priced by the store's fee schedule.
+arkiv-reth-executor.workspace = true
+arkiv-golemdb-state.workspace = true
+arkiv-tokenomics.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The writer's tests run on real GolemDB, opened with the example genesis.
+arkiv-golemdb.workspace = true
+arkiv-reth-chainspec.workspace = true
+arkiv-reth-statemanager.workspace = true
