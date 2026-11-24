@@ -2,6 +2,7 @@
 
 mod filter;
 mod order;
+pub mod words;
 
 use alloc::boxed::Box;
 use alloc::string::String;

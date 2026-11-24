@@ -263,11 +263,13 @@ comparison  = attrRef , compOp , value ;
 compOp      = "=" | "!=" | "<" | "<=" | ">" | ">=" ;
 rangeTest   = attrRef , BETWEEN , value , AND , value ;   (* inclusive *)
 prefixTest  = attrRef , STARTSWITH , strLit ;
-existsTest  = EXISTS , "(" , name , ")" ;
-typeTest    = TYPEOF , "(" , name , ")" , "=" , typeTag ;
+existsTest  = EXISTS , "(" , userName , ")" ;
+typeTest    = TYPEOF , "(" , userName , ")" , "=" , typeTag ;
 
-attrRef     = name | sysName ;
+attrRef     = userName | sysName ;
+userName    = name | quotedName ;
 name        = letter , { letter | digit | "_" | "." | "-" } ;   (* <= 32 bytes *)
+quotedName  = '"' , name , '"' ;   (* the name is what stands between the quotes *)
 sysName     = "$" , name ;
 
 value       = taggedLit | boolLit | numLit ;   (* numLit: untagged number ⇒ i32 *)
@@ -280,12 +282,15 @@ orderBy     = ORDER , BY , attrRef , [ ":" , typeTag ] , [ ASC | DESC ] ;
 ```
 
 Precedence, tightest first: `NOT`, `AND`, `OR` (a `BETWEEN`'s own `AND` is part
-of the predicate). Reserved words:
-`AND OR NOT TRUE FALSE BETWEEN STARTSWITH EXISTS TYPEOF`. Type tags are recognized
+of the predicate). Keywords, case-insensitive:
+`AND OR NOT TRUE FALSE BETWEEN STARTSWITH EXISTS TYPEOF`. A bare keyword is
+always the keyword, so an attribute named like one is written quoted:
+`"and" = true`, `exists("typeof")`, `ORDER BY "not":str`. Type tags are recognized
 positionally (before `(`, as `TYPEOF`'s RHS and after an `ORDER BY`
-attribute's `:`), not globally reserved, and so are `ORDER BY ASC DESC`, which
-are words only where the clause stands: `desc` stays a valid attribute name. `bytes` has no literal,
-since it can never be indexed.
+attribute's `:`), and so are `ORDER BY ASC DESC`, which are words only where
+the clause stands: `str`, `key` and `desc` are valid attribute names, quoted or
+not (`str = str('x')`). No word is reserved. `bytes` has no literal, since it
+can never be indexed.
 
 ### Operator × type matrix
 
@@ -307,8 +312,11 @@ alike.
 
 - **Case-sensitive.** `Level` ≠ `level`.
 - `$` reserved for system attributes; `#` reserved for the structural key cell.
-- Reserved keywords (`AND OR NOT TRUE FALSE BETWEEN STARTSWITH EXISTS TYPEOF`) and type
-  tags (`i32 u64 u256 dec str addr key bytes32 bool`) are not allowed as names.
+- **No word is reserved.** Keywords and type tags are valid names, indexed or
+  not. In a query, a name spelled like a keyword
+  (`AND OR NOT TRUE FALSE BETWEEN STARTSWITH EXISTS TYPEOF`, in any case) is
+  written double-quoted, `"and"`; any other name may be quoted or not, to the
+  same effect. Quoting keeps the name's case: `"AND"` ≠ `"and"`.
 
 ### System attributes
 
