@@ -28,6 +28,8 @@ arkiv-reth-chainspec.workspace = true
 # The executor replacing reth's EVM component.
 arkiv-reth-executor.workspace = true
 arkiv-reth-statemanager.workspace = true
+# `arkiv-reth prefill`: the archives, the run and block 0.
+arkiv-prefill.workspace = true
 arkiv-reth-golemdbprovider.workspace = true
 # The engine-tree state-root seam and the add-ons the validator builder names.
 reth-engine-tree.workspace = true

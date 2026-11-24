@@ -19,6 +19,7 @@
 
 mod genesis;
 mod node;
+mod prefill;
 
 // jemalloc, as reth's own binary does it. reth fragments badly under the stock
 // system allocator on long syncs, and the allocator can only be chosen by the
@@ -294,6 +295,17 @@ fn main() {
     let _ = reth::args::DefaultLogArgs::default()
         .with_log_file_filter("debug,turso_core=info,turso=info".to_owned())
         .try_init();
+
+    // `arkiv-reth prefill …` is Arkiv's own command, which reth's fixed set of
+    // subcommands has no room for: it is picked out before reth parses.
+    let mut args = std::env::args_os();
+    if args.nth(1).as_deref() == Some(std::ffi::OsStr::new("prefill")) {
+        if let Err(err) = prefill::main(args) {
+            eprintln!("Error: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // The store opens on first use: after the command line is parsed and
     // tracing is up, and only for a command that runs Arkiv's state. So
