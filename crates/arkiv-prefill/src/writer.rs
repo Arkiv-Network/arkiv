@@ -65,8 +65,8 @@ pub fn write_archive<S: StoreExt + Clone>(
     let branch = store
         .begin(None)
         .map_err(|e| eyre!("open a branch for {}: {e:?}", archive.index().display()))?;
-    match stage(store, archive, chain_id, schedule, branch, origin) {
-        Ok((hash, entities)) => {
+    let written =
+        stage(store, archive, chain_id, schedule, branch, origin).and_then(|(hash, entities)| {
             let commit = store
                 .commit_tagged(branch, hash.0)
                 .map_err(|e| eyre!("commit {}: {e:?}", archive.index().display()))?;
@@ -75,13 +75,13 @@ pub fn write_archive<S: StoreExt + Clone>(
                 hash,
                 entities,
             })
-        }
-        Err(error) => {
-            // Leave nothing half-written behind.
-            let _ = store.discard(branch);
-            Err(error)
-        }
+        });
+    if written.is_err() {
+        // Leave nothing half-written behind, and free what the branch holds,
+        // a failed commit included.
+        let _ = store.discard(branch);
     }
+    written
 }
 
 /// Every line of `archive` on `branch`, then the prefill count; the archive
@@ -100,7 +100,8 @@ fn stage<S: StoreExt + Clone>(
     while let Some(line) = lines.next() {
         // A malformed line already names its place.
         let (creator, ops) = line?;
-        let at = lines.at().unwrap_or_default();
+        // Formatted only for an error.
+        let at = || lines.at().unwrap_or_default();
         let env = ExecEnv {
             caller: creator,
             block_number: 0,
@@ -118,7 +119,7 @@ fn stage<S: StoreExt + Clone>(
             GolemStateView::new(store.clone(), branch, origin, BlockRef::new(0, [0; 32]));
         let out = executor
             .apply(&env, &mut view, &ops)
-            .map_err(|e| eyre!("{at}: the executor failed: {e:?}"))?;
+            .map_err(|e| eyre!("{}: the executor failed: {e:?}", at()))?;
         if out.status == ExecStatus::Reverted {
             let reason = match out.revert {
                 // With all the gas there is, only a cost past 64 bits runs out.
@@ -129,9 +130,9 @@ fn stage<S: StoreExt + Clone>(
                 Some(r) => format!("{r:?}"),
                 None => "no reason given".to_owned(),
             };
-            return Err(eyre!("{at}: refused: {reason}"));
+            return Err(eyre!("{}: refused: {reason}", at()));
         }
-        StateView::commit(&mut view).map_err(|e| eyre!("{at}: stage the entity: {e:?}"))?;
+        StateView::commit(&mut view).map_err(|e| eyre!("{}: stage the entity: {e:?}", at()))?;
         entities += 1;
     }
     let hash = lines.hash().ok_or_else(|| {
@@ -148,9 +149,12 @@ fn stage<S: StoreExt + Clone>(
 mod tests {
     use super::*;
     use alloy_primitives::U256;
+    use arkiv_golemdb_state::accounts::record_key;
     use arkiv_interfaces::entity::AttributeValue;
     use arkiv_interfaces::primitives::UserBalance;
-    use arkiv_interfaces::statemanager::{AccountBalancesStore, EntityStore, ReadMode};
+    use arkiv_interfaces::statemanager::{
+        AccountBalancesStore, EntityCreationNoncesStore, EntityStore, ReadMode,
+    };
     use arkiv_interfaces::store::{ReadTarget, Store};
     use arkiv_reth_statemanager::{GenesisAccount, HostStore, seed_genesis};
     use std::sync::Arc;
@@ -269,6 +273,16 @@ mod tests {
             second.owner,
             BOB.parse::<alloy_primitives::Address>().unwrap().0.0
         );
+        // Each create advances its creator's minting nonce, as a transaction's
+        // would, though the archive gave the keys: Alice's next derived key
+        // comes from nonce 2. Bob, only an owner, created nothing.
+        let nonce = |who: [u8; 20]| {
+            view.get_entity_creation_nonce(who, ReadMode::ViewOnBase)
+                .unwrap()
+                .value
+                .get()
+        };
+        assert_eq!((nonce([0x11; 20]), nonce([0x22; 20])), (2, 0));
     }
 
     /// Prefill is free: no balance moves, the storage pool's included.
@@ -317,7 +331,7 @@ mod tests {
     #[test]
     fn a_reserved_key_is_refused() {
         let store = started(1);
-        let account = format!("0x{}{}", "00".repeat(12), "22".repeat(20));
+        let account = B256::from(record_key([0x22; 20]).0);
         let reserved = format!(
             r#"{{"$key":"{account}","$creator":"{ALICE}","$owner":"{ALICE}","$expiresAt":5}}"#
         );
