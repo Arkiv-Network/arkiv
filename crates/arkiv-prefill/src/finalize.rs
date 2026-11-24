@@ -132,10 +132,18 @@ fn seal_and_commit(
 /// Nothing else changes in what the file says, so its prefill hash stays the
 /// same: that hash leaves the field out and does not depend on layout.
 /// Refused for a file with no `config.arkiv` section, which is no GolemDB chain,
-/// and for one whose field already holds another root.
+/// for one whose field already holds another root, and for one with a number
+/// that does not fit 64 bits, which JSON parsing rounds and so could not be
+/// written back as it was.
 pub fn set_prefilled_root(genesis: &str, root: B256) -> Result<String> {
     let mut file: Value =
         serde_json::from_str(genesis).map_err(|e| eyre!("parse the genesis file: {e}"))?;
+    if let Some(at) = inexact_number(&file, String::new()) {
+        bail!(
+            "the genesis file's {at} is not a whole number that fits 64 bits, so it cannot be \
+             written back exactly: write it as a hex string"
+        );
+    }
     let arkiv = file
         .pointer_mut("/config/arkiv")
         .and_then(Value::as_object_mut)
@@ -153,6 +161,22 @@ pub fn set_prefilled_root(genesis: &str, root: B256) -> Result<String> {
     let mut text = serde_json::to_string_pretty(&file).expect("JSON serializes");
     text.push('\n');
     Ok(text)
+}
+
+/// The JSON pointer of the first number in `value` that parsed as a float: a
+/// fraction, or an integer too large for `u64`/`i64` and already rounded.
+fn inexact_number(value: &Value, at: String) -> Option<String> {
+    match value {
+        Value::Number(n) if n.is_f64() => Some(at),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| inexact_number(v, format!("{at}/{i}"))),
+        Value::Object(fields) => fields
+            .iter()
+            .find_map(|(k, v)| inexact_number(v, format!("{at}/{k}"))),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +371,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no config.arkiv section"), "{error}");
+        // A number past u64 would come back rounded, so it is refused.
+        let big = r#"{"config":{"arkiv":{},"terminalTotalDifficulty":58750000000000000000000}}"#;
+        let error = set_prefilled_root(big, root).unwrap_err().to_string();
+        assert!(
+            error.contains("/config/terminalTotalDifficulty is not a whole number"),
+            "{error}"
+        );
     }
 }
