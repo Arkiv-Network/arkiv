@@ -21,7 +21,7 @@
 
 use alloy_primitives::B256;
 use arkiv_golemdb_state::{GolemStateView, prefill};
-use arkiv_interfaces::execution::{ExecEnv, ExecStatus};
+use arkiv_interfaces::execution::{ExecEnv, ExecStatus, RevertReason};
 use arkiv_interfaces::primitives::BlockNumber;
 use arkiv_interfaces::statemanager::{BlockRef, StateView};
 use arkiv_interfaces::store::{BranchId, CommitId, StoreExt};
@@ -63,7 +63,7 @@ pub fn write_archive<S: StoreExt + Clone>(
     let schedule = FeeSchedule::from_model(&pricing.model)
         .map_err(|e| eyre!("the store's fee schedule: {e:?}"))?;
     let branch = store
-        .begin(Some(origin))
+        .begin(None)
         .map_err(|e| eyre!("open a branch for {}: {e:?}", archive.index().display()))?;
     match stage(store, archive, chain_id, schedule, branch, origin) {
         Ok((hash, entities)) => {
@@ -120,9 +120,15 @@ fn stage<S: StoreExt + Clone>(
             .apply(&env, &mut view, &ops)
             .map_err(|e| eyre!("{at}: the executor failed: {e:?}"))?;
         if out.status == ExecStatus::Reverted {
-            let reason = out
-                .revert
-                .map_or_else(|| "no reason given".to_owned(), |r| format!("{r:?}"));
+            let reason = match out.revert {
+                // With all the gas there is, only a cost past 64 bits runs out.
+                Some(RevertReason::OutOfGas) => {
+                    "OutOfGas: its cost does not fit 64 bits; is its expiry that far out?"
+                        .to_owned()
+                }
+                Some(r) => format!("{r:?}"),
+                None => "no reason given".to_owned(),
+            };
             return Err(eyre!("{at}: refused: {reason}"));
         }
         StateView::commit(&mut view).map_err(|e| eyre!("{at}: stage the entity: {e:?}"))?;
@@ -321,6 +327,23 @@ mod tests {
             .to_string();
         assert!(
             error.contains("p.jsonl:1: refused: AlreadyExists"),
+            "{error}"
+        );
+    }
+
+    /// A large entity expiring just short of permanent costs more than 64 bits
+    /// of gas, and says so rather than only "out of gas".
+    #[test]
+    fn a_cost_past_64_bits_names_the_expiry() {
+        let store = started(1);
+        // 96 KiB of zeros, as base64.
+        let payload = format!(r#","$payload":"{}""#, "A".repeat(128 * 1024));
+        let (_dir, archive) = archive(&[line(1, ALICE, ALICE, u64::MAX - 1, &payload)]);
+        let error = write_archive(&store, &archive, CHAIN)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("p.jsonl:1: refused: OutOfGas: its cost does not fit 64 bits"),
             "{error}"
         );
     }
