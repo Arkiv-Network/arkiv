@@ -83,6 +83,13 @@ jobs:
           just build
           echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
 
+      # The binary just built, on the committed prefill fixture: prefill,
+      # finalize, and block 0 must be the one the fixture expects. Seconds of
+      # work, and the one check that runs `arkiv-reth prefill` as an operator
+      # would.
+      - name: Prefill fixture
+        run: just prefill_check
+
       # The binaries are already stripped by the profile, so there is nothing
       # for zip to gain — level 1 keeps the upload quick.
       - uses: actions/upload-artifact@v7

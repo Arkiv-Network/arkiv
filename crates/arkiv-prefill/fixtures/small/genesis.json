@@ -1,0 +1,90 @@
+{
+  "config": {
+    "chainId": 424242,
+    "homesteadBlock": 0,
+    "eip150Block": 0,
+    "eip155Block": 0,
+    "eip158Block": 0,
+    "byzantiumBlock": 0,
+    "constantinopleBlock": 0,
+    "petersburgBlock": 0,
+    "istanbulBlock": 0,
+    "berlinBlock": 0,
+    "londonBlock": 0,
+    "mergeNetsplitBlock": 0,
+    "terminalTotalDifficulty": 0,
+    "terminalTotalDifficultyPassed": true,
+    "shanghaiTime": 0,
+    "cancunTime": 0,
+    "pragueTime": 0,
+    "arkiv": {
+      "golemdb": {
+        "hash_function": "keccak-256",
+        "cell_limits": {
+          "max_cell_name_len": 32,
+          "max_str_len": 128,
+          "max_bytes_len": 131072
+        },
+        "record_limits": {
+          "max_cells": 39,
+          "max_indexed_cells": 36
+        },
+        "metering": {
+          "golemdb_code_version": 1,
+          "host_code_version": 1,
+          "weights": {
+            "write.admission.base": 500,
+            "write.admission.entry": 51,
+            "write.admission.byte": 5,
+            "write.record.create": 2002,
+            "write.record.patch": 501,
+            "write.record.delete": 2003,
+            "write.cell.create": 1000,
+            "write.cell.update": 1001,
+            "write.cell.delete": 1002,
+            "write.cell_trie_update": 250,
+            "write.cell_byte": 6,
+            "write.index.join": 2000,
+            "write.index.leave": 2001,
+            "write.index_term_create": 2004,
+            "write.index_trie_update": 502,
+            "write.index_byte": 7,
+            "read.key": 200,
+            "read.cell": 201,
+            "read.cell_scan": 101,
+            "read.byte": 3,
+            "read.term": 202,
+            "read.base": 203,
+            "read.admission.base": 102,
+            "read.admission.entry": 21,
+            "read.admission.byte": 4,
+            "read.term_step": 103,
+            "read.container": 204,
+            "read.set_container": 22,
+            "read.sort_compare": 11,
+            "write.log_append.base": 205,
+            "write.log_append.byte": 8,
+            "read.log_row": 104,
+            "host.arkiv.capacity_rate": 14,
+            "host.arkiv.cell_byte_units": 1,
+            "host.arkiv.index_byte_units": 2,
+            "host.arkiv.c_cell": 64,
+            "host.arkiv.c_idx": 65,
+            "host.arkiv.max_lifetime": 7884000
+          }
+        }
+      }
+    }
+  },
+  "baseFeePerGas": "0x3b9aca00",
+  "gasLimit": "0x3938700",
+  "difficulty": "0x0",
+  "alloc": {
+    "0x1111111111111111111111111111111111111111": {
+      "balance": "0x3635c9adc5dea00000"
+    },
+    "0x2222222222222222222222222222222222222222": {
+      "balance": "0xde0b6b3a7640000"
+    }
+  }
+}

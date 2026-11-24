@@ -56,6 +56,8 @@ pub struct NodeBuilder {
     env: Vec<(String, String)>,
     /// Whether the node stays on GolemDB when the test process names another store.
     golemdb: bool,
+    /// A GolemDB directory to run on instead of a fresh one in the datadir.
+    golemdb_path: Option<PathBuf>,
 }
 
 impl NodeBuilder {
@@ -71,6 +73,7 @@ impl NodeBuilder {
             extra_args: Vec::new(),
             env: Vec::new(),
             golemdb: false,
+            golemdb_path: None,
         }
     }
 
@@ -132,6 +135,16 @@ impl NodeBuilder {
     pub fn golemdb_store(mut self) -> Self {
         self.golemdb = true;
         self
+    }
+
+    /// Run on the GolemDB directory at `path`, which outlives the node,
+    /// instead of a fresh one in its datadir: for a store prepared before the
+    /// node starts, such as a prefilled one. Implies [`golemdb_store`].
+    ///
+    /// [`golemdb_store`]: Self::golemdb_store
+    pub fn golemdb_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.golemdb_path = Some(path.into());
+        self.golemdb_store()
     }
 
     /// Run the node on the in-process store instead of GolemDB.
@@ -254,7 +267,11 @@ impl Node {
         cmd.env_remove("ARKIV_STORE_PATH");
         cmd.envs(self.config.env.iter().map(|(k, v)| (k, v)));
         if self.config.golemdb || !experimental {
-            cmd.env("ARKIV_STORE_PATH", self.datadir.join("golemdb"))
+            let store = match &self.config.golemdb_path {
+                Some(path) => path.clone(),
+                None => self.datadir.join("golemdb"),
+            };
+            cmd.env("ARKIV_STORE_PATH", store)
                 .env_remove("ARKIV_EXPERIMENTAL_STORE");
         }
         // An escape hatch for diagnosing a node under test: extra flags without
