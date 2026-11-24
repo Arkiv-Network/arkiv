@@ -133,3 +133,34 @@ fn a_discarded_frame_keeps_what_it_spent() {
             .is_none()
     );
 }
+
+/// The prefill record round-trips on GolemDB, and it is state: writing it
+/// moves the root, so two stores that disagree on it disagree on block 0.
+#[test]
+fn the_prefill_record_is_part_of_the_root() {
+    use arkiv_golemdb_state::prefill::{self, PrefillCounters};
+    use arkiv_interfaces::store::{ReadTarget, StoreExt};
+
+    let root_after = |total| {
+        let store = GolemDbStore::open_memory(&config()).expect("open golemdb");
+        let branch = store.begin(None).expect("begin");
+        prefill::start(&store, branch, total, [0x4f; 32]).expect("start");
+        assert_eq!(prefill::bump(&store, branch), Ok(1));
+        let commit = store.commit(branch).expect("commit");
+        assert_eq!(
+            prefill::read(&store, ReadTarget::Commit(commit)),
+            Ok(Some(PrefillCounters {
+                total,
+                commits: 1,
+                genesis_hash: [0x4f; 32],
+            }))
+        );
+        store.commit_hash(commit).expect("root")
+    };
+    assert_eq!(
+        root_after(3),
+        root_after(3),
+        "the same record, the same root"
+    );
+    assert_ne!(root_after(3), root_after(4), "another total, another root");
+}

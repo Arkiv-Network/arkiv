@@ -52,22 +52,23 @@ dropped state as a generic `-32603` internal error, not as one of the
 query error codes.
 
 GolemDB is the store in every real deployment: the dev image, Docker Compose
-and Kurtosis all set `ARKIV_STORE_PATH`. The e2e `NOT` tests pass only because
-the test harness defaults to the in-memory store
+and Kurtosis all set `ARKIV_STORE_PATH`. The node tests run on GolemDB too;
+the e2e `NOT` test passes only because it asks for the in-memory store
 (`ARKIV_EXPERIMENTAL_STORE=memory`).
 
 **Where:**
 - [`node`, crates/arkiv-golemdb/src/convert/query.rs:125](../crates/arkiv-golemdb/src/convert/query.rs#L125)
 - [`store_failure`, crates/arkiv-reth-rpc/src/lib.rs:200-205](../crates/arkiv-reth-rpc/src/lib.rs#L200-L205)
-- [`spawn_process`, crates/arkiv-harness/src/node.rs:255-256](../crates/arkiv-harness/src/node.rs#L255-L256)
-- e2e `NOT` tests on the in-memory store: [bin/arkiv-reth/tests/e2e.rs:654-674](../bin/arkiv-reth/tests/e2e.rs#L654-L674)
+- e2e `NOT` test on the in-memory store: `not_queries_over_a_live_node` in
+  [bin/arkiv-reth/tests/e2e.rs](../bin/arkiv-reth/tests/e2e.rs)
 
 **Tasks:**
 - [ ] Decide how GolemDB answers `NOT`: native support in GolemDB, or
       complementing against the live-entity set in the adapter.
 - [ ] Implement it.
 - [ ] Until it is supported, return a typed query error instead of `-32603`.
-- [ ] Run the query e2e tests against GolemDB as well as the in-memory store.
+- [x] Run the query e2e tests on GolemDB. `NOT` is still tested in memory,
+      until GolemDB answers it.
 
 **Done when:** `NOT (rank = u256(30))` on a GolemDB-backed node returns the
 same entities as on the in-memory store.
@@ -161,7 +162,7 @@ as one byte, `0x00` or `0x01`. No adapter change was needed.
   `ranges_are_allowed_on_every_type` and
   `ranges_are_allowed_on_the_system_attributes` in
   [crates/arkiv-query/src/parse/mod.rs](../crates/arkiv-query/src/parse/mod.rs).
-- Live node (in-memory store): `query_operator_classes_over_a_live_node` in
+- Live node (GolemDB): `query_operator_classes_over_a_live_node` in
   [bin/arkiv-reth/tests/e2e.rs](../bin/arkiv-reth/tests/e2e.rs) asserts `str`
   and `$key` ranges. Its error list now checks `STARTSWITH` on a `u256`
   instead of a range on a `str`.
@@ -193,7 +194,7 @@ it.
 **Where:**
 - [`Parser::parse_predicate`, crates/arkiv-query/src/parse/mod.rs:331-334](../crates/arkiv-query/src/parse/mod.rs#L331-L334)
 - [`Query`, crates/arkiv-interfaces/src/query.rs:30-70](../crates/arkiv-interfaces/src/query.rs#L30-L70)
-- e2e test asserting the rejection: [bin/arkiv-reth/tests/e2e.rs:695](../bin/arkiv-reth/tests/e2e.rs#L695)
+- e2e test asserting the rejection: [bin/arkiv-reth/tests/e2e.rs:761](../bin/arkiv-reth/tests/e2e.rs#L761)
 - `cut_operators_name_their_replacement` in [crates/arkiv-query/src/parse/mod.rs](../crates/arkiv-query/src/parse/mod.rs)
 
 **Suggested approach:** with Q3 done, `a != v` can be lowered to
@@ -272,7 +273,7 @@ operator`, and `between = true` was accepted as an attribute name.
 - GolemDB on disk, through the parser, queries and counts:
   `a_between_includes_both_bounds` in
   [crates/arkiv-golemdb/tests/query.rs](../crates/arkiv-golemdb/tests/query.rs).
-- Live node (in-memory store): `query_operator_classes_over_a_live_node`
+- Live node (GolemDB): `query_operator_classes_over_a_live_node`
   asserts `BETWEEN` on `u256` and `str`, an inverted range, and the
   `-32002`/`-32001` errors for mixed bounds and `between = true`.
 

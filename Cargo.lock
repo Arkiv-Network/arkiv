@@ -1518,6 +1518,7 @@ dependencies = [
 name = "arkiv-golemdb-state"
 version = "1.0.1"
 dependencies = [
+ "alloy-primitives",
  "arkiv-golemdb",
  "arkiv-interfaces",
 ]
@@ -1543,6 +1544,20 @@ dependencies = [
 [[package]]
 name = "arkiv-interfaces"
 version = "1.0.1"
+
+[[package]]
+name = "arkiv-prefill"
+version = "1.0.1"
+dependencies = [
+ "alloy-primitives",
+ "arkiv-bindings",
+ "arkiv-interfaces",
+ "base64 0.22.1",
+ "eyre",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "arkiv-query"
@@ -1734,6 +1749,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "arkiv-golemdb",
  "arkiv-golemdb-state",
  "arkiv-interfaces",
  "eyre",
