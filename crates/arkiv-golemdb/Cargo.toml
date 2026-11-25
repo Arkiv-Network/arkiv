@@ -12,6 +12,9 @@ license.workspace = true
 arkiv-interfaces.workspace = true
 golemdb-api.workspace = true
 golemdb-storage.workspace = true
+# The MDBX store GolemDB keeps its data in, opened here so that its reads can
+# wait for a reader slot.
+golemdb-storage-mdbx.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 # The keys GolemDB keeps its own records at.
@@ -28,5 +31,3 @@ arkiv-query.workspace = true
 arkiv-rpc-types.workspace = true
 # `MAX_WAIT_COMMITS`, how long GolemDB lets old data wait before it prunes.
 golemdb-pruning.workspace = true
-# Opening a database's MDBX directly, to read how much space it takes.
-golemdb-storage-mdbx.workspace = true

@@ -18,6 +18,7 @@
 //! branch or commit is `HandleInvalid`.
 
 mod convert;
+mod reader_slots;
 mod tags;
 
 use std::path::Path;
@@ -31,6 +32,7 @@ use arkiv_interfaces::store::{
 };
 use golemdb_api as golemdb;
 use golemdb_api::{Api, ApiError};
+use golemdb_storage_mdbx::MdbxStore;
 
 pub use golemdb_api::{
     CellLimits, Genesis, HashAlgorithm, HostMeteringSchema, OpenError, PricingConfig,
@@ -42,6 +44,7 @@ use convert::{
     golemdb_budget, golemdb_cell, golemdb_commit, immutable_data_address, immutable_data_key,
     immutable_data_row, metered_result, query_op, record_key, segment_row, store_error,
 };
+use reader_slots::{MDBX_READER_SLOTS, ReaderSlots};
 use tags::TagRow;
 
 /// Fixed when the database is created; reopening with anything else fails.
@@ -66,6 +69,10 @@ pub struct SegmentSpec {
 
 /// Commits per segment file, the span GolemDB's design uses.
 const SHARD_SPAN: u64 = 500_000;
+
+/// Where segment files go, under the database's directory. GolemDB's own
+/// default, so a database made before the adapter named it opens as it did.
+const SEGMENT_FILES: &str = "immutable-data";
 
 impl GolemDbConfig {
     fn open_config(&self) -> Result<golemdb::OpenConfig, OpenError> {
@@ -120,16 +127,31 @@ impl GolemDbStore {
     /// Open `directory`, creating it with `config` if it is new. Only one
     /// process may open a directory. `pruning` is how many past commits to
     /// keep, `None` all; it may change between opens.
+    ///
+    /// A read that finds every MDBX reader slot held waits for one.
     pub fn open(
         directory: &Path,
         config: &GolemDbConfig,
         pruning: Option<PruningConfig>,
     ) -> Result<Self, OpenError> {
-        let mut open = config.open_config()?;
+        Self::open_with_reader_slots(directory, config, pruning, MDBX_READER_SLOTS)
+    }
+
+    /// [`open`](Self::open), with at most `reader_slots` reads open at once.
+    fn open_with_reader_slots(
+        directory: &Path,
+        config: &GolemDbConfig,
+        pruning: Option<PruningConfig>,
+        reader_slots: usize,
+    ) -> Result<Self, OpenError> {
+        let mut open = config
+            .open_config()?
+            .with_immutable_data_directory(directory.join(SEGMENT_FILES));
         if let Some(pruning) = pruning {
             open = open.with_pruning(pruning);
         }
-        let database = golemdb::Database::open(directory, &open)?;
+        let store = ReaderSlots::new(MdbxStore::open(directory)?, reader_slots);
+        let database = golemdb::Database::from_store(store, &open)?;
         Ok(Self {
             database,
             _memory_directory: None,

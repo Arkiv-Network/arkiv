@@ -12,6 +12,7 @@ use arkiv_reth_chainspec::ArkivChainSpec;
 use arkiv_reth_executor::{ArkivExecutorBuilder, WithSeals};
 use arkiv_reth_golemdbprovider::ArkivStateRootStrategy;
 use arkiv_reth_payload_builder::ArkivPayloadServiceBuilder;
+use arkiv_reth_rpc::RequestLimit;
 use arkiv_reth_statemanager::segments::rows_for_block;
 use arkiv_reth_statemanager::{BlockSeals, HostStore};
 use reth::network::p2p::full_block::SealedBlockWithAccessList;
@@ -60,16 +61,23 @@ pub struct ArkivNode {
     store: HostStore,
     seals: Arc<BlockSeals>,
     op_cost: OpCost,
+    max_rpc_requests: usize,
 }
 
 impl ArkivNode {
     /// The node over the store Arkiv's state lives in, with what an op costs
-    /// beyond that store's receipts.
-    pub const fn new(store: HostStore, seals: Arc<BlockSeals>, op_cost: OpCost) -> Self {
+    /// beyond that store's receipts, and how many RPC requests run at once.
+    pub const fn new(
+        store: HostStore,
+        seals: Arc<BlockSeals>,
+        op_cost: OpCost,
+        max_rpc_requests: usize,
+    ) -> Self {
         Self {
             store,
             seals,
             op_cost,
+            max_rpc_requests,
         }
     }
 }
@@ -102,6 +110,7 @@ where
         ArkivPayloadValidatorBuilder,
         BasicEngineApiBuilder<ArkivPayloadValidatorBuilder>,
         ArkivEngineValidatorBuilder,
+        RequestLimit,
     >;
 
     /// Arkiv maintains no Merkle trie, so the stages that build and verify one
@@ -151,7 +160,7 @@ where
             ArkivPayloadValidatorBuilder,
             BasicEngineApiBuilder::default(),
             ArkivEngineValidatorBuilder::new(self.store.clone(), self.seals.clone()),
-            Default::default(),
+            RequestLimit::new(self.max_rpc_requests),
             reth_node_builder::rpc::Identity::new(),
         ))
     }

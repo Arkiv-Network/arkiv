@@ -17,6 +17,8 @@ arkiv-interfaces.workspace = true
 # `BlockNumReader` and `HeaderProvider`: the chain's head and its headers.
 reth-storage-api.workspace = true
 jsonrpsee.workspace = true
+# `Layer`, which reth takes its RPC middleware as.
+tower = "0.5"
 alloy-primitives.workspace = true
 # The `BlockHeader` trait (timestamp/number) for arkiv_getBlockTiming.
 alloy-consensus.workspace = true
