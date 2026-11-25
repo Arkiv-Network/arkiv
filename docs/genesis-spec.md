@@ -190,7 +190,7 @@ Values are placeholders.
 | Record IDs | Assigned by GolemDB (principle 3) |
 | Generic user `records` | Every known need has a typed section; raw keys could collide with account or `arkiv_state` keys |
 | Segment rows | Segments sit outside the state root and are appended per commit |
-| Entities | Not needed for a first genesis; may come later |
+| Entities | Too large for a file. A prefilled chain takes them from archives, and the file carries only the resulting root (section 7) |
 | Node settings (`k`, store URL, data directories) | Local configuration, not consensus |
 
 ## 6. Decisions
@@ -201,6 +201,46 @@ Values are placeholders.
 | G2 | Which store backend is consensus? | GolemDB. MemStore and Valkey predate it and remain as demonstrations of the store abstraction; they receive explicit genesis pricing for experiments, but do not persist or activate pricing models. |
 | G3 | How does a node reject a genesis or a database it cannot run? | GolemDB and Arkiv each expose a function returning the sets of versions they support: GolemDB its `format`s, hash functions, `roaring` versions and GolemDB code versions; Arkiv its host code versions. A genesis whose `encoding` or `@meteringModel` names an unsupported value is refused. On opening an existing (for example prefilled) database, the node checks the superblock and the **active** model against the same sets and refuses on mismatch. A pending model with an unsupported version only warns: GolemDB halts the node at its activation. |
 | G4 | Values: cell limits, weights, `arkiv_state` seed (tokenomics O6, O9). | open |
+
+## 7. `prefilledBlockZeroStateRoot`
+
+A prefilled chain's block 0 holds entities from archive files, written into GolemDB before the chain starts (see the [prefill runbook](prefill-runbook.md)). Its genesis file carries block 0's state root:
+
+```json
+{
+  "config": {
+    "chainId": 424242,
+    "arkiv": {
+      "golemdb": { "…": "…" },
+      "prefilledBlockZeroStateRoot": "0xd700bb5e793997aa20a009ec5924ddd02ad769da92b481ee4e02c08edc4d484c"
+    }
+  }
+}
+```
+
+**What it is.** GolemDB's global root after the prefill: `alloc`, every archive's entities, and the prefill record. It is a 32-byte `0x` hex string. Its presence is also what marks a chain as prefilled.
+
+**Who writes it.** `arkiv-reth prefill --finalize`, once, after every archive is in. It asks GolemDB for the root, tags block 0's commit with the block 0 hash that root gives, and writes the root into the file. Nobody writes it by hand.
+
+**Why a prefilled chain needs it.** Block 0's hash names the chain, and reth, peers and the consensus client need it as soon as they read the genesis file. That hash depends on the header's `stateRoot`. A chain that is not prefilled rebuilds the root in memory from `alloc` on every start (section 4). A prefilled one cannot: its data is in the archives, not the file, and may be hundreds of gigabytes. The file publishes the answer once:
+
+| Use | With the field | Without (each node asks its own store) |
+|---|---|---|
+| The operator's node | works | works |
+| A node on a correct copy of the store | works | works |
+| A node on a bad copy, or one built from other archives | refused at start, naming the mismatch | starts on another chain; shows only as "0 peers" |
+| The consensus client's genesis (kurtosis genesis generator) | read from the file | needs the whole prefilled store |
+| "Which chain is this?" before downloading | read the file | download everything first |
+| `arkiv-reth db` / `init` tools | the file alone | must open GolemDB, which is locked while the node runs |
+
+A chain without the field is unchanged.
+
+**How the node checks it.** With the field set, the node uses it as block 0's `stateRoot` instead of rebuilding one, then checks its store at start:
+
+- the store holds a finalized prefill whose block 0 commit is tagged with this file's block 0 hash, and that commit's root is the field's value;
+- the file still hashes to the hash the prefill recorded when it started. The hash is keccak256 of the file's contents in a fixed form (parsed, keys sorted, no whitespace) with this field left out, so re-indenting changes nothing, while editing any value (an `alloc` balance, say) is refused. Without this check such an edit would go unnoticed, because block 0's hash comes from the field, not from `alloc`.
+
+Every other store is refused with what to do; the [runbook](prefill-runbook.md#when-the-node-refuses-to-start) lists the messages. Changing the field, or adding it to a chain that has started, makes another chain.
 
 ## Implementation plan
 
