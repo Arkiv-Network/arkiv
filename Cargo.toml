@@ -136,6 +136,7 @@ arkiv-golemdb-state = { path = "crates/arkiv-golemdb-state" }
 arkiv-golemdb = { path = "crates/arkiv-golemdb" }
 arkiv-reth-payload-builder = { path = "crates/arkiv-reth-payload-builder" }
 arkiv-tokenomics = { path = "crates/arkiv-tokenomics" }
+arkiv-prefill = { path = "crates/arkiv-prefill" }
 
 # Copied from yagna (.cargo/config). A dev build without debug info or
 # incremental state, with dependencies optimized — much faster to link and to

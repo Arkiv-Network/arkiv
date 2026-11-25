@@ -22,6 +22,19 @@
 //! index file's directory. The entities are read in index order, part by part,
 //! line by line.
 //!
+//! # Archive sets
+//!
+//! A prefill takes its archives from a **set file** naming their index files,
+//! in order. Paths are relative to the set file's directory and must stay
+//! inside it, like an index's parts, so a whole prefill is one directory:
+//!
+//! ```json
+//! {"version": 1, "archives": ["A0/index.json", "A1/index.json", "A2/index.json"]}
+//! ```
+//!
+//! The order is the commit order. An archive named twice, or an empty list, is
+//! refused. See [`open_set`].
+//!
 //! # Parts
 //!
 //! A part is JSON Lines: one entity per line, one JSON object per entity. Blank
@@ -99,6 +112,65 @@ struct Index {
     parts: Vec<PathBuf>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Set {
+    version: u64,
+    archives: Vec<PathBuf>,
+}
+
+/// Refuse `path`, read from `file`, unless it stays inside `file`'s directory:
+/// relative, non-empty, and with no `..`, root or prefix component.
+fn inside(file: &Path, what: &str, path: &Path) -> Result<()> {
+    ensure!(
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "{}: {what} {} must be a path inside the file's directory, with no `..`",
+        file.display(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// The archives of the set file `set`, opened, in order: see the
+/// [crate docs](crate#archive-sets).
+pub fn open_set(set: impl AsRef<Path>) -> Result<Vec<Archive>> {
+    let set = set.as_ref();
+    let parsed: Set = serde_json::from_slice(
+        &std::fs::read(set).wrap_err_with(|| format!("open {}", set.display()))?,
+    )
+    .wrap_err_with(|| format!("parse {}", set.display()))?;
+    ensure!(
+        parsed.version == 1,
+        "{}: unsupported archive set version {}",
+        set.display(),
+        parsed.version
+    );
+    ensure!(
+        !parsed.archives.is_empty(),
+        "{}: names no archive",
+        set.display()
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for archive in &parsed.archives {
+        inside(set, "archive", archive)?;
+        ensure!(
+            seen.insert(archive),
+            "{}: archive {} is named twice",
+            set.display(),
+            archive.display()
+        );
+    }
+    let root = set.parent().unwrap_or(Path::new("."));
+    parsed
+        .archives
+        .iter()
+        .map(|archive| Archive::open(root.join(archive)))
+        .collect()
+}
+
 /// An archive: its index file and the parts it names, in order.
 ///
 /// The index is read once, by [`Archive::open`]: the part list and the bytes
@@ -129,15 +201,7 @@ impl Archive {
             parsed.version
         );
         for part in &parsed.parts {
-            ensure!(
-                !part.as_os_str().is_empty()
-                    && part
-                        .components()
-                        .all(|c| matches!(c, std::path::Component::Normal(_))),
-                "{}: part {} must be a path inside the archive's directory, with no `..`",
-                index.display(),
-                part.display()
-            );
+            inside(&index, "part", part)?;
         }
         let root = index.parent().unwrap_or(Path::new("."));
         let parts = parsed.parts.iter().map(|part| root.join(part)).collect();
@@ -316,7 +380,7 @@ mod tests {
             .unwrap();
             let error = Archive::open(&index).unwrap_err().to_string();
             assert!(
-                error.contains("inside the archive's directory"),
+                error.contains("part") && error.contains("inside the file's directory"),
                 "{part}: {error}"
             );
         }
@@ -349,6 +413,69 @@ mod tests {
         ] {
             std::fs::write(&index, body).unwrap();
             assert!(Archive::open(&index).is_err(), "{body}");
+        }
+    }
+
+    /// A set names its archives in order, each relative to the set file.
+    #[test]
+    fn a_set_opens_its_archives_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["A0", "A1"] {
+            let at = dir.path().join(name);
+            std::fs::create_dir(&at).unwrap();
+            std::fs::write(at.join("p.jsonl"), "").unwrap();
+            std::fs::write(
+                at.join("index.json"),
+                r#"{"version":1,"parts":["p.jsonl"]}"#,
+            )
+            .unwrap();
+        }
+        let set = dir.path().join("set.json");
+        std::fs::write(
+            &set,
+            r#"{"version":1,"archives":["A1/index.json","A0/index.json"]}"#,
+        )
+        .unwrap();
+        let archives = open_set(&set).unwrap();
+        assert_eq!(
+            archives
+                .iter()
+                .map(|a| a.index().to_path_buf())
+                .collect::<Vec<_>>(),
+            [
+                dir.path().join("A1/index.json"),
+                dir.path().join("A0/index.json")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bad_set_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("set.json");
+        for (body, expected) in [
+            (
+                r#"{"version":2,"archives":["a"]}"#,
+                "unsupported archive set version 2",
+            ),
+            (r#"{"version":1,"archives":[]}"#, "names no archive"),
+            (
+                r#"{"version":1,"archives":["../a/index.json"]}"#,
+                "inside the file's directory",
+            ),
+            (
+                r#"{"version":1,"archives":["/a/index.json"]}"#,
+                "inside the file's directory",
+            ),
+            (
+                r#"{"version":1,"archives":["a/index.json","a/index.json"]}"#,
+                "named twice",
+            ),
+            (r#"{"version":1,"archives":["a"],"extra":1}"#, "parse"),
+        ] {
+            std::fs::write(&set, body).unwrap();
+            let error = format!("{:#}", open_set(&set).unwrap_err());
+            assert!(error.contains(expected), "{body}: {error}");
         }
     }
 }

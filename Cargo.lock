@@ -1588,6 +1588,7 @@ dependencies = [
  "arkiv-golemdb",
  "arkiv-harness",
  "arkiv-interfaces",
+ "arkiv-prefill",
  "arkiv-reth-chainspec",
  "arkiv-reth-executor",
  "arkiv-reth-golemdbprovider",
