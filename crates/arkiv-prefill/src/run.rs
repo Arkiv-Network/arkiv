@@ -37,7 +37,7 @@ use crate::{Archive, Written, write_archive};
 /// A block 0 hash no chain has. A prefill runs before its chain's block 0
 /// exists, so no commit can be this chain's block 0 yet: one that is tagged as
 /// a block 0 means the store's prefill was already finalized.
-const NO_BLOCK_ZERO: [u8; 32] = [0; 32];
+pub(crate) const NO_BLOCK_ZERO: [u8; 32] = [0; 32];
 
 /// What a prefill writes.
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +143,20 @@ fn start(store: &HostStore, prefill: &Prefill, total: u64) -> Result<()> {
     written
 }
 
+/// That the genesis file, hashing to `file`, is the one the prefill started
+/// with, which recorded `recorded`.
+pub(crate) fn check_genesis(recorded: [u8; 32], file: [u8; 32]) -> Result<()> {
+    ensure!(
+        recorded == file,
+        "the genesis file changed since this prefill started: it hashes to {}, but the prefill \
+         started with one hashing to {}. Use the original file, or start again in an empty \
+         directory",
+        B256::from(file),
+        B256::from(recorded)
+    );
+    Ok(())
+}
+
 /// That the store's prefill, with `done` archives in, is still this one: the
 /// same genesis file, the same number of archives, and the last committed
 /// archive still the one in its place.
@@ -151,14 +165,7 @@ fn check(store: &HostStore, prefill: &Prefill, done: u64) -> Result<()> {
     let counters = prefill::read(&**store, ReadTarget::Commit(head))
         .map_err(|e| eyre!("read the prefill record: {e:?}"))?
         .ok_or_else(|| eyre!("the store has no prefill record"))?;
-    ensure!(
-        counters.genesis_hash == prefill.genesis_hash,
-        "the genesis file changed since this prefill started: it hashes to {}, but the prefill \
-         started with one hashing to {}. Use the original file, or start again in an empty \
-         directory",
-        B256::from(prefill.genesis_hash),
-        B256::from(counters.genesis_hash)
-    );
+    check_genesis(counters.genesis_hash, prefill.genesis_hash)?;
     let given = prefill.archives.len() as u64;
     ensure!(
         counters.total == given,
