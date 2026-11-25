@@ -195,9 +195,24 @@ impl ArkivChainSpec {
     /// same. The fixed form makes the hash depend on what the file says, not
     /// how it is laid out: re-indenting or reordering keys changes nothing,
     /// while changing any value (an `alloc` balance, the chain id) does.
+    ///
+    /// A terminal total difficulty above `u64::MAX` is hashed as a decimal
+    /// string: alloy writes one below 2^128 as a bare JSON number, which a
+    /// `serde_json::Value` cannot hold (mainnet's is one).
     pub fn prefill_genesis_hash(&self) -> B256 {
-        let mut genesis =
-            serde_json::to_value(self.inner.genesis()).expect("a parsed genesis serializes");
+        let mut plain = self.inner.genesis().clone();
+        let big_ttd = plain
+            .config
+            .terminal_total_difficulty
+            .filter(|ttd| *ttd > U256::from(u64::MAX));
+        if big_ttd.is_some() {
+            plain.config.terminal_total_difficulty = None;
+        }
+        let mut genesis = serde_json::to_value(&plain).expect("a parsed genesis serializes");
+        if let Some(ttd) = big_ttd {
+            genesis["config"]["terminalTotalDifficulty"] =
+                serde_json::Value::String(ttd.to_string());
+        }
         if let Some(arkiv) = genesis
             .pointer_mut("/config/arkiv")
             .and_then(serde_json::Value::as_object_mut)
@@ -817,5 +832,27 @@ mod tests {
         assert_ne!(spec(&funded), hash, "alloc");
         base["config"]["chainId"] = json!(1);
         assert_ne!(spec(&base), hash, "chain id");
+    }
+
+    /// A terminal total difficulty too large for 64 bits, mainnet's included,
+    /// hashes rather than panicking, and its value still counts.
+    #[test]
+    fn the_prefill_genesis_hash_takes_a_large_terminal_total_difficulty() {
+        let spec = |ttd: Value| {
+            let mut genesis: Value =
+                serde_json::from_str(include_str!("../../../genesis/example.json")).unwrap();
+            genesis["config"]["terminalTotalDifficulty"] = ttd;
+            ArkivChainSpec::from_genesis(serde_json::from_value(genesis).unwrap())
+                .unwrap()
+                .prefill_genesis_hash()
+        };
+        let mainnet = spec(json!("58750000000000000000000"));
+        assert_eq!(
+            spec(json!("0xc70d808a128d7380000")),
+            mainnet,
+            "hex or decimal"
+        );
+        assert_ne!(spec(json!("58750000000000000000001")), mainnet);
+        assert_ne!(spec(json!("0x1000000000000000000000000000000000")), mainnet);
     }
 }
