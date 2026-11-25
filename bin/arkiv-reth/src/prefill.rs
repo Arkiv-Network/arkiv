@@ -76,7 +76,7 @@ impl PrefillCommand {
             self.archives.display()
         )?;
         if self.finalize {
-            self.finalize(out, &text, &spec, &store)
+            self.finalize(out, &text, &spec, &store, &archives)
         } else {
             self.run(out, &spec, &store, &archives)
         }
@@ -107,14 +107,8 @@ impl PrefillCommand {
             // `run` refuses these, saying why.
             _ => {}
         }
-        let alloc: Vec<GenesisAccount> =
-            GenesisAccount::from_alloc(&spec.genesis().alloc).collect();
-        let prefill = Prefill {
-            chain_id: spec.chain().id(),
-            genesis_hash: spec.prefill_genesis_hash().0,
-            alloc: &alloc,
-            archives,
-        };
+        let alloc = alloc(spec);
+        let prefill = prefill(spec, &alloc, archives);
         let mut since = Instant::now();
         let mut lines = Vec::new();
         let ran = run(store, &prefill, |place, written| {
@@ -148,7 +142,16 @@ impl PrefillCommand {
         text: &str,
         spec: &ArkivChainSpec,
         store: &HostStore,
+        archives: &[arkiv_prefill::Archive],
     ) -> eyre::Result<()> {
+        // Block 0 is what the store holds, so the archives given must be the
+        // ones it was prefilled from: the same checks as a resume (genesis
+        // file, archive count, last archive's hash). On a finished prefill
+        // `run` only checks; any other state `finalize` refuses below.
+        if matches!(classify(store, [0; 32])?, StoreState::ArkivPrefillDone) {
+            let alloc = alloc(spec);
+            run(store, &prefill(spec, &alloc, archives), |_, _| {})?;
+        }
         let published = spec.prefilled_block_zero_state_root();
         let mut with_root = None;
         let finalized = finalize(store, spec.prefill_genesis_hash().0, published, |root| {
@@ -183,6 +186,23 @@ impl PrefillCommand {
         }
         writeln!(out, "Start the chain with: arkiv-reth node --chain {chain}")?;
         Ok(())
+    }
+}
+
+fn alloc(spec: &ArkivChainSpec) -> Vec<GenesisAccount> {
+    GenesisAccount::from_alloc(&spec.genesis().alloc).collect()
+}
+
+fn prefill<'a>(
+    spec: &ArkivChainSpec,
+    alloc: &'a [GenesisAccount],
+    archives: &'a [arkiv_prefill::Archive],
+) -> Prefill<'a> {
+    Prefill {
+        chain_id: spec.chain().id(),
+        genesis_hash: spec.prefill_genesis_hash().0,
+        alloc,
+        archives,
     }
 }
 
@@ -340,6 +360,37 @@ mod tests {
         assert_eq!(
             error,
             "the store is empty: run the prefill before finalizing"
+        );
+        assert!(!setup.genesis().contains("prefilledBlockZeroStateRoot"));
+    }
+
+    /// `--finalize` with archives other than the ones the store was prefilled
+    /// from is refused, and nothing is committed or written.
+    #[test]
+    fn finalize_with_another_archive_set_is_refused() {
+        let setup = Setup::new();
+        setup.run("golemdb", false).unwrap();
+        // The last archive edited: one entity's attribute changed.
+        let part = setup.path("A1/p.jsonl");
+        let edited = std::fs::read_to_string(&part)
+            .unwrap()
+            .replace("str:k1", "str:other");
+        std::fs::write(&part, edited).unwrap();
+        let error = setup.run("golemdb", true).unwrap_err();
+        assert!(
+            error.contains("the list changed since this prefill started"),
+            "{error}"
+        );
+        // Fewer archives.
+        std::fs::write(
+            setup.path("set.json"),
+            r#"{"version":1,"archives":["A0/index.json"]}"#,
+        )
+        .unwrap();
+        let error = setup.run("golemdb", true).unwrap_err();
+        assert!(
+            error.contains("started with 2 archives; 1 were given"),
+            "{error}"
         );
         assert!(!setup.genesis().contains("prefilledBlockZeroStateRoot"));
     }
