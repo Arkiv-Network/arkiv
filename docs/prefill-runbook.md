@@ -72,6 +72,8 @@ arkiv-reth prefill --chain genesis.json --archives set.json --store /var/lib/ark
 
 It runs the same checks as a resume, then commits block 0 on top of the archives, takes GolemDB's root, and writes it into the genesis file as `config.arkiv.prefilledBlockZeroStateRoot` (replacing the file in one step). It prints the root and block 0's hash. A store can be finalized once; a second `--finalize` is refused.
 
+**If block 0 is committed but the genesis file is not written** (a full disk, a read-only file, a crash in between), don't prefill again. If the command got as far as the write, its error names the root. Otherwise run the same `--finalize` again: the refusal reads `already finalized: block 0's root is 0x…, its hash 0x…`. Add that root under `config.arkiv` by hand, as `"prefilledBlockZeroStateRoot": "0x…"`. The node checks the root against the store at start, so a typo is refused rather than run.
+
 **Before starting the node, keep a copy of the store.** This copy is what joining nodes start from (step 6). A store copied from a running node is a later block's state, which a new node cannot start from.
 
 ```bash
