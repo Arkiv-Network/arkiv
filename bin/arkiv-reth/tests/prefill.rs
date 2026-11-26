@@ -1,6 +1,7 @@
 //! The committed prefill fixture, end to end: prefill and finalize it with the
 //! built `arkiv-reth prefill`, then start a node on that store and read the
-//! prefilled entities back over RPC.
+//! prefilled entities back over RPC, and join a second node from a copy of
+//! the store, as `docs/prefill-runbook.md` describes.
 //!
 //! The fixture is `crates/arkiv-prefill/fixtures/small`: two archives, six
 //! entities, and the block 0 root and hash they must produce
@@ -10,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
-use arkiv_harness::{NodeBuilder, connect_reader, hex_quantity};
-use serde_json::Value;
+use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::SolEvent;
+use arkiv_bindings::{Attribute, AttributeValue, IEntityRegistry, Ident32, Operation};
+use arkiv_harness::{ARKIV_ADDRESS, DEV_KEY_0, NodeBuilder, connect, connect_reader, hex_quantity};
+use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_arkiv-reth");
 const READY: Duration = Duration::from_secs(90);
@@ -61,6 +65,48 @@ fn prefill(dir: &Path, extra: &[&str]) -> String {
     stdout
 }
 
+/// The hash of block `number` on the node `client` reads.
+async fn block_hash(client: &arkiv_harness::ArkivClient<impl Provider>, number: u64) -> B256 {
+    client
+        .provider()
+        .get_block_by_number(number.into())
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("block {number}"))
+        .header
+        .hash
+}
+
+/// A copy of the fixture in a new directory, prefilled and finalized: its
+/// `genesis.json` carries block 0's root, its `golemdb` is block 0's store.
+/// `funded` are added to the copy's `alloc`, so they can send transactions;
+/// with any, block 0 is no longer `expected.json`'s.
+fn prefilled(funded: &[Address]) -> tempfile::TempDir {
+    let work = tempfile::tempdir().unwrap();
+    copy(&fixture(), work.path());
+    if !funded.is_empty() {
+        let path = work.path().join("genesis.json");
+        let mut genesis: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for address in funded {
+            genesis["alloc"][address.to_string()] = json!({ "balance": "0x3635c9adc5dea00000" });
+        }
+        std::fs::write(&path, genesis.to_string()).unwrap();
+    }
+    prefill(work.path(), &[]);
+    prefill(work.path(), &["--finalize"]);
+    work
+}
+
+/// The fixture's block 0 root and hash, from `expected.json`.
+fn expected() -> (B256, B256) {
+    let expected: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture().join("expected.json")).unwrap())
+            .unwrap();
+    let field = |name: &str| expected[name].as_str().unwrap().parse().unwrap();
+    (field("root"), field("blockZeroHash"))
+}
+
 /// The entity at `key` (a byte, repeated), as `arkiv_getEntity` returns it.
 async fn entity(client: &arkiv_harness::ArkivClient<impl Provider>, key: u8) -> Value {
     client.get_entity(B256::repeat_byte(key)).await
@@ -68,24 +114,16 @@ async fn entity(client: &arkiv_harness::ArkivClient<impl Provider>, key: u8) -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_starts_on_the_prefilled_fixture() {
-    let work = tempfile::tempdir().unwrap();
+    let work = prefilled(&[]);
     let dir = work.path();
-    copy(&fixture(), dir);
-    prefill(dir, &[]);
-    let finalized = prefill(dir, &["--finalize"]);
 
     // Block 0 is the fixture's, wherever it is built.
-    let expected: Value =
-        serde_json::from_str(&std::fs::read_to_string(fixture().join("expected.json")).unwrap())
-            .unwrap();
-    let root: B256 = expected["root"].as_str().unwrap().parse().unwrap();
-    let hash: B256 = expected["blockZeroHash"].as_str().unwrap().parse().unwrap();
+    let (root, hash) = expected();
     let genesis: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("genesis.json")).unwrap()).unwrap();
     assert_eq!(
         genesis["config"]["arkiv"]["prefilledBlockZeroStateRoot"].as_str(),
-        Some(root.to_string().as_str()),
-        "{finalized}"
+        Some(root.to_string().as_str())
     );
 
     // The node starts on the store under the finalized genesis file, and the
@@ -138,4 +176,94 @@ async fn a_node_starts_on_the_prefilled_fixture() {
         client.entity_count(Some("kind = str('note')"), None).await,
         3
     );
+}
+
+/// The runbook's join: a second node starts from a copy of the store taken
+/// right after the finalize, while the first is already past block 0. It
+/// peers with the first, follows it (reth's RPC consensus stands in for a
+/// consensus client), and ends up on the same chain with the prefilled
+/// entities and the one created after block 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_joins_from_a_copy_of_the_block_zero_store() {
+    let signer: PrivateKeySigner = DEV_KEY_0.parse().unwrap();
+    let work = prefilled(&[signer.address()]);
+    let dir = work.path();
+    let joiner_store = dir.join("golemdb-block0");
+    std::fs::create_dir_all(&joiner_store).unwrap();
+    copy(&dir.join("golemdb"), &joiner_store);
+
+    let mut first = NodeBuilder::new(BIN)
+        .chain(dir.join("genesis.json"))
+        .golemdb_path(dir.join("golemdb"))
+        .http_api("eth,net,admin")
+        .spawn();
+    let first_client = connect(&first.http_url(), signer);
+    first.wait_ready(&first_client, READY).await;
+
+    // An entity created after block 0, then five more blocks, all before the
+    // joiner starts.
+    let payload = Attribute::from_value(
+        Ident32::encode("payload").unwrap(),
+        &AttributeValue::Bytes(b"after block 0".to_vec()),
+        false,
+    )
+    .unwrap();
+    let receipt = first_client
+        .execute(vec![Operation::create(0, 0, 100_000, 0, vec![payload])])
+        .await;
+    let created = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.inner.address == ARKIV_ADDRESS)
+        .find_map(|log| IEntityRegistry::EntityCreated::decode_log(&log.inner).ok())
+        .expect("an EntityCreated log")
+        .entityKey;
+    let created_in = receipt.block_number.expect("a mined receipt");
+    first_client.wait_for_block(created_in + 5, READY).await;
+    let info: Value = first_client
+        .provider()
+        .raw_request("admin_nodeInfo".into(), serde_json::json!([]))
+        .await
+        .unwrap();
+    let enode = info["enode"].as_str().expect("an enode").to_owned();
+
+    let mut joiner = NodeBuilder::new(BIN)
+        .dev(false)
+        .chain(dir.join("genesis.json"))
+        .golemdb_path(&joiner_store)
+        .arg("--trusted-peers")
+        .arg(enode)
+        .arg("--debug.rpc-consensus-url")
+        .arg(first.http_url())
+        .spawn();
+    let joiner_client = connect_reader(&joiner.http_url());
+    joiner.wait_ready(&joiner_client, READY).await;
+    let target = first_client.block_number().await + 3;
+    joiner_client.wait_for_block(target, READY).await;
+
+    // The same chain: block 0, the block with the create, and every block the
+    // joiner followed.
+    for number in [0, 1, created_in, target] {
+        assert_eq!(
+            block_hash(&joiner_client, number).await,
+            block_hash(&first_client, number).await,
+            "block {number}"
+        );
+    }
+    let peers: String = joiner_client
+        .provider()
+        .raw_request("net_peerCount".into(), serde_json::json!([]))
+        .await
+        .unwrap();
+    assert_ne!(peers, "0x0", "the joiner peers with the first node");
+
+    // The prefilled entities and the later one, served by the joiner as the
+    // first node serves them.
+    assert_eq!(joiner_client.entity_count(None, None).await, 7);
+    let entity = entity(&joiner_client, 0xb1).await;
+    assert_eq!(hex_quantity(&entity["createdAt"]), 0, "{entity}");
+    let later = joiner_client.get_entity(created).await;
+    assert_eq!(hex_quantity(&later["createdAt"]), created_in, "{later}");
+    assert_eq!(later, first_client.get_entity(created).await);
 }
