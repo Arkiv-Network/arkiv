@@ -43,12 +43,14 @@ fn copy(from: &Path, to: &Path) {
     }
 }
 
-/// `arkiv-reth prefill` on the copy in `dir`, with `extra` flags; its output.
-fn prefill(dir: &Path, extra: &[&str]) -> String {
+/// `arkiv-reth prefill` with the genesis file `chain` and the archives and
+/// store in `dir`, with `extra` flags: its output, or its output and errors if
+/// it failed.
+fn try_prefill(chain: &Path, dir: &Path, extra: &[&str]) -> Result<String, String> {
     let output = Command::new(BIN)
         .arg("prefill")
         .arg("--chain")
-        .arg(dir.join("genesis.json"))
+        .arg(chain)
         .arg("--archives")
         .arg(dir.join("set.json"))
         .arg("--store")
@@ -57,12 +59,55 @@ fn prefill(dir: &Path, extra: &[&str]) -> String {
         .output()
         .expect("run arkiv-reth prefill");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        output.status.success(),
-        "arkiv-reth prefill {extra:?} failed:\n{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    stdout
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!(
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+/// `arkiv-reth prefill` on the copy in `dir`, with `extra` flags; its output.
+fn prefill(dir: &Path, extra: &[&str]) -> String {
+    try_prefill(&dir.join("genesis.json"), dir, extra)
+        .unwrap_or_else(|error| panic!("arkiv-reth prefill {extra:?} failed:\n{error}"))
+}
+
+/// The JSON file at `path`, changed by `edit`.
+fn edit_json(path: &Path, edit: impl FnOnce(&mut Value)) {
+    let mut json: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    edit(&mut json);
+    std::fs::write(path, json.to_string()).unwrap();
+}
+
+/// A copy of the fixture in a new directory, not yet prefilled.
+fn fixture_copy() -> tempfile::TempDir {
+    let work = tempfile::tempdir().unwrap();
+    copy(&fixture(), work.path());
+    work
+}
+
+/// The fixture's second archive's second part, with a line no prefill
+/// accepts, so a prefill stops after the first archive.
+fn break_second_archive(dir: &Path) -> String {
+    let part = dir.join("A1/entities-0002.jsonl");
+    let good = std::fs::read_to_string(&part).unwrap();
+    std::fs::write(&part, format!("{good}not an entity\n")).unwrap();
+    good
+}
+
+/// Start a node on `store` under the genesis file `chain`, which must refuse
+/// to start; its log.
+async fn refusal(chain: &Path, store: &Path) -> String {
+    let mut node = NodeBuilder::new(BIN)
+        .chain(chain)
+        .golemdb_path(store)
+        .spawn();
+    let status = node.wait_exit(READY).await;
+    assert!(!status.success(), "the node exits with an error ({status})");
+    std::fs::read_to_string(node.log_path()).unwrap()
 }
 
 /// The hash of block `number` on the node `client` reads.
@@ -82,16 +127,14 @@ async fn block_hash(client: &arkiv_harness::ArkivClient<impl Provider>, number: 
 /// `funded` are added to the copy's `alloc`, so they can send transactions;
 /// with any, block 0 is no longer `expected.json`'s.
 fn prefilled(funded: &[Address]) -> tempfile::TempDir {
-    let work = tempfile::tempdir().unwrap();
-    copy(&fixture(), work.path());
+    let work = fixture_copy();
     if !funded.is_empty() {
-        let path = work.path().join("genesis.json");
-        let mut genesis: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        for address in funded {
-            genesis["alloc"][address.to_string()] = json!({ "balance": "0x3635c9adc5dea00000" });
-        }
-        std::fs::write(&path, genesis.to_string()).unwrap();
+        edit_json(&work.path().join("genesis.json"), |genesis| {
+            for address in funded {
+                genesis["alloc"][address.to_string()] =
+                    json!({ "balance": "0x3635c9adc5dea00000" });
+            }
+        });
     }
     prefill(work.path(), &[]);
     prefill(work.path(), &["--finalize"]);
@@ -266,4 +309,191 @@ async fn a_node_joins_from_a_copy_of_the_block_zero_store() {
     let later = joiner_client.get_entity(created).await;
     assert_eq!(hex_quantity(&later["createdAt"]), created_in, "{later}");
     assert_eq!(later, first_client.get_entity(created).await);
+}
+
+/// Each store an operator can wrongly start a node on is refused with the
+/// message the runbook's "When the node refuses to start" table quotes,
+/// before the node runs anything. (A store made with other GolemDB settings is
+/// in `e2e.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_refuses_a_store_that_does_not_fit_its_genesis_file() {
+    let work = prefilled(&[]);
+    let dir = work.path();
+    let finalized = dir.join("genesis.json");
+    let store = dir.join("golemdb");
+    // The genesis file as it was before `--finalize`: the fixture's.
+    let before_finalize = fixture().join("genesis.json");
+
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    // The finalized file, with alloc edited after the prefill.
+    let edited = dir.join("edited.json");
+    std::fs::copy(&finalized, &edited).unwrap();
+    edit_json(&edited, |genesis| {
+        genesis["alloc"][BOB]["balance"] = json!("0x1");
+    });
+
+    // A prefill a bad archive stopped after the first archive.
+    let stopped = fixture_copy();
+    break_second_archive(stopped.path());
+    let chain = stopped.path().join("genesis.json");
+    try_prefill(&chain, stopped.path(), &[]).expect_err("the bad archive is refused");
+
+    // Every archive in, `--finalize` not run.
+    let unfinalized = fixture_copy();
+    prefill(unfinalized.path(), &[]);
+
+    // Finalized from another archive set: one attribute in the second archive.
+    let other = fixture_copy();
+    let part = other.path().join("A1/entities-0001.jsonl");
+    let changed = std::fs::read_to_string(&part)
+        .unwrap()
+        .replace("str:long-lived", "str:other");
+    std::fs::write(&part, changed).unwrap();
+    prefill(other.path(), &[]);
+    prefill(other.path(), &["--finalize"]);
+
+    // The store of a chain that was not prefilled: a node ran on the genesis
+    // file without the field.
+    let plain = dir.join("plain");
+    let mut node = NodeBuilder::new(BIN)
+        .chain(&before_finalize)
+        .golemdb_path(&plain)
+        .spawn();
+    node.wait_ready(&connect_reader(&node.http_url()), READY)
+        .await;
+    node.terminate();
+
+    let cases = [
+        (
+            &finalized,
+            &empty,
+            "the Arkiv store is empty. Run `arkiv-reth prefill` into this store first",
+        ),
+        (
+            &finalized,
+            &stopped.path().join("golemdb"),
+            "the Arkiv store holds an unfinished prefill: 1 of 2 archives are in",
+        ),
+        (
+            &finalized,
+            &unfinalized.path().join("golemdb"),
+            "the Arkiv store holds a finished prefill whose block 0 is not finalized yet",
+        ),
+        (
+            &edited,
+            &store,
+            "the genesis file changed after the prefill",
+        ),
+        (
+            &before_finalize,
+            &store,
+            "the Arkiv store was prefilled, but the genesis file has no \
+             config.arkiv.prefilledBlockZeroStateRoot",
+        ),
+        (
+            &finalized,
+            &other.path().join("golemdb"),
+            "the Arkiv store's prefill was finalized as another block 0 than this genesis file's",
+        ),
+        (&finalized, &plain, "the Arkiv store holds another chain"),
+    ];
+    for (chain, store, message) in cases {
+        let log = refusal(chain, store).await;
+        assert!(
+            log.contains(message),
+            "{} on {}: expected {message:?} in\n{log}",
+            chain.display(),
+            store.display()
+        );
+    }
+
+    // None of them was written to: the right pair still starts.
+    let mut node = NodeBuilder::new(BIN)
+        .chain(&finalized)
+        .golemdb_path(&store)
+        .spawn();
+    let client = connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    assert_eq!(block_hash(&client, 0).await, expected().1);
+}
+
+/// A prefill stopped by a bad archive resumes, once the archive is fixed,
+/// after the archive already in, and reaches the fixture's block 0: the same
+/// as a run that never stopped.
+#[test]
+fn a_prefill_stopped_by_a_bad_archive_resumes_to_the_same_block_zero() {
+    let work = fixture_copy();
+    let dir = work.path();
+    let good = break_second_archive(dir);
+    let chain = dir.join("genesis.json");
+    let error = try_prefill(&chain, dir, &[]).expect_err("the bad archive is refused");
+    // The first archive is in; the error names the bad line.
+    assert!(error.contains("committed as commit 2"), "{error}");
+    assert!(
+        error.contains("A1/entities-0002.jsonl:2: not a JSON object"),
+        "{error}"
+    );
+
+    std::fs::write(dir.join("A1/entities-0002.jsonl"), good).unwrap();
+    let resumed = prefill(dir, &[]);
+    assert_eq!(
+        resumed.matches("committed as commit").count(),
+        1,
+        "only the second archive is written:\n{resumed}"
+    );
+    let finalized = prefill(dir, &["--finalize"]);
+    let (root, hash) = expected();
+    assert!(
+        finalized.contains(&format!("state root {root}, hash {hash}")),
+        "{finalized}"
+    );
+}
+
+/// A finalize that commits block 0 but cannot write the genesis file names
+/// the root, and so does running it again. Added to the file by hand, as the
+/// runbook says, the root starts the node on the fixture's block 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finalize_that_cannot_write_the_genesis_file_is_finished_by_hand() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = fixture_copy();
+    let dir = work.path();
+    prefill(dir, &[]);
+    // The genesis file in a read-only directory: it cannot be replaced.
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::copy(dir.join("genesis.json"), locked.join("genesis.json")).unwrap();
+    let mode = |mode| std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(&locked, mode(0o555)).unwrap();
+    let chain = locked.join("genesis.json");
+    let failed = try_prefill(&chain, dir, &["--finalize"]);
+    let again = try_prefill(&chain, dir, &["--finalize"]);
+    std::fs::set_permissions(&locked, mode(0o755)).unwrap();
+
+    let (root, hash) = expected();
+    let failed = failed.expect_err("the genesis file's directory is read-only (not root?)");
+    assert!(
+        failed.contains("block 0 is committed, but writing") && failed.contains(&root.to_string()),
+        "{failed}"
+    );
+    let again = again.expect_err("block 0 is already committed");
+    assert!(
+        again.contains(&format!("block 0's root is {root}, its hash {hash}")),
+        "{again}"
+    );
+
+    let by_hand = dir.join("genesis.json");
+    edit_json(&by_hand, |genesis| {
+        genesis["config"]["arkiv"]["prefilledBlockZeroStateRoot"] = json!(root.to_string());
+    });
+    let mut node = NodeBuilder::new(BIN)
+        .chain(&by_hand)
+        .golemdb_path(dir.join("golemdb"))
+        .spawn();
+    let client = connect_reader(&node.http_url());
+    node.wait_ready(&client, READY).await;
+    assert_eq!(block_hash(&client, 0).await, hash);
+    assert_eq!(client.entity_count(None, None).await, 6);
 }

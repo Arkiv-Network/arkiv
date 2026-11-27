@@ -127,7 +127,7 @@ fn stage<S: StoreExt + Clone>(
                     "OutOfGas: its cost does not fit 64 bits; is its expiry that far out?"
                         .to_owned()
                 }
-                Some(r) => format!("{r:?}"),
+                Some(r) => r.to_string(),
                 None => "no reason given".to_owned(),
             };
             return Err(eyre!("{}: refused: {reason}", at()));
@@ -285,8 +285,9 @@ mod tests {
         let error = write_archive(&store, &archive, CHAIN)
             .unwrap_err()
             .to_string();
+        // The key in hex, as the chain writes it, not as a list of bytes.
         assert!(
-            error.contains("p.jsonl:2: refused: AlreadyExists"),
+            error.contains("p.jsonl:2: refused: entity 0x") && error.ends_with(" already exists"),
             "{error}"
         );
         assert_eq!(store.head(), head, "nothing committed");
@@ -312,7 +313,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("p.jsonl:1: refused: AlreadyExists"),
+            error.contains(&format!(
+                "p.jsonl:1: refused: entity {account} already exists"
+            )),
             "{error}"
         );
     }

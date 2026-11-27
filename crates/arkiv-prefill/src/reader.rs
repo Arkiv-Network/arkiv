@@ -17,7 +17,7 @@ use std::path::Path;
 
 use alloy_primitives::{Address, B256, Keccak256};
 use arkiv_bindings::types::{Ident32ByteError, validate_ident32_bytes};
-use arkiv_interfaces::constants::OP_MAX_ATTRIBUTES;
+use arkiv_interfaces::constants::{MAX_BYTES_VALUE_LEN, MAX_STR_BYTES, OP_MAX_ATTRIBUTES};
 use arkiv_interfaces::entity::{Attribute, AttributeValue, CreationFlags, annotations};
 use arkiv_interfaces::execution::Op;
 use arkiv_interfaces::primitives::UserAddress;
@@ -274,12 +274,14 @@ fn parse_line(line: &str) -> Result<(UserAddress, Vec<Op>), String> {
     let mut attributes = Vec::new();
     if fields.contains_key("$contentType") {
         let value = AttributeValue::Str(text("$contentType")?.into());
+        check_length("$contentType", &value)?;
         attributes.push(Attribute::unindexed("contentType", value));
     }
     if fields.contains_key("$payload") {
         let payload = STANDARD
             .decode(text("$payload")?)
             .map_err(|e| format!("\"$payload\" is not base64: {e}"))?;
+        check_length("$payload", &AttributeValue::Bytes(payload.clone()))?;
         attributes.push(Attribute::unindexed(
             "payload",
             AttributeValue::Bytes(payload),
@@ -287,10 +289,9 @@ fn parse_line(line: &str) -> Result<(UserAddress, Vec<Op>), String> {
     }
     for (name, value) in fields.iter().filter(|(name, _)| !name.starts_with('$')) {
         check_attribute_name(name)?;
-        attributes.push(Attribute::new(
-            name.as_bytes(),
-            parse_attribute(name, value)?,
-        ));
+        let value = parse_attribute(name, value)?;
+        check_length(name, &value)?;
+        attributes.push(Attribute::new(name.as_bytes(), value));
     }
     // Ascending by name, as the decoder requires of a create.
     attributes.sort_by(|a, b| a.key.cmp(&b.key));
@@ -341,6 +342,21 @@ fn check_attribute_name(name: &str) -> Result<(), String> {
             format!("{name:?}: invalid attribute name byte 0x{value:02x} at position {position}")
         }
     })
+}
+
+/// The length limits a transaction's values meet, from the same constants as
+/// the decoder's: a longer value would otherwise get as far as the store and
+/// be refused there without its name.
+fn check_length(name: &str, value: &AttributeValue) -> Result<(), String> {
+    let (length, max) = match value {
+        AttributeValue::Str(text) => (text.len(), MAX_STR_BYTES),
+        AttributeValue::Bytes(bytes) => (bytes.len(), MAX_BYTES_VALUE_LEN),
+        _ => return Ok(()),
+    };
+    if length > max {
+        return Err(format!("{name:?} is {length} bytes long, at most {max}"));
+    }
+    Ok(())
 }
 
 /// A user attribute: `"<tag>:<value>"`.
@@ -522,6 +538,14 @@ mod tests {
             (
                 serde_json::json!({ "9x": "str:a" }),
                 r#""9x": invalid attribute name"#,
+            ),
+            (
+                serde_json::json!({ "kind": format!("str:{}", "x".repeat(MAX_STR_BYTES + 1)) }),
+                r#""kind" is 129 bytes long, at most 128"#,
+            ),
+            (
+                serde_json::json!({ "$contentType": "x".repeat(MAX_STR_BYTES + 1) }),
+                r#""$contentType" is 129 bytes long, at most 128"#,
             ),
             (
                 serde_json::json!({ "payload": "str:a", "$payload": "" }),

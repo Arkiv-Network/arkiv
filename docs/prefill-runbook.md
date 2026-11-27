@@ -1,6 +1,6 @@
 # Prefill runbook
 
-How to launch an Arkiv chain whose block 0 already holds entities, and how other nodes join it.
+How to launch an Arkiv chain whose block 0 already holds entities, and how other nodes join it. New to prefills? [prefill.md](prefill.md) walks through one small example, archives included, with the gotchas.
 
 A prefill writes entities from archive files into GolemDB **before** the chain starts, so they are part of block 0: created at block 0, with expiries counted from block 0. The operator runs it once, on one machine. Everyone else joins after the chain has started.
 
@@ -74,7 +74,7 @@ It runs the same checks as a resume, then commits block 0 on top of the archives
 
 **If block 0 is committed but the genesis file is not written** (a full disk, a read-only file, a crash in between), don't prefill again. If the command got as far as the write, its error names the root. Otherwise run the same `--finalize` again: the refusal reads `already finalized: block 0's root is 0x…, its hash 0x…`. Add that root under `config.arkiv` by hand, as `"prefilledBlockZeroStateRoot": "0x…"`. The node checks the root against the store at start, so a typo is refused rather than run.
 
-**Before starting the node, keep a copy of the store.** This copy is what joining nodes start from (step 6). A store copied from a running node is a later block's state, which a new node cannot start from.
+**Before starting the node, keep a copy of the store.** This copy is what joining nodes start from (step 6), and what to publish: anyone can check it against the genesis file. A later store of the same chain also works for a joiner, which skips the blocks the store already holds, but copy it only from a stopped node (a running node's directory can be copied mid-write), and CI checks only the block 0 copy.
 
 ```bash
 cp -R /var/lib/arkiv/golemdb /var/lib/arkiv/golemdb-block0
