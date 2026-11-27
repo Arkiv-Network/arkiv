@@ -116,21 +116,15 @@ An entity can also carry `$creationFlags`, which is a list holding `"readonly"`,
 
 ### Mistakes in a line
 
-When a line is wrong, the prefill stops and names the file and line number, for example `A0/p.jsonl:2`. Nothing from the archive with the bad line is committed, so you can fix the line and run the same command again. These are the mistakes people make most often, with the message each one produces:
+When a line is wrong, the prefill stops and names the file and line number, for example `A0/p.jsonl:2`. Nothing from the archive with the bad line is committed, so you can fix the line and run the same command again. An attribute is checked exactly as it would be in a transaction, with the same limits on names, value lengths and the number of attributes. The mistakes below are the ones that come from the prefill itself:
 
 | What was written | What the prefill says | What it means |
 |---|---|---|
-| `"kind": "note"` | `"kind" is not a tagged string: "note"` | The attribute is missing its type tag. Write `"str:note"`. |
-| `"size": 3` | `"size" is not a tagged string: 3` | Numbers need a tag as well. Write `"i32:3"`. |
 | `"$expiresAt": 0` | `"$expiresAt" is 0: the entity would already be expired at block 0` | The expiry has to be a block after block 0. |
 | `"$expiresAt": "0x64"` | `"$expiresAt" is not a number: "0x64"` | The expiry must be decimal, even though `u64:` attributes accept hex. |
-| `"$key": "0x1234"` | `"$key" is not an entity key: "0x1234"` | A key must be a full 32 bytes. |
-| `"$payload": "hello!"` | `"$payload" is not base64: …` | The payload has to be base64-encoded. |
-| `"$foo": "x"` | `unknown field "$foo"` | Names starting with `$` are reserved, so you cannot add your own. |
-| an attribute name 33 bytes long | `attribute names are at most 32 bytes` | Shorten the name. |
-| the same `$key` used twice | `refused: AlreadyExists { key: [194, 194, …] }` | Each key can be used only once, across all archives. Note that the message prints the key as a list of decimal byte values rather than as hex. |
-| the key `0x00…00`, or `keccak256("arkiv.prefill")` | `refused: AlreadyExists { … }` | Both keys are already used by the chain's own records. |
-| a `str:` value longer than the genesis file allows | `the executor failed: Store("Entity(Store(InvalidArgument))")` | This message does not say which limit was hit. The limits are in the genesis file under `config.arkiv.golemdb.cell_limits` (the fixture allows strings of up to 128 bytes), so check your values against them before you start. |
+| `"$foo": "x"` | `unknown field "$foo"` | Only the system fields listed above exist. You cannot add your own `$` field. |
+| the same `$key` used twice | `refused: entity 0xc1c1…c1 already exists` | A transaction derives its key, but a prefill line chooses it, so it is up to you to keep keys unique across all archives. |
+| the key `0x00…00`, or `keccak256("arkiv.prefill")` | `refused: entity 0x00…00 already exists` | Both keys are already used by the chain's own records. |
 | a line longer than 1 MiB | `line longer than 1048576 bytes; is the part missing its line breaks?` | Usually this means the file lost its line breaks. |
 
 ### Things that are allowed but may surprise you
@@ -138,7 +132,6 @@ When a line is wrong, the prefill stops and names the file and line number, for 
 - **Expiries are kept exactly as you write them.** The chain's `max_lifetime` setting limits transactions, but it does not apply to prefilled data. In the fixture, `0xb1…` expires at block 1,000,000,000.
 - **Prefilled entities are not yet removed when they expire.** That will come with the new pruning design, which is tracked in #333. Choose your expiries as if they were already enforced, because they will be.
 - **Creating prefilled entities is free.** No fee is charged and nothing is paid into the storage pool, so the creators do not need a balance or an entry in `alloc`. Everything after block 0 costs the normal price.
-- **The prefill accepts a key written without `0x`**, and attribute names such as `Kind` or `my-kind`. Whatever spelling you choose for a name, use the same one everywhere.
 - **Keys are used as written.** When a transaction creates an entity, the key is derived from the creator and a counter. A prefill line simply states its key. If you are importing data from another chain, keep the keys it already has. Each prefilled entity still moves its creator's counter forward, just as a transaction would, so that creator's first transaction after block 0 carries on from where the prefill left off.
 
 ## 3. The genesis file
@@ -189,7 +182,7 @@ Error: A1/entities-0002.jsonl:2: not a JSON object: expected ident at line 1 col
 Archive A1 was not committed, so you can fix it. When you run the command again, the prefill writes only A1.
 
 > [!CAUTION]
-> **Once an archive is committed, do not change it, not even its whitespace.** An archive's hash covers its raw bytes, so even reformatting a file turns it into a different archive. A resumed run only checks the most recently committed archive, so a change to an earlier one goes unnoticed. The prefill carries on, but your store no longer matches the files you are going to publish. The audit in step 6 catches this, because it rebuilds block 0 from the published files. If you need to change data that is already committed, start again with an empty store directory.
+> **Once an archive is committed, leave its files alone.** An archive's hash covers its raw bytes, so a resume refuses even a reformatted file if it is the last committed archive. A resume checks only that last one, though, so a change to an earlier archive goes unnoticed at that point. If the change was only formatting, block 0 is unaffected, as the section on block 0's root explains. If it changed an entity, the published files no longer produce your store's block 0, and the audit will report a different root. To change data that is already committed, start again with an empty store directory.
 
 ## 5. Finalizing and getting block 0's hash
 
@@ -239,6 +232,70 @@ The genesis file contains the state root, not the hash. The hash also covers the
 > [!IMPORTANT]
 > **Copy the store now, before any node runs on it.** Run `cp -R golemdb golemdb-block0`. This copy is what you publish for nodes that want to join. It holds exactly block 0, so anyone can check it against the genesis file. A store that a node has already run on has moved past block 0.
 
+## Block 0's root, from start to finish
+
+Block 0's state root is the one value that ties everything together. The genesis file publishes it, block 0's header carries it, the node checks the store against it at start-up, and an audit recomputes it. This section follows it from the first commit to the running chain.
+
+### How it is built
+
+The root is GolemDB's state root, a single hash over everything the store holds. It grows commit by commit:
+
+```mermaid
+flowchart TD
+  C0["commit 0: GolemDB is created<br/>with the genesis file's settings"] --> C1
+  C1["commit 1: the alloc accounts, and the prefill record<br/>(how many archives, how many are in, the genesis file's hash)"] --> CA
+  CA["commits 2 … N+1: one per archive<br/>the record's count goes up by one each time"] --> CB
+  CB["commit N+2: empty<br/>its root is block 0's root"] --> F
+  F["--finalize writes the root into genesis.json,<br/>builds block 0's header and tags the commit with its hash"] --> S
+  S["node start: the store's block 0 must have<br/>the root the genesis file names"]
+```
+
+Because the prefill record is part of the state, the root covers more than the entities. It also covers the alloc accounts, the number of archives, and the hash of the genesis file the prefill started with. Block 0's hash is then computed from the header, which holds the root and the rest of the genesis file's fields.
+
+### What it depends on
+
+The root depends on the content of your files, not on how they are formatted. It changes if you change any of these:
+
+- an entity: its key, creator, owner, expiry, flags or attributes;
+- the order of the archives in `set.json`, or how many archives there are;
+- anything in the genesis file, such as an account in `alloc`, a GolemDB setting or the chain id.
+
+It does not change if you reformat a file. To check this, every file of the fixture was rewritten with different spacing, indentation and key order: the archive parts, the index files, the set file and the genesis file. Each archive got a new archive hash, but block 0 came out exactly the same:
+
+```text
+                 archive A0      archive A1      block 0 root    block 0 hash
+as committed     0xd4d2a083…     0x187c4045…     0xd700bb5e…     0x5a79e960…
+reformatted      0x9649a76b…     0xdc39f5ca…     0xd700bb5e…     0x5a79e960…
+```
+
+The genesis file behaves the same way, because the prefill hashes a canonical form of it, with its keys sorted and the prefill field left out.
+
+The archive hash is the one value that does depend on the exact bytes. It has a narrow job. The prefill uses it to recognise which archives are already in when it resumes, so that a changed file is not mistaken for one that is done. It is stored as a tag on the commit, outside the data the root covers, which is why reformatting changes it without touching block 0.
+
+### If the prefill dies part of the way through
+
+Each archive is written on its own branch and committed in one step at the end. If the process dies in the middle of an archive, whether from a crash, a power cut or `kill -9`, that archive's writes were never committed, and the store is left exactly as it was after the previous archive. Running the same command again checks what is in and continues from there.
+
+Here is a real run of four archives with 1,000 entities each, killed with `kill -9` while it was writing the second archive, and then resumed:
+
+```text
+store: 1 of 4 archives in; checking nothing changed, then resuming
+A1/index.json  committed as commit 3 · 1000 entities · 3.0 s
+A2/index.json  committed as commit 4 · 1000 entities · 3.3 s
+A3/index.json  committed as commit 5 · 1000 entities · 3.3 s
+4 of 4 archives in. Run again with --finalize to commit block 0.
+```
+
+After finalizing, the resumed store had the same block 0 root and hash as a run of the same files that was never interrupted. A prefill that stops part way costs you the time of the archive it was writing, and nothing else. You do not need to start again, and you do not need to clean anything up first.
+
+The same is true while finalizing. Block 0's commit is made in one step, so if the process dies before it, run `--finalize` again. If it dies after the commit but before the genesis file is written, the store already knows the root, and the section on finalizing above shows how to get it back.
+
+### You never compute it by hand
+
+You do not need to work out the root or block 0's hash yourself, and you should not try to. `--finalize` reads the root from GolemDB and builds block 0's header from the genesis file using the node's own code, so the hash it prints is exactly the hash the node will compute. It also writes the root into the genesis file for you.
+
+After that, every other copy of the value is checked rather than trusted. The node compares the store's block 0 with the genesis file at every start, and an audit rebuilds block 0 from the published files and compares it with the genesis file too. The only time you handle the root yourself is when the genesis file could not be written, and even then the prefill prints the exact value to paste in.
+
 ## 6. Auditing: anyone can rebuild block 0
 
 Anyone who has the finalized `genesis.json`, the set file and the archives can check the result. On any machine, and into an empty store, they run:
@@ -278,13 +335,11 @@ A node that wants to join the chain starts from a copy of the block 0 store, `go
 
 | What you see | Why it happens | What to do |
 |---|---|---|
-| `is not a tagged string` | An attribute value has no type tag. | Add the tag, for example `"str:…"` or `"i32:…"`. |
 | `"$expiresAt" is 0` or `is not a number` | The expiry is 0, or it is written in hex. | Write a decimal block number greater than 0. |
-| `refused: AlreadyExists { key: [ … ] }` | A key is used twice, or it is one of the two reserved keys. | Make every key unique. Convert the printed bytes to hex to find the duplicate. |
-| `Store("Entity(Store(InvalidArgument))")` | A value is larger than a limit in `cell_limits`. | Check your values against the limits in the genesis file. |
+| `refused: entity 0x… already exists` | A key is used twice, or it is one of the two reserved keys. | Make every key unique. |
 | `must be an absolute path` | The store path is relative. | Use an absolute path, such as `"$PWD/golemdb"`. |
 | `the list changed since this prefill started` | The archives were reordered, or the last committed archive was edited. | Put the files back as they were, or start again with an empty store. |
 | `this store was started with 2 archives; 1 were given` | Archives were added to or removed from `set.json`. | Use the set file the prefill started with. |
 | `the genesis file changed since this prefill started` | The genesis file was edited after the first run. | Use the original file, or start again. |
-| The audit reports a different root. | An earlier archive was edited after it was committed. | Publish exactly the files that were committed. |
+| The audit reports a different root. | An entity in an earlier archive was changed after the archive was committed. | Publish the data that was committed, or prefill again from the changed files. |
 | Prefilled entities are still there after their expiry. | Removing expired prefilled entities is not built yet (#333). | Nothing for now. This is expected. |
