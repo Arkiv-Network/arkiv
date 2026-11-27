@@ -1,6 +1,6 @@
 # Prefill runbook
 
-How to launch an Arkiv chain whose block 0 already holds entities, and how other nodes join it.
+How to launch an Arkiv chain whose block 0 already holds entities, and how other nodes join it. New to prefills? [prefill.md](prefill.md) walks through one small example, archives included, with the gotchas.
 
 A prefill writes entities from archive files into GolemDB **before** the chain starts, so they are part of block 0: created at block 0, with expiries counted from block 0. The operator runs it once, on one machine. Everyone else joins after the chain has started.
 
