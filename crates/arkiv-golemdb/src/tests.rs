@@ -713,6 +713,80 @@ fn tags_and_roots_survive_a_reopen() {
     assert_eq!(store.commit_hash(sealed.commit_nr), Ok(sealed.state_root));
 }
 
+/// The adapter names the directory of segment files itself. It must be the one
+/// GolemDB uses when none is named, or a database made earlier loses its rows.
+#[test]
+fn segment_files_are_where_golemdb_puts_them_by_default() {
+    let dir = TempDir::new().unwrap();
+    let commit = {
+        let store = open(&dir);
+        store.commit(stage(&store, 1)).unwrap()
+    };
+
+    let database = golemdb::Database::open(dir.path(), &config().open_config().unwrap()).unwrap();
+    let rows = database
+        .immutable_data_rows_of(
+            SEGMENT,
+            golemdb_commit(commit),
+            &golemdb::ImmutableDataReadOptions::all(),
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(segment_row).collect::<Vec<_>>(),
+        vec![row(1)]
+    );
+}
+
+/// GolemDB opens one read for each call. On a single reader slot, a call that
+/// opened a second read while it held the first would wait for itself and hang
+/// this test, as it would hang a node whose slots are all taken.
+#[test]
+fn no_call_needs_a_second_reader_slot() {
+    let dir = TempDir::new().unwrap();
+    let store = GolemDbStore::open_with_reader_slots(dir.path(), &config(), None, 1).unwrap();
+
+    commit_block(&store, 1);
+    commit_block(&store, 2);
+    let tagged = store.commit_tagged(stage(&store, 3), [9; 32]).unwrap();
+    assert_eq!(store.head(), tagged);
+
+    // Reads of committed state.
+    read(&store, ReadTarget::Commit(tagged), 3).unwrap();
+    let query = Query {
+        filter: n_at_least(0),
+        page: Page {
+            offset: 0,
+            limit: 10,
+        },
+        ..Query::default()
+    };
+    assert_eq!(
+        store.query(None, &query, None).unwrap().value.records.len(),
+        3
+    );
+    assert_eq!(store.count(None, &n_at_least(0), None).unwrap().value, 3);
+    store.pricing_snapshot(tagged).unwrap();
+    assert_eq!(store.segment_rows_of(SEGMENT, tagged), Ok(vec![row(3)]));
+    assert_eq!(
+        store.segment_get(SEGMENT, SegmentAddress::Ordinal(0)),
+        Ok(Some(row(3)))
+    );
+    assert_eq!(store.commit_by_tag([9; 32]), Ok(Some(tagged)));
+    assert_eq!(store.tag_of(tagged), Ok(Some([9; 32])));
+    store.commit_hash(tagged).unwrap();
+
+    // A branch's own reads, and its ways back and out.
+    let branch = store.begin(Some(tagged)).unwrap();
+    store.checkpoint(branch).unwrap();
+    store
+        .delete(branch, RecordKey([3; 32]), None, None)
+        .unwrap();
+    read(&store, ReadTarget::Branch(branch), 2).unwrap();
+    store.rollback(branch).unwrap();
+    store.branch_info(branch).unwrap();
+    store.discard(branch).unwrap();
+}
+
 /// `commit_tags` is the adapter's own, so a host segment of that name is a
 /// duplicate GolemDB refuses at open.
 #[test]

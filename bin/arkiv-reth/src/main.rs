@@ -271,7 +271,7 @@ struct ArkivArgs {
     /// Maximum number of concurrent `arkiv_*` requests; further ones wait for a turn.
     ///
     /// Each holds one GolemDB read slot. The whole node shares a fixed number of
-    /// them with block import and `eth_*` reads, and with none left reads fail.
+    /// them with block import and `eth_*` reads, and with none left reads wait.
     #[arg(
         long = "rpc.max-arkiv-requests",
         value_name = "COUNT",
@@ -279,6 +279,20 @@ struct ArkivArgs {
         default_value_t = arkiv_reth_rpc::DEFAULT_MAX_CONCURRENT_READS
     )]
     rpc_max_arkiv_requests: usize,
+
+    /// Maximum number of RPC requests running at once, over HTTP and WebSocket;
+    /// further ones wait for a turn.
+    ///
+    /// A request that reads the store holds one GolemDB read slot. The limit
+    /// leaves slots free for block building and import; set above the number
+    /// of slots, 112, it leaves none.
+    #[arg(
+        long = "rpc.max-concurrent-requests",
+        value_name = "COUNT",
+        value_parser = RangedU64ValueParser::<usize>::new().range(1..=Semaphore::MAX_PERMITS as u64),
+        default_value_t = arkiv_reth_rpc::DEFAULT_MAX_CONCURRENT_REQUESTS
+    )]
+    rpc_max_concurrent_requests: usize,
 }
 
 fn main() {
@@ -375,7 +389,12 @@ fn main() {
             let rpc_store = store.clone();
             let rpc_seals = seals.clone();
             // Arkiv node types: Ethereum's, on ArkivChainSpec, with our executor.
-            let node = ArkivNode::new(store.clone(), seals.clone(), op_cost);
+            let node = ArkivNode::new(
+                store.clone(),
+                seals.clone(),
+                op_cost,
+                arkiv_args.rpc_max_concurrent_requests,
+            );
             // Spelt out rather than `.node(node)`: that convenience pins the
             // provider to reth's `BlockchainProvider`, and the whole point here
             // is to run on ours. `with_types_and_provider` names the provider
@@ -452,26 +471,38 @@ mod tests {
         assert_eq!(engine.tree_config().backfill_run_threshold(), 100);
     }
 
-    /// `--rpc.max-arkiv-requests` as the `node` command parses `flags`.
-    fn arkiv_requests(flags: &[&str]) -> Result<usize, clap::Error> {
+    /// Arkiv's own flags as the `node` command parses `flags`.
+    fn arkiv_args(flags: &[&str]) -> Result<ArkivArgs, clap::Error> {
         let args = ["arkiv-reth", "node"].iter().chain(flags).copied();
         let mut cli = Cli::<genesis::NodeChainSpecParser, ArkivArgs>::try_parse_from(args)?;
-        let mut requests = None;
-        cli.apply_node_command(|node| requests = Some(node.ext.rpc_max_arkiv_requests));
-        Ok(requests.expect("a node command"))
+        let mut parsed = None;
+        cli.apply_node_command(|node| parsed = Some(node.ext.clone()));
+        Ok(parsed.expect("a node command"))
     }
 
     #[test]
     fn the_arkiv_request_limit_has_a_default_and_refuses_zero() {
+        let requests = |flags| arkiv_args(flags).map(|args| args.rpc_max_arkiv_requests);
         let default = arkiv_reth_rpc::DEFAULT_MAX_CONCURRENT_READS;
-        assert_eq!(arkiv_requests(&[]).unwrap(), default);
-        assert_eq!(
-            arkiv_requests(&["--rpc.max-arkiv-requests", "64"]).unwrap(),
-            64
-        );
-        assert!(arkiv_requests(&["--rpc.max-arkiv-requests", "0"]).is_err());
+        assert_eq!(requests(&[]).unwrap(), default);
+        assert_eq!(requests(&["--rpc.max-arkiv-requests", "64"]).unwrap(), 64);
+        assert!(requests(&["--rpc.max-arkiv-requests", "0"]).is_err());
         let too_many = (Semaphore::MAX_PERMITS + 1).to_string();
-        assert!(arkiv_requests(&["--rpc.max-arkiv-requests", &too_many]).is_err());
+        assert!(requests(&["--rpc.max-arkiv-requests", &too_many]).is_err());
+    }
+
+    #[test]
+    fn the_request_limit_has_a_default_and_refuses_zero() {
+        let requests = |flags| arkiv_args(flags).map(|args| args.rpc_max_concurrent_requests);
+        let default = arkiv_reth_rpc::DEFAULT_MAX_CONCURRENT_REQUESTS;
+        assert_eq!(requests(&[]).unwrap(), default);
+        assert_eq!(
+            requests(&["--rpc.max-concurrent-requests", "8"]).unwrap(),
+            8
+        );
+        assert!(requests(&["--rpc.max-concurrent-requests", "0"]).is_err());
+        let too_many = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert!(requests(&["--rpc.max-concurrent-requests", &too_many]).is_err());
     }
 
     /// A chain spec whose genesis has `config.arkiv.golemdb` set to `golemdb`,

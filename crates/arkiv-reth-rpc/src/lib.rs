@@ -15,7 +15,10 @@
 
 pub mod cursor;
 pub mod error;
+mod request_limit;
 pub mod store_reads;
+
+pub use request_limit::{DEFAULT_MAX_CONCURRENT_REQUESTS, RequestLimit};
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
@@ -44,7 +47,7 @@ const NOT_COMMITTED: &str = "state for this block is not committed";
 
 /// How many `arkiv_*` reads run at once unless the node is told otherwise.
 /// Each read holds one GolemDB read slot at a time. The node shares a fixed
-/// number of slots, block import included, and with none left every read fails.
+/// number of slots, block import included, and with none left every read waits.
 pub const DEFAULT_MAX_CONCURRENT_READS: usize = 32;
 
 /// Build the `arkiv_*` [`RpcModule`], ready to merge into reth's rpc modules.

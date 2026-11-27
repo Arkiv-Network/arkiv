@@ -1746,6 +1746,7 @@ dependencies = [
  "reth-storage-api",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]
